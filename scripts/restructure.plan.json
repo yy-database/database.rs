@@ -1,0 +1,4289 @@
+{
+  "schema": 2,
+  "mode": "apply",
+  "workspace": "projects/database",
+  "designDecision": {
+    "status": "resolved",
+    "chosen": "13-packages",
+    "summary": "六包方案作废，按设计文档约 4109-4130 行的能力树重排。",
+    "facadeRule": "门面只按能力 re-export，不出现 database::yydb / yyds / iris / sqlite，也不建品牌 feature。"
+  },
+  "domains": {
+    "types": "projects/database/database.types",
+    "input": "projects/database/database.input",
+    "query": "projects/database/database.query",
+    "execution": "projects/database/database.execution",
+    "formats": "projects/database/database.formats",
+    "storage": "projects/database/database.storage",
+    "cluster": "projects/database/database.cluster",
+    "protocol": "projects/database/database.protocol",
+    "client": "projects/database/database.client",
+    "server": "projects/database/database.server",
+    "orm": "projects/database/database.orm",
+    "generate": "projects/database/database.generate"
+  },
+  "stubs": [
+    {
+      "domain": "facade",
+      "dir": "projects/database/database",
+      "pkg": "database",
+      "manifest": "projects/database/database/Cargo.toml",
+      "lib": "projects/database/database/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "types",
+      "dir": "projects/database/database.types",
+      "pkg": "database-types",
+      "manifest": "projects/database/database.types/Cargo.toml",
+      "lib": "projects/database/database.types/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "input",
+      "dir": "projects/database/database.input",
+      "pkg": "database-input",
+      "manifest": "projects/database/database.input/Cargo.toml",
+      "lib": "projects/database/database.input/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "query",
+      "dir": "projects/database/database.query",
+      "pkg": "database-query",
+      "manifest": "projects/database/database.query/Cargo.toml",
+      "lib": "projects/database/database.query/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "execution",
+      "dir": "projects/database/database.execution",
+      "pkg": "database-execution",
+      "manifest": "projects/database/database.execution/Cargo.toml",
+      "lib": "projects/database/database.execution/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "formats",
+      "dir": "projects/database/database.formats",
+      "pkg": "database-formats",
+      "manifest": "projects/database/database.formats/Cargo.toml",
+      "lib": "projects/database/database.formats/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "storage",
+      "dir": "projects/database/database.storage",
+      "pkg": "database-storage",
+      "manifest": "projects/database/database.storage/Cargo.toml",
+      "lib": "projects/database/database.storage/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "cluster",
+      "dir": "projects/database/database.cluster",
+      "pkg": "database-cluster",
+      "manifest": "projects/database/database.cluster/Cargo.toml",
+      "lib": "projects/database/database.cluster/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "protocol",
+      "dir": "projects/database/database.protocol",
+      "pkg": "database-protocol",
+      "manifest": "projects/database/database.protocol/Cargo.toml",
+      "lib": "projects/database/database.protocol/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "client",
+      "dir": "projects/database/database.client",
+      "pkg": "database-client",
+      "manifest": "projects/database/database.client/Cargo.toml",
+      "lib": "projects/database/database.client/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "server",
+      "dir": "projects/database/database.server",
+      "pkg": "database-server",
+      "manifest": "projects/database/database.server/Cargo.toml",
+      "lib": "projects/database/database.server/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "orm",
+      "dir": "projects/database/database.orm",
+      "pkg": "database-orm",
+      "manifest": "projects/database/database.orm/Cargo.toml",
+      "lib": "projects/database/database.orm/src/lib.rs",
+      "state": "create"
+    },
+    {
+      "domain": "generate",
+      "dir": "projects/database/database.generate",
+      "pkg": "database-generate",
+      "manifest": "projects/database/database.generate/Cargo.toml",
+      "lib": "projects/database/database.generate/src/lib.rs",
+      "state": "create"
+    }
+  ],
+  "moves": [
+    {
+      "id": "yydb-types",
+      "src": "projects/types/yydb-types",
+      "pkg": "yydb-types",
+      "note": "通用值/标识/错误进 types；UDF 执行模型按职责进 execution。",
+      "state": "ready",
+      "error": null,
+      "bytes": 129357,
+      "targets": [
+        {
+          "domain": "types",
+          "module": "yydb",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "execution",
+          "module": "udf_contract",
+          "match": [
+            "udf/"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/types/yydb-types/src/constraint.rs",
+          "to": "projects/database/database.types/src/yydb/constraint.rs",
+          "sha256": "5ebc2fced46bf2042a621e33ff65ab67a589f089d90a268610556e05fc3a6939",
+          "bytes": 4536
+        },
+        {
+          "from": "projects/types/yydb-types/src/hex.rs",
+          "to": "projects/database/database.types/src/yydb/hex.rs",
+          "sha256": "12789b4088f948d7f9913b4b1a04e7b1d4c8bd69c285d55891c7102d3259a662",
+          "bytes": 1258
+        },
+        {
+          "from": "projects/types/yydb-types/src/lib.rs",
+          "to": "projects/database/database.types/src/yydb/mod.rs",
+          "sha256": "4658eea1d2416245bf20a128b3b9cd1a6a1a7a3f8d1bbecaa703dd6da80db2e2",
+          "bytes": 31117
+        },
+        {
+          "from": "projects/types/yydb-types/src/object.rs",
+          "to": "projects/database/database.types/src/yydb/object.rs",
+          "sha256": "4ab115b84641886666e2ed554586208902baf0ed8023e277d473cf86a5433ca2",
+          "bytes": 11355
+        },
+        {
+          "from": "projects/types/yydb-types/src/scalar.rs",
+          "to": "projects/database/database.types/src/yydb/scalar.rs",
+          "sha256": "1281257d0bdc3d08273a3990473fffe61881112fe4b3789447c6e5883eecbeca",
+          "bytes": 40953
+        },
+        {
+          "from": "projects/types/yydb-types/src/udf/error.rs",
+          "to": "projects/database/database.execution/src/udf_contract/udf/error.rs",
+          "sha256": "5103c1168819971cabc0fb9f090db17ef07d7b55b864a7e8647bb1d39f260614",
+          "bytes": 3264
+        },
+        {
+          "from": "projects/types/yydb-types/src/udf/host.rs",
+          "to": "projects/database/database.execution/src/udf_contract/udf/host.rs",
+          "sha256": "ffcc3d3b8ca4cb42f131b6e4a885a273a1a4f413f9e5a430e761995912120475",
+          "bytes": 2813
+        },
+        {
+          "from": "projects/types/yydb-types/src/udf/identity.rs",
+          "to": "projects/database/database.execution/src/udf_contract/udf/identity.rs",
+          "sha256": "8ccf706d24b9368c8281be694b8cf042505c4fa6eff7f94de54ec8ff70c8af62",
+          "bytes": 2295
+        },
+        {
+          "from": "projects/types/yydb-types/src/udf/mod.rs",
+          "to": "projects/database/database.execution/src/udf_contract/udf/mod.rs",
+          "sha256": "e8c2b9b4677ebaeedeedd1cc7895f9d156777d7a160a4b0114bbeec2af6814cb",
+          "bytes": 654
+        },
+        {
+          "from": "projects/types/yydb-types/src/udf/policy.rs",
+          "to": "projects/database/database.execution/src/udf_contract/udf/policy.rs",
+          "sha256": "6f9eb91b6a2c2858b2f8ec45072d95c7fea41fd7b90e66b88301b0ca145f605a",
+          "bytes": 3055
+        },
+        {
+          "from": "projects/types/yydb-types/src/udf/signature.rs",
+          "to": "projects/database/database.execution/src/udf_contract/udf/signature.rs",
+          "sha256": "7948a2faa9c48f886b7d6afbd0b9167a3bad14846ecba06d2d496c7f7b4c87bb",
+          "bytes": 3908
+        },
+        {
+          "from": "projects/types/yydb-types/src/udf/value.rs",
+          "to": "projects/database/database.execution/src/udf_contract/udf/value.rs",
+          "sha256": "3e1f61bcbb73c5fd4b9f3e04aea0ef364996ca7a07e8b59c75e0fceccce37047",
+          "bytes": 870
+        },
+        {
+          "from": "projects/types/yydb-types/src/value.rs",
+          "to": "projects/database/database.types/src/yydb/value.rs",
+          "sha256": "0d646d545e5a2bc57f2d8948961c8ffdf98afc8d9efdf20583606eec94d040c6",
+          "bytes": 3352
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/types/yydb-types/Cargo.toml",
+          "to": "projects/database/database.types/parts/yydb/Cargo.toml",
+          "sha256": "d6fd6599929e69020b77df9713a705fb8abd295238414063edb494a67df2f379",
+          "bytes": 407
+        },
+        {
+          "from": "projects/types/yydb-types/readme.md",
+          "to": "projects/database/database.types/parts/yydb/readme.md",
+          "sha256": "70959d392ae197cc4db8639d2ec40f22825266f8042600e5cc73aff7c4420e23",
+          "bytes": 292
+        },
+        {
+          "from": "projects/types/yydb-types/tests/diagnostic_envelope.rs",
+          "to": "projects/database/database.types/parts/yydb/tests/diagnostic_envelope.rs",
+          "sha256": "2e00297af6c0c6440dff1edb117d161b9b96749c745147358ae6e1fea1484426",
+          "bytes": 2089
+        },
+        {
+          "from": "projects/types/yydb-types/tests/error_catalog.rs",
+          "to": "projects/database/database.types/parts/yydb/tests/error_catalog.rs",
+          "sha256": "6f2d136c1d0a364cc2f1fd9e97ad991fda30326a6ae01df626d8184f7d29f1db",
+          "bytes": 2332
+        },
+        {
+          "from": "projects/types/yydb-types/tests/scalars.rs",
+          "to": "projects/database/database.types/parts/yydb/tests/scalars.rs",
+          "sha256": "2bd0541bee672d3d33f65df3dcc75cedf84f3d02eab50717a5de9050ef4f0b01",
+          "bytes": 14807
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-types",
+      "src": "projects/types/yyds-types",
+      "pkg": "yyds-types",
+      "note": "分片/复制/路由进 cluster；VOS UDF lowering 进 input；KV 命令/结果进 query。",
+      "state": "ready",
+      "error": null,
+      "bytes": 70775,
+      "targets": [
+        {
+          "domain": "types",
+          "module": "yyds",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "cluster",
+          "module": "yyds",
+          "match": [
+            "distributed_execution.rs",
+            "replication.rs",
+            "replication_log.rs",
+            "routing.rs"
+          ]
+        },
+        {
+          "domain": "input",
+          "module": "yyds",
+          "match": [
+            "vos_udf.rs"
+          ]
+        },
+        {
+          "domain": "query",
+          "module": "yyds_kv",
+          "match": [
+            "key_value.rs"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/types/yyds-types/src/distributed_execution.rs",
+          "to": "projects/database/database.cluster/src/yyds/distributed_execution.rs",
+          "sha256": "0b9ac5beb07d04a537f9d7949c2e42baa887bc79f1569a952a27f7aa9599288d",
+          "bytes": 22115
+        },
+        {
+          "from": "projects/types/yyds-types/src/errors.rs",
+          "to": "projects/database/database.types/src/yyds/errors.rs",
+          "sha256": "5c472ae236e5a57fdffa95c56d816a4316beeea2bb103a454e89020ddf2b1e9f",
+          "bytes": 3784
+        },
+        {
+          "from": "projects/types/yyds-types/src/identity.rs",
+          "to": "projects/database/database.types/src/yyds/identity.rs",
+          "sha256": "6d72680ab065262a33d16878f6f434d7cf2fc86de587abb21e25b7a6e806dea7",
+          "bytes": 525
+        },
+        {
+          "from": "projects/types/yyds-types/src/key_value.rs",
+          "to": "projects/database/database.query/src/yyds_kv/key_value.rs",
+          "sha256": "5c2f0ed3a3cf2da90359e2187b4281279b6dac6a472c437417375357dfb15b6f",
+          "bytes": 5206
+        },
+        {
+          "from": "projects/types/yyds-types/src/lib.rs",
+          "to": "projects/database/database.types/src/yyds/mod.rs",
+          "sha256": "cda213e28f14d03b84d3d6783f1ba8cde529792c8c21b90131be274601c5768e",
+          "bytes": 1714
+        },
+        {
+          "from": "projects/types/yyds-types/src/replication.rs",
+          "to": "projects/database/database.cluster/src/yyds/replication.rs",
+          "sha256": "b57aad197750763b6d1c08adedb96d160b25a205c0a5a1da02f7929096350ebe",
+          "bytes": 7487
+        },
+        {
+          "from": "projects/types/yyds-types/src/replication_log.rs",
+          "to": "projects/database/database.cluster/src/yyds/replication_log.rs",
+          "sha256": "e0ccc7f7fb7b483dfcc3908f0814945aa3e01896beab194bff6d1679dc74ff38",
+          "bytes": 5102
+        },
+        {
+          "from": "projects/types/yyds-types/src/routing.rs",
+          "to": "projects/database/database.cluster/src/yyds/routing.rs",
+          "sha256": "a258c00cd2a293c85a61006251a433b200c9511d093bf0516429b447461e2dc3",
+          "bytes": 3382
+        },
+        {
+          "from": "projects/types/yyds-types/src/schema.rs",
+          "to": "projects/database/database.types/src/yyds/schema.rs",
+          "sha256": "cae2eb3011d0044cfd6e91c5208f829baf31df19ee955d1ea96a95b18f76eee9",
+          "bytes": 1547
+        },
+        {
+          "from": "projects/types/yyds-types/src/vos_udf.rs",
+          "to": "projects/database/database.input/src/yyds/vos_udf.rs",
+          "sha256": "b71cb0832b26cbd1b5bf41fe04d2fe1a65ad8d6c08858caf3a1f21a1c964a2ee",
+          "bytes": 4853
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/types/yyds-types/Cargo.toml",
+          "to": "projects/database/database.types/parts/yyds/Cargo.toml",
+          "sha256": "f38c2363c3d11ca3438d7b6adb0b5247d5a64118fb1edfa304168c8b989eb926",
+          "bytes": 555
+        },
+        {
+          "from": "projects/types/yyds-types/package.json",
+          "to": "projects/database/database.types/parts/yyds/package.json",
+          "sha256": "d69614ac94d14c4ff89fd1aa094f9e4554f723cf3f329b940d82e12c7c4b9394",
+          "bytes": 91
+        },
+        {
+          "from": "projects/types/yyds-types/readme.md",
+          "to": "projects/database/database.types/parts/yyds/readme.md",
+          "sha256": "bf685c8b3d0ccdd81c4958aaa958f9cd990526d95c6a6adf55f484b4f764a6b7",
+          "bytes": 247
+        },
+        {
+          "from": "projects/types/yyds-types/src/readme.md",
+          "to": "projects/database/database.types/parts/yyds/src/readme.md",
+          "sha256": "7b806efd216b8522a8b11173d0c30a70cc52b31a11801e5562229bbb7e1dcf43",
+          "bytes": 253
+        },
+        {
+          "from": "projects/types/yyds-types/tests/execution.rs",
+          "to": "projects/database/database.types/parts/yyds/tests/execution.rs",
+          "sha256": "26bf22fe957c0386cd3187ff156ad06e704dd7f6ddb96f4defd980082f2eaae6",
+          "bytes": 4486
+        },
+        {
+          "from": "projects/types/yyds-types/tests/key_value.rs",
+          "to": "projects/database/database.types/parts/yyds/tests/key_value.rs",
+          "sha256": "0e080aa41c678299d5bf550b6d0f8be52a668c1ae160e34afea91c74efbdba8a",
+          "bytes": 1919
+        },
+        {
+          "from": "projects/types/yyds-types/tests/main.rs",
+          "to": "projects/database/database.types/parts/yyds/tests/main.rs",
+          "sha256": "8d4564ca87e7b13cb03c7ef983e22bf74991e81c6e46356da52452e380598d9e",
+          "bytes": 53
+        },
+        {
+          "from": "projects/types/yyds-types/tests/readme.md",
+          "to": "projects/database/database.types/parts/yyds/tests/readme.md",
+          "sha256": "59bb0c35164c3b20488fbec2fbd9255ff1929270e09a270ecc09c23965537bc5",
+          "bytes": 36
+        },
+        {
+          "from": "projects/types/yyds-types/tests/replication.rs",
+          "to": "projects/database/database.types/parts/yyds/tests/replication.rs",
+          "sha256": "8c664bc7839b7c9eb4e0a03719c9a4d7407de15ab310942d31e2fcef817b351b",
+          "bytes": 2220
+        },
+        {
+          "from": "projects/types/yyds-types/tests/replication_log.rs",
+          "to": "projects/database/database.types/parts/yyds/tests/replication_log.rs",
+          "sha256": "a86d8f2a0775ea8470df1d727a7148288f99083997d8d5a7f8ea3672109c8945",
+          "bytes": 1975
+        },
+        {
+          "from": "projects/types/yyds-types/tests/routing.rs",
+          "to": "projects/database/database.types/parts/yyds/tests/routing.rs",
+          "sha256": "01edceff4f05c038a73cf9d7cba955a5e423fef5245e6eb8ec5a26cda9739297",
+          "bytes": 1034
+        },
+        {
+          "from": "projects/types/yyds-types/tests/schema.rs",
+          "to": "projects/database/database.types/parts/yyds/tests/schema.rs",
+          "sha256": "655b3007d91c8b5166701e481f309f705ccd5287453df00982949e6ac3df170c",
+          "bytes": 735
+        },
+        {
+          "from": "projects/types/yyds-types/tests/udf.rs",
+          "to": "projects/database/database.types/parts/yyds/tests/udf.rs",
+          "sha256": "911d78ad73d8c14125505908b077b8656fa757149b1f05fd400a38245e81c171",
+          "bytes": 1456
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-types",
+      "src": "projects/types/iris-types",
+      "pkg": "iris-types",
+      "state": "ready",
+      "error": null,
+      "bytes": 263425,
+      "targets": [
+        {
+          "domain": "orm",
+          "module": "iris_types",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/types/iris-types/src/adapter.rs",
+          "to": "projects/database/database.orm/src/iris_types/adapter.rs",
+          "sha256": "83959472cd06a3f74d39dc726673b51d98ea19cf6b14f8ce027fe3b38c237a61",
+          "bytes": 5019
+        },
+        {
+          "from": "projects/types/iris-types/src/cache_route.rs",
+          "to": "projects/database/database.orm/src/iris_types/cache_route.rs",
+          "sha256": "33e67828c0f689733fb553e02d063d2b7a7a6b65ef8b0749fcffab00e614145d",
+          "bytes": 6732
+        },
+        {
+          "from": "projects/types/iris-types/src/capability.rs",
+          "to": "projects/database/database.orm/src/iris_types/capability.rs",
+          "sha256": "2093021db123a36cb1746ac7951516b913bbf75595a380b53abc860803334167",
+          "bytes": 5326
+        },
+        {
+          "from": "projects/types/iris-types/src/contract.rs",
+          "to": "projects/database/database.orm/src/iris_types/contract.rs",
+          "sha256": "2f23c53bf940149e0a20b0527256abbae891681ca3444115421828e0dd67851f",
+          "bytes": 5482
+        },
+        {
+          "from": "projects/types/iris-types/src/diagnostic.rs",
+          "to": "projects/database/database.orm/src/iris_types/diagnostic.rs",
+          "sha256": "1d340870bdfa4411872e25c8bd26d6b65f88ff2af17ca3ed573fd0a890c8374d",
+          "bytes": 2141
+        },
+        {
+          "from": "projects/types/iris-types/src/error.rs",
+          "to": "projects/database/database.orm/src/iris_types/error.rs",
+          "sha256": "f30cf8f8c9ab49f7f0ac17bb1cb97bc18e41015c58a46ab91be47d0af0b986eb",
+          "bytes": 1458
+        },
+        {
+          "from": "projects/types/iris-types/src/explain.rs",
+          "to": "projects/database/database.orm/src/iris_types/explain.rs",
+          "sha256": "73fbf74b568ca385dea5f6920a32f9449a2b84982c942e8a0632371125c8685f",
+          "bytes": 12638
+        },
+        {
+          "from": "projects/types/iris-types/src/hydrate.rs",
+          "to": "projects/database/database.orm/src/iris_types/hydrate.rs",
+          "sha256": "d7f51f4747ead6fcd6612c8de57445909031053ff9f45a0e53044e275b8bf8f9",
+          "bytes": 2959
+        },
+        {
+          "from": "projects/types/iris-types/src/lib.rs",
+          "to": "projects/database/database.orm/src/iris_types/mod.rs",
+          "sha256": "e4d50953abbb0b4e02c4fdd00b4a1cc343f7dbcaffa91b314279d146f48e495b",
+          "bytes": 5748
+        },
+        {
+          "from": "projects/types/iris-types/src/lower.rs",
+          "to": "projects/database/database.orm/src/iris_types/lower.rs",
+          "sha256": "991c868b455ea09e79dac2b0c953c54dd2af7db6c138a0ec6909f846c579bb32",
+          "bytes": 23300
+        },
+        {
+          "from": "projects/types/iris-types/src/object_store.rs",
+          "to": "projects/database/database.orm/src/iris_types/object_store.rs",
+          "sha256": "1222b6c7276bad34089d79366e62831fb13fdb5b542eb8bcda924100a9c26cc0",
+          "bytes": 16773
+        },
+        {
+          "from": "projects/types/iris-types/src/planner.rs",
+          "to": "projects/database/database.orm/src/iris_types/planner.rs",
+          "sha256": "fa21dc5510ff39dd12b283fa4d3f7faa5c9f8523bc4c1d7acbacf10c6243fa6e",
+          "bytes": 6340
+        },
+        {
+          "from": "projects/types/iris-types/src/project.rs",
+          "to": "projects/database/database.orm/src/iris_types/project.rs",
+          "sha256": "6e3ae86fdaee27d60ebdffcb3b9d52110aa0b7e3839a0f23f424257e0e8b287b",
+          "bytes": 19079
+        },
+        {
+          "from": "projects/types/iris-types/src/projection_status.rs",
+          "to": "projects/database/database.orm/src/iris_types/projection_status.rs",
+          "sha256": "d60854df038ecd69eb6d8d7fdaf436d72b11524fb5bce0c6828925f2dd0a810d",
+          "bytes": 9946
+        },
+        {
+          "from": "projects/types/iris-types/src/projection_store.rs",
+          "to": "projects/database/database.orm/src/iris_types/projection_store.rs",
+          "sha256": "00bd2e419149e037f3869ef6a583946eccefe0c397ef7abd0b1a2b3148ed4b21",
+          "bytes": 20536
+        },
+        {
+          "from": "projects/types/iris-types/src/projection_verify.rs",
+          "to": "projects/database/database.orm/src/iris_types/projection_verify.rs",
+          "sha256": "4688fc5b021590446874ef0b785f2012945772c2455423be1a8e303e30086e99",
+          "bytes": 8229
+        },
+        {
+          "from": "projects/types/iris-types/src/reference.rs",
+          "to": "projects/database/database.orm/src/iris_types/reference.rs",
+          "sha256": "7cbf95d1f2b5442702ace2f34365b1778edb45c618e65336758f7e955fa4d7eb",
+          "bytes": 11807
+        },
+        {
+          "from": "projects/types/iris-types/src/schema.rs",
+          "to": "projects/database/database.orm/src/iris_types/schema.rs",
+          "sha256": "de3e2c9d77af07fdd81f7751d2c6d19b60237acd3b08f377a83e89171da78c37",
+          "bytes": 5875
+        },
+        {
+          "from": "projects/types/iris-types/src/session.rs",
+          "to": "projects/database/database.orm/src/iris_types/session.rs",
+          "sha256": "edff42af0222f2a55fc4984fe273989ae248a4db565f3fb0bf356adeef16e9f0",
+          "bytes": 3258
+        },
+        {
+          "from": "projects/types/iris-types/src/topology.rs",
+          "to": "projects/database/database.orm/src/iris_types/topology.rs",
+          "sha256": "743518b3a8f15dad22bda84c4715c6118f06f244445e32c7873acc527ca8c339",
+          "bytes": 31034
+        },
+        {
+          "from": "projects/types/iris-types/src/topology_activate.rs",
+          "to": "projects/database/database.orm/src/iris_types/topology_activate.rs",
+          "sha256": "c546acd29edfef14ece15db83d599ad27334ac3fccc1e40dc99a4e5a2f57780a",
+          "bytes": 9144
+        },
+        {
+          "from": "projects/types/iris-types/src/typed_plan.rs",
+          "to": "projects/database/database.orm/src/iris_types/typed_plan.rs",
+          "sha256": "c2d86a26e21f47a97b708f404e074d5b4137dbf19d2d51890af5a9ffb5fb177d",
+          "bytes": 20530
+        },
+        {
+          "from": "projects/types/iris-types/src/uuid_v7.rs",
+          "to": "projects/database/database.orm/src/iris_types/uuid_v7.rs",
+          "sha256": "d5f4def3506102c5a547759c78243fbde56d5507ffac92b8475ec064a3588c5a",
+          "bytes": 116
+        },
+        {
+          "from": "projects/types/iris-types/src/value.rs",
+          "to": "projects/database/database.orm/src/iris_types/value.rs",
+          "sha256": "b386a9bcaed43ecf7e98786f46a339a380bc4f83512036be28f4d80d2a2e58b2",
+          "bytes": 24035
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/types/iris-types/Cargo.toml",
+          "to": "projects/database/database.orm/parts/iris_types/Cargo.toml",
+          "sha256": "e2ca8115010b01aeaf7ad3a74dfc2a8d5a974e9d8394185d0d1ca5e4b565049d",
+          "bytes": 454
+        },
+        {
+          "from": "projects/types/iris-types/readme.md",
+          "to": "projects/database/database.orm/parts/iris_types/readme.md",
+          "sha256": "82d4a6cd3889c70eb2bfdd65cdc3640f3c6590ee8dc2e259a07a62207a58d7ab",
+          "bytes": 254
+        },
+        {
+          "from": "projects/types/iris-types/tests/value_wire.rs",
+          "to": "projects/database/database.orm/parts/iris_types/tests/value_wire.rs",
+          "sha256": "ce1ed0a42ec64cd88f4979ddc979850486052a7708a9fa41525ec92b11aece9b",
+          "bytes": 5212
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-ir",
+      "src": "projects/types/iris-ir",
+      "pkg": "iris-ir",
+      "note": "plan/op/envelope 形态 -> query；orm 依赖 query，反向不允许。",
+      "state": "ready",
+      "error": null,
+      "bytes": 32284,
+      "targets": [
+        {
+          "domain": "query",
+          "module": "iris_ir",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/types/iris-ir/src/commit.rs",
+          "to": "projects/database/database.query/src/iris_ir/commit.rs",
+          "sha256": "d11101a6e43690ff51926c85f0cf8a157702352893bbea523258143ef8f4f055",
+          "bytes": 2919
+        },
+        {
+          "from": "projects/types/iris-ir/src/composite.rs",
+          "to": "projects/database/database.query/src/iris_ir/composite.rs",
+          "sha256": "485766bb2cd72bc2f9f1d89224436a2b9bdfe80d4581989dd09d658a1406800d",
+          "bytes": 6470
+        },
+        {
+          "from": "projects/types/iris-ir/src/envelope.rs",
+          "to": "projects/database/database.query/src/iris_ir/envelope.rs",
+          "sha256": "f16378b6f8e8c41c5ec1b793563ee3cac0a7071167524557eccef7cba7dcb730",
+          "bytes": 3265
+        },
+        {
+          "from": "projects/types/iris-ir/src/lib.rs",
+          "to": "projects/database/database.query/src/iris_ir/mod.rs",
+          "sha256": "bfbb8ca4ac5279e9a7a41c123ade85f5cfd1d79964e430d0f916b377a8d76341",
+          "bytes": 1766
+        },
+        {
+          "from": "projects/types/iris-ir/src/object.rs",
+          "to": "projects/database/database.query/src/iris_ir/object.rs",
+          "sha256": "b7404b4760e61219d21117f533cc8588edea570144eebecc1534342b4dff0cd2",
+          "bytes": 6227
+        },
+        {
+          "from": "projects/types/iris-ir/src/op.rs",
+          "to": "projects/database/database.query/src/iris_ir/op.rs",
+          "sha256": "766ba323b42b3d505e62c7476f5bf67dd230a46614f1a9b2c44f46a618731645",
+          "bytes": 5181
+        },
+        {
+          "from": "projects/types/iris-ir/src/plan.rs",
+          "to": "projects/database/database.query/src/iris_ir/plan.rs",
+          "sha256": "ac7475a33d0482b67ba268e6df6f4ca16393df87740bbb92ed6f0420795b3aa0",
+          "bytes": 1596
+        },
+        {
+          "from": "projects/types/iris-ir/src/projection.rs",
+          "to": "projects/database/database.query/src/iris_ir/projection.rs",
+          "sha256": "c56d5959069941ecd72e1cc87465935e3bb18e22623e5956088280fc68987bf0",
+          "bytes": 4278
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/types/iris-ir/Cargo.toml",
+          "to": "projects/database/database.query/parts/iris_ir/Cargo.toml",
+          "sha256": "489a35502b9516ea6b1c32f36f01d93c82cb7abc10be452015169c78043b1a3f",
+          "bytes": 333
+        },
+        {
+          "from": "projects/types/iris-ir/readme.md",
+          "to": "projects/database/database.query/parts/iris_ir/readme.md",
+          "sha256": "1e87a2deacb561ed4e1b0adf3d8f4fd358876ef5ba38e15da0685738fe24666c",
+          "bytes": 249
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-query",
+      "src": "projects/planning/yydb-query",
+      "pkg": "yydb-query",
+      "note": "SQL/lower/resolve 进 input；dml/exec/write 进 execution；绑定/计划/结果留 query。",
+      "state": "ready",
+      "error": null,
+      "bytes": 791806,
+      "targets": [
+        {
+          "domain": "query",
+          "module": "yydb_query",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "input",
+          "module": "yydb_query",
+          "match": [
+            "sql.rs",
+            "lower.rs",
+            "resolve.rs"
+          ]
+        },
+        {
+          "domain": "execution",
+          "module": "yydb_ops",
+          "match": [
+            "dml.rs",
+            "exec.rs",
+            "write.rs"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/planning/yydb-query/src/catalog.rs",
+          "to": "projects/database/database.query/src/yydb_query/catalog.rs",
+          "sha256": "71086be68fc890e82cd35dbe8a6dbe39937e5eec4a399de2bf99ce9f17d0e5e7",
+          "bytes": 7109
+        },
+        {
+          "from": "projects/planning/yydb-query/src/coerce.rs",
+          "to": "projects/database/database.query/src/yydb_query/coerce.rs",
+          "sha256": "e506276565c102fa96b8011d9ed0bf9d96921d501a2e160801d9451f7de7fa1f",
+          "bytes": 11444
+        },
+        {
+          "from": "projects/planning/yydb-query/src/constraints.rs",
+          "to": "projects/database/database.query/src/yydb_query/constraints.rs",
+          "sha256": "4e46c4ee9d413b9b8695c90ddfa33cba0ee62cda8aed11e23686821eedb761a8",
+          "bytes": 6633
+        },
+        {
+          "from": "projects/planning/yydb-query/src/dml.rs",
+          "to": "projects/database/database.execution/src/yydb_ops/dml.rs",
+          "sha256": "c7a6775e38e8c5b4f02e73b232eef82dd7925706c79e072f9eb540f25964746a",
+          "bytes": 26338
+        },
+        {
+          "from": "projects/planning/yydb-query/src/exec.rs",
+          "to": "projects/database/database.execution/src/yydb_ops/exec.rs",
+          "sha256": "76c53192aed4375ac94d7fff2ac94fdde39429888a8e63f189ec8f9f8be40bf1",
+          "bytes": 129722
+        },
+        {
+          "from": "projects/planning/yydb-query/src/lib.rs",
+          "to": "projects/database/database.query/src/yydb_query/mod.rs",
+          "sha256": "935a538813339b44991d4ffd83ad39ba8457a902c92a0200f42995fad9c6b53e",
+          "bytes": 6418
+        },
+        {
+          "from": "projects/planning/yydb-query/src/lower.rs",
+          "to": "projects/database/database.input/src/yydb_query/lower.rs",
+          "sha256": "24ad7c27169523db7c0afb6a6fb87f29e31cfd31f34262950ac3947c0fded143",
+          "bytes": 15068
+        },
+        {
+          "from": "projects/planning/yydb-query/src/ops.rs",
+          "to": "projects/database/database.query/src/yydb_query/ops.rs",
+          "sha256": "5854b35d2dce0d88c6bdc40e8b36a0f37fff24c2967d569490bce99750457522",
+          "bytes": 43761
+        },
+        {
+          "from": "projects/planning/yydb-query/src/params.rs",
+          "to": "projects/database/database.query/src/yydb_query/params.rs",
+          "sha256": "850f6872763df50dfe52321b65b7dbf2e3826e874c2fbf39d63768508a9c2861",
+          "bytes": 29829
+        },
+        {
+          "from": "projects/planning/yydb-query/src/resolve.rs",
+          "to": "projects/database/database.input/src/yydb_query/resolve.rs",
+          "sha256": "913386b3faa3300462b948f9defe258197df447ccfd89ef8a82bd06c484ad860",
+          "bytes": 3099
+        },
+        {
+          "from": "projects/planning/yydb-query/src/result.rs",
+          "to": "projects/database/database.query/src/yydb_query/result.rs",
+          "sha256": "bf593f9f46d3d08bf0cb206675fc5697b09cc365931a2a32467e64e93c4abdb6",
+          "bytes": 5382
+        },
+        {
+          "from": "projects/planning/yydb-query/src/sql.rs",
+          "to": "projects/database/database.input/src/yydb_query/sql.rs",
+          "sha256": "4a1f2b5d4c120ef99dfdf93aa6dbc8b8b5f5a045a6da28024723b92dfa9bab1a",
+          "bytes": 111547
+        },
+        {
+          "from": "projects/planning/yydb-query/src/store.rs",
+          "to": "projects/database/database.query/src/yydb_query/store.rs",
+          "sha256": "1b57c845f61d0838adba14bf44659f8127a92555813e7ca4dd953b1da875c06f",
+          "bytes": 28706
+        },
+        {
+          "from": "projects/planning/yydb-query/src/window.rs",
+          "to": "projects/database/database.query/src/yydb_query/window.rs",
+          "sha256": "0d4d913054f8763ea544803ada26cdb674789d1c0871e246428d6779812c4fc0",
+          "bytes": 13434
+        },
+        {
+          "from": "projects/planning/yydb-query/src/write.rs",
+          "to": "projects/database/database.execution/src/yydb_ops/write.rs",
+          "sha256": "6287969647e215d165955894109c70babe3a8aa40a4d75f55d765547ffb635aa",
+          "bytes": 27221
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/planning/yydb-query/Cargo.toml",
+          "to": "projects/database/database.query/parts/yydb_query/Cargo.toml",
+          "sha256": "37f3e899f6160d81518699c2cf7be6814d3abac9c935c078557ba568b32825ae",
+          "bytes": 856
+        },
+        {
+          "from": "projects/planning/yydb-query/readme.md",
+          "to": "projects/database/database.query/parts/yydb_query/readme.md",
+          "sha256": "3390932990400f7724e95cbbc01d3b28bbbda43cdd12b0269bee227626a90c60",
+          "bytes": 217
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/binary_result.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/binary_result.rs",
+          "sha256": "5a30449e4c83a8cbb80339259830382679f3b49f0787744caf8be1112c18bc43",
+          "bytes": 9828
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/dml.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/dml.rs",
+          "sha256": "fda8f0289202865094e16651d538d77cf7984b5f17e82031dd6a0f3d3eda62c7",
+          "bytes": 12509
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/params_scan.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/params_scan.rs",
+          "sha256": "979e5bf641b34bfc5fe7556ccfde914ae091477afa07d8f3f9c5c107e618eea7",
+          "bytes": 1871
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/prepared_parameters.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/prepared_parameters.rs",
+          "sha256": "5cd02508c96eef993d544edc7f168a0589ce5eafe57d64fe371cf2acd040f36d",
+          "bytes": 3975
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/read_window.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/read_window.rs",
+          "sha256": "7e713f39ba63458b09be2253adc38f6e196d00ac72971dcc1d2363041860b044",
+          "bytes": 4156
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/scalars.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/scalars.rs",
+          "sha256": "2934673b05cb0f338698a31731dbe9f3faecd1dc8aa0d1d754fc59d95668cde7",
+          "bytes": 4293
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/sql.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/sql.rs",
+          "sha256": "68e9f782a820cd900dc38ad5c7d2795961376025986aae2b1a773ac29c574d05",
+          "bytes": 250228
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/unique.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/unique.rs",
+          "sha256": "ab6675f5de7153a7743afc534406498dd38e6928076bf286e74685c8c9e70440",
+          "bytes": 5605
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/value_compare.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/value_compare.rs",
+          "sha256": "7b6b6f31a5f90d0f4a8bf78d8753955c3830370061d0d48053b22c23ec676c64",
+          "bytes": 3144
+        },
+        {
+          "from": "projects/planning/yydb-query/tests/window.rs",
+          "to": "projects/database/database.query/parts/yydb_query/tests/window.rs",
+          "sha256": "5ce84855c2e63305fed6a2a689ecf7c291c05e71d60f096f7b2bd9101a4d4538",
+          "bytes": 29413
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-formats",
+      "src": "projects/formats/yydb-formats",
+      "pkg": "yydb-formats",
+      "note": "页/记录/WAL/blob 字节布局留 formats；file/pager/memory/shm/append 的实际读写进 storage。",
+      "state": "ready",
+      "error": null,
+      "bytes": 231777,
+      "targets": [
+        {
+          "domain": "formats",
+          "module": "yydb",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "storage",
+          "module": "yydb_io",
+          "match": [
+            "file.rs",
+            "pager.rs",
+            "memory.rs",
+            "shm.rs",
+            "wal_append.rs"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/formats/yydb-formats/src/blob.rs",
+          "to": "projects/database/database.formats/src/yydb/blob.rs",
+          "sha256": "36cca2fb7416dc516c0623279c24881819861fbf1c720be62017de0253895a83",
+          "bytes": 4170
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/blob_refs.rs",
+          "to": "projects/database/database.formats/src/yydb/blob_refs.rs",
+          "sha256": "f74eec84961cee4baf986595976e8fc7ae91ae53c3c032ebeb685565be82c4a4",
+          "bytes": 3140
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/btree.rs",
+          "to": "projects/database/database.formats/src/yydb/btree.rs",
+          "sha256": "28a02cea55eabc8993f6c12c5b0ebbf2e645b8346afc6002ebb5923026da141e",
+          "bytes": 27414
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/crc32c.rs",
+          "to": "projects/database/database.formats/src/yydb/crc32c.rs",
+          "sha256": "91277a24c5692a22b93773329de5dd831a2777dec80a90c8ecce08d8247d043f",
+          "bytes": 2194
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/doctor.rs",
+          "to": "projects/database/database.formats/src/yydb/doctor.rs",
+          "sha256": "6f62ba46a2d7ac42ad77f64829110a53d41bfcd6652766581d6038ad48a8149d",
+          "bytes": 8870
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/file.rs",
+          "to": "projects/database/database.storage/src/yydb_io/file.rs",
+          "sha256": "721487752f2e63d594c5f2614494a80e4d3c9f50a28c08d87890ddcf81d39436",
+          "bytes": 24394
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/header.rs",
+          "to": "projects/database/database.formats/src/yydb/header.rs",
+          "sha256": "38b3f0d53fa397b3dd32a3f2f4d540e5426fe8e5e9b04f431ce59966307d1161",
+          "bytes": 7069
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/internal.rs",
+          "to": "projects/database/database.formats/src/yydb/internal.rs",
+          "sha256": "7b15aa85d0de47df578737db7f968d32423b67b0df5dd8677a259aede197eee7",
+          "bytes": 6757
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/key.rs",
+          "to": "projects/database/database.formats/src/yydb/key.rs",
+          "sha256": "49c12659c9a322d59a907170b2781ddb824244f91b3186e1e9a2a5e49d9d18aa",
+          "bytes": 1565
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/leaf.rs",
+          "to": "projects/database/database.formats/src/yydb/leaf.rs",
+          "sha256": "cd134e443a91d291dd1ab333de5972087921bab40c1810e276a14f5cda4f8fc2",
+          "bytes": 14275
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/lib.rs",
+          "to": "projects/database/database.formats/src/yydb/mod.rs",
+          "sha256": "60af7aaf5ef5c817515c88da63f1be23b10c74a662db11d5828b4aaeb760a631",
+          "bytes": 2421
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/memory.rs",
+          "to": "projects/database/database.storage/src/yydb_io/memory.rs",
+          "sha256": "d2a2c426a28a505f52d0f011276809be09f31174e5d8c5d141a8be876affddc4",
+          "bytes": 13327
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/page.rs",
+          "to": "projects/database/database.formats/src/yydb/page.rs",
+          "sha256": "d0c1b856a8ac52e61b381fdbac85c41a19bf66b0290586fd6c96d2bbbb5ed4b9",
+          "bytes": 2823
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/pager.rs",
+          "to": "projects/database/database.storage/src/yydb_io/pager.rs",
+          "sha256": "a8a07609c99e8eb4ddf7560f12e0b06be6564ec201cec1323f49973185867e0e",
+          "bytes": 2304
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/shm.rs",
+          "to": "projects/database/database.storage/src/yydb_io/shm.rs",
+          "sha256": "ba77801e82a04e07fbdde8cb63ebc622507149a2a89d9cfc490f88a7e428ed6d",
+          "bytes": 3947
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/wal.rs",
+          "to": "projects/database/database.formats/src/yydb/wal.rs",
+          "sha256": "1f2d98ddebac9c5c46ae0cd31e072f4cc2de2a5218ee691fd643f1e128b78c88",
+          "bytes": 14495
+        },
+        {
+          "from": "projects/formats/yydb-formats/src/wal_append.rs",
+          "to": "projects/database/database.storage/src/yydb_io/wal_append.rs",
+          "sha256": "f529cda56a0fae33164684d58447e363bf751d520db92f3466fa13bcbfa764a4",
+          "bytes": 19092
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/formats/yydb-formats/Cargo.toml",
+          "to": "projects/database/database.formats/parts/yydb/Cargo.toml",
+          "sha256": "b004bc06375851111a4e7d1dbcd60d7135ce05617a0fd970feeabd228c522fba",
+          "bytes": 475
+        },
+        {
+          "from": "projects/formats/yydb-formats/readme.md",
+          "to": "projects/database/database.formats/parts/yydb/readme.md",
+          "sha256": "31209112d3ea82813ed6159d54e8b76d84d580b25c7a8b3c2e113a160e10d676",
+          "bytes": 253
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/batch_put.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/batch_put.rs",
+          "sha256": "d2b1d641e9a9481a3aa7c5675937268f2fd1b949de3408b326f136f4606b5f4a",
+          "bytes": 4437
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/btree_split.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/btree_split.rs",
+          "sha256": "ef206eff8c7242834518e846470061d60561fa2b55fff1536d1af2e97ee8aeb8",
+          "bytes": 7639
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/checkpoint_recovery.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/checkpoint_recovery.rs",
+          "sha256": "1cc58545d4efa32467b9dbefb59dc634b6d6a05b793b4d192a3bca227a655610",
+          "bytes": 8319
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/crc32c.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/crc32c.rs",
+          "sha256": "afd683b19379cf09dc5813f7c4cb631f1f5c5e7be13221e15a622d060ca0468d",
+          "bytes": 993
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/file_pager.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/file_pager.rs",
+          "sha256": "8085958dfdd1e4155ffc66b05edbbe5dc23da2292754645cb753631a2df64026",
+          "bytes": 3565
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/README.md",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/README.md",
+          "sha256": "2a5dff3bdccf9eaeb82348a1f0ec9b814d2f9e955a77db7015addfebd20e0577",
+          "bytes": 967
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/blob_chunk_header_min.bin",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/blob_chunk_header_min.bin",
+          "sha256": "e4ffa5734bc5269bed5cbd394c79ed3091bc68f8cec00804a31871319736fa0c",
+          "bytes": 82
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/gen_golden.py",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/gen_golden.py",
+          "sha256": "aaf9d33ba3b29aace3079a6730959eab8ca5660fede818f2e1a47f76fe3f23f9",
+          "bytes": 3443
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/manifest.toml",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/manifest.toml",
+          "sha256": "cec8c9e614ee8a74ceed5eb03408d2fe01facb00a94d4d945ad53e4d221c118c",
+          "bytes": 1200
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/page0_bad_checksum.bin",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/page0_bad_checksum.bin",
+          "sha256": "8fd9dad881cd1374ed62500a7737b50433cd7b40c4650733063cf9b46994f641",
+          "bytes": 4096
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/page0_empty_dual_slot.bin",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/page0_empty_dual_slot.bin",
+          "sha256": "302e9e0a58ce625df9165a58bec95ac663ce8d9a12b6362217fe97cf89379e5f",
+          "bytes": 4096
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/shm_empty.bin",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/shm_empty.bin",
+          "sha256": "616e0327852efb7396b63a8e22bc6c4a2fddb42af1969d73a7394610095b0899",
+          "bytes": 4096
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/wal_header.bin",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/wal_header.bin",
+          "sha256": "8cbafe57faab8f1ed254fb2f1009aca5fd37bd50efcb7dfcd905979fe986d202",
+          "bytes": 37
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/wal_txn_commit_minimal.bin",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/wal_txn_commit_minimal.bin",
+          "sha256": "ca4bea29b812720fc211da0d4c091999ec289f45cca74a8078077df2c8eb183c",
+          "bytes": 4276
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/format_v0_doctor.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/format_v0_doctor.rs",
+          "sha256": "c5535edd5fdd72dcf59f22422ac53efaf160b2cb8a9155aad35eb3fe077092cf",
+          "bytes": 984
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/format_v0_golden.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/format_v0_golden.rs",
+          "sha256": "fccd21d987d1ab2dd26766286412116e1482ffde0dab071bb7467bd4251fe149",
+          "bytes": 4413
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/leaf_roundtrip.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/leaf_roundtrip.rs",
+          "sha256": "32034fb02ee97d389604a629164ee6f61d67f55c4fe2ceff5a45baa4b5275f78",
+          "bytes": 531
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/memory_kv.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/memory_kv.rs",
+          "sha256": "9be06b0c7624d972b5e3f2f9f4ca4487609c673b4ab4e1ae3f1436821705cb63",
+          "bytes": 776
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/memory_pager.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/memory_pager.rs",
+          "sha256": "60798aae9a3da06ff6b5bdfe76f7ff9bbcce651c3b65da549a432d251599c619",
+          "bytes": 547
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/wal_durability.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/wal_durability.rs",
+          "sha256": "8a3de92cf9ce0e2b0b2a1a880434d4771d960be22a0a542ed6b4f8cbd1380c6b",
+          "bytes": 7300
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/wal_record.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/wal_record.rs",
+          "sha256": "7bc723474c43ecd1c86ca9c044ff0fd1b40fa4404c81ad7f49d1e0401ad4ea3b",
+          "bytes": 5864
+        },
+        {
+          "from": "projects/formats/yydb-formats/tests/wal_recovery.rs",
+          "to": "projects/database/database.formats/parts/yydb/tests/wal_recovery.rs",
+          "sha256": "771609fa2696388dedf00beb886e643fe5b73661410232901b3f4e9c9a6c1207",
+          "bytes": 5104
+        }
+      ],
+      "untracked": [
+        {
+          "from": "projects/formats/yydb-formats/tests/fixtures/format-v0/crc32c_reference.txt",
+          "to": "projects/database/database.formats/parts/yydb/tests/fixtures/format-v0/crc32c_reference.txt",
+          "sha256": "ef0d94f793118f2298a09e6fddc8dfa6a4185d3cc67f9b387cd91c19f90e1656",
+          "bytes": 27
+        }
+      ],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-formats",
+      "src": "projects/formats/yyds-formats",
+      "pkg": "yyds-formats",
+      "state": "ready",
+      "error": null,
+      "bytes": 21896,
+      "targets": [
+        {
+          "domain": "formats",
+          "module": "yyds",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/formats/yyds-formats/src/catalog.rs",
+          "to": "projects/database/database.formats/src/yyds/catalog.rs",
+          "sha256": "c43fe0c861aaebda8989f2071f335e14ed146ed8dd9e23ed8bc6e6e581c08158",
+          "bytes": 8041
+        },
+        {
+          "from": "projects/formats/yyds-formats/src/key.rs",
+          "to": "projects/database/database.formats/src/yyds/key.rs",
+          "sha256": "eeec65bf69211476cde5f0036e04e2382e0de5314f9208eed0f6916e873a9dc3",
+          "bytes": 997
+        },
+        {
+          "from": "projects/formats/yyds-formats/src/kv.rs",
+          "to": "projects/database/database.formats/src/yyds/kv.rs",
+          "sha256": "1409345490779592eea7e2215bf0d76150ab592cad08efdfc6f2b2b385fdb02d",
+          "bytes": 6238
+        },
+        {
+          "from": "projects/formats/yyds-formats/src/lib.rs",
+          "to": "projects/database/database.formats/src/yyds/mod.rs",
+          "sha256": "2fde08920d8a0cddd34218da05396d7082840de3f6be9ad312a456b3b6226ab3",
+          "bytes": 1370
+        },
+        {
+          "from": "projects/formats/yyds-formats/src/record.rs",
+          "to": "projects/database/database.formats/src/yyds/record.rs",
+          "sha256": "5216973d68ab34496f7d140f92599f1d9bdf85827d67defdc807b03354e17005",
+          "bytes": 1135
+        },
+        {
+          "from": "projects/formats/yyds-formats/src/replication.rs",
+          "to": "projects/database/database.formats/src/yyds/replication.rs",
+          "sha256": "d1885c765027d0bf213db5c224654690f2a598981f687089535a86e845d68d6f",
+          "bytes": 2582
+        },
+        {
+          "from": "projects/formats/yyds-formats/src/value.rs",
+          "to": "projects/database/database.formats/src/yyds/value.rs",
+          "sha256": "7093f45fc6c5e584517ba15bf61feaccca8c6710df75363ffac480513ba34030",
+          "bytes": 873
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/formats/yyds-formats/Cargo.toml",
+          "to": "projects/database/database.formats/parts/yyds/Cargo.toml",
+          "sha256": "c4b126057ae58079fdebb0fdc473d199dfa73af1d0a5bb2a5d27805b5c38682a",
+          "bytes": 391
+        },
+        {
+          "from": "projects/formats/yyds-formats/readme.md",
+          "to": "projects/database/database.formats/parts/yyds/readme.md",
+          "sha256": "9bad5e6d8cfc75fd4b9ed7b61ab3c4307108d0f22ef9f690cf604ecda1ec875e",
+          "bytes": 269
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "sqlite-formats",
+      "src": "projects/formats/sqlite-formats",
+      "pkg": "sqlite-formats",
+      "state": "ready",
+      "error": null,
+      "bytes": 39192,
+      "targets": [
+        {
+          "domain": "formats",
+          "module": "sqlite",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/formats/sqlite-formats/src/assets/blank.sqlite",
+          "to": "projects/database/database.formats/src/sqlite/assets/blank.sqlite",
+          "sha256": "a2e9200b15954b25f4738e1321678c8832ac9eaf30ee5f33b7780af53706fe89",
+          "bytes": 4096
+        },
+        {
+          "from": "projects/formats/sqlite-formats/src/format.rs",
+          "to": "projects/database/database.formats/src/sqlite/format.rs",
+          "sha256": "2307a05827500cf2c35353db522e0c22e8f62c1ad23020fa109f72a2f5fde3e1",
+          "bytes": 8412
+        },
+        {
+          "from": "projects/formats/sqlite-formats/src/lib.rs",
+          "to": "projects/database/database.formats/src/sqlite/mod.rs",
+          "sha256": "219394a46ec4e6bdb9eb2ceb7fda25b71e107261b597f9be8dd96d56117a164f",
+          "bytes": 1115
+        },
+        {
+          "from": "projects/formats/sqlite-formats/src/record.rs",
+          "to": "projects/database/database.formats/src/sqlite/record.rs",
+          "sha256": "f5d48b3d082fb41b5882ccecd65d5e896cfb71362b0181cf1ad0e170ead2a1eb",
+          "bytes": 10018
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/formats/sqlite-formats/Cargo.toml",
+          "to": "projects/database/database.formats/parts/sqlite/Cargo.toml",
+          "sha256": "8539f7eb0c5dde1d40aaa211ed30f0e6b7bbf4b405d0f5a9cad9ec38402292c0",
+          "bytes": 588
+        },
+        {
+          "from": "projects/formats/sqlite-formats/readme.md",
+          "to": "projects/database/database.formats/parts/sqlite/readme.md",
+          "sha256": "d056fca2c9c6b8d50f0ae0494745160cae4fab23eb0def8b760303de26920bf5",
+          "bytes": 300
+        },
+        {
+          "from": "projects/formats/sqlite-formats/tests/format_header.rs",
+          "to": "projects/database/database.formats/parts/sqlite/tests/format_header.rs",
+          "sha256": "632682ee8d32d0efdffec597e36fb19a37f13e39ed77ce52dbbaea30216e839c",
+          "bytes": 5363
+        },
+        {
+          "from": "projects/formats/sqlite-formats/tests/record_codec.rs",
+          "to": "projects/database/database.formats/parts/sqlite/tests/record_codec.rs",
+          "sha256": "2539191f63afafb889d5eeb229786b4e9b2c12cf6a4cd5a5ce65d2f525f76434",
+          "bytes": 9300
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-storage",
+      "src": "projects/storage/yydb-storage",
+      "pkg": "yydb-storage",
+      "state": "ready",
+      "error": null,
+      "bytes": 54045,
+      "targets": [
+        {
+          "domain": "storage",
+          "module": "yydb",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/storage/yydb-storage/src/blob.rs",
+          "to": "projects/database/database.storage/src/yydb/blob.rs",
+          "sha256": "c13a4492a5e55992797d5b8c8534cc1376206f28a997a945bd9fc20b65b00d75",
+          "bytes": 5135
+        },
+        {
+          "from": "projects/storage/yydb-storage/src/database.rs",
+          "to": "projects/database/database.storage/src/yydb/database.rs",
+          "sha256": "5699b37ad9022e8866636a719ed15617b34e04da76ae0fe08534f385a868b467",
+          "bytes": 9765
+        },
+        {
+          "from": "projects/storage/yydb-storage/src/files.rs",
+          "to": "projects/database/database.storage/src/yydb/files.rs",
+          "sha256": "a8f32376b0d45c248772829d0dbcc1f3b064ce743f57326780202e8d883f8a16",
+          "bytes": 1357
+        },
+        {
+          "from": "projects/storage/yydb-storage/src/journal.rs",
+          "to": "projects/database/database.storage/src/yydb/journal.rs",
+          "sha256": "66a3313028e17f2766f6be040ea02e51e463e50d66ab3d27a6cd1b8b30703fa3",
+          "bytes": 2489
+        },
+        {
+          "from": "projects/storage/yydb-storage/src/lib.rs",
+          "to": "projects/database/database.storage/src/yydb/mod.rs",
+          "sha256": "a21fa711ed6d81e43c2652b42ddb56349ff28dcbbb86ca13b4509d18923b329a",
+          "bytes": 1255
+        },
+        {
+          "from": "projects/storage/yydb-storage/src/lock.rs",
+          "to": "projects/database/database.storage/src/yydb/lock.rs",
+          "sha256": "7a75a7ac68e5fd8bac91cf9e4be4bf44298fa03e1c77432fd7df8521d3578c2f",
+          "bytes": 8408
+        },
+        {
+          "from": "projects/storage/yydb-storage/src/snapshot.rs",
+          "to": "projects/database/database.storage/src/yydb/snapshot.rs",
+          "sha256": "e2dcf45ef209a7621d406aa2ac240c1d315f13a731a6dfdb3ebe92c2a64e2d5b",
+          "bytes": 16685
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/storage/yydb-storage/Cargo.toml",
+          "to": "projects/database/database.storage/parts/yydb/Cargo.toml",
+          "sha256": "48a396100a7c6085e669b0d41f3363d3cf4fe605c60f8d844e606b31985f47e5",
+          "bytes": 740
+        },
+        {
+          "from": "projects/storage/yydb-storage/readme.md",
+          "to": "projects/database/database.storage/parts/yydb/readme.md",
+          "sha256": "ba1ea0640007a35fac6cbaeae5117c1db2a6109192a6313ab9e22af3bf01b8b0",
+          "bytes": 267
+        },
+        {
+          "from": "projects/storage/yydb-storage/tests/failure_matrix.rs",
+          "to": "projects/database/database.storage/parts/yydb/tests/failure_matrix.rs",
+          "sha256": "25c072b3107e8a39d0b54ba6879332c23b4cb9eb93218389086460357dd6818c",
+          "bytes": 3742
+        },
+        {
+          "from": "projects/storage/yydb-storage/tests/writer_lock.rs",
+          "to": "projects/database/database.storage/parts/yydb/tests/writer_lock.rs",
+          "sha256": "235685b068fd5e001078f7f5245969868aa7b2c642d35cb77fbe8ba3792492d9",
+          "bytes": 4202
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-kv",
+      "src": "projects/storage/yyds-storage",
+      "pkg": "yyds-kv",
+      "state": "ready",
+      "error": null,
+      "bytes": 48837,
+      "targets": [
+        {
+          "domain": "storage",
+          "module": "yyds_kv",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/storage/yyds-storage/src/lib.rs",
+          "to": "projects/database/database.storage/src/yyds_kv/mod.rs",
+          "sha256": "0356a034da3c2cf6087d752eafa0c0fdb79ef17f2364e7efd2fd2be27dbd3c15",
+          "bytes": 383
+        },
+        {
+          "from": "projects/storage/yyds-storage/src/replication_log.rs",
+          "to": "projects/database/database.storage/src/yyds_kv/replication_log.rs",
+          "sha256": "25f98f2450ba764f9b8f50eb5da81fa360d0e14f61cfb172e0687e3894dabba2",
+          "bytes": 6579
+        },
+        {
+          "from": "projects/storage/yyds-storage/src/store.rs",
+          "to": "projects/database/database.storage/src/yyds_kv/store.rs",
+          "sha256": "fd06343c351d1de0717e3a2013092ed29327e20a1af6b0d2528fe15acb17af30",
+          "bytes": 17835
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/storage/yyds-storage/Cargo.toml",
+          "to": "projects/database/database.storage/parts/yyds_kv/Cargo.toml",
+          "sha256": "3d34e27358164c4dda63316e42b1dd3fc56da0d110f154278af506015f282afd",
+          "bytes": 452
+        },
+        {
+          "from": "projects/storage/yyds-storage/readme.md",
+          "to": "projects/database/database.storage/parts/yyds_kv/readme.md",
+          "sha256": "6bb67ac06cbedefb35ce0c662d940c5726aebee753ebe465ff21cd8d957c1839",
+          "bytes": 238
+        },
+        {
+          "from": "projects/storage/yyds-storage/src/readme.md",
+          "to": "projects/database/database.storage/parts/yyds_kv/src/readme.md",
+          "sha256": "81f8c8d9396e4d5de3bc6acda0c79fd67873aa484c93ec6c6f9bc486736f7734",
+          "bytes": 244
+        },
+        {
+          "from": "projects/storage/yyds-storage/tests/file_shard.rs",
+          "to": "projects/database/database.storage/parts/yyds_kv/tests/file_shard.rs",
+          "sha256": "7419ae472d7f7159d4a5de051e88a4603d5ea8e589884c26b27b1ce34b1f4296",
+          "bytes": 12206
+        },
+        {
+          "from": "projects/storage/yyds-storage/tests/memory_shard.rs",
+          "to": "projects/database/database.storage/parts/yyds_kv/tests/memory_shard.rs",
+          "sha256": "ec561e6d28d951cdfdb74ce00af500e1a2856d4e4101ff34eb65f43a894df08d",
+          "bytes": 7812
+        },
+        {
+          "from": "projects/storage/yyds-storage/tests/replication_log.rs",
+          "to": "projects/database/database.storage/parts/yyds_kv/tests/replication_log.rs",
+          "sha256": "b41ace398476c577059a4c3df64055206f662a4a683040a05b2985e762448794",
+          "bytes": 3088
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "sqlite-storage",
+      "src": "projects/storage/sqlite-storage",
+      "pkg": "sqlite-storage",
+      "state": "ready",
+      "error": null,
+      "bytes": 242382,
+      "targets": [
+        {
+          "domain": "storage",
+          "module": "sqlite",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/storage/sqlite-storage/src/database.rs",
+          "to": "projects/database/database.storage/src/sqlite/database.rs",
+          "sha256": "0f2cf16c5c5dc3cc3028d9779e8684102405163c84cdf4578b17bcdfbd1f717c",
+          "bytes": 5522
+        },
+        {
+          "from": "projects/storage/sqlite-storage/src/journal.rs",
+          "to": "projects/database/database.storage/src/sqlite/journal.rs",
+          "sha256": "775da0bd86e0f66077e077c8bcce2070bdc77c8439294699b062dc20300b4faf",
+          "bytes": 3158
+        },
+        {
+          "from": "projects/storage/sqlite-storage/src/lib.rs",
+          "to": "projects/database/database.storage/src/sqlite/mod.rs",
+          "sha256": "567f6210fdcf80a8f92f71ef1b203bd313678fd06ac1dbcc6a7f856f4b8c0352",
+          "bytes": 949
+        },
+        {
+          "from": "projects/storage/sqlite-storage/src/schema.rs",
+          "to": "projects/database/database.storage/src/sqlite/schema.rs",
+          "sha256": "9c06d61ecbad09455baf0fabf3ed554de05f4ae349a796ef7024cb11abe035dd",
+          "bytes": 21939
+        },
+        {
+          "from": "projects/storage/sqlite-storage/src/table.rs",
+          "to": "projects/database/database.storage/src/sqlite/table.rs",
+          "sha256": "2d71f295fc0ba361de88c79b77875b8584d85ea7f3146a9a6f38a8b94bcb8d39",
+          "bytes": 15810
+        },
+        {
+          "from": "projects/storage/sqlite-storage/src/wal.rs",
+          "to": "projects/database/database.storage/src/sqlite/wal.rs",
+          "sha256": "beca8631f8c151a2e20fce747c42bb92829da42a3c259130514421ddfcc707af",
+          "bytes": 4513
+        },
+        {
+          "from": "projects/storage/sqlite-storage/src/writer.rs",
+          "to": "projects/database/database.storage/src/sqlite/writer.rs",
+          "sha256": "30fbb9b2b210881fc212ccc7669106e5581603a2ab2b5500b21b4c2388d8af5a",
+          "bytes": 146478
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/storage/sqlite-storage/Cargo.toml",
+          "to": "projects/database/database.storage/parts/sqlite/Cargo.toml",
+          "sha256": "d3802e42e591801e0716dfb152e27be5310d5a88ca76f2e2348e789d215b2331",
+          "bytes": 496
+        },
+        {
+          "from": "projects/storage/sqlite-storage/readme.md",
+          "to": "projects/database/database.storage/parts/sqlite/readme.md",
+          "sha256": "453a12e1396571afc08050c7f71b7276b082d13f3780439f0301fd35563b5b84",
+          "bytes": 343
+        },
+        {
+          "from": "projects/storage/sqlite-storage/tests/reader_corpus.rs",
+          "to": "projects/database/database.storage/parts/sqlite/tests/reader_corpus.rs",
+          "sha256": "2966ba73d462b756972fdb037579ddbab58ca9a712ae7a18d0ca5d5de2d3933e",
+          "bytes": 13814
+        },
+        {
+          "from": "projects/storage/sqlite-storage/tests/writer.rs",
+          "to": "projects/database/database.storage/parts/sqlite/tests/writer.rs",
+          "sha256": "effb004bf605cdc9d54b3f1c4381ac3df6df31236804f08acf50b1d6862e5f99",
+          "bytes": 29360
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-engine",
+      "src": "projects/execution/yydb-engine",
+      "pkg": "yydb-engine",
+      "note": "连接/事务/UDF/对象/KV 运行态留 execution；storage/ 与 journal 的持久化实现进 storage。",
+      "state": "ready",
+      "error": null,
+      "bytes": 245185,
+      "targets": [
+        {
+          "domain": "execution",
+          "module": "yydb_engine",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "storage",
+          "module": "yydb_engine_io",
+          "match": [
+            "storage/",
+            "journal.rs"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/execution/yydb-engine/src/batch.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/batch.rs",
+          "sha256": "30d46b2315ae62eba7e947c316759bcb1b83db5ac79c036b75b61fb6ef060935",
+          "bytes": 1200
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/bytes.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/bytes.rs",
+          "sha256": "2616b1ac5868524efa804fca73c7793fafd39c1cfce677bffbd92638e6a4f823",
+          "bytes": 4225
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/catalog.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/catalog.rs",
+          "sha256": "58e1e6712dd437b673b3fb2f8373641113e5edc1d894379f2b05593200a21dc8",
+          "bytes": 26415
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/backup.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/backup.rs",
+          "sha256": "4474587906200b2ea6b500880d5209c82faaeba487358e732f6ef4c7d7046fe5",
+          "bytes": 6087
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/compact.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/compact.rs",
+          "sha256": "6d2e3618888e5df63765f5e8bb6e91e7381168a12bd479052d82c136221df1e7",
+          "bytes": 890
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/doctor.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/doctor.rs",
+          "sha256": "b7edf4512a3df7658fe5ef3dd0c00d1567b1f8a505db956a4f6a360552b6cddb",
+          "bytes": 2063
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/journal.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/journal.rs",
+          "sha256": "25dd86679c813af2d4f336e27469c6fc44ba50d3cea1b9b48ec3a9ad7ce26f9c",
+          "bytes": 2532
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/kv.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/kv.rs",
+          "sha256": "c53089dd4cdde4e8260c41250a0c3765fba9ad53561bbc1ee4f4e74d2e7e1366",
+          "bytes": 6612
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/lease.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/lease.rs",
+          "sha256": "8ed76d5265ace560b15364f2b5f1091fee2179dcf85c62625bfed599bc7509f1",
+          "bytes": 2608
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/mod.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/mod.rs",
+          "sha256": "5633279e812e9e2f4c25258311c7b0c856e3228f09d3630e90868032a31b718c",
+          "bytes": 12796
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/objects_api.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/objects_api.rs",
+          "sha256": "5488d8840a53ce114afa08f9d1b025d3b29760130b946e3e4a3786733dd1cbe0",
+          "bytes": 4701
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/query.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/query.rs",
+          "sha256": "28ee2004907502b0c101053d1725eecc45854db760b6b07678b280712ac0e97b",
+          "bytes": 23431
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/schema_api.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/schema_api.rs",
+          "sha256": "b939bc23b2bac8ac6760a52d23c65a8dce1a8ea946fadba00926b620ec364028",
+          "bytes": 9386
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/state.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/state.rs",
+          "sha256": "48eb6a169b4fa064aef4d2c2bdd1e4f5878854dc515a8b53d8b3ced0103b5a20",
+          "bytes": 26968
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/transaction.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/transaction.rs",
+          "sha256": "91224b24b7361c4952b20e909df5d2ac6ec194ac2459eb5d8d3b536ef022b5eb",
+          "bytes": 7300
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/connection/udf.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/connection/udf.rs",
+          "sha256": "2c2006b22f85d49124767ed754254adc4ed600e82889c526fcccee3a20045c7c",
+          "bytes": 4117
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/journal.rs",
+          "to": "projects/database/database.storage/src/yydb_engine_io/journal.rs",
+          "sha256": "22a5cae6bec12c5cce08998f180cd5ef98583f2fbe7dc8f83101cae0d874b770",
+          "bytes": 282
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/kv/lease.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/kv/lease.rs",
+          "sha256": "438451b769c0157c926d7e2bfb992255e71b7a26fe6e228f4ee0a76c9a0cedb2",
+          "bytes": 10048
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/kv/mod.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/kv/mod.rs",
+          "sha256": "e748d2b33860136be640aec8a1ad13e605056926dfd20eb12cca1e3aedacc54f",
+          "bytes": 98
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/kv/retention.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/kv/retention.rs",
+          "sha256": "9ba83fa30379fb67edfeeae53c9d72a7551cdb505ab96ae55f3ef9f28ac80acf",
+          "bytes": 8028
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/lib.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/mod.rs",
+          "sha256": "9e902b40209f285c17d67b0ffae9ef2609929582764d5955958477cda331a0cd",
+          "bytes": 1970
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/objects/mod.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/objects/mod.rs",
+          "sha256": "98a4a385516f230ac04633583f7539de9d9c68d4d2a824b485c2b6215bc8bc41",
+          "bytes": 27229
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/objects/references.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/objects/references.rs",
+          "sha256": "0ad1faf251e021a4fe61a65a447b8391aab3fed68749ee19305dd2ff7569d35a",
+          "bytes": 7596
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/storage/doctor.rs",
+          "to": "projects/database/database.storage/src/yydb_engine_io/storage/doctor.rs",
+          "sha256": "52fb3100c8845a906fd55c35ef34bc9fb315243a666cc8b08c5b5f5597ea6caa",
+          "bytes": 8967
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/storage/mod.rs",
+          "to": "projects/database/database.storage/src/yydb_engine_io/storage/mod.rs",
+          "sha256": "4811ad80eca8ed94cabb1004bb882c2c44f3dea08020f0f11cebd0b1f8e26f4d",
+          "bytes": 120
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/storage/snapshot.rs",
+          "to": "projects/database/database.storage/src/yydb_engine_io/storage/snapshot.rs",
+          "sha256": "2c34a7dd1502a9690c6072153ed6afb2a12fb0ce2227534bb3ee3b18a66161de",
+          "bytes": 16644
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/udf/api.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/udf/api.rs",
+          "sha256": "992de5cd295a9fcce7b02fdf286cf767b3d8cb2ff3b98078a997266890c1bfaf",
+          "bytes": 1796
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/udf/mod.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/udf/mod.rs",
+          "sha256": "02f163dc3ab3159498b8ef45a97552fe7a357ca75e0c44296aa50ca1adf91116",
+          "bytes": 478
+        },
+        {
+          "from": "projects/execution/yydb-engine/src/udf/session.rs",
+          "to": "projects/database/database.execution/src/yydb_engine/udf/session.rs",
+          "sha256": "93a208247beb941c14952f73f612c39a21f170a87bc00588991ddc315af49b91",
+          "bytes": 9702
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/execution/yydb-engine/Cargo.toml",
+          "to": "projects/database/database.execution/parts/yydb_engine/Cargo.toml",
+          "sha256": "bfb1623e171502514544c60b1f2280935304d4737d0a9daae645c519d724df53",
+          "bytes": 1040
+        },
+        {
+          "from": "projects/execution/yydb-engine/readme.md",
+          "to": "projects/database/database.execution/parts/yydb_engine/readme.md",
+          "sha256": "f953900ca12c1d8d2f316f3620e22780202538cc75bc21976bb47702f7be605a",
+          "bytes": 271
+        },
+        {
+          "from": "projects/execution/yydb-engine/tests/connection_close.rs",
+          "to": "projects/database/database.execution/parts/yydb_engine/tests/connection_close.rs",
+          "sha256": "4b9fd002eb47752eb9c47814843baea94c8b8da42369e828a01855bbbc8c1a1c",
+          "bytes": 2801
+        },
+        {
+          "from": "projects/execution/yydb-engine/tests/prepared_schema_invalidation.rs",
+          "to": "projects/database/database.execution/parts/yydb_engine/tests/prepared_schema_invalidation.rs",
+          "sha256": "472592034c325608d93d34c4e6a067a6c34f9f269f7b39499cb5b289b9e1e4c5",
+          "bytes": 4824
+        },
+        {
+          "from": "projects/execution/yydb-engine/tests/session.rs",
+          "to": "projects/database/database.execution/parts/yydb_engine/tests/session.rs",
+          "sha256": "0a353f33213ddb84ec23615c1d87f67d3052d1efb75e2a31d47340e42ddc11d3",
+          "bytes": 1960
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-execution",
+      "src": "projects/execution/yydb-execution",
+      "pkg": "yydb-execution",
+      "state": "ready",
+      "error": null,
+      "bytes": 35718,
+      "targets": [
+        {
+          "domain": "execution",
+          "module": "yydb_execution",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/execution/yydb-execution/src/lib.rs",
+          "to": "projects/database/database.execution/src/yydb_execution/mod.rs",
+          "sha256": "2fbe3104b48e080a4c89e3af127818c4b21252b8bf7f3d6e68a92fd97ad0333f",
+          "bytes": 27171
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/execution/yydb-execution/Cargo.toml",
+          "to": "projects/database/database.execution/parts/yydb_execution/Cargo.toml",
+          "sha256": "2b12af6aedbc0b356d3f9a6d064731c1790d190bab89348fe24f7d98de71e14f",
+          "bytes": 351
+        },
+        {
+          "from": "projects/execution/yydb-execution/readme.md",
+          "to": "projects/database/database.execution/parts/yydb_execution/readme.md",
+          "sha256": "fd63545afb8dddcf48d598a469bdee5bf0f0615eb59909db5881af2bbbea8a32",
+          "bytes": 219
+        },
+        {
+          "from": "projects/execution/yydb-execution/tests/program.rs",
+          "to": "projects/database/database.execution/parts/yydb_execution/tests/program.rs",
+          "sha256": "0d78fa30e0d499ac75b75b99f3e544942cadcc790ac88f9319f81541d7100014",
+          "bytes": 7977
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-udf",
+      "src": "projects/execution/yydb-udf",
+      "pkg": "yydb-udf",
+      "state": "ready",
+      "error": null,
+      "bytes": 32562,
+      "targets": [
+        {
+          "domain": "execution",
+          "module": "yydb_udf",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/execution/yydb-udf/src/adapters/execution.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/adapters/execution.rs",
+          "sha256": "80709211afb0f16bd2c25c5020b8501ad520a738a4e18347c85085f2b50d6f2d",
+          "bytes": 2885
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/adapters/host.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/adapters/host.rs",
+          "sha256": "1d14a2571aa1cfd37c5063356422398d28852aaf7227ba573e7c0e224eb1131b",
+          "bytes": 2197
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/adapters/mod.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/adapters/mod.rs",
+          "sha256": "2f76c90c4685734b6a375f3df10f0ead87e3d0bcee1935f298aadf3d46fca064",
+          "bytes": 317
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/adapters/native.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/adapters/native.rs",
+          "sha256": "dd835a6df12acbb390e30f7cb6541fd24165b6f84ac76234c0052c4b44cd7bd2",
+          "bytes": 2460
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/lib.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/mod.rs",
+          "sha256": "faff008e8a67341c828c06cabc9b52c9dbdc6d99f6dd6f2d9a50f10671e9974b",
+          "bytes": 1193
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/registry/mod.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/registry/mod.rs",
+          "sha256": "ee0bb4df37ef9a5094a068342ee86cf62964d461bdcb43241e08708648563ba3",
+          "bytes": 10140
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/runtime/implementation.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/runtime/implementation.rs",
+          "sha256": "ff729fbc465c5219ef48e4fa4d99fc6cb0b2cb5123fe309954258dfdb1c8c46e",
+          "bytes": 1044
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/runtime/invocation.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/runtime/invocation.rs",
+          "sha256": "4768b593b1f38b99705b31ced6d4286fc04bb74a8ea6ebb579afe9fce7c8b2f6",
+          "bytes": 2599
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/runtime/mod.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/runtime/mod.rs",
+          "sha256": "3085cdac9842d07f7547d45821b8fb9259f0d4ddc24e1932edf99fd7090eb729",
+          "bytes": 337
+        },
+        {
+          "from": "projects/execution/yydb-udf/src/runtime/value_execution.rs",
+          "to": "projects/database/database.execution/src/yydb_udf/runtime/value_execution.rs",
+          "sha256": "fbff28e1c81de85f18531ecefdc7a1a7d616dc9fdfe1d736fb455c6cbe1b7b4e",
+          "bytes": 1726
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/execution/yydb-udf/Cargo.toml",
+          "to": "projects/database/database.execution/parts/yydb_udf/Cargo.toml",
+          "sha256": "6272f6b26ca6305b431a028b57d7b399265933a1df7fbc3c6ba55011896ae901",
+          "bytes": 410
+        },
+        {
+          "from": "projects/execution/yydb-udf/readme.md",
+          "to": "projects/database/database.execution/parts/yydb_udf/readme.md",
+          "sha256": "d89b5436cbae9eb73bdcb6dfd119bf1d71a2391dce49cb9b7cd449eb74895306",
+          "bytes": 199
+        },
+        {
+          "from": "projects/execution/yydb-udf/tests/host.rs",
+          "to": "projects/database/database.execution/parts/yydb_udf/tests/host.rs",
+          "sha256": "770b6b32f16d67cb619be8744a2d017774110cb087ddee4d15be10e00b1a63d9",
+          "bytes": 1962
+        },
+        {
+          "from": "projects/execution/yydb-udf/tests/registry.rs",
+          "to": "projects/database/database.execution/parts/yydb_udf/tests/registry.rs",
+          "sha256": "8c5557df00d20d769429cd9dc08f008ab3ebf8cbe458609f7eacaec5233386d7",
+          "bytes": 4235
+        },
+        {
+          "from": "projects/execution/yydb-udf/tests/value.rs",
+          "to": "projects/database/database.execution/parts/yydb_udf/tests/value.rs",
+          "sha256": "cf1fe47a36b3aa96311fd03020ea04359f40a5482efa62cfe856a9ff1cb61020",
+          "bytes": 858
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-execution",
+      "src": "projects/execution/yyds-execution",
+      "pkg": "yyds-execution",
+      "state": "ready",
+      "error": null,
+      "bytes": 62513,
+      "targets": [
+        {
+          "domain": "execution",
+          "module": "yyds_execution",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/execution/yyds-execution/src/lib.rs",
+          "to": "projects/database/database.execution/src/yyds_execution/mod.rs",
+          "sha256": "7d8b0f9a4ce2c4533d57e8d8251d55130e2f13127029e648e527378c954600e4",
+          "bytes": 11613
+        },
+        {
+          "from": "projects/execution/yyds-execution/src/local.rs",
+          "to": "projects/database/database.execution/src/yyds_execution/local.rs",
+          "sha256": "faedfa5f025f109ce09246997859c29313c9c713ad45b1ffe90b1de338ca32ce",
+          "bytes": 44796
+        },
+        {
+          "from": "projects/execution/yyds-execution/src/sweep.rs",
+          "to": "projects/database/database.execution/src/yyds_execution/sweep.rs",
+          "sha256": "647ff48604ee74229cef4f5f1e45011909d872f6d2e0b92e731015882a39bd60",
+          "bytes": 2426
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/execution/yyds-execution/Cargo.toml",
+          "to": "projects/database/database.execution/parts/yyds_execution/Cargo.toml",
+          "sha256": "c8d8eb5744ff72315fcd1b49126da61f1acaff35b8192810ff64863a959a3402",
+          "bytes": 409
+        },
+        {
+          "from": "projects/execution/yyds-execution/readme.md",
+          "to": "projects/database/database.execution/parts/yyds_execution/readme.md",
+          "sha256": "1b535904e83c4c1539eba9004b510bc3f1fdbf733e53ec7f7e0bd643017cdd1c",
+          "bytes": 203
+        },
+        {
+          "from": "projects/execution/yyds-execution/src/readme.md",
+          "to": "projects/database/database.execution/parts/yyds_execution/src/readme.md",
+          "sha256": "510ffdeafedf5de954541803fabdee5455477c51038dd556b261989826492496",
+          "bytes": 209
+        },
+        {
+          "from": "projects/execution/yyds-execution/tests/smoke.rs",
+          "to": "projects/database/database.execution/parts/yyds_execution/tests/smoke.rs",
+          "sha256": "382e0963bd1fcbe5f98f480611ae6f7a3318013337cee5ad99af7351afdd747c",
+          "bytes": 2857
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-catalog",
+      "src": "projects/control/yyds-catalog",
+      "pkg": "yyds-catalog",
+      "state": "ready",
+      "error": null,
+      "bytes": 20520,
+      "targets": [
+        {
+          "domain": "cluster",
+          "module": "yyds_catalog",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/control/yyds-catalog/src/catalog.rs",
+          "to": "projects/database/database.cluster/src/yyds_catalog/catalog.rs",
+          "sha256": "413e4ea63111426953b1625059291011028541813536a0c8e55c6bc48cdb6517",
+          "bytes": 10870
+        },
+        {
+          "from": "projects/control/yyds-catalog/src/format.rs",
+          "to": "projects/database/database.cluster/src/yyds_catalog/format.rs",
+          "sha256": "5d2abf2e70de37c5f60db88a952256e580f22904c7f8a1a4abc8799685ded301",
+          "bytes": 1251
+        },
+        {
+          "from": "projects/control/yyds-catalog/src/lib.rs",
+          "to": "projects/database/database.cluster/src/yyds_catalog/mod.rs",
+          "sha256": "d0de26f6c097da2c52e6913ad69b003b38f0f0604e1b05e5ab115cad2ae20771",
+          "bytes": 273
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/control/yyds-catalog/Cargo.toml",
+          "to": "projects/database/database.cluster/parts/yyds_catalog/Cargo.toml",
+          "sha256": "5626ba71485d319882eeea9de6ff6e2174021f8d098647778d45e9e388ddb10f",
+          "bytes": 473
+        },
+        {
+          "from": "projects/control/yyds-catalog/readme.md",
+          "to": "projects/database/database.cluster/parts/yyds_catalog/readme.md",
+          "sha256": "7c481d05f4fdaf5c1e198542d74d10bc070a0ef42c6bd0638b90c591aa0af7fa",
+          "bytes": 193
+        },
+        {
+          "from": "projects/control/yyds-catalog/src/readme.md",
+          "to": "projects/database/database.cluster/parts/yyds_catalog/src/readme.md",
+          "sha256": "7ecb8a65db60cbcacfd040c5c4f06956e68469e8fc13571c3f7d45bb9f8efe4d",
+          "bytes": 199
+        },
+        {
+          "from": "projects/control/yyds-catalog/tests/catalog.rs",
+          "to": "projects/database/database.cluster/parts/yyds_catalog/tests/catalog.rs",
+          "sha256": "bd869c0d0bbeb94033b00a0f3c029f24b3ca23077663d93893366a38af17cbc0",
+          "bytes": 5048
+        },
+        {
+          "from": "projects/control/yyds-catalog/tests/catalog_file.rs",
+          "to": "projects/database/database.cluster/parts/yyds_catalog/tests/catalog_file.rs",
+          "sha256": "568bdf52cb6ad3c78818519f55b2f6d425fbf688648a7377a15d95f7c487fe1e",
+          "bytes": 2213
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-control",
+      "src": "projects/control/yyds-control",
+      "pkg": "yyds-control",
+      "state": "ready",
+      "error": null,
+      "bytes": 14698,
+      "targets": [
+        {
+          "domain": "cluster",
+          "module": "yyds_control",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/control/yyds-control/src/lib.rs",
+          "to": "projects/database/database.cluster/src/yyds_control/mod.rs",
+          "sha256": "355662c3d4f6d81407b6720cd54405032890d77cb63d0ab27a4b194eb8d4b131",
+          "bytes": 7238
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/control/yyds-control/Cargo.toml",
+          "to": "projects/database/database.cluster/parts/yyds_control/Cargo.toml",
+          "sha256": "ee05edef200f9732103dba61da8c5109630aab5f9631014c34f0ff5b5582c52b",
+          "bytes": 319
+        },
+        {
+          "from": "projects/control/yyds-control/readme.md",
+          "to": "projects/database/database.cluster/parts/yyds_control/readme.md",
+          "sha256": "6bc180597f71076d014d64eba27767dd2b88c6d51eb2d6360862f4ff2fa19d38",
+          "bytes": 196
+        },
+        {
+          "from": "projects/control/yyds-control/src/readme.md",
+          "to": "projects/database/database.cluster/parts/yyds_control/src/readme.md",
+          "sha256": "fdea8cc4255b00dbc7438c9c0d69c3f05a421c444530a7b1a05d8fef49a9a816",
+          "bytes": 202
+        },
+        {
+          "from": "projects/control/yyds-control/tests/lease.rs",
+          "to": "projects/database/database.cluster/parts/yyds_control/tests/lease.rs",
+          "sha256": "39dbe460cb76c55d1a1f61b74d04e788714f036b617f228b7b654873d6dde457",
+          "bytes": 6743
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-protocol",
+      "src": "projects/protocol/yydb-protocol",
+      "pkg": "yydb-protocol",
+      "state": "ready",
+      "error": null,
+      "bytes": 30974,
+      "targets": [
+        {
+          "domain": "protocol",
+          "module": "yydb",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/protocol/yydb-protocol/src/lib.rs",
+          "to": "projects/database/database.protocol/src/yydb/mod.rs",
+          "sha256": "70d8a4939f2b84228d57af5d6f3b4512248fe28f2b4580d0b1274175c5bd1d4b",
+          "bytes": 30218
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/protocol/yydb-protocol/Cargo.toml",
+          "to": "projects/database/database.protocol/parts/yydb/Cargo.toml",
+          "sha256": "e7bc153c271dbf4f43ba4523ce2aa155d406b9f55ff7b85c380b014bf208c4fe",
+          "bytes": 530
+        },
+        {
+          "from": "projects/protocol/yydb-protocol/readme.md",
+          "to": "projects/database/database.protocol/parts/yydb/readme.md",
+          "sha256": "ef201752c7ebb609ef290db726a03709e2aa5b657003d73ec211870b2a1e5668",
+          "bytes": 226
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-gateway",
+      "src": "projects/gateways/yyds-gateway",
+      "pkg": "yyds-gateway",
+      "note": "SQL 输入进 input；catalog/planner/meta/ddl 进 query；sql_execute 进 execution；config/kind/serial 与网关基座留 protocol。",
+      "state": "ready",
+      "error": null,
+      "bytes": 665240,
+      "targets": [
+        {
+          "domain": "protocol",
+          "module": "gateway",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "input",
+          "module": "sql",
+          "match": [
+            "sql.rs"
+          ]
+        },
+        {
+          "domain": "query",
+          "module": "sql",
+          "match": [
+            "catalog_bind.rs",
+            "sql_batch.rs",
+            "sql_ddl.rs",
+            "sql_describe.rs",
+            "sql_meta.rs",
+            "sql_parameters.rs",
+            "sql_planner.rs",
+            "sql_schema.rs"
+          ]
+        },
+        {
+          "domain": "execution",
+          "module": "sql_exec",
+          "match": [
+            "sql_execute.rs",
+            "sql_execute/"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/gateways/yyds-gateway/src/catalog_bind.rs",
+          "to": "projects/database/database.query/src/sql/catalog_bind.rs",
+          "sha256": "78238d888b4332c12a0dbd4552b2978b1b4cafa1367ef9ee1142792b4cbc01b5",
+          "bytes": 83695
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/config.rs",
+          "to": "projects/database/database.protocol/src/gateway/config.rs",
+          "sha256": "332a6e615c7632e1b3c5f28157b2111b2b7cf8f5599406f281478ff672884921",
+          "bytes": 983
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/kind.rs",
+          "to": "projects/database/database.protocol/src/gateway/kind.rs",
+          "sha256": "0766b6dad1eea71f51cc303af039dcf508727bd2d823bea0cce9166efd388e83",
+          "bytes": 1396
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/lib.rs",
+          "to": "projects/database/database.protocol/src/gateway/mod.rs",
+          "sha256": "4b7fea07fa53cb19a4ee8ecbbf1305f6d2ca85cdd0c6f88a67da8d26c5b0207f",
+          "bytes": 4325
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql.rs",
+          "to": "projects/database/database.input/src/sql/sql.rs",
+          "sha256": "e55697fb7a4d5213f4741dd36906ab498e4d59803cd1a3412426dff9623b79f9",
+          "bytes": 107591
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_batch.rs",
+          "to": "projects/database/database.query/src/sql/sql_batch.rs",
+          "sha256": "2582a41faa572bf015fe7da5a7a19fb6d544547c3476c93127b81b2a5e84526f",
+          "bytes": 6646
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_ddl.rs",
+          "to": "projects/database/database.query/src/sql/sql_ddl.rs",
+          "sha256": "555165de26c793dc63f55ac9939dfdd7de087cf8c6dca4937d8cd7bfc6407ce2",
+          "bytes": 39778
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_describe.rs",
+          "to": "projects/database/database.query/src/sql/sql_describe.rs",
+          "sha256": "368485705a0851b415f183277958ca84c495080ff67179bef96584d8ccaf6154",
+          "bytes": 10487
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_execute.rs",
+          "to": "projects/database/database.execution/src/sql_exec/sql_execute.rs",
+          "sha256": "8a35878a9ad98a6f8a5654c15d85adc0f9d4b0e297972316d4346ae65496ab0d",
+          "bytes": 26427
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_execute/expression.rs",
+          "to": "projects/database/database.execution/src/sql_exec/sql_execute/expression.rs",
+          "sha256": "44144cb71456ed48e57f3cdf143c29c4e0403f3544bf1aedfb952c3426cc40f2",
+          "bytes": 32847
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_execute/read.rs",
+          "to": "projects/database/database.execution/src/sql_exec/sql_execute/read.rs",
+          "sha256": "493afc65323e293925ccfaa43d4a29f5fb4734fc17e670639d276beb475bd809",
+          "bytes": 25993
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_execute/scalar.rs",
+          "to": "projects/database/database.execution/src/sql_exec/sql_execute/scalar.rs",
+          "sha256": "43acff9aacf077feaa11483c1a72b5d1d01757d38d2987156d20c48cbc577dca",
+          "bytes": 17218
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_execute/values.rs",
+          "to": "projects/database/database.execution/src/sql_exec/sql_execute/values.rs",
+          "sha256": "c9f8ed28e6e19a8874779f57edd8dd05f08e08d51caefdbf6656762534a468de",
+          "bytes": 11676
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_execute/window.rs",
+          "to": "projects/database/database.execution/src/sql_exec/sql_execute/window.rs",
+          "sha256": "a148a5867d765215db5377b2148e4f9cf6fc3fcd6dc598f5054cbdffa91662ec",
+          "bytes": 29162
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_execute/write.rs",
+          "to": "projects/database/database.execution/src/sql_exec/sql_execute/write.rs",
+          "sha256": "2a76a0ed3dfda8ae5dd624bd33c35c21027c2d52ec68c7e430f862ad053ad352",
+          "bytes": 42365
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_meta.rs",
+          "to": "projects/database/database.query/src/sql/sql_meta.rs",
+          "sha256": "436e271163a090c58f765b65614acfd2ded77f7517acd717de12c01c8bf2271a",
+          "bytes": 64734
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_parameters.rs",
+          "to": "projects/database/database.query/src/sql/sql_parameters.rs",
+          "sha256": "71d0a391004f88663690a9bbfd4c230eae3e2307ed9babde5f1883e4bd3cb29d",
+          "bytes": 7470
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_planner.rs",
+          "to": "projects/database/database.query/src/sql/sql_planner.rs",
+          "sha256": "521bb9dc3e620a4253ed9a8d59ce168941cdae79cb6f56deedadef6dc9cf3c88",
+          "bytes": 95378
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_schema.rs",
+          "to": "projects/database/database.query/src/sql/sql_schema.rs",
+          "sha256": "3bc445978a02106e87ac963998ec20ffdd2cd72b5a0abd65170004c8f8e6411f",
+          "bytes": 39790
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/src/sql_serial.rs",
+          "to": "projects/database/database.protocol/src/gateway/sql_serial.rs",
+          "sha256": "06f753bc5cf9d1d92a646918103d870c2daa102068a9cfbce872b1c5eee29a88",
+          "bytes": 2582
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/gateways/yyds-gateway/Cargo.toml",
+          "to": "projects/database/database.protocol/parts/gateway/Cargo.toml",
+          "sha256": "3e29477f23848a889fb988df4b02f0c47fd255534ee77d413746aab55b3c165e",
+          "bytes": 654
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/readme.md",
+          "to": "projects/database/database.protocol/parts/gateway/readme.md",
+          "sha256": "37772353b7e3041220370249a999cc99fb36a7ffe79b9d3e1fe2464e099eb3a1",
+          "bytes": 279
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/tests/gateway.rs",
+          "to": "projects/database/database.protocol/parts/gateway/tests/gateway.rs",
+          "sha256": "1339cf533cd9be906fe0cbb1855592d36e38fe0d25fe3d570062946a3f1c5fff",
+          "bytes": 13762
+        },
+        {
+          "from": "projects/gateways/yyds-gateway/tests/sql_composite_field_binding.rs",
+          "to": "projects/database/database.protocol/parts/gateway/tests/sql_composite_field_binding.rs",
+          "sha256": "7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6",
+          "bytes": 2
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-gateway-mysql",
+      "src": "projects/gateways/yyds-gateway-mysql",
+      "pkg": "yyds-gateway-mysql",
+      "state": "ready",
+      "error": null,
+      "bytes": 94728,
+      "targets": [
+        {
+          "domain": "server",
+          "module": "mysql",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "client",
+          "module": "mysql",
+          "match": [
+            "client.rs"
+          ]
+        },
+        {
+          "domain": "protocol",
+          "module": "mysql_wire",
+          "match": [
+            "wire.rs"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/src/client.rs",
+          "to": "projects/database/database.client/src/mysql/client.rs",
+          "sha256": "bc83ec74d10f1188082f1db3d276efdcc5121856f1e67a7993051ef8c25618b2",
+          "bytes": 3332
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/src/connection.rs",
+          "to": "projects/database/database.server/src/mysql/connection.rs",
+          "sha256": "9cc1e00b672d385948e4f6f644861f151d8f1665192361c6ad7f00790b04d5e2",
+          "bytes": 79794
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/src/lib.rs",
+          "to": "projects/database/database.server/src/mysql/mod.rs",
+          "sha256": "a22c5e57295440ea37bacc90481a122e1254413e7427170bc8f3044c3a4be714",
+          "bytes": 792
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/src/service.rs",
+          "to": "projects/database/database.server/src/mysql/service.rs",
+          "sha256": "b2d0cb0fd7f22b36d0a0274431ad65b98142454251400b1a6e409ae59fb7216a",
+          "bytes": 6019
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/src/wire.rs",
+          "to": "projects/database/database.protocol/src/mysql_wire/wire.rs",
+          "sha256": "c77c8134be42fb7d19b6f79a6a84882df1e07680b1bca65e15ef98cf4244b2f3",
+          "bytes": 2122
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/Cargo.toml",
+          "to": "projects/database/database.server/parts/mysql/Cargo.toml",
+          "sha256": "7686d40eec899591dae78565d72340a76a9501e4e4b32278debbc0eb99ac5fa3",
+          "bytes": 659
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/readme.md",
+          "to": "projects/database/database.server/parts/mysql/readme.md",
+          "sha256": "cb3ecb3a5b29ee3c217a4410631b980a0666c6015d7c40a42119987936cd2310",
+          "bytes": 242
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/tests/gateway.rs",
+          "to": "projects/database/database.server/parts/mysql/tests/gateway.rs",
+          "sha256": "dc80635a43ebbe768d73bce8f148f4f89baf4e634ad80301529eedc5881a7d8f",
+          "bytes": 313
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mysql/tests/wire.rs",
+          "to": "projects/database/database.server/parts/mysql/tests/wire.rs",
+          "sha256": "a9f1af48c411edf25113ee7f162950809c28a0c8702c0732bdc430bbf650b130",
+          "bytes": 1455
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-gateway-pgsql",
+      "src": "projects/gateways/yyds-gateway-pgsql",
+      "pkg": "yyds-gateway-pgsql",
+      "state": "ready",
+      "error": null,
+      "bytes": 116633,
+      "targets": [
+        {
+          "domain": "server",
+          "module": "pgsql",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "client",
+          "module": "pgsql",
+          "match": [
+            "client.rs"
+          ]
+        },
+        {
+          "domain": "protocol",
+          "module": "pgsql_wire",
+          "match": [
+            "wire.rs"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/src/client.rs",
+          "to": "projects/database/database.client/src/pgsql/client.rs",
+          "sha256": "ca24486fe1260a1e40c154a2a01cd851c9c7d74969ec7b56c899dfffe435637e",
+          "bytes": 3799
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/src/connection.rs",
+          "to": "projects/database/database.server/src/pgsql/connection.rs",
+          "sha256": "2c22e0432b3e3d09ea2cc7cc7d9e1931b4f0f878a0e75e67189d0bd15db64dbc",
+          "bytes": 93495
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/src/lib.rs",
+          "to": "projects/database/database.server/src/pgsql/mod.rs",
+          "sha256": "4d2e801c59aa7b44aaf80a52cd4c43ff68d2c722cbe7e1639ecf9356b5da9a33",
+          "bytes": 2049
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/src/service.rs",
+          "to": "projects/database/database.server/src/pgsql/service.rs",
+          "sha256": "7d40b083beca79327a87d104fd08475e557aa95ccac9c99b48f8e6b52f7fad24",
+          "bytes": 6241
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/src/wire.rs",
+          "to": "projects/database/database.protocol/src/pgsql_wire/wire.rs",
+          "sha256": "dbb4c1bfd32fbedaddb01053c48f3ef8bb001008b2455c71e5c0717ced8dc837",
+          "bytes": 6299
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/Cargo.toml",
+          "to": "projects/database/database.server/parts/pgsql/Cargo.toml",
+          "sha256": "559ea464094a9a5559ccbf5be6a07109cd1c6162f287ac21779e56e7f169fbeb",
+          "bytes": 664
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/readme.md",
+          "to": "projects/database/database.server/parts/pgsql/readme.md",
+          "sha256": "843a441abd2deca0d8ae53bd82714cc2d61281328d3f3297805b4bbf90234663",
+          "bytes": 253
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/tests/gateway.rs",
+          "to": "projects/database/database.server/parts/pgsql/tests/gateway.rs",
+          "sha256": "9da04951ee6eb48d19efa0c0a3403896d764c030c46ea9fac49ea36801e348e1",
+          "bytes": 449
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-pgsql/tests/wire.rs",
+          "to": "projects/database/database.server/parts/pgsql/tests/wire.rs",
+          "sha256": "033acb2878a3193d93987d32a5483a4bffcf842c97ebb3e9fcf5b7da0c110fd7",
+          "bytes": 3384
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-gateway-redis",
+      "src": "projects/gateways/yyds-gateway-redis",
+      "pkg": "yyds-gateway-redis",
+      "note": "resp/bind 是 wire 编解码；bin 与服务会话进 server。",
+      "state": "ready",
+      "error": null,
+      "bytes": 95431,
+      "targets": [
+        {
+          "domain": "server",
+          "module": "redis",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "client",
+          "module": "redis",
+          "match": [
+            "client.rs"
+          ]
+        },
+        {
+          "domain": "protocol",
+          "module": "redis_wire",
+          "match": [
+            "resp.rs",
+            "bind.rs"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/gateways/yyds-gateway-redis/src/bin/yyds-redis-server.rs",
+          "to": "projects/database/database.server/src/redis/bin/yyds-redis-server.rs",
+          "sha256": "30b4d3292d1c07cacaaac71da056d8fb735e4f3bb7cc2c289d334f61979f19ba",
+          "bytes": 1963
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/src/bind.rs",
+          "to": "projects/database/database.protocol/src/redis_wire/bind.rs",
+          "sha256": "a02a31c08b9b5e4d5fda9165cb6708b67007548405606c561410d591cb3ee428",
+          "bytes": 9567
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/src/client.rs",
+          "to": "projects/database/database.client/src/redis/client.rs",
+          "sha256": "eba36cde1fc27d79b5d092c183641e903d7a2e7e2ace069bf02582f627094d7d",
+          "bytes": 7749
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/src/connection.rs",
+          "to": "projects/database/database.server/src/redis/connection.rs",
+          "sha256": "22437eaf89e04be0afee210f48eb9e9a2a7467f272aefcdfcb28ed1d5b5b2b39",
+          "bytes": 59782
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/src/lib.rs",
+          "to": "projects/database/database.server/src/redis/mod.rs",
+          "sha256": "30dedffc45e279d23b54f27dd0831df0d93c8e1da9c4b7ae706f153969951dce",
+          "bytes": 1632
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/src/resp.rs",
+          "to": "projects/database/database.protocol/src/redis_wire/resp.rs",
+          "sha256": "cc7f79f5e3a2918c3e300a7076da173e1c8f7e916d3b80d00be769b7cbd6b536",
+          "bytes": 5520
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/src/service.rs",
+          "to": "projects/database/database.server/src/redis/service.rs",
+          "sha256": "48729265d16856f1db84c4ae191977242f1ffaed66989499ccddccd787db2c97",
+          "bytes": 5499
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/gateways/yyds-gateway-redis/Cargo.toml",
+          "to": "projects/database/database.server/parts/redis/Cargo.toml",
+          "sha256": "64fdb9724d7f9d5fb07ab8d4aa5739e68005e151af4146c43a5659ba8f5fc4e4",
+          "bytes": 465
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/readme.md",
+          "to": "projects/database/database.server/parts/redis/readme.md",
+          "sha256": "32216910a47d2538d44f7bf097b314d838546695474d69776843993bb1098f9b",
+          "bytes": 245
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/tests/gateway.rs",
+          "to": "projects/database/database.server/parts/redis/tests/gateway.rs",
+          "sha256": "b5b716c71639445125110591739818d53de7f39cd3c1eda126be72acbd543497",
+          "bytes": 394
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-redis/tests/resp.rs",
+          "to": "projects/database/database.server/parts/redis/tests/resp.rs",
+          "sha256": "0d121b45448ef871fd95480e0bb5e2874a24d08df8ccbdef255bddc5dfea94e3",
+          "bytes": 2615
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yyds-gateway-mongo",
+      "src": "projects/gateways/yyds-gateway-mongo",
+      "pkg": "yyds-gateway-mongo",
+      "note": "现有文件没有独立 client；client 能力需合并后新写。",
+      "state": "ready",
+      "error": null,
+      "bytes": 116867,
+      "targets": [
+        {
+          "domain": "server",
+          "module": "mongo",
+          "rest": true,
+          "primary": true
+        },
+        {
+          "domain": "protocol",
+          "module": "mongo_wire",
+          "match": [
+            "bson.rs",
+            "wire.rs"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/src/bson.rs",
+          "to": "projects/database/database.protocol/src/mongo_wire/bson.rs",
+          "sha256": "66e93b86ee81ddc320f03401918faf8e42d3b61d9e1c899a9db166ac5db0060a",
+          "bytes": 13371
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/src/connection.rs",
+          "to": "projects/database/database.server/src/mongo/connection.rs",
+          "sha256": "f21a2d70b60a168491c69d0a7777df2248378b33e52da710ba8964a308a1e835",
+          "bytes": 3095
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/src/lib.rs",
+          "to": "projects/database/database.server/src/mongo/mod.rs",
+          "sha256": "f70d370d5b79446a4c418e90f9d2e9e9c40b9f558c0269190ea451b074f0cb6d",
+          "bytes": 44459
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/src/service.rs",
+          "to": "projects/database/database.server/src/mongo/service.rs",
+          "sha256": "712509cdc9933e8bb292afab5aae2f067b9031cccef8cbbe631108b48f5f1a2e",
+          "bytes": 5517
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/src/wire.rs",
+          "to": "projects/database/database.protocol/src/mongo_wire/wire.rs",
+          "sha256": "b5ba8c14916939f466aeb500e42246b44bbc714af317a0e6937fc08658291a39",
+          "bytes": 6548
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/Cargo.toml",
+          "to": "projects/database/database.server/parts/mongo/Cargo.toml",
+          "sha256": "b4a576f738b0467369c9decde07ce140f78998db6cc7ee39e4b6a12c9fa2035c",
+          "bytes": 489
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/readme.md",
+          "to": "projects/database/database.server/parts/mongo/readme.md",
+          "sha256": "2fe57ee9d4f33e1edc5f7af98a3247054103e21f98a1c74d58eafa5a283d9105",
+          "bytes": 715
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/tests/crud.rs",
+          "to": "projects/database/database.server/parts/mongo/tests/crud.rs",
+          "sha256": "45c08753ba89a629d55332e4adeee48d2714496d4ce41ff4cb6f2025c619a04e",
+          "bytes": 26277
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/tests/gateway.rs",
+          "to": "projects/database/database.server/parts/mongo/tests/gateway.rs",
+          "sha256": "19efec47dd53c22b94237c8ef1ecc4b69e27546c47220aa7bdd34ee40c05b444",
+          "bytes": 10408
+        },
+        {
+          "from": "projects/gateways/yyds-gateway-mongo/tests/wire.rs",
+          "to": "projects/database/database.server/parts/mongo/tests/wire.rs",
+          "sha256": "9e25faf166030e2c486a53c5e6b043c7dd3ad10f210baeff1a43aa7b1f2480f3",
+          "bytes": 5988
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-client",
+      "src": "projects/services/yydb-client",
+      "pkg": "yydb-client",
+      "state": "ready",
+      "error": null,
+      "bytes": 6808,
+      "targets": [
+        {
+          "domain": "client",
+          "module": "yydb",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/services/yydb-client/src/lib.rs",
+          "to": "projects/database/database.client/src/yydb/mod.rs",
+          "sha256": "f8464818f4edeeb8e9a270ad7c63430989f66fb50898fcbf8cf2d036287a73ed",
+          "bytes": 6201
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/services/yydb-client/Cargo.toml",
+          "to": "projects/database/database.client/parts/yydb/Cargo.toml",
+          "sha256": "f91cb73c2a52e54c719518c5d58009eddd62000b24a4a733b6665a7abecc6f61",
+          "bytes": 382
+        },
+        {
+          "from": "projects/services/yydb-client/readme.md",
+          "to": "projects/database/database.client/parts/yydb/readme.md",
+          "sha256": "b809a3adcd29601d740328a99b9e5ea4d1ed2366b2d5d5b606ec1fc9a85d6037",
+          "bytes": 225
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "yydb-server",
+      "src": "projects/services/yydb-server",
+      "pkg": "yydb-server",
+      "note": "host_wire 暂留 server，合并时再判断是否下沉到 protocol。",
+      "state": "ready",
+      "error": null,
+      "bytes": 71349,
+      "targets": [
+        {
+          "domain": "server",
+          "module": "yydb",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/services/yydb-server/src/auth.rs",
+          "to": "projects/database/database.server/src/yydb/auth.rs",
+          "sha256": "2bf477f13be0d4b8cf881ab76f17f52f3456741faec59df4ede31b0e7f981f8d",
+          "bytes": 13605
+        },
+        {
+          "from": "projects/services/yydb-server/src/dispatch.rs",
+          "to": "projects/database/database.server/src/yydb/dispatch.rs",
+          "sha256": "6ed15084f74f34a91dda8d6233c8b7cd781903a3589a1da47c13bcca66d2a535",
+          "bytes": 20146
+        },
+        {
+          "from": "projects/services/yydb-server/src/host_wire.rs",
+          "to": "projects/database/database.server/src/yydb/host_wire.rs",
+          "sha256": "cae19d39c5f2061dc7f584c93cd238b794a765b6b6cf66eaf3b5f55612d87c7e",
+          "bytes": 2526
+        },
+        {
+          "from": "projects/services/yydb-server/src/lib.rs",
+          "to": "projects/database/database.server/src/yydb/mod.rs",
+          "sha256": "1e7e4916adacd28327a0719d4d193dfba7cc4e7b2733eee52f12267722228fa3",
+          "bytes": 746
+        },
+        {
+          "from": "projects/services/yydb-server/src/serve.rs",
+          "to": "projects/database/database.server/src/yydb/serve.rs",
+          "sha256": "a9615432bac38843db859ab17fa635c328734548034a2d0afb73a61b0246f106",
+          "bytes": 13871
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/services/yydb-server/Cargo.toml",
+          "to": "projects/database/database.server/parts/yydb/Cargo.toml",
+          "sha256": "1a21a6a6a7ee0bba9b99a0607e1b6b0d176df887c6be4887764a19c9e3a8f6b9",
+          "bytes": 815
+        },
+        {
+          "from": "projects/services/yydb-server/readme.md",
+          "to": "projects/database/database.server/parts/yydb/readme.md",
+          "sha256": "b47e760ab6cfd9a758c54a376c5b75e55b8e15867f5c6a04f361b39eb459edbc",
+          "bytes": 228
+        },
+        {
+          "from": "projects/services/yydb-server/tests/auth_bootstrap.rs",
+          "to": "projects/database/database.server/parts/yydb/tests/auth_bootstrap.rs",
+          "sha256": "a401f521310175e779fb98a064faead6a3f6c0fe98eb7aa17341e18f4f216ba3",
+          "bytes": 1388
+        },
+        {
+          "from": "projects/services/yydb-server/tests/auth_env_tokens.rs",
+          "to": "projects/database/database.server/parts/yydb/tests/auth_env_tokens.rs",
+          "sha256": "3037fb384b43ce90d88a179ff3ce10827295a75960b396b97508b93a4fa11e10",
+          "bytes": 654
+        },
+        {
+          "from": "projects/services/yydb-server/tests/authz.rs",
+          "to": "projects/database/database.server/parts/yydb/tests/authz.rs",
+          "sha256": "8a93ddb1234e5f5957360a7cdfb75601ad6da1c1c025d9d3c1c20a050b45b84f",
+          "bytes": 12044
+        },
+        {
+          "from": "projects/services/yydb-server/tests/bind_policy.rs",
+          "to": "projects/database/database.server/parts/yydb/tests/bind_policy.rs",
+          "sha256": "c3109ffc2ab8f33652112ffd3f1d32ebfa2a10aaec41a0944cd96ed4c05d7666",
+          "bytes": 2007
+        },
+        {
+          "from": "projects/services/yydb-server/tests/tcp_roundtrip.rs",
+          "to": "projects/database/database.server/parts/yydb/tests/tcp_roundtrip.rs",
+          "sha256": "6f667d0fd73fb75f741d8cf429ad800a3d552839b7ce9b568d37e22fccb35902",
+          "bytes": 3319
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-adapter-d1",
+      "src": "projects/adapters/iris-adapter-d1",
+      "pkg": "iris-adapter-d1",
+      "state": "skipped-dirty",
+      "error": "源路径有未提交改动（git status --porcelain 非空）",
+      "bytes": 0,
+      "targets": [
+        {
+          "domain": "orm",
+          "module": "adapter_d1",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [],
+      "partsFiles": [],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-adapter-mysql",
+      "src": "projects/adapters/iris-adapter-mysql",
+      "pkg": "iris-adapter-mysql",
+      "state": "ready",
+      "error": null,
+      "bytes": 44520,
+      "targets": [
+        {
+          "domain": "orm",
+          "module": "adapter_mysql",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/adapters/iris-adapter-mysql/src/catalog.rs",
+          "to": "projects/database/database.orm/src/adapter_mysql/catalog.rs",
+          "sha256": "2f8d1dcfe907bee0512a03fd10676e0b54711b2557090aabe16dbd3bb83e7c54",
+          "bytes": 8792
+        },
+        {
+          "from": "projects/adapters/iris-adapter-mysql/src/execute.rs",
+          "to": "projects/database/database.orm/src/adapter_mysql/execute.rs",
+          "sha256": "1b45c014b5803fa087e1a0daf3a8b2162431ec6251169e95f4e79b6d3f6636cd",
+          "bytes": 1391
+        },
+        {
+          "from": "projects/adapters/iris-adapter-mysql/src/lib.rs",
+          "to": "projects/database/database.orm/src/adapter_mysql/mod.rs",
+          "sha256": "33d7ca8d419a9d53a6468f270db2933885a7a68fd1b270774d6a9008a3c3ae9a",
+          "bytes": 10394
+        },
+        {
+          "from": "projects/adapters/iris-adapter-mysql/src/migrate.rs",
+          "to": "projects/database/database.orm/src/adapter_mysql/migrate.rs",
+          "sha256": "1937ba4a86f9bfa984e86147cbb9103a7fb3090d409ef8dc92c7f038bdfecb79",
+          "bytes": 8584
+        },
+        {
+          "from": "projects/adapters/iris-adapter-mysql/src/schema_map.rs",
+          "to": "projects/database/database.orm/src/adapter_mysql/schema_map.rs",
+          "sha256": "96325623cb04fb0148c4269e3e8e119bdf0145ed59ef104a23d61cc77c48b342",
+          "bytes": 1011
+        },
+        {
+          "from": "projects/adapters/iris-adapter-mysql/src/uuid_util.rs",
+          "to": "projects/database/database.orm/src/adapter_mysql/uuid_util.rs",
+          "sha256": "16010de57667e7a62d17780568ff22e98d13262850792d35b8bf4030b35705e6",
+          "bytes": 1470
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/adapters/iris-adapter-mysql/Cargo.toml",
+          "to": "projects/database/database.orm/parts/adapter_mysql/Cargo.toml",
+          "sha256": "362fbeb5f1ab01331d36db5ca658843a32f7e1a067c97ce6815a883144ae4108",
+          "bytes": 445
+        },
+        {
+          "from": "projects/adapters/iris-adapter-mysql/readme.md",
+          "to": "projects/database/database.orm/parts/adapter_mysql/readme.md",
+          "sha256": "010a0cabf14ea9633f72e3d1f7845ce57c65d8d2dc9786918bd83b69ca936994",
+          "bytes": 285
+        },
+        {
+          "from": "projects/adapters/iris-adapter-mysql/tests/mysql_vertical.rs",
+          "to": "projects/database/database.orm/parts/adapter_mysql/tests/mysql_vertical.rs",
+          "sha256": "4da214b39a4c435b23d8ba3a18b01ac96132c29caf2e08cabb37182f3c98879b",
+          "bytes": 11583
+        },
+        {
+          "from": "projects/adapters/iris-adapter-mysql/tests/uuid_util.rs",
+          "to": "projects/database/database.orm/parts/adapter_mysql/tests/uuid_util.rs",
+          "sha256": "471a64ab1dd877d28f5d36c90ccf87dde338d79767ab69cba14ca71313f9e78a",
+          "bytes": 565
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-adapter-postgres",
+      "src": "projects/adapters/iris-adapter-postgres",
+      "pkg": "iris-adapter-postgres",
+      "state": "ready",
+      "error": null,
+      "bytes": 35380,
+      "targets": [
+        {
+          "domain": "orm",
+          "module": "adapter_postgres",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/adapters/iris-adapter-postgres/src/catalog.rs",
+          "to": "projects/database/database.orm/src/adapter_postgres/catalog.rs",
+          "sha256": "da903b839fd218eb9733c5bb78d580a2182170c279114b72b9921373186a6f9f",
+          "bytes": 7577
+        },
+        {
+          "from": "projects/adapters/iris-adapter-postgres/src/execute.rs",
+          "to": "projects/database/database.orm/src/adapter_postgres/execute.rs",
+          "sha256": "02da227641358ca94172889cebdf4c6d0e847dba3ba2dbcabb97dc743757506e",
+          "bytes": 1256
+        },
+        {
+          "from": "projects/adapters/iris-adapter-postgres/src/lib.rs",
+          "to": "projects/database/database.orm/src/adapter_postgres/mod.rs",
+          "sha256": "f661b0ec8ead52cd85e0aac5cae8883cf41a4fcbb9afefd0ccdeaeb9224cd64b",
+          "bytes": 9356
+        },
+        {
+          "from": "projects/adapters/iris-adapter-postgres/src/migrate.rs",
+          "to": "projects/database/database.orm/src/adapter_postgres/migrate.rs",
+          "sha256": "2b42dbd887346aedfe84e9d6fbdb75f09c35753f5daa1772ebda727e2ac7708b",
+          "bytes": 5518
+        },
+        {
+          "from": "projects/adapters/iris-adapter-postgres/src/outbox.rs",
+          "to": "projects/database/database.orm/src/adapter_postgres/outbox.rs",
+          "sha256": "f4dae5a2f67a54abf66933db0f87a9efe2c199671bde44f428ebd57bf151d7c9",
+          "bytes": 3676
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/adapters/iris-adapter-postgres/Cargo.toml",
+          "to": "projects/database/database.orm/parts/adapter_postgres/Cargo.toml",
+          "sha256": "103badf62d5c2f3bcaac4faed96fb0538efb8300d5c0c2c4d95adb10d05ff31d",
+          "bytes": 453
+        },
+        {
+          "from": "projects/adapters/iris-adapter-postgres/readme.md",
+          "to": "projects/database/database.orm/parts/adapter_postgres/readme.md",
+          "sha256": "ab6a1704e30666b7af4eeb7430c28c5b2c21818d1907dfa9eb35f58d93c41e68",
+          "bytes": 195
+        },
+        {
+          "from": "projects/adapters/iris-adapter-postgres/tests/outbox_phase10b.rs",
+          "to": "projects/database/database.orm/parts/adapter_postgres/tests/outbox_phase10b.rs",
+          "sha256": "5e8aca32f33e01584a92d7b845dc6a400f6fb62e90ab5a7bdfc635d95c16e8a0",
+          "bytes": 1908
+        },
+        {
+          "from": "projects/adapters/iris-adapter-postgres/tests/postgres_vertical.rs",
+          "to": "projects/database/database.orm/parts/adapter_postgres/tests/postgres_vertical.rs",
+          "sha256": "99edd174d2ebf1fa96d0524efe90f207dcb720d82adf0e0bd637a8c8873ca2ea",
+          "bytes": 5441
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-adapter-redis",
+      "src": "projects/adapters/iris-adapter-redis",
+      "pkg": "iris-adapter-redis",
+      "state": "ready",
+      "error": null,
+      "bytes": 39367,
+      "targets": [
+        {
+          "domain": "orm",
+          "module": "adapter_redis",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/adapters/iris-adapter-redis/src/cache.rs",
+          "to": "projects/database/database.orm/src/adapter_redis/cache.rs",
+          "sha256": "d32c275085f9fc796bdb36fadd9589eded30b2b0bf7c6ec29e1e26b60d03d6c2",
+          "bytes": 8951
+        },
+        {
+          "from": "projects/adapters/iris-adapter-redis/src/lib.rs",
+          "to": "projects/database/database.orm/src/adapter_redis/mod.rs",
+          "sha256": "8b52da34f93b2206fa3fa8329b1a451b7ec75d61b06195cd0792500acd1ac218",
+          "bytes": 14149
+        },
+        {
+          "from": "projects/adapters/iris-adapter-redis/src/mapping.rs",
+          "to": "projects/database/database.orm/src/adapter_redis/mapping.rs",
+          "sha256": "58dc716d8d5295341d48b2307551366a3c327a76b54ea01b68c01bd81a3e871a",
+          "bytes": 1677
+        },
+        {
+          "from": "projects/adapters/iris-adapter-redis/src/ops.rs",
+          "to": "projects/database/database.orm/src/adapter_redis/ops.rs",
+          "sha256": "20ed37327a8b9229d56e927b7370bb70c19eccac5a86cee440700ded1053646a",
+          "bytes": 2416
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/adapters/iris-adapter-redis/Cargo.toml",
+          "to": "projects/database/database.orm/parts/adapter_redis/Cargo.toml",
+          "sha256": "3f7f51b4e4176cb4b8bc90e79553b849cce4754c4ab976be334f4cd46b71def2",
+          "bytes": 489
+        },
+        {
+          "from": "projects/adapters/iris-adapter-redis/readme.md",
+          "to": "projects/database/database.orm/parts/adapter_redis/readme.md",
+          "sha256": "9ee3f19b454b0645bc1dbfcd7f82ae915dba5439fd74c7318a540261d25ace90",
+          "bytes": 214
+        },
+        {
+          "from": "projects/adapters/iris-adapter-redis/tests/cache_phase10c.rs",
+          "to": "projects/database/database.orm/parts/adapter_redis/tests/cache_phase10c.rs",
+          "sha256": "f1367298b903b23272f47e8ae3b2ad0d3d81d90e8ce52c45f3fbee91d03adc34",
+          "bytes": 5637
+        },
+        {
+          "from": "projects/adapters/iris-adapter-redis/tests/parse_redis_url.rs",
+          "to": "projects/database/database.orm/parts/adapter_redis/tests/parse_redis_url.rs",
+          "sha256": "06a7873ad11f36223df921c9baae1afa5ca9a7b58c691172566aabb2f43fddf0",
+          "bytes": 1175
+        },
+        {
+          "from": "projects/adapters/iris-adapter-redis/tests/redis_vertical.rs",
+          "to": "projects/database/database.orm/parts/adapter_redis/tests/redis_vertical.rs",
+          "sha256": "7978a6744bf15140f0b337dabb2f2483f5d3589b0a32e8b95b8ac4e70c3b26ff",
+          "bytes": 4659
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-adapter-sqlite",
+      "src": "projects/adapters/iris-adapter-sqlite",
+      "pkg": "iris-adapter-sqlite",
+      "state": "ready",
+      "error": null,
+      "bytes": 68604,
+      "targets": [
+        {
+          "domain": "orm",
+          "module": "adapter_sqlite",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/src/catalog.rs",
+          "to": "projects/database/database.orm/src/adapter_sqlite/catalog.rs",
+          "sha256": "01e239dabc3021ffaa7a80aa7f0168cc5facdaecf2d3b1775e1e2ace4282e17f",
+          "bytes": 7637
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/src/execute.rs",
+          "to": "projects/database/database.orm/src/adapter_sqlite/execute.rs",
+          "sha256": "25354f611b1d14c6a9b5daaf1e69a4453bc0c972abaeaa19f0f107d346bdd982",
+          "bytes": 12551
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/src/lib.rs",
+          "to": "projects/database/database.orm/src/adapter_sqlite/mod.rs",
+          "sha256": "e1f585ace9c76625b4f03a7207b1468e514e5d81daf222a30c5a4e98549b8434",
+          "bytes": 10323
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/src/migrate.rs",
+          "to": "projects/database/database.orm/src/adapter_sqlite/migrate.rs",
+          "sha256": "65e2271efa337192665d7dbefa78171412e910a50d5876ee2456772626cacaea",
+          "bytes": 5418
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/src/outbox.rs",
+          "to": "projects/database/database.orm/src/adapter_sqlite/outbox.rs",
+          "sha256": "b85bc234cd01dcc646471c1e377d15aeaa7b29d9c327ad1eae85013c25090eb2",
+          "bytes": 9975
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/src/provider.rs",
+          "to": "projects/database/database.orm/src/adapter_sqlite/provider.rs",
+          "sha256": "cd02506b8f55217a852ffeba2f07930480bd11f736f95c90c4d8543492925b00",
+          "bytes": 6678
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/src/types.rs",
+          "to": "projects/database/database.orm/src/adapter_sqlite/types.rs",
+          "sha256": "e23be943726780491989dd539664e5e359824c796b960770f41b7c5409167a6a",
+          "bytes": 8066
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/Cargo.toml",
+          "to": "projects/database/database.orm/parts/adapter_sqlite/Cargo.toml",
+          "sha256": "1e223affcac42cd9ad86fbe17a70038d37bc15b6755efc18d8add8dd9f2b11f9",
+          "bytes": 400
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/readme.md",
+          "to": "projects/database/database.orm/parts/adapter_sqlite/readme.md",
+          "sha256": "f82cb45392be779c500829a2deda4353ed2f3ef2b4236a6ada1bcf36cf5feb3c",
+          "bytes": 1636
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/tests/sqlite_vertical.rs",
+          "to": "projects/database/database.orm/parts/adapter_sqlite/tests/sqlite_vertical.rs",
+          "sha256": "0674d2092868bda5a0035c2df08d615394c2e2e0551ba5a7c570d37fac588217",
+          "bytes": 2930
+        },
+        {
+          "from": "projects/adapters/iris-adapter-sqlite/tests/types_bind.rs",
+          "to": "projects/database/database.orm/parts/adapter_sqlite/tests/types_bind.rs",
+          "sha256": "a3bd7610942ea25726d4e654f1f29bd247f37cd019a29a53f7a9849616353d30",
+          "bytes": 2990
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-connector-yydb",
+      "src": "projects/connectors/iris-connector-yydb",
+      "pkg": "iris-connector-yydb",
+      "state": "ready",
+      "error": null,
+      "bytes": 53398,
+      "targets": [
+        {
+          "domain": "orm",
+          "module": "connector_yydb",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/connectors/iris-connector-yydb/src/error.rs",
+          "to": "projects/database/database.orm/src/connector_yydb/error.rs",
+          "sha256": "0c5c8a50482874ba29f5a45a2fb5887c4d3cdf3e23bc03954b4827342e951739",
+          "bytes": 1140
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/src/lib.rs",
+          "to": "projects/database/database.orm/src/connector_yydb/mod.rs",
+          "sha256": "ccab2f979aea5a0955b8d50838ea0693c0137d7bcdaac80f4d75f405e6ec5a81",
+          "bytes": 28646
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/src/plan.rs",
+          "to": "projects/database/database.orm/src/connector_yydb/plan.rs",
+          "sha256": "8e71ebedc7794b2470e5e6d9f24b5534517457eb3a85e1107b04a67112e30264",
+          "bytes": 10014
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/connectors/iris-connector-yydb/Cargo.toml",
+          "to": "projects/database/database.orm/parts/connector_yydb/Cargo.toml",
+          "sha256": "0809844f005f640ec9683e53baec1099cef6d138912005dee29af79ec02044d7",
+          "bytes": 512
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/readme.md",
+          "to": "projects/database/database.orm/parts/connector_yydb/readme.md",
+          "sha256": "b98a63306aec8bb3cbe90d9575e4cbdb994cd72df0bf007e7414c44283968fd5",
+          "bytes": 211
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/tests/generated/errors.rs",
+          "to": "projects/database/database.orm/parts/connector_yydb/tests/generated/errors.rs",
+          "sha256": "45f0b5ab9f2fb8413f62b411b35c74d80811772d3cc5fe3a90c9f7706bf7b3ad",
+          "bytes": 214
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/tests/generated/metadata.rs",
+          "to": "projects/database/database.orm/parts/connector_yydb/tests/generated/metadata.rs",
+          "sha256": "ffd9303cce81cf441e43a5f70f84dbfb9176ef69f9cbd2e57710e73f058e79c5",
+          "bytes": 596
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/tests/generated/mod.rs",
+          "to": "projects/database/database.orm/parts/connector_yydb/tests/generated/mod.rs",
+          "sha256": "2da4f0a4591efe13108f3cccfe25b6c880072dadcbb3293b9da55cf83214013c",
+          "bytes": 530
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/tests/generated/models.rs",
+          "to": "projects/database/database.orm/parts/connector_yydb/tests/generated/models.rs",
+          "sha256": "727259fc6eec75e5af039d4a35056c0b99c16998e4b105c8302a102eb4e51161",
+          "bytes": 2955
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/tests/generated/operations.rs",
+          "to": "projects/database/database.orm/parts/connector_yydb/tests/generated/operations.rs",
+          "sha256": "8e650b2f02df202b1c5f0c06611f0f56bd6f3da46bae702fbc1eb14c5fa4306c",
+          "bytes": 8444
+        },
+        {
+          "from": "projects/connectors/iris-connector-yydb/tests/generated/schema.vos",
+          "to": "projects/database/database.orm/parts/connector_yydb/tests/generated/schema.vos",
+          "sha256": "9c28667e63a48ab1c1765898c79401c36996b7c444a911470beadf4aa5c3586b",
+          "bytes": 136
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [
+        {
+          "path": "projects/connectors/iris-connector-yydb/target",
+          "reason": "target/ 构建产物不搬"
+        }
+      ],
+      "unmapped": []
+    },
+    {
+      "id": "iris-connector-yyds",
+      "src": "projects/connectors/iris-connector-yyds",
+      "pkg": "iris-connector-yyds",
+      "state": "ready",
+      "error": null,
+      "bytes": 9150,
+      "targets": [
+        {
+          "domain": "orm",
+          "module": "connector_yyds",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/connectors/iris-connector-yyds/src/lib.rs",
+          "to": "projects/database/database.orm/src/connector_yyds/mod.rs",
+          "sha256": "d5a6b6eed94cdda7a9a9f1bae3970a1c509000a4bbe25893536faa27fb182f33",
+          "bytes": 6502
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/connectors/iris-connector-yyds/Cargo.toml",
+          "to": "projects/database/database.orm/parts/connector_yyds/Cargo.toml",
+          "sha256": "f6ea02b717e9d143697d0a5b957af1ec1c97abef01fe55bcade38a3d16bfe546",
+          "bytes": 367
+        },
+        {
+          "from": "projects/connectors/iris-connector-yyds/readme.md",
+          "to": "projects/database/database.orm/parts/connector_yyds/readme.md",
+          "sha256": "17e128ce053f0f78b29bc0eb3a1249124f2e50577b7ec39812fbe1726e6b67eb",
+          "bytes": 235
+        },
+        {
+          "from": "projects/connectors/iris-connector-yyds/tests/yyds_readiness.rs",
+          "to": "projects/database/database.orm/parts/connector_yyds/tests/yyds_readiness.rs",
+          "sha256": "5048dd4d290fa96f4f5565dccc373777c322f53c0b4f9177d4c9341478685fc1",
+          "bytes": 2046
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    },
+    {
+      "id": "iris-generator",
+      "src": "projects/tools/iris-generator",
+      "pkg": "iris-generator",
+      "state": "ready",
+      "error": null,
+      "bytes": 275103,
+      "targets": [
+        {
+          "domain": "generate",
+          "module": "iris",
+          "rest": true,
+          "primary": true
+        }
+      ],
+      "files": [
+        {
+          "from": "projects/tools/iris-generator/src/bin/iris-python-generate.rs",
+          "to": "projects/database/database.generate/src/iris/bin/iris-python-generate.rs",
+          "sha256": "9dafaa35c15fd7df383528c253a9116c431597e090c5b49d42510cb25b0cb0c3",
+          "bytes": 1230
+        },
+        {
+          "from": "projects/tools/iris-generator/src/bin/iris-runtime-sync.rs",
+          "to": "projects/database/database.generate/src/iris/bin/iris-runtime-sync.rs",
+          "sha256": "228526800893bd5e13950dca6d9a07f9c7fefeaf0d842fc649d5d7a1e1ea65f0",
+          "bytes": 1001
+        },
+        {
+          "from": "projects/tools/iris-generator/src/carrier.rs",
+          "to": "projects/database/database.generate/src/iris/carrier.rs",
+          "sha256": "f67804b547fbb2686068621ad50a1c0e9c1b8a4c48fb026b10deec00b2a7aea8",
+          "bytes": 4350
+        },
+        {
+          "from": "projects/tools/iris-generator/src/lib.rs",
+          "to": "projects/database/database.generate/src/iris/mod.rs",
+          "sha256": "79b7df56389b6e9cfa369860e78af8f9742e3531620602da3ed1778ffe0de4ec",
+          "bytes": 32550
+        },
+        {
+          "from": "projects/tools/iris-generator/src/operations_artifact.rs",
+          "to": "projects/database/database.generate/src/iris/operations_artifact.rs",
+          "sha256": "7bfd3dc59256c23f5623562dd68e11e34913b214ddaa7e5cd8618291ff970d04",
+          "bytes": 7333
+        },
+        {
+          "from": "projects/tools/iris-generator/src/projection.rs",
+          "to": "projects/database/database.generate/src/iris/projection.rs",
+          "sha256": "9cf4812e7660f76d6fa9e84e3adbb11dea1d16b7c8a3c9e6079c9b271c5c48f2",
+          "bytes": 13387
+        },
+        {
+          "from": "projects/tools/iris-generator/src/python.rs",
+          "to": "projects/database/database.generate/src/iris/python.rs",
+          "sha256": "aaadafdb367509399c810cf4c96421fe42cfe14daba47ed685048e605b29af34",
+          "bytes": 6375
+        },
+        {
+          "from": "projects/tools/iris-generator/src/python_view.rs",
+          "to": "projects/database/database.generate/src/iris/python_view.rs",
+          "sha256": "17c4c19d5970bd7c8ccb83d632bddd91fcb1412a30b910f0e2ea3de7436a331f",
+          "bytes": 10870
+        },
+        {
+          "from": "projects/tools/iris-generator/src/render.rs",
+          "to": "projects/database/database.generate/src/iris/render.rs",
+          "sha256": "d57e46047c02940cc72d6b40925d8d770fdf04b2ad6b63fe0a2c678365bd6d81",
+          "bytes": 7253
+        },
+        {
+          "from": "projects/tools/iris-generator/src/rust_view.rs",
+          "to": "projects/database/database.generate/src/iris/rust_view.rs",
+          "sha256": "e5708ac07f3100818f86efe90ca26d23436c0613437b815d2b882b7c982c12db",
+          "bytes": 16274
+        },
+        {
+          "from": "projects/tools/iris-generator/src/ts_view.rs",
+          "to": "projects/database/database.generate/src/iris/ts_view.rs",
+          "sha256": "e391dc6f792f71d7f6eaeadc16bf38031ca29b254eb40a43716a31cf8f8aa8b3",
+          "bytes": 23995
+        },
+        {
+          "from": "projects/tools/iris-generator/src/typescript.rs",
+          "to": "projects/database/database.generate/src/iris/typescript.rs",
+          "sha256": "adb6ec8c937979fe071ebd6c8090674fbf3448cb6903a1d3eecbab62e1747b94",
+          "bytes": 5262
+        }
+      ],
+      "partsFiles": [
+        {
+          "from": "projects/tools/iris-generator/Cargo.toml",
+          "to": "projects/database/database.generate/parts/iris/Cargo.toml",
+          "sha256": "50c6f049d6a3c738dea627c3c8206515d68f9be32a91ec5d497018204c963bd9",
+          "bytes": 1143
+        },
+        {
+          "from": "projects/tools/iris-generator/build.rs",
+          "to": "projects/database/database.generate/parts/iris/build.rs",
+          "sha256": "43cd65d423dc016edaf839720a0a711d22050b54d052edc3640e375c9bafb1ce",
+          "bytes": 4526
+        },
+        {
+          "from": "projects/tools/iris-generator/readme.md",
+          "to": "projects/database/database.generate/parts/iris/readme.md",
+          "sha256": "7deb71a2af9af84788037ae1b0397207654f72bad784c6d285536afc328dffdb",
+          "bytes": 238
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/README.md",
+          "to": "projects/database/database.generate/parts/iris/templates/README.md",
+          "sha256": "658497c3c73d54dfbc12eda655f20ab5b66ae0f84ec42ba82ca8f745a1cf37fc",
+          "bytes": 1038
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/errors.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/errors.py.dejavu",
+          "sha256": "b979dfa36497fa3dd23f9112e6e510c95c86feacda7078ba1da9674a889753a1",
+          "bytes": 852
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/executor.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/executor.py.dejavu",
+          "sha256": "766b49951f3ef94aba704635db0104d416778e72143d85d6508a7ff676bbcae3",
+          "bytes": 3569
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/init.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/init.py.dejavu",
+          "sha256": "6559ad3e978ca1e59506725bca63ea616e513fb1d10d4077d977b733e7a58a6c",
+          "bytes": 428
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/inputs.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/inputs.py.dejavu",
+          "sha256": "15cbe53544dcc2a0767c312abc5cb412e436b110f2eea056605cced6c6c2d0d2",
+          "bytes": 2485
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/internal_init.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/internal_init.py.dejavu",
+          "sha256": "8be810b45d25c01e7631d6651864abf42a6177825c349e1681ea83d5bd012706",
+          "bytes": 85
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/metadata.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/metadata.py.dejavu",
+          "sha256": "c4bac3e4f01a4e0ad6f07224e906bda38891efe99b443d903ba66859d91f977e",
+          "bytes": 464
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/models.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/models.py.dejavu",
+          "sha256": "2bc9e0110c1e0da160049f9de52d1cd05a551c4ed527fab4122c76d55744e871",
+          "bytes": 643
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/operations.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/operations.py.dejavu",
+          "sha256": "c18d170ff299beffd71ad29d97ad5dfe005a9b40e43d927a55b5b1088288d4aa",
+          "bytes": 7673
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/py_typed.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/py_typed.dejavu",
+          "sha256": "43cad408665d58adbfb3479fb76f3512170ca573559e1abcb7508bed0193e69f",
+          "bytes": 39
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/python/synthesize.py.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/python/synthesize.py.dejavu",
+          "sha256": "2fec44c42c042ffc18370ceccc6ccb5e695dc9ab798e6e339144f4f9f13f5d17",
+          "bytes": 19078
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/rust/domain_mod.rs.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/rust/domain_mod.rs.dejavu",
+          "sha256": "9872648b3773cee90c3b69830e10c83195288db328b414874ed3735ee900be6a",
+          "bytes": 211
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/rust/errors.rs.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/rust/errors.rs.dejavu",
+          "sha256": "695d8e3b9e356986b043f7429bddd5b23b4f1ef3a25903441579ba48eb5bdb90",
+          "bytes": 58
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/rust/file_header.rs.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/rust/file_header.rs.dejavu",
+          "sha256": "2fef28d1f8ce592562353be607c6807f7be808451a851a4b61aff5814d26dba5",
+          "bytes": 149
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/rust/metadata.rs.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/rust/metadata.rs.dejavu",
+          "sha256": "6da6e8e9699c5fecf5b9d3d83fdd1b9c3c9831e631bf56c2a89efbb5f30facd0",
+          "bytes": 510
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/rust/models_helpers.rs.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/rust/models_helpers.rs.dejavu",
+          "sha256": "0e65c555ff36712967842cc81e23c7dcd20b899deee37dfb508e8ee16dfefbc0",
+          "bytes": 1901
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/rust/models_impl.rs.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/rust/models_impl.rs.dejavu",
+          "sha256": "7ce02929449ed442398da6318d686fa156c7a07a67d49f1833a4bc2e47cbdd3f",
+          "bytes": 625
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/rust/operations.rs.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/rust/operations.rs.dejavu",
+          "sha256": "ff2f59ad4055929b62759abd53f3eb4e330ac091907f93920f7b23e9ee151bd3",
+          "bytes": 7867
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/rust/rust_index.rs.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/rust/rust_index.rs.dejavu",
+          "sha256": "d9858b1b6f57598ba37dabea558054192aa28f24e2dde7356d7c5d9cd1c70972",
+          "bytes": 374
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/browser.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/browser.ts.dejavu",
+          "sha256": "2fbe6640a0e7458ec23f6e805ea7c39e23953c2db7ea9395f051462682a9aaa4",
+          "bytes": 1118
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/cloudflare.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/cloudflare.ts.dejavu",
+          "sha256": "98cddf0abdfba8a23b9368ca169a5e4eeb74bcbf8a0d446e871b9295ff235701",
+          "bytes": 722
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/contract-types.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/contract-types.ts.dejavu",
+          "sha256": "8c4010a5575e439d70efab9d5dbafc9a41ed03655105de1372d9609a0c4e073a",
+          "bytes": 3002
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/errors.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/errors.ts.dejavu",
+          "sha256": "0a4f8cb031769fff9e1bd0e3a1191eb98518f48fe4746c0b14f4bda3a8f477c4",
+          "bytes": 476
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/index.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/index.ts.dejavu",
+          "sha256": "3882c4160442cf2031dc5110fae6293693baac95b5b965551104c94291227df3",
+          "bytes": 361
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/inputs.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/inputs.ts.dejavu",
+          "sha256": "c0d53d75f4e974973c6b206b9abab22b863a7a416d9a90fbf9d65316169a90b0",
+          "bytes": 7771
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/metadata.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/metadata.ts.dejavu",
+          "sha256": "ff8fc4c853cf7bd0da60cbaed63aebc08b594383b151fc551957b399e6053502",
+          "bytes": 870
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/models.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/models.ts.dejavu",
+          "sha256": "9a7de1ecc06251b9a8b55edddbf3444d92ffbdd3dfb4a4ab9d39d4b4b72308d2",
+          "bytes": 258
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/node.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/node.ts.dejavu",
+          "sha256": "662064501068b3d1fb27ade5da96dbf4c70bc2afbddd3a7f9313687009c5e60e",
+          "bytes": 1043
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/operations.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/operations.ts.dejavu",
+          "sha256": "3dde11ffccf1fa1ab1dd4830335ec8540b5e0459bd700ed65d82aa0931f27b56",
+          "bytes": 9151
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/references.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/references.ts.dejavu",
+          "sha256": "860c0f88798a8155c4927f8e51648d5cf197e4e97adac3647a7d9b5e855375bb",
+          "bytes": 940
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/runtime/db-binding.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/runtime/db-binding.ts.dejavu",
+          "sha256": "288504ab4c6359aacd7b68cdea4519a6bb6fe0c69ddac68190cf50deb7f7d69b",
+          "bytes": 2390
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/runtime/hex.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/runtime/hex.ts.dejavu",
+          "sha256": "a9177bf41ae27efc22d714a9a0d01b1bd68c6a94077267d547f7f054b551f0c6",
+          "bytes": 1079
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/runtime/operation-binding.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/runtime/operation-binding.ts.dejavu",
+          "sha256": "e54ce27448f52b6723c18a8c3b4f73b61afaa300cd44da2ee5548703799f8038",
+          "bytes": 10664
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/runtime/operation-parameters.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/runtime/operation-parameters.ts.dejavu",
+          "sha256": "23b609e01b8e86363a20d19157fa2e7ec66d13179c0baffe77ed7013422ed2df",
+          "bytes": 8598
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/runtime/parse.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/runtime/parse.ts.dejavu",
+          "sha256": "d4f214dc0e2dd8bad5016ea57e3730ea2ae94288654f9fb133c913ba13d0a06f",
+          "bytes": 1160
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/runtime/validate-contract.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/runtime/validate-contract.ts.dejavu",
+          "sha256": "3c59fa595a5ce1fc56429667db7abdcc0f2d602146b4a9ad65560238371b32af",
+          "bytes": 1998
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/runtime/value-carrier.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/runtime/value-carrier.ts.dejavu",
+          "sha256": "415e251c111e70b138baf1b902a6bc5de42d967430e19f82026cf72f6d079483",
+          "bytes": 9700
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/runtime/wire-row-map.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/runtime/wire-row-map.ts.dejavu",
+          "sha256": "e4e9cd6dcfa3ee2a496c51d2fc0e01d694c51227bd2032bba199783afa91d3d3",
+          "bytes": 1614
+        },
+        {
+          "from": "projects/tools/iris-generator/templates/typescript/synthesize.ts.dejavu",
+          "to": "projects/database/database.generate/parts/iris/templates/typescript/synthesize.ts.dejavu",
+          "sha256": "73b430b56b79e2f42d8e83343eed7b7bcddd01dae17e2904eaccd0dae129345f",
+          "bytes": 24641
+        },
+        {
+          "from": "projects/tools/iris-generator/tests/smoke.rs",
+          "to": "projects/database/database.generate/parts/iris/tests/smoke.rs",
+          "sha256": "6a02f458aa45f04b4012a9d7f1861b834bee62833e90d8daeeef659eee94aaf9",
+          "bytes": 3711
+        }
+      ],
+      "untracked": [],
+      "skippedIgnored": [],
+      "unmapped": []
+    }
+  ],
+  "deferred": [
+    {
+      "path": "projects/facades/yydb",
+      "pkg": "yydb",
+      "abilities": [
+        "execution",
+        "storage",
+        "formats",
+        "query",
+        "protocol",
+        "client",
+        "server"
+      ],
+      "advice": "拆成能力引用后由 database 门面统一暴露；产品仓只保留绑定。"
+    },
+    {
+      "path": "projects/facades/yyds",
+      "pkg": "yyds",
+      "abilities": [
+        "cluster",
+        "execution",
+        "storage",
+        "formats",
+        "protocol",
+        "client",
+        "server"
+      ],
+      "advice": "同上，分片/复制语义归 cluster。"
+    },
+    {
+      "path": "projects/facades/sqlite",
+      "pkg": "sqlite",
+      "abilities": [
+        "input",
+        "query",
+        "formats",
+        "storage",
+        "execution"
+      ],
+      "advice": "SQL 语义与 format-3 归能力包，产品门面退场。"
+    },
+    {
+      "path": "projects/facades/iris",
+      "pkg": "iris",
+      "abilities": [
+        "orm",
+        "generate",
+        "query"
+      ],
+      "advice": "ORM 与代码生成归能力包，产品仓只保留薄门面。"
+    },
+    {
+      "path": "projects/facades/iris-host",
+      "pkg": "iris-host",
+      "abilities": [
+        "orm",
+        "execution",
+        "client"
+      ],
+      "advice": "宿主会话能力归 orm/execution。"
+    },
+    {
+      "path": "projects/facades/iris-wasm",
+      "pkg": "iris-wasm",
+      "abilities": [
+        "orm",
+        "generate"
+      ],
+      "advice": "wasm 只做绑定转换，语义归 orm/generate。"
+    }
+  ],
+  "unresolved": [],
+  "untouched": [
+    {
+      "path": "projects/searcher",
+      "reason": "空目录（未跟踪、无 Cargo.toml），不是 crate；保持原样等待人工裁决。"
+    }
+  ],
+  "provisional": [
+    {
+      "path": "projects/planning/yydb-query/src/store.rs",
+      "placed": "query",
+      "reason": "行存储假设与 placement hook 也可归 storage；暂随 query 走。"
+    },
+    {
+      "path": "projects/types/yyds-types/src/key_value.rs",
+      "placed": "query",
+      "reason": "KV 命令与结果形状也可归 storage；按命令语义暂放 query。"
+    },
+    {
+      "path": "projects/storage/yyds-storage/src/replication_log.rs",
+      "placed": "storage",
+      "reason": "复制日志的字节格式归 formats，协调归 cluster；这里只留持久化读写。"
+    },
+    {
+      "path": "projects/gateways/yyds-gateway-mongo",
+      "placed": "server + protocol",
+      "reason": "现有文件没有独立 client 实现，client 能力需合并后补写。"
+    },
+    {
+      "path": "projects/services/yydb-server/src/host_wire.rs",
+      "placed": "server",
+      "reason": "host wire 也可能属于 protocol；合并时复核。"
+    }
+  ],
+  "manualTodo": [
+    {
+      "file": "Cargo.toml",
+      "action": "members 用 \"projects/database/*\" 替换 13 条旧类别通配；default-members 指向 database 门面"
+    },
+    {
+      "file": "Cargo.toml",
+      "action": "workspace.dependencies 的 path 全部改指 projects/database/database.<domain>/；删除以旧 crate 名为键的依赖项"
+    },
+    {
+      "file": "Cargo.toml",
+      "action": "workspace.dependencies 不再暴露任何品牌 profile（yydb/yyds/iris/sqlite 相关键）"
+    },
+    {
+      "file": "projects/database/database/Cargo.toml",
+      "action": "补 12 个能力包的 re-export 与 feature；只做模块入口，不写实现，不建品牌 feature"
+    },
+    {
+      "file": "projects/database/database.types/src/yydb",
+      "action": "把 yydb-types 的这一部分并进 types，在 projects/database/database.types/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.execution/src/udf_contract",
+      "action": "把 yydb-types 的这一部分并进 execution，在 projects/database/database.execution/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.types/parts/yydb",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 types/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.types/src/yyds",
+      "action": "把 yyds-types 的这一部分并进 types，在 projects/database/database.types/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.cluster/src/yyds",
+      "action": "把 yyds-types 的这一部分并进 cluster，在 projects/database/database.cluster/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.input/src/yyds",
+      "action": "把 yyds-types 的这一部分并进 input，在 projects/database/database.input/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.query/src/yyds_kv",
+      "action": "把 yyds-types 的这一部分并进 query，在 projects/database/database.query/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.types/parts/yyds",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 types/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.orm/src/iris_types",
+      "action": "把 iris-types 的这一部分并进 orm，在 projects/database/database.orm/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.orm/parts/iris_types",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 orm/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.query/src/iris_ir",
+      "action": "把 iris-ir 的这一部分并进 query，在 projects/database/database.query/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.query/parts/iris_ir",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 query/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.query/src/yydb_query",
+      "action": "把 yydb-query 的这一部分并进 query，在 projects/database/database.query/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.input/src/yydb_query",
+      "action": "把 yydb-query 的这一部分并进 input，在 projects/database/database.input/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.execution/src/yydb_ops",
+      "action": "把 yydb-query 的这一部分并进 execution，在 projects/database/database.execution/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.query/parts/yydb_query",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 query/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.formats/src/yydb",
+      "action": "把 yydb-formats 的这一部分并进 formats，在 projects/database/database.formats/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.storage/src/yydb_io",
+      "action": "把 yydb-formats 的这一部分并进 storage，在 projects/database/database.storage/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.formats/parts/yydb",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 formats/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.formats/src/yyds",
+      "action": "把 yyds-formats 的这一部分并进 formats，在 projects/database/database.formats/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.formats/parts/yyds",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 formats/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.formats/src/sqlite",
+      "action": "把 sqlite-formats 的这一部分并进 formats，在 projects/database/database.formats/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.formats/parts/sqlite",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 formats/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.storage/src/yydb",
+      "action": "把 yydb-storage 的这一部分并进 storage，在 projects/database/database.storage/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.storage/parts/yydb",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 storage/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.storage/src/yyds_kv",
+      "action": "把 yyds-kv 的这一部分并进 storage，在 projects/database/database.storage/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.storage/parts/yyds_kv",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 storage/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.storage/src/sqlite",
+      "action": "把 sqlite-storage 的这一部分并进 storage，在 projects/database/database.storage/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.storage/parts/sqlite",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 storage/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.execution/src/yydb_engine",
+      "action": "把 yydb-engine 的这一部分并进 execution，在 projects/database/database.execution/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.storage/src/yydb_engine_io",
+      "action": "把 yydb-engine 的这一部分并进 storage，在 projects/database/database.storage/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.execution/parts/yydb_engine",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 execution/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.execution/src/yydb_execution",
+      "action": "把 yydb-execution 的这一部分并进 execution，在 projects/database/database.execution/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.execution/parts/yydb_execution",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 execution/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.execution/src/yydb_udf",
+      "action": "把 yydb-udf 的这一部分并进 execution，在 projects/database/database.execution/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.execution/parts/yydb_udf",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 execution/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.execution/src/yyds_execution",
+      "action": "把 yyds-execution 的这一部分并进 execution，在 projects/database/database.execution/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.execution/parts/yyds_execution",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 execution/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.cluster/src/yyds_catalog",
+      "action": "把 yyds-catalog 的这一部分并进 cluster，在 projects/database/database.cluster/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.cluster/parts/yyds_catalog",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 cluster/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.cluster/src/yyds_control",
+      "action": "把 yyds-control 的这一部分并进 cluster，在 projects/database/database.cluster/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.cluster/parts/yyds_control",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 cluster/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.protocol/src/yydb",
+      "action": "把 yydb-protocol 的这一部分并进 protocol，在 projects/database/database.protocol/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.protocol/parts/yydb",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 protocol/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.protocol/src/gateway",
+      "action": "把 yyds-gateway 的这一部分并进 protocol，在 projects/database/database.protocol/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.input/src/sql",
+      "action": "把 yyds-gateway 的这一部分并进 input，在 projects/database/database.input/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.query/src/sql",
+      "action": "把 yyds-gateway 的这一部分并进 query，在 projects/database/database.query/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.execution/src/sql_exec",
+      "action": "把 yyds-gateway 的这一部分并进 execution，在 projects/database/database.execution/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.protocol/parts/gateway",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 protocol/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.server/src/mysql",
+      "action": "把 yyds-gateway-mysql 的这一部分并进 server，在 projects/database/database.server/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.client/src/mysql",
+      "action": "把 yyds-gateway-mysql 的这一部分并进 client，在 projects/database/database.client/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.protocol/src/mysql_wire",
+      "action": "把 yyds-gateway-mysql 的这一部分并进 protocol，在 projects/database/database.protocol/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.server/parts/mysql",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 server/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.server/src/pgsql",
+      "action": "把 yyds-gateway-pgsql 的这一部分并进 server，在 projects/database/database.server/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.client/src/pgsql",
+      "action": "把 yyds-gateway-pgsql 的这一部分并进 client，在 projects/database/database.client/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.protocol/src/pgsql_wire",
+      "action": "把 yyds-gateway-pgsql 的这一部分并进 protocol，在 projects/database/database.protocol/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.server/parts/pgsql",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 server/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.server/src/redis",
+      "action": "把 yyds-gateway-redis 的这一部分并进 server，在 projects/database/database.server/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.client/src/redis",
+      "action": "把 yyds-gateway-redis 的这一部分并进 client，在 projects/database/database.client/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.protocol/src/redis_wire",
+      "action": "把 yyds-gateway-redis 的这一部分并进 protocol，在 projects/database/database.protocol/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.server/parts/redis",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 server/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.server/src/mongo",
+      "action": "把 yyds-gateway-mongo 的这一部分并进 server，在 projects/database/database.server/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.protocol/src/mongo_wire",
+      "action": "把 yyds-gateway-mongo 的这一部分并进 protocol，在 projects/database/database.protocol/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.server/parts/mongo",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 server/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.client/src/yydb",
+      "action": "把 yydb-client 的这一部分并进 client，在 projects/database/database.client/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.client/parts/yydb",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 client/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.server/src/yydb",
+      "action": "把 yydb-server 的这一部分并进 server，在 projects/database/database.server/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.server/parts/yydb",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 server/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.orm/src/adapter_d1",
+      "action": "把 iris-adapter-d1 的这一部分并进 orm，在 projects/database/database.orm/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.orm/parts/adapter_d1",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 orm/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.orm/src/adapter_mysql",
+      "action": "把 iris-adapter-mysql 的这一部分并进 orm，在 projects/database/database.orm/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.orm/parts/adapter_mysql",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 orm/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.orm/src/adapter_postgres",
+      "action": "把 iris-adapter-postgres 的这一部分并进 orm，在 projects/database/database.orm/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.orm/parts/adapter_postgres",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 orm/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.orm/src/adapter_redis",
+      "action": "把 iris-adapter-redis 的这一部分并进 orm，在 projects/database/database.orm/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.orm/parts/adapter_redis",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 orm/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.orm/src/adapter_sqlite",
+      "action": "把 iris-adapter-sqlite 的这一部分并进 orm，在 projects/database/database.orm/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.orm/parts/adapter_sqlite",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 orm/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.orm/src/connector_yydb",
+      "action": "把 iris-connector-yydb 的这一部分并进 orm，在 projects/database/database.orm/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.orm/parts/connector_yydb",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 orm/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.orm/src/connector_yyds",
+      "action": "把 iris-connector-yyds 的这一部分并进 orm，在 projects/database/database.orm/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.orm/parts/connector_yyds",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 orm/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/database/database.generate/src/iris",
+      "action": "把 iris-generator 的这一部分并进 generate，在 projects/database/database.generate/src/lib.rs 声明模块并把 crate:: 路径改成新模块路径"
+    },
+    {
+      "file": "projects/database/database.generate/parts/iris",
+      "action": "旧 Cargo.toml/tests/readme 暂存，依赖迁入 generate/Cargo.toml，合并后由人工删除该 parts 目录（脚本不删）"
+    },
+    {
+      "file": "projects/facades/yydb",
+      "action": "deferred：职责拆到 execution / storage / formats / query / protocol / client / server，产品仓只留绑定与重导出"
+    },
+    {
+      "file": "projects/facades/yyds",
+      "action": "deferred：职责拆到 cluster / execution / storage / formats / protocol / client / server，产品仓只留绑定与重导出"
+    },
+    {
+      "file": "projects/facades/sqlite",
+      "action": "deferred：职责拆到 input / query / formats / storage / execution，产品仓只留绑定与重导出"
+    },
+    {
+      "file": "projects/facades/iris",
+      "action": "deferred：职责拆到 orm / generate / query，产品仓只留绑定与重导出"
+    },
+    {
+      "file": "projects/facades/iris-host",
+      "action": "deferred：职责拆到 orm / execution / client，产品仓只留绑定与重导出"
+    },
+    {
+      "file": "projects/facades/iris-wasm",
+      "action": "deferred：职责拆到 orm / generate，产品仓只留绑定与重导出"
+    },
+    {
+      "file": "projects/searcher",
+      "action": "不动：空目录（未跟踪、无 Cargo.toml），不是 crate；保持原样等待人工裁决。"
+    }
+  ]
+}
