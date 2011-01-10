@@ -1,0 +1,81 @@
+﻿[workspace]
+resolver = "2"
+members = [
+    "projects/database/*",
+    "projects/odm/*",
+    "projects/searcher/*",
+]
+default-members = [
+    "projects/database/database",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+authors = ["Yggdrasill Team <192607617@qq.com>"]
+license = "MPL-2.0"
+repository = "https://github.com/oovm/database.rs"
+
+[workspace.dependencies]
+# Shared language / SQL / template substrate (pinned revs).
+vos = { git = "https://github.com/voml/vos-language.git", rev = "387d9fc3c9a556ddb8a433c627a866a2918d0186" }
+von = { git = "https://github.com/voml/von-language.git", rev = "ccc58c90c8f94c0be3dfcacb3b0caec98a6ae3e4", features = ["serde"] }
+dejavu = { git = "https://github.com/doki-land/dejavu-engine.git", rev = "8aba1a0a61ac9d7f2112123a57faec649cf67427" }
+oak-sql = { git = "https://github.com/yggdrasil-language/oaks.git", rev = "d33f38e6f6118446a4deeb6a0682999e594d8185", package = "oak-sql" }
+oak-core = { git = "https://github.com/yggdrasil-language/oaks.git", rev = "d33f38e6f6118446a4deeb6a0682999e594d8185", package = "oak-core" }
+boost-fs = { git = "https://github.com/oovm/rust-boost", rev = "9aa52745d6eae2d7748c76e4e3e6555e1f6e4b86" }
+
+# Ability packages (facade + capability packages + protocol.* + searcher.*).
+database = { path = "projects/database/database" }
+database-types = { path = "projects/database/database.types" }
+database-input = { path = "projects/database/database.input" }
+database-query = { path = "projects/database/database.query" }
+database-execution = { path = "projects/database/database.execution" }
+database-udf = { path = "projects/database/database.udf" }
+database-formats = { path = "projects/database/database.formats" }
+database-storage = { path = "projects/database/database.storage" }
+database-cluster = { path = "projects/database/database.cluster" }
+database-protocol = { path = "projects/database/database.protocol" }
+database-protocol-yy = { path = "projects/database/database.protocol.yy" }
+database-protocol-mysql = { path = "projects/database/database.protocol.mysql" }
+database-protocol-pgsql = { path = "projects/database/database.protocol.pgsql" }
+database-protocol-redis = { path = "projects/database/database.protocol.redis" }
+database-protocol-mongo = { path = "projects/database/database.protocol.mongo" }
+database-client = { path = "projects/database/database.client" }
+database-server = { path = "projects/database/database.server" }
+odm = { path = "projects/odm/odm" }
+odm-types = { path = "projects/odm/odm.types" }
+odm-adapter = { path = "projects/odm/odm.adapter" }
+odm-generate = { path = "projects/odm/odm.generate" }
+odm-input-graphql = { path = "projects/odm/odm.input.graphql" }
+odm-input-sql = { path = "projects/odm/odm.input.sql" }
+odm-input-vos = { path = "projects/odm/odm.input.vos" }
+searcher = { path = "projects/searcher/searcher" }
+searcher-types = { path = "projects/searcher/searcher.types" }
+searcher-document = { path = "projects/searcher/searcher.document" }
+searcher-index = { path = "projects/searcher/searcher.index" }
+searcher-query = { path = "projects/searcher/searcher.query" }
+searcher-rank = { path = "projects/searcher/searcher.rank" }
+searcher-store = { path = "projects/searcher/searcher.store" }
+
+# Third party — dialect wire is owned by protocol/client/server. No rusqlite / official SQLite engine.
+blake3 = "1"
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+base64 = "0.23.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+once_cell = "1"
+thiserror = "2"
+getrandom = "0.4"
+getrandom-03 = { package = "getrandom", version = "0.4.3" }
+glob = "0.3"
+libc = { version = "0.2", default-features = false }
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+
+[profile.release]
+lto = true
+panic = "abort"
