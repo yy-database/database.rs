@@ -8,7 +8,12 @@ time-travel.*
 .vs/
 .idea/
 *.iml
+*.log
+*.txt
 
 # Rust
 target/
 Cargo.lock
+
+# Local path overrides
+.cargo/config.toml
