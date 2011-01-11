@@ -1,0 +1,14 @@
+# `database-formats` owns on-disk byte layouts: pages, records, WAL, blobs, shard snapshots, replication logs, SQLite format-3.
+[package]
+name = "database-formats"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+blake3 = { workspace = true }
+database-types = { workspace = true }
+vos = { workspace = true }
