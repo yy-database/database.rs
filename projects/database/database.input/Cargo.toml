@@ -1,0 +1,18 @@
+# `database-input` owns VOS / SQL / command input semantics and lowering.
+[package]
+name = "database-input"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-query = { workspace = true }
+database-types = { workspace = true }
+oak-core = { workspace = true }
+oak-sql = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+vos = { workspace = true }
