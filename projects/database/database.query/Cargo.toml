@@ -1,0 +1,24 @@
+# `database-query` owns binding, parameters, predicates, projections, plan validation and result description.
+[package]
+name = "database-query"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-cluster = { workspace = true }
+database-types = { workspace = true }
+oak-core = { workspace = true }
+oak-sql = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+vos = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
