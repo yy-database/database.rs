@@ -1,0 +1,15 @@
+# `database-udf` 维护 UDF 合同、注册表、宿主/原生适配与调用运行时。
+[package]
+name = "database-udf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
