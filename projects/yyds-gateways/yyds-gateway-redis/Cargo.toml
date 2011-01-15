@@ -1,0 +1,18 @@
+[package]
+name = "yyds-gateway-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Redis wire disguise gateway for YYDS"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yyds-gateway = { workspace = true }
+yyds-types = { workspace = true }
+yyds-control = { workspace = true }
+yyds-execution = { workspace = true }
+yyds-kv = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "yyds-gateway-mongo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MongoDB wire disguise gateway for YYDS"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yyds-gateway = { workspace = true }
+yyds-types = { workspace = true }
+yyds-control = { workspace = true }
+yyds-execution = { workspace = true }
+
+[dev-dependencies]
+yyds-kv = { workspace = true }

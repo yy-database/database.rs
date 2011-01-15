@@ -1,0 +1,27 @@
+[package]
+name = "yyds-types"
+version.workspace = true
+edition.workspace = true
+authors = ["Aster <192607617@qq.com>"]
+description = "Shared types for the distributed YYDS database"
+publish = false
+readme = "readme.md"
+license = "MPL-2.0"
+exclude = ["package.json", "tests/**"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true, optional = true }
+vos = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[package.metadata.docs.rs]
+all-features = true

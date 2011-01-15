@@ -1,0 +1,26 @@
+[package]
+name = "yyds-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared disguise gateway core for YYDS protocol adapters"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oak-core = { workspace = true }
+oak-sql = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+vos = { workspace = true }
+yyds-catalog = { workspace = true }
+yyds-execution = { workspace = true }
+yyds-types = { workspace = true }
+
+[dev-dependencies]
+boost-fs = { workspace = true }
+yyds-gateway-conformance = { workspace = true }
+yyds-kv = { workspace = true }
