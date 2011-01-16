@@ -1,0 +1,16 @@
+﻿# `database-protocol-yy` 是共享 YY 线协议编解码（嵌入式与分布式同一套；仅 magic 不同）。
+[package]
+name = "database-protocol-yy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-types = { workspace = true }
+database-udf = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }

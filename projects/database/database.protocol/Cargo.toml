@@ -1,0 +1,16 @@
+﻿# `database-protocol` 再导出 `database.protocol.*` 线协议编解码。
+[package]
+name = "database-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-protocol-yy = { workspace = true }
+database-protocol-mysql = { workspace = true }
+database-protocol-pgsql = { workspace = true }
+database-protocol-redis = { workspace = true }
+database-protocol-mongo = { workspace = true }

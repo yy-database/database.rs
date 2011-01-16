@@ -1,0 +1,14 @@
+﻿# `database-protocol-pgsql` 负责 PostgreSQL 启动包与类型消息组帧。
+[package]
+name = "database-protocol-pgsql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

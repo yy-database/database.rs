@@ -1,0 +1,14 @@
+﻿# `database-protocol-mongo` 负责 MongoDB BSON / OP_MSG 线协议编解码。
+[package]
+name = "database-protocol-mongo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

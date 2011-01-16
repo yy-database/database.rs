@@ -1,0 +1,16 @@
+﻿# `database-protocol-mysql` 负责 MySQL 线协议组帧与握手编解码。
+[package]
+name = "database-protocol-mysql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+sha1 = { workspace = true }
