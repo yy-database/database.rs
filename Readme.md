@@ -1,31 +1,35 @@
-Rust Template Project
-=====================
+# database.rs
 
-Rust template project for monorepo
+Aggregated Rust core for the YY database family.
 
-## Change the initial commit
+Product repos (`yydb`, `yyds`, `iris-orm`, and dialect surfaces) stay as **distribution shells**: language bindings, packaging, and public branding. Shared engines, formats, gateways, and Iris adapters live here so they are not forked three ways.
+
+## Workspace layout
+
+| Area | Crates |
+|------|--------|
+| YYDB | `yydb`, `yydb-*`, `sqlite`, `sqlite-*` |
+| YYDS | `yyds-*`, `yyds-gateways/*` (MySQL / PostgreSQL / Redis / Mongo) |
+| Iris | `iris`, `iris-*` adapters and connectors |
 
 ```shell
-git commit --amend --message "🎂 Project initialized!" --date "2012-12-12"
+cargo check --workspace
 ```
 
-## Emoji Comment
+Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-07-20`).
 
-| Emoji  | Meaning                      |  
-|--------|------------------------------|  
-| 🎂     | Project initialized!         |  
-| 🎉     | Release new version          |  
-| 🧪🔮   | Experimental code            |   
-| 🔧🐛🐞 | Bug fix                      |  
-| 🔒     | Security fix                 |  
-| 🐣🐤🐥 | Add feature                  |  
-| 📝🎀   | Documentation                |  
-| 🚀     | Performance improve!         |  
-| 🚧     | Work in progress             |  
-| 🚨     | Test coverage improve!       |  
-| 🚥     | CI improve!                  |  
-| 🔥🧨   | Remove code or files         |
-| 🧹     | Code refactor                |
-| 📈     | Add analytics or branch code |
-| 🤖     | Automation fix               |
-| 📦     | Update dependencies          |
+Local sibling path overrides belong in `.cargo/config.toml` (gitignored). CI resolves the pinned git `rev`s in the root `Cargo.toml`.
+
+## Commit style
+
+| Emoji | Meaning |
+|-------|---------|
+| 🎂 | Project initialized |
+| 🚧 | Scaffold / migration in progress |
+| ✨ | User-visible capability |
+| 🐛 | Bug fix |
+| 🧪 | Tests |
+| 📝 | Documentation |
+| ♻️ | Refactor |
+| 🔥 | Delete obsolete code |
+| 📦 | Packaging / publish |
