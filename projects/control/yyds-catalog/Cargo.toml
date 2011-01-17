@@ -1,0 +1,20 @@
+[package]
+name = "yyds-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Distributed `.yyds` catalog lifecycle for YYDS"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+vos = { workspace = true }
+yyds-formats = { workspace = true }
+yyds-types = { workspace = true }
+
+[dev-dependencies]
+boost-fs.workspace = true
