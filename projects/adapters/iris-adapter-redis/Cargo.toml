@@ -1,0 +1,17 @@
+[package]
+name = "iris-adapter-redis"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Limited Redis keyspace/document/cache adapter for Iris"
+publish = false
+
+[dependencies]
+iris-types = { workspace = true }
+iris-ir = { workspace = true }
+vos = { workspace = true }
+yyds-gateway-redis = { workspace = true }
+yyds-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
