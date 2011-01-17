@@ -1,0 +1,13 @@
+[package]
+name = "yyds-gateway-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared SQL behavior case set for YYDS gateway adapters"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yyds-gateway = { workspace = true }

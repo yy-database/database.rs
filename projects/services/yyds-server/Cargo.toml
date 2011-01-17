@@ -1,0 +1,13 @@
+[package]
+name = "yyds-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "YY-native wire server loop for YYDS"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"

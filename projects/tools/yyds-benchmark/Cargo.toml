@@ -1,0 +1,13 @@
+[package]
+name = "yyds-bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Benchmarks and load harnesses for YYDS gateways and cluster paths"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"

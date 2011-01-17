@@ -1,0 +1,13 @@
+[package]
+name = "yyds-exchange"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Inter-fragment exchange and shuffle transport for YYDS"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
