@@ -1,0 +1,38 @@
+[package]
+name = "iris"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Iris ORM — sole Rust facade for distribution shells"
+readme = "readme.md"
+publish = false
+
+[dependencies]
+iris-types = { workspace = true }
+iris-ir = { workspace = true }
+iris-host = { workspace = true }
+iris-generator = { workspace = true, default-features = false, optional = true }
+iris-wasm = { workspace = true, optional = true }
+iris-adapter-mysql = { workspace = true, optional = true }
+iris-adapter-postgres = { workspace = true, optional = true }
+iris-adapter-sqlite = { workspace = true, optional = true }
+von = { workspace = true }
+
+[features]
+default = ["host"]
+# Session core used by every language binding.
+host = []
+# Codegen + Dejavu templates (Node CLI / napi generate).
+generator = ["dep:iris-generator"]
+generator-aot = ["generator", "iris-generator/aot", "iris-generator/templates-host"]
+# Browser / edge wasm bridge helpers.
+wasm-bridge = ["dep:iris-wasm"]
+# Managed push against foreign adapters.
+migrate = ["dep:iris-adapter-mysql", "dep:iris-adapter-postgres", "dep:iris-adapter-sqlite"]
+# Full Node binding surface.
+napi = ["host", "generator-aot", "wasm-bridge", "migrate"]
+# Full Python binding surface.
+pyo3 = ["host"]
+
+[dev-dependencies]

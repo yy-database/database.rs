@@ -1,0 +1,25 @@
+[package]
+name = "yyds"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "YYDS distributed database facade — sole dependency for distribution shells"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yyds-types = { workspace = true }
+yyds-kv = { workspace = true }
+yyds-catalog = { workspace = true }
+yyds-control = { workspace = true }
+yyds-execution = { workspace = true }
+yyds-gateway = { workspace = true }
+yyds-gateway-redis = { workspace = true }
+yyds-gateway-mysql = { workspace = true }
+yyds-gateway-pgsql = { workspace = true }
+yyds-gateway-mongo = { workspace = true }
