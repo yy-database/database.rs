@@ -1,14 +1,13 @@
-//! SQLite product facade: format-3 file inspection and writable snapshot tooling.
+//! SQLite product facade: format-3 L2 tooling and the future L3 continuation kernel.
 //!
-//! This crate is **not** the YYDB SQL dialect. Embedded SQL over `.yydb` lives in
-//! [`yydb::sql::SqliteConnection`]. Here we only own upstream SQLite bytes:
+//! | Level | Capability | Entry point |
+//! |-------|------------|-------------|
+//! | L2 | Read-only **file import** | [`SqliteDatabase`] |
+//! | L2 | Writable **snapshot builder** | [`SqliteWriter`] |
+//! | L3 | **Continuation runtime** (planned) | execution over format-3 without `rusqlite` |
 //!
-//! | Capability | Entry point | Storage |
-//! |------------|-------------|---------|
-//! | Read-only **file import** | [`SqliteDatabase`] | existing `.sqlite` / format-3 bytes |
-//! | Writable **snapshot builder** | [`SqliteWriter`] | new format-3 files for migration / fixtures |
-//!
-//! No SQLite C library. No YYDB engine dependency.
+//! YYDB no longer owns any SQL dialect. Former `yydb::sql::SqliteConnection` work
+//! moves into this product's L3 plan. No official SQLite C library. No YYDB engine.
 
 #![deny(missing_docs)]
 
@@ -28,5 +27,5 @@ pub const BACKEND_ID: &str = "sqlite";
 /// Short label for the binary-compatibility constraint.
 pub const CONSTRAINT: &str = "upstream SQLite format-3 engine";
 
-/// Why this crate does not execute SQL.
-pub const WHY_NOT_ENGINE: &str = "SQLite product owns format import/export only. SQL over .yydb is yydb::sql.";
+/// Why SQL execution is not exposed on the L2 surface yet.
+pub const WHY_NOT_ENGINE: &str = "L2 is format import/export only. L3 continuation (including SQL) is the SQLite product roadmap. YYDB has no SQL.";

@@ -121,9 +121,8 @@ yyds-gateway-conformance = { path = "projects/conformance/gateway-conformance" }
 yydb-conformance = { path = "projects/conformance/yydb-conformance" }
 iris-conformance = { path = "projects/conformance/iris-conformance" }
 
-# Third party — SQLite embedded only. Dialect wire is owned by gateways/*.
+# Third party — dialect wire is owned by gateways/*. No rusqlite / official SQLite engine.
 blake3 = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
 sha1 = "0.11.0"
 sha2 = "0.10"
 base64 = "0.23.1"

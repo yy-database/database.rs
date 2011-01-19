@@ -27,7 +27,7 @@ use provider::SqliteError;
 pub use catalog::adopt_plan;
 pub use migrate::{PushReport, apply_push, plan_push};
 pub use outbox::AuthorityTxn;
-pub use provider::{CatalogColumn, CatalogSnapshot, CatalogTable, RusqliteProvider, SqliteValue, StatementResult};
+pub use provider::{CatalogColumn, CatalogSnapshot, CatalogTable, RusqliteProvider, SqliteProvider, SqliteValue, StatementResult};
 
 /// Adapter identifier.
 pub const BACKEND_ID: &str = "sqlite";
@@ -35,9 +35,9 @@ pub const BACKEND_ID: &str = "sqlite";
 /// Adapter crate version label.
 pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// SQLite foreign datasource backed by the bundled engine.
+/// SQLite foreign datasource. Execution waits on the product L3 continuation kernel.
 pub struct SqliteSource {
-    provider: Mutex<RusqliteProvider>,
+    provider: Mutex<SqliteProvider>,
     path: Option<PathBuf>,
 }
 
@@ -62,7 +62,7 @@ impl SqliteSource {
 
     /// Open an in-memory SQLite database.
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self { provider: Mutex::new(RusqliteProvider::open_in_memory()?), path: None })
+        Ok(Self { provider: Mutex::new(SqliteProvider::open_in_memory()?), path: None })
     }
 
     /// Open or create a file-backed SQLite database.
@@ -71,7 +71,7 @@ impl SqliteSource {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Self { provider: Mutex::new(RusqliteProvider::open(&path)?), path: Some(path) })
+        Ok(Self { provider: Mutex::new(SqliteProvider::open(&path)?), path: Some(path) })
     }
 
     /// On-disk path when file-backed.
