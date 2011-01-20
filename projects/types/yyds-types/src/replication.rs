@@ -88,14 +88,34 @@ pub enum ReplicaError {
     LeaderNotMember,
     /// A learner was selected as leader.
     LeaderMustBeVoter,
-    /// The new term is not strictly newer.
-    NonMonotonicTerm { current: LeaderTerm, found: LeaderTerm },
-    /// The supplied epoch is older than the replica set epoch.
-    StaleEpoch { expected: ShardEpoch, found: ShardEpoch },
-    /// The supplied term is older than the replica set term.
-    StaleTerm { expected: LeaderTerm, found: LeaderTerm },
-    /// The caller is not the current leader.
-    NotLeader { expected: ReplicaNodeId, found: ReplicaNodeId },
+    /// 新任期未严格大于当前任期。
+    NonMonotonicTerm {
+        /// 副本集当前任期。
+        current: LeaderTerm,
+        /// 入站声称的任期。
+        found: LeaderTerm,
+    },
+    /// 入站世代早于副本集世代。
+    StaleEpoch {
+        /// 副本集当前世代。
+        expected: ShardEpoch,
+        /// 入站世代。
+        found: ShardEpoch,
+    },
+    /// 入站任期早于副本集任期。
+    StaleTerm {
+        /// 副本集当前任期。
+        expected: LeaderTerm,
+        /// 入站任期。
+        found: LeaderTerm,
+    },
+    /// 调用方不是当前 leader。
+    NotLeader {
+        /// 目录发布的 leader。
+        expected: ReplicaNodeId,
+        /// 实际调用方。
+        found: ReplicaNodeId,
+    },
 }
 
 impl ReplicaSet {

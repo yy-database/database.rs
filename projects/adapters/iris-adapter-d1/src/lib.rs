@@ -1,15 +1,10 @@
-//! D1 target-adapter type contract for Iris.
+//! Iris 的 D1 目标适配器类型合同（Rust 侧）。
 //!
-//! This crate owns the **Rust-side** D1 adapter contract: wire types,
-//! [`D1Request`] / [`D1Response`], execution modes, and
-//! [`D1Capabilities`].  It is intentionally **runtime-free** -- no
-//! Cloudflare binding, no SQL engine, no network I/O.  WASM export and
-//! TS host bridge both consume these types.
-//!
-//! Design source: `决策和进度表/iris/06-d1-adapter-and-edge-host.md` §3-§5.
+//! 拥有线类型、[`D1Request`] / [`D1Response`]、执行模式与 [`D1Capabilities`]。
+//! **无运行时**：不含 Cloudflare binding、SQL 引擎或网络 I/O。WASM 导出与
+//! TS 宿主桥都消费这些类型。
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 use serde::{Deserialize, Serialize};
 

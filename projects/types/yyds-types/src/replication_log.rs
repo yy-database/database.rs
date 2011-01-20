@@ -30,10 +30,20 @@ pub enum ReplicationError {
     LearnerCannotLead,
     /// The requested log position does not exist.
     UnknownIndex(LogIndex),
-    /// Commit must advance one contiguous position at a time.
-    NonContiguousCommit { expected: LogIndex, found: LogIndex },
-    /// A quorum has not acknowledged the requested position.
-    QuorumNotReached { required: usize, observed: usize },
+    /// 提交必须一次只推进一个连续位点。
+    NonContiguousCommit {
+        /// 期望的下一提交位点。
+        expected: LogIndex,
+        /// 实际请求的位点。
+        found: LogIndex,
+    },
+    /// 尚未凑齐法定人数对该位点的确认。
+    QuorumNotReached {
+        /// 需要的确认数。
+        required: usize,
+        /// 已观察到的确认数。
+        observed: usize,
+    },
     /// The log index counter overflowed.
     IndexExhausted,
 }

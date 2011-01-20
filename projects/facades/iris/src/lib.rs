@@ -1,28 +1,26 @@
-//! Iris ORM public facade.
+//! Iris ORM 公开门面。
 //!
-//! Distribution shells depend on **this crate only**. Host / generator / wasm
-//! / migrate surfaces are feature-gated modules — never depend on
-//! `iris-host` / `iris-generator` / adapters directly from a product shell.
+//! 产品壳**只依赖本 crate**。host / generator / wasm / migrate 以 feature
+//! 模块暴露；壳工程不得直接依赖 `iris-host`、`iris-generator` 或各 adapter。
 
-#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 #[cfg(feature = "migrate")]
 pub mod migrate;
 pub mod project;
 
-/// Shared session core for Node / Python / other host bindings.
+/// Node / Python 等宿主绑定共用的会话核心。
 pub mod host {
     pub use iris_host::*;
 }
 
-/// Dejavu / GenerationModel code generation.
+/// 基于 Dejavu / GenerationModel 的代码生成。
 #[cfg(feature = "generator")]
 pub mod generator {
     pub use iris_generator::*;
 }
 
-/// Browser / edge wasm helpers.
+/// 浏览器 / 边缘 wasm 辅助。
 #[cfg(feature = "wasm-bridge")]
 pub mod wasm {
     pub use iris_wasm::*;

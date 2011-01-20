@@ -1,16 +1,12 @@
-//! Native YYDS connector --?Phase 5 readiness gate.
+//! Iris → YYDS 原生连接器（就绪门）。
 //!
-//! Iris will speak **formal VOS / shared VOS IR** to YYDS only. Historical SQL
-//! gateways (`yyds-gateway/src/sql`, ODBC, we-trust-sqlite/mysql/postgres, --?
-//! are forbidden product paths for this connector.
+//! Iris 对 YYDS **只**走正式 VOS / 共享 VOS IR。历史 SQL 网关、ODBC 等路径
+//! 不是本连接器的产品面。
 //!
-//! As of 2026-08-12 the sibling `yyds` tree still exposes OpsGraph / DsValue
-//! clients rather than a versioned VOS IR executor + `.yyds`/`.yykv` lifecycle
-//! facade Iris can consume safely. Until that ships, [`YydsSource::connect`]
-//! returns [`Error::NotReady`] and capability handshake reports unavailable.
+//! 在 YYDS 提供可安全消费的版本化 VOS IR 执行器与 `.yyds` / `.yykv` 生命周期
+//! 门面之前，[`YydsSource::connect`] 返回 [`Error::NotReady`]，能力握手报告不可用。
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 use iris_ir::IrVersion;
 use iris_types::{CapabilitySet, CompensationBudget, QueryCaps, WriteCaps};

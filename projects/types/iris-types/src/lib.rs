@@ -1,6 +1,5 @@
-//! Iris runtime core: parse -> plan -> capability -> reference execution.
+//! Iris 运行时核心：解析 → 计划 → 能力协商 → 参考执行。
 
-#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 mod adapter;

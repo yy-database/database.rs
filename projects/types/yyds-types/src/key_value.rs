@@ -88,30 +88,48 @@ pub enum KeyValueResult {
     GetDelete(Option<Vec<u8>>),
     /// Value returned before an atomic replacement.
     GetSet(Option<Vec<u8>>),
-    /// Revision assigned to a successful write.
-    Put { revision: u64 },
-    /// Revision assigned when a conditional write inserts the key, or `None` when it exists.
-    PutIfAbsent { revision: Option<u64> },
-    /// Revision assigned when a conditional write replaces the key, or `None` when absent.
-    PutIfPresent { revision: Option<u64> },
-    /// Whether a delete found and removed a value.
-    Delete { removed: bool },
-    /// Result of an atomic signed integer increment.
-    Increment { value: i64 },
-    /// Presence and expiry deadline observed by [`KeyValueAction::GetExpiry`].
+    /// 成功写入后分配的修订号。
+    Put {
+        /// 新记录修订号。
+        revision: u64,
+    },
+    /// 条件写入在键不存在时插入；若已存在则为 `None`。
+    PutIfAbsent {
+        /// 插入成功时的修订号；键已存在则为 `None`。
+        revision: Option<u64>,
+    },
+    /// 条件写入在键存在时替换；若缺失则为 `None`。
+    PutIfPresent {
+        /// 替换成功时的修订号；键缺失则为 `None`。
+        revision: Option<u64>,
+    },
+    /// 删除是否找到并移除了值。
+    Delete {
+        /// `true` 表示原先存在并已删除。
+        removed: bool,
+    },
+    /// 原子有符号整数自增结果。
+    Increment {
+        /// 自增后的值。
+        value: i64,
+    },
+    /// [`KeyValueAction::GetExpiry`] 观察到的存活与截止时间。
     Expiry {
-        /// Whether the key currently has a live value.
+        /// 键当前是否仍有存活值。
         present: bool,
-        /// Deadline in Unix epoch milliseconds, if the live record carries one.
+        /// 存活记录上的截止 Unix 毫秒；无过期则为 `None`。
         expires_at: Option<i64>,
     },
-    /// Whether a [`KeyValueAction::SetExpiry`] or [`KeyValueAction::ClearExpiry`] applied to a live key.
-    ExpiryChanged { applied: bool },
-    /// Whether a [`KeyValueAction::Rename`] found the source and moved it.
+    /// [`KeyValueAction::SetExpiry`] / [`KeyValueAction::ClearExpiry`] 是否作用到存活键。
+    ExpiryChanged {
+        /// `true` 表示过期元数据已变更。
+        applied: bool,
+    },
+    /// [`KeyValueAction::Rename`] 是否找到源键并完成搬迁。
     Rename {
-        /// Whether the source key had a live record when the move ran.
+        /// 搬迁时源键是否有存活记录。
         source_present: bool,
-        /// Whether the record was moved to the destination.
+        /// 是否已搬到目标键。
         applied: bool,
     },
 }

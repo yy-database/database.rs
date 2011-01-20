@@ -1,12 +1,9 @@
-//! Native YYDB connector.
+//! Iris → YYDB 原生连接器。
 //!
-//! Iris speaks formal VOS / shared VOS IR to YYDB via the public `yydb::Connection`
-//! facade. YYDB exposes the full VOS executor (prepare, query_prepared, query_vos,
-//! execute_vos_write, transactions, schema handshake, doctor) on its Connection —
-//! this connector wraps each capability with Iris-level policy and row mapping.
+//! 经公开门面 `yydb::Connection` 使用正式 VOS / 共享 VOS IR。YYDB 在
+//! Connection 上提供完整 VOS 执行面；本连接器为每项能力加上 Iris 策略与行映射。
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 mod error;
 mod plan;

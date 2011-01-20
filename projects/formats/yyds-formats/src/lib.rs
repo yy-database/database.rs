@@ -1,10 +1,10 @@
-//! On-disk codecs for YYDS (catalog / shard / replication log).
+//! YYDS 磁盘编解码（目录 / 分片 / 复制日志）。
 //!
-//! Dialect disguise gateways (MySQL / PostgreSQL / Redis / Mongo) do not own
-//! storage formats — service-level compatibility stores through these codecs.
+//! MySQL / PostgreSQL / Redis / Mongo 伪装网关不拥有存储格式；服务级兼容
+//! 一律落在这些 codec 之上。
 
 #![deny(missing_debug_implementations)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 mod catalog;
 mod key;
@@ -26,16 +26,16 @@ pub use replication::{
 pub use value::{InlineValue, ObjectRef, StoredValue};
 
 pub mod catalog_format {
-    //! `.yyds` catalog byte codec.
+    //! `.yyds` 目录字节编解码。
     pub use crate::catalog::*;
 }
 
 pub mod kv_format {
-    //! `.yykv` shard snapshot codec.
+    //! `.yykv` 分片快照编解码。
     pub use crate::kv::*;
 }
 
 pub mod replication_format {
-    //! `YYRL` replica-log frame codec.
+    //! `YYRL` 复制日志帧编解码。
     pub use crate::replication::*;
 }

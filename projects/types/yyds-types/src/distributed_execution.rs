@@ -1,35 +1,40 @@
-//! YYDS-owned distributed execution contracts.
+//! YYDS 自有的分布式执行合同。
 //!
-//! This model is intentionally independent from `yydb-execution`. It describes
-//! typed shard and coordinator values, partial results, and distributed UDF
-//! placement. VOS and SQL bind into this model through their respective YYDS
-//! frontends.
+//! 与 `yydb-execution` 刻意解耦：这里描述分片 / 协调器上的类型化值、
+//! 部分结果与分布式 UDF 放置。VOS 与方言前端各自投影进本模型，
+//! 不得把 YYDB 单机执行计划直接塞进来。
 
-/// A node identifier in a distributed scalar program.
+/// 分布式标量程序中的节点编号。
 pub type NodeId = u32;
 
-/// Identifier of a distributed execution fragment.
+/// 分布式执行片段的标识。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FragmentId(pub u32);
 
-/// Placement role of a distributed fragment.
+/// 分布式片段的放置角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentRole {
+    /// 在数据分片上本地求值。
     Shard,
+    /// 在协调器上汇聚或部分聚合。
     Coordinator,
+    /// 在靠近客户端的边缘节点执行。
     Edge,
 }
 
-/// Exchange performed between distributed fragments.
+/// 片段之间的数据交换方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exchange {
-    /// Send all partial rows to one coordinator.
+    /// 把全部部分行送到单一协调器。
     Gather,
-    /// Send a copy to every target fragment.
+    /// 向每个目标片段复制一份。
     Broadcast,
-    /// Repartition rows by a stable catalog field identity.
-    Repartition { field_id: u64 },
-    /// Merge compatible partial aggregate states.
+    /// 按稳定目录字段身份重新分区。
+    Repartition {
+        /// 用于重分区的目录字段身份。
+        field_id: u64,
+    },
+    /// 合并兼容的部分聚合状态。
     Merge,
 }
 
@@ -42,12 +47,18 @@ pub struct RetryPolicy {
     pub idempotent: bool,
 }
 
-/// Read consistency requested by a distributed plan.
+/// 分布式计划请求的读一致性。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consistency {
+    /// 在同一快照世代上读。
     Snapshot,
+    /// 允许最终一致的滞后读。
     Eventual,
-    BoundedStaleness { max_millis: u64 },
+    /// 允许有界陈旧，超过阈值必须刷新。
+    BoundedStaleness {
+        /// 可接受的最大陈旧毫秒数。
+        max_millis: u64,
+    },
 }
 
 /// Approximation contract attached to a distributed result.
@@ -197,40 +208,56 @@ pub enum PlanValidationError {
     ApproximationMetadata,
 }
 
-/// Metric attached to a distributed vector value.
+/// 分布式向量值附带的度量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorMetric {
+    /// 余弦相似度。
     Cosine,
+    /// 欧氏距离。
     Euclidean,
+    /// 点积。
     Dot,
 }
 
-/// Runtime type understood by the YYDS data and control planes.
+/// YYDS 数据面与控制面共用的运行时类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
-    /// Explicit null value.
+    /// 显式空值。
     Null,
-    /// Boolean value.
+    /// 布尔。
     Bool,
-    /// Signed 64-bit integer.
+    /// 有符号 64 位整数。
     I64,
-    /// UTF-8 text.
+    /// UTF-8 文本。
     Text,
-    /// Opaque bytes.
+    /// 不透明字节。
     Bytes,
-    /// Immutable object manifest reference.
+    /// 不可变对象清单引用。
     File,
-    /// Fixed-dimension vector.
-    Vector { dimension: u32, metric: VectorMetric },
-    /// Schema-identified distributed record.
-    Record { schema_id: u64, field_count: u32 },
+    /// 固定维度向量。
+    Vector {
+        /// 分量个数；构造时必须非零。
+        dimension: u32,
+        /// 该向量声明的度量。
+        metric: VectorMetric,
+    },
+    /// 带 schema 身份的分布式记录。
+    Record {
+        /// 非零 schema 身份。
+        schema_id: u64,
+        /// 字段个数（与布局发布一致）。
+        field_count: u32,
+    },
 }
 
-/// A reference to an immutable object manifest.
+/// 指向不可变对象清单的引用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRef {
+    /// 对象内容身份。
     pub object_id: String,
+    /// 对象世代；世代前进表示内容替换。
     pub generation: u64,
+    /// 对象字节长度。
     pub byte_len: u64,
 }
 
@@ -271,11 +298,16 @@ impl VectorValue {
     }
 }
 
-/// Error raised while constructing a distributed vector.
+/// 构造分布式向量时的错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorValueError {
+    /// 维度为空或与声明不符。
     InvalidDimension,
-    NonFiniteComponent { index: usize },
+    /// 某个分量不是有限浮点。
+    NonFiniteComponent {
+        /// 非法分量的下标。
+        index: usize,
+    },
 }
 
 /// A schema-bound record value.
@@ -305,17 +337,21 @@ impl RecordValue {
     }
 }
 
-/// Error raised while constructing a record.
+/// 构造记录值时的错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordValueError {
+    /// schema 身份为零或非法。
     InvalidSchemaId,
 }
 
-/// One published distributed record layout field.
+/// 已发布的分布式记录布局中的一个字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutField {
+    /// 目录级字段身份。
     pub field_id: u64,
+    /// 布局内的稳定下标。
     pub index: u32,
+    /// 字段运行时类型。
     pub ty: Type,
 }
 
@@ -346,9 +382,10 @@ impl RecordLayout {
     }
 }
 
-/// Error raised while publishing a distributed layout.
+/// 发布分布式布局时的错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordLayoutError {
+    /// schema 身份为零或非法。
     InvalidSchemaId,
 }
 
@@ -389,17 +426,32 @@ impl Value {
     }
 }
 
-/// A scalar node evaluated by one distributed execution fragment.
+/// 单个分布式执行片段求值的标量节点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
-    /// Literal value.
+    /// 字面量。
     Literal(Value),
-    /// Positional parameter.
-    Parameter { index: u32, ty: Type },
-    /// Positional input.
-    Input { index: u32, ty: Type },
-    /// Checked integer addition.
-    AddI64 { left: NodeId, right: NodeId },
+    /// 按位参数。
+    Parameter {
+        /// 参数下标。
+        index: u32,
+        /// 期望类型。
+        ty: Type,
+    },
+    /// 按位输入。
+    Input {
+        /// 输入下标。
+        index: u32,
+        /// 期望类型。
+        ty: Type,
+    },
+    /// 检查溢出的 i64 加法。
+    AddI64 {
+        /// 左操作数节点。
+        left: NodeId,
+        /// 右操作数节点。
+        right: NodeId,
+    },
 }
 
 /// A typed scalar fragment before shard or coordinator planning.
@@ -477,27 +529,36 @@ impl ValidatedProgram {
     }
 }
 
-/// Validation errors for a distributed execution fragment.
+/// 分布式执行片段的校验错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationError {
+    /// 程序形状非法（空节点、越界输出等）。
     InvalidProgram,
+    /// 引用了不存在的节点 / 参数 / 输入。
     InvalidReference,
+    /// 运算数类型与算子声明不符。
     TypeMismatch,
 }
 
-/// A distributed UDF placement policy.
+/// 分布式 UDF 的放置策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdfPlacement {
+    /// 优先在分片本地执行。
     Shard,
+    /// 必须在协调器执行。
     Coordinator,
+    /// 可在边缘节点执行。
     Edge,
 }
 
-/// A distributed UDF effect contract.
+/// 分布式 UDF 的副作用合同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdfEffect {
+    /// 只读；可安全重放。
     Read,
+    /// 可能改写存储状态。
     Write,
+    /// 依赖外部系统；重放语义由放置方声明。
     External,
 }
 
@@ -587,18 +648,24 @@ fn fetch_value(values: &[Value], index: u32, ty: Type) -> Result<Value, EvalErro
     Ok(value)
 }
 
-/// Validation errors for distributed UDF contracts.
+/// 分布式 UDF 合同的校验错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdfValidationError {
+    /// 函数身份为空。
     EmptyId,
+    /// 实现版本为零或非法。
     InvalidVersion,
+    /// 函数体程序无法通过片段校验。
     InvalidProgram,
 }
 
-/// Evaluation errors for a distributed scalar fragment.
+/// 分布式标量片段的求值错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalError {
+    /// 引用了不存在的节点 / 参数 / 输入。
     InvalidReference,
+    /// 运算数类型与算子声明不符。
     TypeMismatch,
+    /// 检查算术溢出。
     Overflow,
 }

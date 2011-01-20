@@ -1,10 +1,9 @@
-//! Isolated MySQL foreign-store adapter.
+//! Iris 的 MySQL 外存适配器。
 //!
-//! Wire IO goes through [`yyds_gateway_mysql::client::Session`] (same classic
-//! protocol framing as the YYDS MySQL disguise server). No third-party `mysql` crate.
+//! 线协议经 [`yyds_gateway_mysql::client::Session`]（与 YYDS MySQL 伪装服务同帧）。
+//! 不依赖第三方 `mysql` crate。属 L1 服务模拟，不接管对方数据目录。
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 mod catalog;
 mod execute;

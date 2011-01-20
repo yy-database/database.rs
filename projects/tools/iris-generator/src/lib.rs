@@ -1,12 +1,9 @@
-//! Iris code generation (Dejavu-backed) for the **Rust host**.
+//! Iris 代码生成（Dejavu 后端）· **Rust 宿主**。
 //!
-//! Shared `.dejavu` templates + GenerationModel live in the multi-language mono;
-//! each host renders with its own Dejavu facade (this crate uses the Rust
-//! `dejavu` crate). Emit Rust bindings that call `iris::*` -- never FFI wraps
-//! for other languages. Other hosts (e.g. TypeScript `@yydb/iris`) ship their
-//! own generator against the same template contract.
+//! 共享 `.dejavu` 模板与 GenerationModel；各宿主用各自的 Dejavu 门面渲染
+//!（本 crate 用 Rust `dejavu`）。生成调用 `iris::*` 的 Rust 绑定，不为其它
+//! 语言做 FFI 包装。其它宿主（如 TS）按同一模板合同自备生成器。
 
-#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::{

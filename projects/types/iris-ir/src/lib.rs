@@ -1,9 +1,7 @@
-//! Iris physical plan and versioned envelopes.
+//! Iris 物理计划与版本化信封。
 //!
-//! Backend-neutral, non-SQL shapes only. Foreign-store command text must never
-//! appear here.
+//! 只含后端无关、非 SQL 的形状。外存命令文本不得出现在本 crate。
 
-#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 mod commit;

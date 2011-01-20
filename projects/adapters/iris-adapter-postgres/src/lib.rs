@@ -1,12 +1,10 @@
-//! PostgreSQL wire adapter for Iris.
+//! Iris 的 PostgreSQL 线协议适配器。
 //!
-//! Speaks PostgreSQL protocol-v3 through [`yyds_gateway_pgsql::client::Session`]
-//! (same framing as the YYDS PostgreSQL disguise server). Storage behind the
-//! gateway is YYDS (`.yyds` / `.yykv`), not a foreign PostgreSQL data directory.
-//! No third-party `postgres` / `r2d2` crates.
+//! 经 [`yyds_gateway_pgsql::client::Session`] 说 protocol-v3（与 YYDS PostgreSQL
+//! 伪装服务同帧）。网关背后是 YYDS 存储（`.yyds` / `.yykv`），不是对方数据目录。
+//! 不依赖第三方 `postgres` / `r2d2`。属 L1 服务模拟。
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 mod catalog;
 mod execute;

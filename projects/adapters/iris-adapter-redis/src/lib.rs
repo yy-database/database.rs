@@ -1,10 +1,9 @@
-//! Limited Redis keyspace / document / cache adapter.
+//! Iris 的有限 Redis 键空间 / 文档 / 缓存适配器。
 //!
-//! Speaks the Redis wire through `yyds-gateway-redis::client` (same framing as
-//! the YYDS Redis disguise server). No third-party `redis` crate.
+//! 经 `yyds-gateway-redis::client` 说 Redis 线协议（与 YYDS Redis 伪装服务同帧）。
+//! 不依赖第三方 `redis` crate。属 L1 服务模拟。
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 mod cache;
 mod mapping;

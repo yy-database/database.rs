@@ -33,8 +33,13 @@ pub enum RoutingError {
     EmptyMap,
     /// A shard identity is empty or repeated.
     InvalidShardIdentity,
-    /// The caller used a map epoch older than the published one.
-    StaleEpoch { expected: ShardEpoch, found: ShardEpoch },
+    /// 调用方使用的路由图世代早于已发布世代。
+    StaleEpoch {
+        /// 已发布的路由世代。
+        expected: ShardEpoch,
+        /// 调用方带来的世代。
+        found: ShardEpoch,
+    },
 }
 
 impl ShardMap {

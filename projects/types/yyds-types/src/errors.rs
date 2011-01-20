@@ -2,36 +2,65 @@ use std::{error, fmt, io, result};
 
 use crate::replication::{FenceToken, OwnerEntry};
 
-/// Convenient alias used across YYDS APIs.
+/// YYDS API 通用结果别名。
 pub type Result<T> = result::Result<T, Error>;
 
-/// Errors produced by YYDS catalog, shard, and wire paths.
+/// YYDS 目录、分片与线协议路径产生的错误。
 #[derive(Debug)]
 pub enum Error {
-    /// Underlying filesystem or I/O failure.
+    /// 底层文件系统或 I/O 失败。
     Io(io::Error),
-    /// Shard or catalog bytes do not match the expected layout.
+    /// 分片或目录字节与期望布局不符。
     Corrupt(&'static str),
-    /// Requested key is absent from the shard.
-    NotFound { key: String },
-    /// Stored catalog schema version does not match the caller's expectation.
-    SchemaConflict { expected: u32, found: u32 },
-    /// A routing epoch is not newer than the published catalog epoch.
-    RoutingConflict { expected: u64, found: u64 },
-    /// Schema document failed VOS validation (shared language contract).
-    Schema { message: String },
-    /// Feature exists as a product surface but is not implemented yet.
+    /// 分片中不存在请求的键。
+    NotFound {
+        /// 缺失的键。
+        key: String,
+    },
+    /// 已存目录 schema 版本与调用方期望不一致。
+    SchemaConflict {
+        /// 调用方期望的版本。
+        expected: u32,
+        /// 实际读到的版本。
+        found: u32,
+    },
+    /// 路由世代未新于已发布目录世代。
+    RoutingConflict {
+        /// 要求严格新于的世代。
+        expected: u64,
+        /// 实际见到的世代。
+        found: u64,
+    },
+    /// Schema 文档未通过 VOS 校验。
+    Schema {
+        /// 校验失败说明。
+        message: String,
+    },
+    /// 产品面已声明但尚未实现的能力。
     Unsupported(&'static str),
-    /// A stored or supplied decimal integer is invalid or outside signed 64-bit range.
+    /// 存入或传入的十进制整数非法，或超出有符号 64 位。
     InvalidIntegerValue,
-    /// A checked integer operation exceeds signed 64-bit range.
+    /// 检查整数运算超出有符号 64 位。
     IntegerOverflow,
-    /// Independent compare-and-set failed.
-    CasConflict { key: String },
-    /// VOS-authored UDF could not be lowered into the distributed execution model.
-    Udf { name: String, message: String },
-    /// Incoming fence token does not match the catalog's published owner for that shard.
-    FencingRejected { fence: FenceToken, current: OwnerEntry },
+    /// 独立 compare-and-set 失败。
+    CasConflict {
+        /// 发生冲突的键。
+        key: String,
+    },
+    /// VOS 编写的 UDF 无法落入分布式执行模型。
+    Udf {
+        /// UDF 名称。
+        name: String,
+        /// 失败说明。
+        message: String,
+    },
+    /// 入站 fence 与目录为该分片发布的 owner 不一致。
+    FencingRejected {
+        /// 被拒绝的 fence。
+        fence: FenceToken,
+        /// 目录当前发布的 owner。
+        current: OwnerEntry,
+    },
 }
 
 impl fmt::Display for Error {

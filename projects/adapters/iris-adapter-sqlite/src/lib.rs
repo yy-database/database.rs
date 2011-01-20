@@ -1,10 +1,10 @@
-//! Isolated SQLite foreign-store adapter.
+//! Iris 的 SQLite 外存适配器。
 //!
-//! Backend commands stay **private** to this crate. The public API speaks Iris
-//! physical plans, observed catalogs, and mapping manifests -- never SQL strings.
+//! 后端命令文本留在本 crate 私有；公开面只谈 Iris 物理计划、观测目录与
+//! 映射清单。执行依赖 SQLite 产品 L3 接续内核；内核未就绪时 open / 写路径
+//! fail-closed，禁止用官方引擎顶档。
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 mod catalog;
 mod execute;
@@ -29,13 +29,13 @@ pub use migrate::{PushReport, apply_push, plan_push};
 pub use outbox::AuthorityTxn;
 pub use provider::{CatalogColumn, CatalogSnapshot, CatalogTable, RusqliteProvider, SqliteProvider, SqliteValue, StatementResult};
 
-/// Adapter identifier.
+/// 适配器后端标识。
 pub const BACKEND_ID: &str = "sqlite";
 
-/// Adapter crate version label.
+/// 本 crate 版本标签。
 pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// SQLite foreign datasource. Execution waits on the product L3 continuation kernel.
+/// SQLite 外存数据源。真正执行等待产品 L3 接续内核。
 pub struct SqliteSource {
     provider: Mutex<SqliteProvider>,
     path: Option<PathBuf>,
