@@ -1,4 +1,4 @@
-//! CLI entry of the SQLite-referenced measurement harness.
+//! CLI entry of the YYDB-only measurement harness.
 //!
 //! `yydb-bench [--rows N] [--point-ops N] [--range-scans N] [--range-len N]
 //! [--batch-size N] [--single-inserts N] [--value-bytes N] [--dir PATH]
@@ -79,39 +79,23 @@ fn print_measure(report: &MeasureReport) {
         report.rounds.len(),
         report.discarded_rounds
     );
-    println!(
-        "{:<6} {:<6} {:<14} {:>14} {:>14} {:>8} {:>14} {:>14}",
-        "round", "cache", "order", "yydb range", "sqlite range", "ratio", "yydb point", "sqlite point"
-    );
+    println!("{:<6} {:<6} {:>14} {:>14}", "round", "cache", "yydb range", "yydb point");
     for round in &report.rounds {
         println!(
-            "{:<6} {:<6} {:<14} {:>14} {:>14} {:>7.2}x {:>14} {:>14}",
-            round.round,
-            round.cache,
-            round.order,
-            round.yydb_range_ns_per_row,
-            round.sqlite_range_ns_per_row,
-            round.yydb_range_ns_per_row as f64 / round.sqlite_range_ns_per_row.max(1) as f64,
-            round.yydb_point_ns_per_op,
-            round.sqlite_point_ns_per_op
+            "{:<6} {:<6} {:>14} {:>14}",
+            round.round, round.cache, round.yydb_range_ns_per_row, round.yydb_point_ns_per_op
         );
     }
     println!();
-    spread("range ns/row", &report.yydb_range, &report.sqlite_range);
-    spread("point ns/op", &report.yydb_point, &report.sqlite_point);
-    let ratio = &report.ratio_x1000;
-    println!(
-        "ratio yydb/sqlite: median {:.2}x · p90 {:.2}x · max {:.2}x (n={})",
-        ratio.median as f64 / 1000.0,
-        ratio.p90 as f64 / 1000.0,
-        ratio.max as f64 / 1000.0,
-        ratio.samples
-    );
+    spread("range ns/row", &report.yydb_range);
+    spread("point ns/op", &report.yydb_point);
 }
 
-fn spread(label: &str, yydb: &yydb_bench::Series, sqlite: &yydb_bench::Series) {
-    println!("{:<16} yydb median {:>10} (min {:>10}, p90 {:>10}, max {:>10})", label, yydb.median, yydb.min, yydb.p90, yydb.max);
-    println!("{:<16} sqlite median {:>8} (min {:>10}, p90 {:>10}, max {:>10})", "", sqlite.median, sqlite.min, sqlite.p90, sqlite.max);
+fn spread(label: &str, series: &yydb_bench::Series) {
+    println!(
+        "{:<16} yydb median {:>10} (min {:>10}, p90 {:>10}, max {:>10})",
+        label, series.median, series.min, series.p90, series.max
+    );
 }
 
 fn print_report(baseline: &Baseline) {
@@ -127,15 +111,15 @@ fn print_report(baseline: &Baseline) {
         config.single_inserts,
         config.value_bytes
     );
-    println!("{:<24} {:>14} {:>14} {:>10}", "workload", "yydb", "sqlite", "yydb/sqlite");
-    row("batch load (ns)", baseline.yydb.batch_load_ns, baseline.sqlite.batch_load_ns);
-    row("single insert (ns/op)", baseline.yydb.single_insert_ns_per_op, baseline.sqlite.single_insert_ns_per_op);
-    row("point get cold (ns/op)", baseline.yydb.point_get_ns_per_op, baseline.sqlite.point_get_ns_per_op);
-    row("point get warm (ns/op)", baseline.yydb.point_get_warm_ns_per_op, baseline.sqlite.point_get_warm_ns_per_op);
-    row("range scan (ns/row)", baseline.yydb.range_scan_ns_per_row, baseline.sqlite.range_scan_ns_per_row);
-    row("reopen open (ns)", baseline.yydb.reopen_open_ns, baseline.sqlite.reopen_open_ns);
-    row("reopen+100 gets (ns)", baseline.yydb.reopen_point_get_ns, baseline.sqlite.reopen_point_get_ns);
-    row("empty reopen (ns)", baseline.yydb.empty_reopen_ns, baseline.sqlite.empty_reopen_ns);
+    println!("{:<24} {:>14}", "workload", "yydb");
+    row("batch load (ns)", baseline.yydb.batch_load_ns);
+    row("single insert (ns/op)", baseline.yydb.single_insert_ns_per_op);
+    row("point get cold (ns/op)", baseline.yydb.point_get_ns_per_op);
+    row("point get warm (ns/op)", baseline.yydb.point_get_warm_ns_per_op);
+    row("range scan (ns/row)", baseline.yydb.range_scan_ns_per_row);
+    row("reopen open (ns)", baseline.yydb.reopen_open_ns);
+    row("reopen+100 gets (ns)", baseline.yydb.reopen_point_get_ns);
+    row("empty reopen (ns)", baseline.yydb.empty_reopen_ns);
     if let Some(publish) = &baseline.yydb.publish {
         println!();
         println!(
@@ -188,9 +172,8 @@ fn print_report(baseline: &Baseline) {
     println!("Raw numbers only: no absolute SLO is asserted. Compare on the same machine.");
 }
 
-fn row(label: &str, yydb: u128, sqlite: u128) {
-    let ratio = yydb as f64 / sqlite.max(1) as f64;
-    println!("{label:<24} {yydb:>14} {sqlite:>14} {ratio:>9.2}x");
+fn row(label: &str, yydb: u128) {
+    println!("{label:<24} {yydb:>14}");
 }
 
 fn print_profile(report: &yydb_bench::ProfileReport) {
