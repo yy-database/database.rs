@@ -78,19 +78,21 @@ pub mod connection {
     pub use yydb_engine::connection::{Connection, ReadProfile};
 }
 
-/// Private SQL bridge — not part of the `@yydb/yydb` public author surface.
+/// Private SQL bridge — **scheduled for removal**.
 ///
-/// Integration tests access SQL lowering and execution through this module.
-/// Downstream authors should not depend on it.
+/// YYDB no longer offers SQL as a product contract. Remaining symbols exist only
+/// while integration tests and `yydb-bench` are rewritten onto VOS. New code must
+/// not depend on this module. Dialect SQL continuation belongs to the SQLite
+/// product L3 plan.
 #[doc(hidden)]
 pub mod __sql_private {
     pub use yydb_query::{Dialect, SqlOutcome, SqlPlan, execute_sql, prepare_sql};
 }
 
-/// SQLite-flavoured SQL dialect over the YYDB engine (`.yydb` storage).
+/// Legacy SQLite-flavoured SQL over `.yydb` — **scheduled for removal**.
 ///
-/// Format-3 file import/export belongs to the separate `sqlite` product crate
-/// and the `SQLite` distribution shell — not this module.
+/// Do not use for new work. Format-3 L2 tooling and L3 continuation (including
+/// SQL) live on the `sqlite` product facade, not here.
 pub mod sql;
 
 /// Batched write operations.

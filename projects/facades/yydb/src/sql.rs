@@ -1,8 +1,7 @@
-//! Writable SQLite dialect surface backed by the YYDB engine.
+//! Legacy SQLite dialect over the YYDB engine — **scheduled for removal**.
 //!
-//! Statements are parsed by `oak-sql`, lowered by `yydb-query` into the shared
-//! operator set and executed against YYDB storage. Indexing, locking,
-//! transactions and durability therefore behave exactly like the VOS surface.
+//! YYDB product contract is VOS-only. Dialect SQL continuation moves to the
+//! SQLite product L3 plan. Do not expand this module.
 
 use std::path::Path;
 
