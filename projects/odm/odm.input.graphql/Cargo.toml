@@ -1,0 +1,12 @@
+# `odm-input-graphql`：把 GraphQL SDL 降到统一 `MappingModel`。
+[package]
+name = "odm-input-graphql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+odm-types = { workspace = true }

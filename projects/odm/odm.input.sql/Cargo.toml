@@ -1,0 +1,12 @@
+# `odm-input-sql`：把 SQL DDL 降到统一 `MappingModel`。
+[package]
+name = "odm-input-sql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+odm-types = { workspace = true }
