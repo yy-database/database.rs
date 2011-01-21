@@ -2,6 +2,8 @@
 
 Aggregated Rust core for the YY database family.
 
+实现约定（`unsafe`、文档 lint、中文注释、门面依赖）见 [`AGENTS.md`](./AGENTS.md)。
+
 Product repos (`yydb`, `yyds`, `iris-orm`, and dialect surfaces) stay as **distribution shells**: language bindings, packaging, and public branding. Shared formats, execution, gateways, and Iris adapters live here so they are not forked three ways.
 
 ## Storage vs dialect compatibility
