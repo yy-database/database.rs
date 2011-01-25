@@ -1,10 +1,7 @@
-# `yydb-execution`
+# yydb-execution
 
-Stable local execution model owned by YYDB. VOS frontends lower into this IR through the
-[`yydb`](https://crates.io/crates/yydb) binder, so planners never share an unstable AST across crates.
+YYDB 本地稳定执行模型（算子与会话内执行合同）。被引擎与查询规划消费。
 
-The crate deliberately has no dependency on Oak, VOS, YYDS, or a remote execution protocol.
+## 相关
 
-Depend on **`yydb`** (`yydb::execution`) unless you extend the execution layer directly.
-
-[docs.rs](https://docs.rs/yydb-execution) · [YYDB overview](https://github.com/yy-database/yydb)
+[门面 yydb](../../facades/yydb/readme.md) · [根 readme](../../../readme.md)

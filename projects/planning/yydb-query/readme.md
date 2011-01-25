@@ -1,13 +1,7 @@
-# `yydb-query`
+# yydb-query
 
-Phase 1 VOS query lowering, read pipelines, and insert/write DML against the YYDB record map.
+YYDB 后端无关的查询规划与 DML 执行面。与 VOS / 引擎协同，不是独立 SQL 产品。
 
-Every write value is coerced to the column type the schema declares. A `vector<N>` column accepts exactly `N` finite
-`f32` components and refuses another dimension, an empty vector, or a non-finite component before the row is staged,
-so a stored embedding always matches its declared shape. Rows persist the tagged form, so a corrupt or padded component
-payload fails the read rather than decoding into a wider or shorter vector.
+## 相关
 
-Embedded hosts should depend on [`yydb`](https://crates.io/crates/yydb) and use `yydb::query` (this crate re-exported).
-Direct `yydb-query` is for engine work and tests only.
-
-[docs.rs](https://docs.rs/yydb-query) · [YYDB overview](https://github.com/yy-database/yydb)
+[门面 yydb](../../facades/yydb/readme.md) · [根 readme](../../../readme.md)

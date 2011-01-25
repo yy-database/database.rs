@@ -1,5 +1,7 @@
 # yyds-catalog
 
-Catalog control plane for **YYDS**: versioned VOS schema documents and shard registration in `.yyds` files.
+分布式 `.yyds` catalog 生命周期。经门面 `yyds` 的 `catalog` 再导出。
 
-This crate is **not** the embedded `.yydb` engine. It owns cluster catalog truth that `yyds-kv` shards execute under.
+## 相关
+
+[门面 yyds](../../facades/yyds/readme.md) · [根 readme](../../../readme.md)

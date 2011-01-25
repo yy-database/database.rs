@@ -1,63 +1,37 @@
-# `yydb`
+# yydb
 
-Embedded, single-file database for Rust: opens a portable `.yydb` file, stores a
-versioned [VOS](https://github.com/voml/vos-language) schema with host-side validation, and exposes durable local
-records. Same storage engine as the YYDB CLI and `@yydb/yydb`.
+嵌入式单文件数据库的 **Rust 门面**。打开 `.yydb`，用 [VOS](https://github.com/voml/vos-language) 声明 schema，同一 `Connection` 上做 KV、事务与 serve。
 
-[![crates.io](https://img.shields.io/crates/v/yydb)](https://crates.io/crates/yydb)
-[![docs.rs](https://docs.rs/yydb/badge.svg)](https://docs.rs/yydb)
+产品壳的 Node / Python / wasm 绑定只应依赖本 crate，不要直连 `yydb-engine` 等内部层。
 
-## Example
+## 用法
 
 ```rust
-use yydb::{Connection, Result};
+use yydb::{Connection, OpenFlags, Result};
 
 fn main() -> Result<()> {
-    let db = Connection::open("app.yydb")?;
+    let db = Connection::open_with_flags("app.yydb", OpenFlags::wal())?;
     db.ensure_schema("table Project { @@id: uuid, title: utf8 }")?;
     db.put("project/title", b"Spark")?;
-
-    assert_eq!(
-        db.get("project/title")?.as_deref(),
-        Some(b"Spark".as_slice()),
-    );
+    assert_eq!(db.get("project/title")?.as_deref(), Some(b"Spark".as_slice()));
     Ok(())
 }
 ```
 
-`Connection::open` creates the file when needed. `Connection::open_in_memory()` keeps object CAS in-process without
-filesystem sidecars �?useful for tests. `prepare_vos` and `query_prepared` reuse named statements across calls.
+常用入口：`connection` / `udf` / `catalog` / `protocol`；非 `wasm32` 另有 `client` / `server`。
 
-## API surface
+## 约束
 
-`yydb` is the **facade** �?the normal Rust dependency for embed hosts.
+- 壳工程**只依赖**本 crate
+- **无 SQL 产品合同**；方言 SQL 续跑归 `sqlite` 产品 L3
+- `wasm32` 目标不含 `server` / `client`
 
-```rust
-use yydb::prelude::*;
-// UDF: yydb::udf::UdfRegistry
-// wire types: yydb::protocol
-// remote client: yydb::client
-// serve loop: yydb::server (native only)
-```
+## 相关
 
-| Layer      | Crate                             | When to depend                 |
-|------------|-----------------------------------|--------------------------------|
-| Bottom     | `yydb-types`, `yydb-formats`      | Engine internals only          |
-| Durability | `yydb-storage`                    | File, snapshot, WAL and blob access |
-| Engine     | `yydb-engine`, `yydb-execution`, `yydb-udf`, `yydb-query` | Database runtime and components |
-| **Facade** | **`yydb`**                        | **Default �?`Connection`, `client`, `server`** |
-| Protocol   | `yydb-protocol`                   | Wire frames only (no database) |
-| Transport  | `yydb-client`, `yydb-server`      | Aggregated as `yydb::client` / `yydb::server` |
-| Bindings   | `yydb-napi`, `yydb-pyo3`, `yydb-wasm` | Language hosts only        |
-
-## Related surfaces
-
-| Need               | Surface               |
-|--------------------|-----------------------|
-| Rust embed         | `yydb` (`Connection`) |
-| Rust wire server   | `yydb::server`        |
-| Rust remote client | `yydb::client`        |
-| Node all-in-one    | `@yydb/yydb`          |
-| TS wire client     | `@yydb/yydb-client`   |
-
-[API reference](https://docs.rs/yydb) · [YYDB overview](https://github.com/yy-database/yydb) · [User guides](https://github.com/yy-database/yydb/tree/dev/projects/yydb.ts/homepage/documentation/zh-hans)
+| 需求 | 去向 |
+|------|------|
+| format-3 文件 | 门面 `sqlite` |
+| 分布式 / 方言伪装 | 门面 `yyds` |
+| ORM | 门面 `iris` |
+| Node / Python 壳 | [yy-database/yydb](https://github.com/yy-database/yydb) |
+| 仓库总览 | [根 readme](../../../readme.md) |

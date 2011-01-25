@@ -1,5 +1,7 @@
 # yyds-server
 
-YY-native wire server loop for YYDS.
+YYDS 自有 YY wire 服务循环。经门面 `yyds` 使用。
 
-Status: scaffold only.
+## 相关
+
+[门面 yyds](../../facades/yyds/readme.md) · [根 readme](../../../readme.md)

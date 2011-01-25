@@ -1,16 +1,9 @@
 # sqlite-storage
 
-SQLite read-only storage runtime, modeled after `yydb-storage`.
+SQLite 主文件运行时：文件/内存句柄、schema 表读取、rowid B-tree 扫描、只读 catalog。建立在 `sqlite-formats` 上。
 
-This crate owns SQLite main-file runtime behaviour:
+经门面 `sqlite` 使用。L2 只读；L3 接续运行另见门面说明。
 
-- `SqliteDatabase` — file-backed or in-memory handle; opens and validates SQLite main files
-- `read_table` — rowid-table B-tree traversal, including overflow page assembly
-- `read_schema` / `read_named_table` — catalog reads from SQLite's main-file schema table
-- Resource limits for scans and record decoding
+## 相关
 
-**Depends on `sqlite-formats`** for pure header/record/encoding primitives.
-
-**Not yet here**: WAL recovery, journal rollback, index scan, write path,
-transactional pager, or cross-process locking. Those follow the same staged
-roadmap as `yydb-storage` already has.
+[门面 sqlite](../../facades/sqlite/readme.md) · [根 readme](../../../readme.md)

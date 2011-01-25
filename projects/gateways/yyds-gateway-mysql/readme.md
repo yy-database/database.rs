@@ -1,3 +1,9 @@
 # yyds-gateway-mysql
 
-MySQL protocol gateway work for YYDS. `service::MysqlService` attaches a loopback protocol-v10 listener to an existing node owner. It accepts protocol-4.1 clients using an empty password and supports Oak-parsed `SET NAMES utf8mb4` session initialization with the `utf8mb4_bin` collation, which is the only one this gateway can honour because text is compared by Unicode code point without case folding. Other character sets and collations are rejected. Relational SQL execution, authentication and TLS are not implemented. The PyMySQL reference probe uses ordinary charset initialization and receives explicit unsupported errors for queries. This is not a MySQL-compatible database server. The listener does not create or maintain a separate cluster.
+MySQL 线协议伪装网关（L1）。不引入 `mysql` crate 做引擎。
+
+经门面 `yyds::gateway::mysql` 使用。
+
+## 相关
+
+[门面 yyds](../../facades/yyds/readme.md) · [根 readme](../../../readme.md)

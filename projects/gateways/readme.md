@@ -1,15 +1,17 @@
 # gateways
 
-Protocol disguise gateways that make YYDS look like familiar database products on the wire.
+YYDS **L1 服务模拟** 方言伪装网关目录。线协议像对方，磁盘仍是 YYDS。
 
-| Crate | Role |
+| Crate | 伪装 |
 |-------|------|
-| `yyds-gateway` | Shared config, banners, SQL bind/plan (extract target: `yyds-query`), legacy-surface guards |
-| `yyds-gateway-redis` | Redis wire disguise |
-| `yyds-gateway-mysql` | MySQL wire disguise |
-| `yyds-gateway-pgsql` | PostgreSQL wire disguise |
-| `yyds-gateway-mongo` | Mongo wire disguise |
+| `yyds-gateway` | 共享内核 |
+| `yyds-gateway-mysql` | MySQL |
+| `yyds-gateway-pgsql` | PostgreSQL |
+| `yyds-gateway-redis` | Redis |
+| `yyds-gateway-mongo` | MongoDB |
 
-Shared behavioral cases live under `../conformance/gateway-conformance`.
+产品壳只依赖门面 `yyds`。
 
-These gateways are **not** SQL translation layers for Iris. They expose a dialect wire surface backed by YYDS. Native YY wire belongs in `yyds-protocol` / `yyds-server`, not here.
+## 相关
+
+[门面 yyds](../facades/yyds/readme.md) · [根 readme](../../readme.md)

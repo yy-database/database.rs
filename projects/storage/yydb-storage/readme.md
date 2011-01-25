@@ -1,11 +1,9 @@
-# `yydb-storage`
+# yydb-storage
 
-Durable YYDB file access: main-file lifecycle, writer locking, snapshot commit, WAL and checkpoint coordination,
-durable CAS blob I/O, and storage metrics.
+YYDB 持久访问：锁、快照提交、WAL 协调与 CAS blob I/O。建立在 `yydb-formats` 之上。
 
-The crate knows the physical `YDPG` / `YYWL` / `YYBB` v0 layout. It does not know VOS, query planning, UDFs, or
-`Connection`, and it never receives engine state: callers hand over opaque metadata rows plus logical records.
+经 `yydb-engine` / 门面 `yydb` 使用。
 
-Workspace-internal and not published. Application authors depend on [`yydb`](https://crates.io/crates/yydb).
+## 相关
 
-[YYDB overview](https://github.com/yy-database/yydb)
+[门面 yydb](../../facades/yydb/readme.md) · [根 readme](../../../readme.md)

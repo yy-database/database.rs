@@ -1,9 +1,7 @@
-# `yydb-udf`
+# yydb-udf
 
-UDF contract, layered registry, and host adapters between [`yydb-execution`](https://crates.io/crates/yydb-execution)
-and the [`yydb`](https://crates.io/crates/yydb) facade.
+YYDB UDF 合同、注册表与宿主适配。经门面 `yydb` 的 `udf` 模块使用。
 
-Depend on **`yydb`** for host UDF types (`HostMicroDefinition`, `UdfValue`, …). Use `yydb::udf` and
-`yydb::udf::UdfRegistry` in application code.
+## 相关
 
-[docs.rs](https://docs.rs/yydb-udf) · [YYDB overview](https://github.com/yy-database/yydb)
+[门面 yydb](../../facades/yydb/readme.md) · [根 readme](../../../readme.md)

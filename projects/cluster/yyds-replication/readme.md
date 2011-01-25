@@ -1,5 +1,7 @@
 # yyds-replication
 
-Replica log apply, quorum, and shard replication for YYDS.
+YYDS 副本日志应用、法定人数与分片复制。集群内部件。
 
-Status: scaffold only.
+## 相关
+
+[门面 yyds](../../facades/yyds/readme.md) · [根 readme](../../../readme.md)

@@ -1,7 +1,9 @@
 # yyds-types
 
-Shared identity and error types for **YYDS**, the distributed VOS database.
+YYDS 共享类型：节点、分片、错误与控制面合同。被集群、网关与门面共同依赖。
 
-YYDS is the network-facing sibling of embedded [YYDB](https://github.com/yy-database/yydb.rs). Like YYDB it uses **[VOS](https://github.com/voml/vos-language)** for schema, DDL, and query. There is no private SQL dialect and no parallel schema language.
+产品壳请用门面 `yyds`。
 
-Storage differs from YYDB: catalog truth lives in versioned `.yyds` files (VOS documents) and shard data in `.yykv` files (`yyds-kv`).
+## 相关
+
+[门面 yyds](../../facades/yyds/readme.md) · [根 readme](../../../readme.md)

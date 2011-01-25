@@ -1,3 +1,9 @@
 # yyds-gateway-pgsql
 
-PostgreSQL gateway work for YYDS. `service::PgsqlService` attaches a loopback listener to an existing node owner and stops its client workers with the node lifecycle. It does not create or maintain a separate cluster. The wire connection path negotiates protocol v3, declines SSL/GSS encryption requests, completes unauthenticated startup, and publishes standard session parameters. Oak-parsed `BEGIN`, `COMMIT`, and `ROLLBACK` maintain protocol transaction status, including failed-transaction state and recovery. These are empty wire-level transaction boundaries only: relational SQL execution and storage transactions are not implemented. Unsupported queries return explicit SQLSTATEs. Bind it to loopback only. It is not yet a PostgreSQL-compatible database server.
+PostgreSQL 线协议伪装网关（L1）。不引入 `postgres` 客户端做引擎。
+
+经门面 `yyds::gateway::pgsql` 使用。
+
+## 相关
+
+[门面 yyds](../../facades/yyds/readme.md) · [根 readme](../../../readme.md)

@@ -1,32 +1,35 @@
 # sqlite
 
-SQLite product facade for **format-3 import/export only**.
+SQLite **产品门面**：format-3 **L2** 只读检查与可写快照。不捆绑官方 C 库，不依赖 YYDB 引擎。
 
-SQL dialect over `.yydb` is [`yydb::sql::SqliteConnection`](https://docs.rs/yydb) —
-it must not be pulled into this crate (keeps the SQLite product free of the YYDB engine).
+| 档 | 能力 | 入口 |
+|----|------|------|
+| L2 | 只读打开既有 `.sqlite` | `SqliteDatabase` |
+| L2 | 写出新快照 / 夹具 | `SqliteWriter` |
+| L3 | 接续运行（规划中） | 自有内核，含日后方言 SQL |
 
-## Read-only upstream file inspection
-
-`SqliteDatabase` reads an existing SQLite format-3 file so its schema and rows
-can be adopted into YYDB / Iris. `sqlite-storage` owns the main-file runtime
-(file/memory handle, schema table reads, rowid B-tree scans, resource limits)
-and `sqlite-formats` owns the byte-level format facts (header validation,
-record decoding, encoding primitives). There is no SQL engine and no WAL
-recovery on this path.
+## 用法
 
 ```rust
-use sqlite::{SchemaObjectKind, SqliteDatabase};
+use sqlite::{SchemaObjectKind, SqliteDatabase, TableLimits};
 
-let db = SqliteDatabase::open("app.sqlite")?;
-let tables = db
-    .schema(Default::default())?
-    .into_iter()
-    .filter(|o| o.kind == SchemaObjectKind::Table);
-let rows = db.table("samples", Default::default())?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = SqliteDatabase::open("app.sqlite")?;
+    let tables = db.schema(TableLimits::default())?
+        .into_iter()
+        .filter(|o| o.kind == SchemaObjectKind::Table);
+    let _rows = db.table("samples", TableLimits::default())?;
+    let _ = tables.count();
+    Ok(())
+}
 ```
 
-## Writable snapshot builder
+## 约束
 
-`SqliteWriter` builds new format-3 files for fixtures and migration hand-off.
+- L2 不做 WAL 恢复、不做 SQL 执行
+- 禁止用 `rusqlite` / 官方引擎冒充 L3
+- Iris `iris-adapter-sqlite` 随本产品 L3 就绪后再挂执行面
 
-No SQLite C library. No YYDB engine dependency.
+## 相关
+
+[根 readme](../../../readme.md) · 产品壳 `SQLite` 仓

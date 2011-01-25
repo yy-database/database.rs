@@ -1,9 +1,9 @@
-# `yydb-formats`
+# yydb-formats
 
-YYDB format v0 parsing, validation, and in-memory page backend: `YDPG` page files, `YYWL` WAL, `YYSH` SHM, and `YYBB`
-blob chunk headers.
+`.yydb` v0 页文件格式的解析与校验。无文件系统事务、无查询执行。
 
-Workspace-internal crate. It knows the physical layout but not VOS, query planning, or connection state. Application
-authors depend on [`yydb`](https://crates.io/crates/yydb).
+经 `yydb-storage` / 门面 `yydb` 使用。
 
-[docs.rs](https://docs.rs/yydb-formats) · [YYDB overview](https://github.com/yy-database/yydb)
+## 相关
+
+[门面 yydb](../../facades/yydb/readme.md) · [根 readme](../../../readme.md)

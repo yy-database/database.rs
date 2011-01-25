@@ -1,14 +1,9 @@
-# `yydb-types`
+# yydb-types
 
-Bottom shared types for the YYDB workspace: `Error`, `Value`, schema identity, and CAS refs. Engine crates build on this
-package.
+YYDB 共享类型：错误、打开标志、键值与 catalog 合同。被引擎、存储与门面共同依赖。
 
-Binary payloads, UUIDs, temporal values, fixed-point decimals, and `vector<N>` embeddings travel as a tagged JSON
-object that keeps their exact bits. A vector tag carries its declared dimension alongside the little-endian `f32`
-components, so a payload whose length disagrees with its own dimension, a non-finite component, or an unknown tag is
-refused instead of being decoded into a smaller vector or a silently truncated value.
+产品壳请用门面 `yydb`，不要直接依赖本 crate。
 
-Depend on [`yydb`](https://crates.io/crates/yydb) unless you extend engine internals or author a binding layer — the
-facade re-exports these types (`yydb::Value`, `yydb::Error`, `yydb::types`, …).
+## 相关
 
-[docs.rs](https://docs.rs/yydb-types) · [YYDB overview](https://github.com/yy-database/yydb)
+[门面 yydb](../../facades/yydb/readme.md) · [根 readme](../../../readme.md)

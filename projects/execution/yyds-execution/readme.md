@@ -1,5 +1,7 @@
-# YYDS Execution
+# yyds-execution
 
-This crate owns the execution boundary between protocol adapters and YYDS shard storage. `LocalExecutor` routes namespace-scoped key/value commands using a published `ShardMap` and executes them against mounted `.yykv` shards.
+YYDS 键值路由与本地分片执行。经门面 `yyds` 的 `execution` 模块再导出。
 
-The current executor is process-local. It does not implement replication, leader election, remote shard calls, quorum durability, rebalancing, or cluster health. Callers must not treat successful local execution as a distributed commit.
+## 相关
+
+[门面 yyds](../../facades/yyds/readme.md) · [根 readme](../../../readme.md)

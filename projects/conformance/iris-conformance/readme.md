@@ -1,5 +1,7 @@
 # iris-conformance
 
-Shared behavioral case set for Iris connectors and adapters.
+Iris connector / adapter 共享行为用例集。
 
-Status: scaffold only.
+## 相关
+
+[门面 iris](../../facades/iris/readme.md) · [根 readme](../../../readme.md)
