@@ -1,0 +1,26 @@
+# `odm` 是对象—数据库映射（ODM）能力域的唯一公开门面。
+[package]
+name = "odm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = ["types", "adapter", "generate", "input-vos", "input-sql", "input-graphql"]
+types = ["dep:odm-types"]
+adapter = ["dep:odm-adapter"]
+generate = ["dep:odm-generate"]
+input-vos = ["types", "dep:odm-input-vos"]
+input-sql = ["types", "dep:odm-input-sql"]
+input-graphql = ["types", "dep:odm-input-graphql"]
+
+[dependencies]
+odm-types = { workspace = true, optional = true }
+odm-adapter = { workspace = true, optional = true }
+odm-generate = { workspace = true, optional = true }
+odm-input-vos = { workspace = true, optional = true }
+odm-input-sql = { workspace = true, optional = true }
+odm-input-graphql = { workspace = true, optional = true }
