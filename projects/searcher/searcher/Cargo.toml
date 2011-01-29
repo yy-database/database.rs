@@ -1,0 +1,12 @@
+# `searcher` 是搜索能力域的唯一公开门面（占位，便于 workspace 解析）。
+[package]
+name = "searcher"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+searcher-types = { workspace = true }

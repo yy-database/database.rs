@@ -1,0 +1,14 @@
+# `searcher-index` 拥有倒排索引、段与发布流程。
+[package]
+name = "searcher-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+searcher-document = { workspace = true }
+searcher-store = { workspace = true }
+searcher-types = { workspace = true }
