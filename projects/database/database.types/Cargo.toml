@@ -1,0 +1,19 @@
+# `database-types`：共享值、标识、错误与跨层合同（按能力分模块，不按产品品牌）。
+[package]
+name = "database-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+vos = { workspace = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
