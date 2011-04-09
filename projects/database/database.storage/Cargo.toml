@@ -1,0 +1,23 @@
+# `database-storage` owns actual reads/writes, locks, snapshots, checkpoints, recovery and object storage.
+[package]
+name = "database-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+blake3 = { workspace = true }
+database-formats = { workspace = true }
+database-types = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+vos = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
