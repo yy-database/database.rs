@@ -1,0 +1,19 @@
+# `database-cluster` owns sharding, routing, ownership, fencing, replication and distributed orchestration.
+[package]
+name = "database-cluster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-formats = { workspace = true }
+database-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+vos = { workspace = true }
+
+[dev-dependencies]
+boost-fs = { workspace = true }
