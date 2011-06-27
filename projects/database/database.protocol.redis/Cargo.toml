@@ -1,0 +1,14 @@
+﻿# `database-protocol-redis` 负责 RESP 线协议编解码与命令绑定。
+[package]
+name = "database-protocol-redis"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+database-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
