@@ -1,0 +1,32 @@
+﻿# `database-server` owns service sessions, auth ingress, prepared-statement lifecycle and request dispatch.
+[package]
+name = "database-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+base64 = { workspace = true }
+database-cluster = { workspace = true }
+database-execution = { workspace = true }
+database-protocol = { workspace = true }
+database-protocol-mongo = { workspace = true }
+database-protocol-mysql = { workspace = true }
+database-protocol-pgsql = { workspace = true }
+database-protocol-redis = { workspace = true }
+database-protocol-yy = { workspace = true }
+database-query = { workspace = true }
+database-storage = { workspace = true }
+database-types = { workspace = true }
+database-udf = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+vos = { workspace = true }
+
+[dev-dependencies]
+boost-fs = { workspace = true }
+database-client = { workspace = true }
