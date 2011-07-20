@@ -1,0 +1,63 @@
+# `database` 是数据库家族的唯一稳定公开门面。
+[package]
+name = "database"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = [
+    "types",
+    "input",
+    "query",
+    "execution",
+    "udf",
+    "formats",
+    "storage",
+    "cluster",
+    "protocol",
+    "protocol-yy",
+    "protocol-mysql",
+    "protocol-pgsql",
+    "protocol-redis",
+    "protocol-mongo",
+    "client",
+    "server",
+]
+types = ["dep:database-types"]
+input = ["dep:database-input"]
+query = ["dep:database-query"]
+execution = ["dep:database-execution"]
+udf = ["dep:database-udf"]
+formats = ["dep:database-formats"]
+storage = ["dep:database-storage"]
+cluster = ["dep:database-cluster"]
+protocol = ["dep:database-protocol"]
+protocol-yy = ["protocol", "dep:database-protocol-yy"]
+protocol-mysql = ["protocol", "dep:database-protocol-mysql"]
+protocol-pgsql = ["protocol", "dep:database-protocol-pgsql"]
+protocol-redis = ["protocol", "dep:database-protocol-redis"]
+protocol-mongo = ["protocol", "dep:database-protocol-mongo"]
+client = ["dep:database-client"]
+server = ["dep:database-server"]
+
+[dependencies]
+database-types = { workspace = true, optional = true }
+database-input = { workspace = true, optional = true }
+database-query = { workspace = true, optional = true }
+database-execution = { workspace = true, optional = true }
+database-udf = { workspace = true, optional = true }
+database-formats = { workspace = true, optional = true }
+database-storage = { workspace = true, optional = true }
+database-cluster = { workspace = true, optional = true }
+database-protocol = { workspace = true, optional = true }
+database-protocol-yy = { workspace = true, optional = true }
+database-protocol-mysql = { workspace = true, optional = true }
+database-protocol-pgsql = { workspace = true, optional = true }
+database-protocol-redis = { workspace = true, optional = true }
+database-protocol-mongo = { workspace = true, optional = true }
+database-client = { workspace = true, optional = true }
+database-server = { workspace = true, optional = true }
