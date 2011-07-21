@@ -1,0 +1,19 @@
+# `odm-types`：对象映射合同、会话、计划与投影状态。
+[package]
+name = "odm-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+blake3 = { workspace = true }
+database-query = { workspace = true }
+glob = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+von = { workspace = true }
+vos = { workspace = true }
