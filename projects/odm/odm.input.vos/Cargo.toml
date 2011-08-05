@@ -1,0 +1,13 @@
+# `odm-input-vos`：把 VOS DDL 降到统一 `MappingModel`。
+[package]
+name = "odm-input-vos"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+odm-types = { workspace = true }
+vos = { workspace = true }
