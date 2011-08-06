@@ -1,0 +1,28 @@
+# `odm-adapter`：外存与本地数据源适配（含文档库式适配，同属 ODM 族）。
+[package]
+name = "odm-adapter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+blake3 = { workspace = true }
+database-client = { workspace = true }
+database-execution = { workspace = true }
+database-formats = { workspace = true }
+database-protocol = { workspace = true }
+database-query = { workspace = true }
+database-server = { workspace = true }
+database-storage = { workspace = true }
+database-types = { workspace = true }
+odm-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+vos = { workspace = true }
+
+[dev-dependencies]
+database = { workspace = true }
+odm-generate = { workspace = true }
