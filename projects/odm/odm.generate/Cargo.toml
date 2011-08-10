@@ -1,0 +1,30 @@
+# `odm-generate`：生成模型、Dejavu 渲染与多语言发射器。
+[package]
+name = "odm-generate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dejavu = { workspace = true }
+once_cell = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+vos = { workspace = true }
+
+[build-dependencies]
+dejavu = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = ["aot", "templates-host"]
+aot = []
+templates-host = ["templates-typescript", "templates-python", "templates-rust"]
+templates-typescript = []
+templates-python = []
+templates-rust = []
