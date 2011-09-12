@@ -1,0 +1,16 @@
+# `searcher-types` 持有搜索合同、命中结果与错误。
+[package]
+name = "searcher-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]

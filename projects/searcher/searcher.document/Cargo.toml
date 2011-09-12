@@ -1,0 +1,13 @@
+# `searcher-document` 定义可索引文档与变更操作。
+[package]
+name = "searcher-document"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+searcher-types = { workspace = true }
+serde = { workspace = true }

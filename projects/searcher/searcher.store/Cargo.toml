@@ -1,0 +1,13 @@
+# `searcher-store` 是搜索与分布式存储之间的唯一持久化边界。
+[package]
+name = "searcher-store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+searcher-document = { workspace = true }
+searcher-types = { workspace = true }

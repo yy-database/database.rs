@@ -1,0 +1,12 @@
+# `searcher-rank` 拥有评分与排序。
+[package]
+name = "searcher-rank"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+searcher-types = { workspace = true }

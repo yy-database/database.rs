@@ -1,0 +1,15 @@
+# `searcher-query` 拥有查询语义与候选计划。
+[package]
+name = "searcher-query"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+searcher-index = { workspace = true }
+searcher-rank = { workspace = true }
+searcher-types = { workspace = true }
+serde = { workspace = true }
