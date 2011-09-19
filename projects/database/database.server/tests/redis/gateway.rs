@@ -1,4 +1,4 @@
-use database_server::redis::{DEFAULT_PORT, GATEWAY_ID, handle_command};
+use database_server::yyds::redis::{DEFAULT_PORT, GATEWAY_ID, handle_command};
 
 #[test]
 fn redis_ping_returns_pong() {

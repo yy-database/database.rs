@@ -11,7 +11,7 @@ use std::{
 };
 
 use database_execution::cluster::LocalExecutor;
-use database_server::mongo::{
+use database_server::yyds::mongo::{
     connection::serve_cancellable_with_executor,
     wire::{self, FrameLimits},
 };

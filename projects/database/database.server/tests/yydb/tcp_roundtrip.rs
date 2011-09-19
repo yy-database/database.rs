@@ -8,7 +8,7 @@ use std::{
 use database_client::yy::{Client, Error};
 use database_execution::database_execution::engine::{Connection, Value};
 use database_protocol_yy::{read_frame, write_frame};
-use database_server::yy::{SessionState, dispatch};
+use database_server::yydb::{SessionState, dispatch};
 
 #[test]
 fn connect_rejects_empty_endpoint() {

@@ -1,4 +1,4 @@
-use database_server::pgsql::{DEFAULT_PORT, GATEWAY_ID, handle_input};
+use database_server::yyds::pgsql::{DEFAULT_PORT, GATEWAY_ID, handle_input};
 
 #[test]
 fn pgsql_select_one() {

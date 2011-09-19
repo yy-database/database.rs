@@ -1,10 +1,8 @@
 //! `database-server` owns service sessions, auth ingress, prepared-statement lifecycle and request dispatch.
 #![deny(missing_docs)]
 
-pub mod mongo;
-pub mod mysql;
-pub mod pgsql;
-pub mod redis;
+/// Embedded engine host service — loopback-first YY wire serve for out-of-process clients.
+pub mod yydb;
 
-/// Shared YY wire server (embedded/distributed differ only by product magic).
-pub mod yy;
+/// Distributed runtime gateways — MySQL / PostgreSQL / Redis / Mongo disguise protocols.
+pub mod yyds;

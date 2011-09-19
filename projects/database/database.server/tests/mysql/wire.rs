@@ -1,4 +1,4 @@
-use database_server::mysql::wire::{PacketError, decode_packet, encode_packet};
+use database_server::yyds::mysql::wire::{PacketError, decode_packet, encode_packet};
 
 #[test]
 fn binary_payload_roundtrip_and_every_fragment_boundary() {

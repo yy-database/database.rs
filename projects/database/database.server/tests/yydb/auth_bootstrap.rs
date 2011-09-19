@@ -1,6 +1,6 @@
 //! Bootstrap and session lookup rules for server-side authentication.
 
-use database_server::yy::auth::{AuthBootstrap, Principal, PrincipalKind, SessionRegistry};
+use database_server::yydb::auth::{AuthBootstrap, Principal, PrincipalKind, SessionRegistry};
 use database_types::Error;
 
 #[test]
