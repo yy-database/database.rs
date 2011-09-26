@@ -1,4 +1,4 @@
-use database_formats::local::{PAGE_SIZE, encode_empty_page0};
+use database_formats::yy::yydb::{PAGE_SIZE, encode_empty_page0};
 use database_storage::local_io::MemoryPager;
 
 #[test]

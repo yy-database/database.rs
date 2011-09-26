@@ -1,9 +1,9 @@
 //! `.yyds` catalog bytes — thin validation wrapper over `database-formats`.
 
-use database_formats::cluster::catalog_format;
+use database_formats::yy::yyds::catalog_format;
 use database_types::cluster::{CatalogSchema, OwnerEntry, Result, ShardEpoch, ShardId};
 
-pub use database_formats::cluster::CATALOG_MAGIC as MAGIC;
+pub use database_formats::yy::yyds::CATALOG_MAGIC as MAGIC;
 
 /// Serialize catalog state to `.yyds` bytes after contract validation.
 pub fn encode(

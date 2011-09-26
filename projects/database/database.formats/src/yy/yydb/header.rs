@@ -2,7 +2,7 @@
 
 use database_types::{Error, Result};
 
-use crate::local::crc32c::crc32c;
+use super::crc32c::crc32c;
 
 /// Five-byte magic prefix for v0 page files.
 pub const PAGE_MAGIC: &[u8; 5] = b"YDPG\x00";

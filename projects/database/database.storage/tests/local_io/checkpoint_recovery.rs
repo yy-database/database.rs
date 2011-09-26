@@ -5,7 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use database_formats::local::{PAGE_SIZE, WalFile, WalHeader, parse_page0, parse_wal};
+use database_formats::yy::{
+    yydb::{PAGE_SIZE, parse_page0},
+    yywl::{WalFile, WalHeader, parse_wal},
+};
 use database_storage::local_io::{
     FilePager, encode_frame, encode_wal_header, replay_wal_pages, replay_wal_pages_after, truncate_wal_records, wal_sidecar_path,
 };

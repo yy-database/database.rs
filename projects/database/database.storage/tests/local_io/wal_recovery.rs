@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use database_formats::local::{WAL_RECORD_HEADER_BYTES, WalRecordError, parse_wal, scan_wal, wal_frame_offsets};
+use database_formats::yy::yywl::{WAL_RECORD_HEADER_BYTES, WalRecordError, parse_wal, scan_wal, wal_frame_offsets};
 use database_storage::local_io::{FilePager, wal_sidecar_path};
 use database_types::Error;
 

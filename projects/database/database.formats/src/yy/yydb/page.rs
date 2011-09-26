@@ -2,7 +2,7 @@
 
 use database_types::{Error, Result};
 
-use crate::local::{crc32c::crc32c, header::PAGE_SIZE};
+use super::{crc32c::crc32c, header::PAGE_SIZE};
 
 /// Bytes before the slotted payload.
 pub const PAGE_HEADER_LEN: usize = 16;

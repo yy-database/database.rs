@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use database_formats::cluster::replication_format::{self as fmt, APPEND, COMMIT, FRAME_HEADER, FRAME_TRAILER, MAGIC};
+use database_formats::yy::yyds::replication_format::{self as fmt, APPEND, COMMIT, FRAME_HEADER, FRAME_TRAILER, MAGIC};
 use database_types::cluster::{Error, LogIndex, ReplicationEntry, Result};
 
 /// 单个分片的持久追加 / 提交日志。

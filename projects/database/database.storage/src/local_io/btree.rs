@@ -5,7 +5,7 @@ use std::{cmp::Ordering, sync::Arc};
 use database_types::{Error, Result};
 
 use crate::local_io::pager::{DecodedPage, PageStore};
-use database_formats::local::{
+use database_formats::yy::yydb::{
     internal::{InternalEntry, InternalPage, encoded_entries_bytes},
     key::{TREE_RECORD, TreeKey},
     leaf::{LeafCell, LeafPage},

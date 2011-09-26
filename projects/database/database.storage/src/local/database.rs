@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use database_formats::local::{BlobManifestDelta, PAGE_MAGIC, WAL_MAGIC, parse_wal_recover};
+use database_formats::yy::{
+    yydb::PAGE_MAGIC,
+    yywl::{BlobManifestDelta, WAL_MAGIC, parse_wal_recover},
+};
 use database_types::{Error, Result};
 
 use crate::local_io::{

@@ -1,8 +1,11 @@
 //! `YYWL` v0 record validation and torn-tail classification.
 
-use database_formats::local::{
-    MAX_WAL_RECORD_BYTES, WAL_HEADER_BYTES, WAL_RECORD_HEADER_BYTES, WalRecordError, WalTail, crc32c, parse_wal, parse_wal_recover, scan_wal,
-    wal_frame_offsets,
+use database_formats::yy::{
+    yydb::crc32c,
+    yywl::{
+        MAX_WAL_RECORD_BYTES, WAL_HEADER_BYTES, WAL_RECORD_HEADER_BYTES, WalRecordError, WalTail, parse_wal, parse_wal_recover, scan_wal,
+        wal_frame_offsets,
+    },
 };
 use database_storage::local_io::{encode_frame, encode_wal_header, truncate_wal_to_recoverable_prefix, wal_recoverable_byte_len};
 

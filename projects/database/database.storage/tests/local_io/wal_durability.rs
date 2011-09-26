@@ -6,7 +6,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use database_formats::local::{PAGE_SIZE, WalTail, committed_transactions, scan_wal};
+use database_formats::yy::{
+    yydb::PAGE_SIZE,
+    yywl::{WalTail, committed_transactions, scan_wal},
+};
 use database_storage::local_io::{
     WalDurability, WalSink, WalWriter, encode_wal_header, parse_shm, replay_wal_pages, sync_shm_from_commit, sync_shm_from_wal,
     truncate_wal_torn_tail,
@@ -86,7 +89,7 @@ fn wal_commit_syncs_once_before_reporting_lsn() {
     assert_eq!(state.syncs, 1, "one commit must issue exactly one durability barrier");
     let scan = scan_wal(&state.bytes).unwrap();
     assert_eq!(scan.tail, WalTail::Clean);
-    assert_eq!(committed_transactions(&database_formats::local::parse_wal(&state.bytes).unwrap()), 1);
+    assert_eq!(committed_transactions(&database_formats::yy::yywl::parse_wal(&state.bytes).unwrap()), 1);
 }
 
 #[test]
@@ -120,10 +123,10 @@ fn wal_short_append_is_a_torn_tail() {
     let state = sink.state();
     let scan = scan_wal(&state.bytes).unwrap();
     assert!(matches!(scan.tail, WalTail::Torn { .. }), "a short write must leave a torn tail");
-    assert_eq!(committed_transactions(&database_formats::local::parse_wal_recover(&state.bytes).unwrap()), 1);
+    assert_eq!(committed_transactions(&database_formats::yy::yywl::parse_wal_recover(&state.bytes).unwrap()), 1);
 
     let mut pages = std::collections::BTreeMap::new();
-    let wal = database_formats::local::parse_wal_recover(&state.bytes).unwrap();
+    let wal = database_formats::yy::yywl::parse_wal_recover(&state.bytes).unwrap();
     replay_wal_pages(&wal, &mut pages).unwrap();
     assert_eq!(pages.get(&1), Some(&page(0x11)));
     assert_eq!(pages.get(&2), None, "an incomplete transaction must not publish page 2");
@@ -148,7 +151,7 @@ fn wal_disk_full_before_write_keeps_prior_commit() {
     assert_eq!(state.bytes.len(), committed_len);
     let scan = scan_wal(&state.bytes).unwrap();
     assert_eq!(scan.tail, WalTail::Clean, "a rejected append must not leave bytes behind");
-    assert_eq!(committed_transactions(&database_formats::local::parse_wal(&state.bytes).unwrap()), 1);
+    assert_eq!(committed_transactions(&database_formats::yy::yywl::parse_wal(&state.bytes).unwrap()), 1);
 }
 
 #[test]

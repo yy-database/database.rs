@@ -1,4 +1,4 @@
-use crate::cluster::{Key, StoredValue};
+use super::{Key, StoredValue};
 
 /// One versioned KV record inside a shard.
 #[derive(Debug, Clone, PartialEq, Eq)]

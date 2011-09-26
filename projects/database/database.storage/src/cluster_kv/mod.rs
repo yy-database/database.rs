@@ -3,6 +3,6 @@
 mod replication_log;
 mod store;
 
-pub use database_formats::cluster::{InlineValue, Key, ObjectRef, Record, StoredValue};
+pub use database_formats::yy::yykv::{InlineValue, Key, ObjectRef, Record, StoredValue};
 pub use replication_log::DurableReplicationLog;
 pub use store::{FileShard, KvStore, MemoryShard, ShardChange, compare_and_put, now_unix_ms};

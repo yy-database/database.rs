@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use database_formats::cluster::{Key, Record, StoredValue, decode_snapshot, encode_snapshot};
+use database_formats::yy::yykv::{Key, Record, StoredValue, decode_snapshot, encode_snapshot};
 use database_types::cluster::{Error, Namespace, Result, SweepReport};
 
 /// Current wall clock as Unix epoch milliseconds, used for record expiry deadlines.

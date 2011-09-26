@@ -91,8 +91,8 @@ fn range_scan_agrees_after_batch_splits() {
         [("rec-000000", None), ("rec-000000", Some("rec-000010")), ("rec-000500", Some("rec-000510")), ("rec-001400", None), ("zzz", None)];
     for (start, end) in windows {
         let got = pager.scan_kv_range(start, end.map(str::as_bytes)).unwrap();
-        let start_key = database_formats::local::TreeKey::user_record(start);
-        let end_key = end.map(database_formats::local::TreeKey::user_record);
+        let start_key = database_formats::yy::yydb::TreeKey::user_record(start);
+        let end_key = end.map(database_formats::yy::yydb::TreeKey::user_record);
         let want: Vec<_> = all.iter().filter(|(key, _)| *key >= start_key && end_key.as_ref().is_none_or(|end| key < end)).cloned().collect();
         assert_eq!(got, want, "window {start:?}..{end:?}");
     }

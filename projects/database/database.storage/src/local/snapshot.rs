@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use database_formats::local::{KEY_KIND_USER, TREE_RECORD, TreeKey};
+use database_formats::yy::yydb::{KEY_KIND_USER, TREE_RECORD, TreeKey};
 use database_types::{Error, Result};
 
 use crate::local_io::{file::FilePager, memory::MemoryPager, pager::DecodedPage};
@@ -42,10 +42,10 @@ pub trait PagerKv {
     /// Delete one row, reporting whether it existed.
     fn delete_kv(&mut self, key: impl AsRef<[u8]>) -> Result<bool>;
     /// Scan every stored row with its physical key.
-    fn scan_kv(&mut self) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>>;
+    fn scan_kv(&mut self) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>>;
     /// Scan rows whose user key lies in `[start, end)`. `end = None` means
     /// "to the last key".
-    fn scan_kv_range(&mut self, start: &str, end: Option<&str>) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>>;
+    fn scan_kv_range(&mut self, start: &str, end: Option<&str>) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>>;
     /// Scan at most `limit` rows whose user key lies in `[start, end)`.
     ///
     /// `limit` bounds the record-tree walk, so a caller that only needs the first
@@ -55,7 +55,7 @@ pub trait PagerKv {
         start: &str,
         end: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>>;
+    ) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>>;
     /// Collect the decoded leaf pages whose user keys lie in `[start, end)`.
     ///
     /// The caller borrows the stored cell values instead of receiving copies, so
@@ -80,11 +80,11 @@ impl PagerKv for FilePager {
         FilePager::delete_kv(self, key)
     }
 
-    fn scan_kv(&mut self) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>> {
+    fn scan_kv(&mut self) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>> {
         FilePager::scan_kv(self)
     }
 
-    fn scan_kv_range(&mut self, start: &str, end: Option<&str>) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>> {
+    fn scan_kv_range(&mut self, start: &str, end: Option<&str>) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>> {
         FilePager::scan_kv_range(self, start, end.map(str::as_bytes))
     }
 
@@ -93,7 +93,7 @@ impl PagerKv for FilePager {
         start: &str,
         end: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>> {
+    ) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>> {
         FilePager::scan_kv_range_limited(self, start, end.map(str::as_bytes), limit)
     }
 
@@ -119,11 +119,11 @@ impl PagerKv for MemoryPager {
         MemoryPager::delete_kv(self, key)
     }
 
-    fn scan_kv(&mut self) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>> {
+    fn scan_kv(&mut self) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>> {
         MemoryPager::scan_kv(self)
     }
 
-    fn scan_kv_range(&mut self, start: &str, end: Option<&str>) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>> {
+    fn scan_kv_range(&mut self, start: &str, end: Option<&str>) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>> {
         MemoryPager::scan_kv_range(self, start, end.map(str::as_bytes))
     }
 
@@ -132,7 +132,7 @@ impl PagerKv for MemoryPager {
         start: &str,
         end: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(database_formats::local::TreeKey, Vec<u8>)>> {
+    ) -> Result<Vec<(database_formats::yy::yydb::TreeKey, Vec<u8>)>> {
         MemoryPager::scan_kv_range_limited(self, start, end.map(str::as_bytes), limit)
     }
 
@@ -220,7 +220,7 @@ impl RowWindow {
             segments: self.segments.iter(),
             current: None,
             leaves: (&[] as &[Arc<DecodedPage>]).iter(),
-            cells: (&[] as &[database_formats::local::LeafCell]).iter(),
+            cells: (&[] as &[database_formats::yy::yydb::LeafCell]).iter(),
         }
     }
 
@@ -235,14 +235,14 @@ pub struct RowWindowIter<'a> {
     segments: std::slice::Iter<'a, WindowSegment>,
     current: Option<&'a WindowSegment>,
     leaves: std::slice::Iter<'a, Arc<DecodedPage>>,
-    cells: std::slice::Iter<'a, database_formats::local::LeafCell>,
+    cells: std::slice::Iter<'a, database_formats::yy::yydb::LeafCell>,
 }
 
 impl<'a> RowWindowIter<'a> {
     fn enter(&mut self, segment: &'a WindowSegment) {
         self.current = Some(segment);
         self.leaves = segment.leaves.iter();
-        self.cells = (&[] as &'a [database_formats::local::LeafCell]).iter();
+        self.cells = (&[] as &'a [database_formats::yy::yydb::LeafCell]).iter();
     }
 
     /// Position `cells` at the first cell of the next leaf that is at or above
@@ -278,7 +278,7 @@ impl<'a> Iterator for RowWindowIter<'a> {
                 if segment.end.as_ref().is_some_and(|end| cell.key >= *end) {
                     // The rest of this leaf is past the segment, and so is every
                     // later leaf of the same window.
-                    self.cells = (&[] as &'a [database_formats::local::LeafCell]).iter();
+                    self.cells = (&[] as &'a [database_formats::yy::yydb::LeafCell]).iter();
                     continue;
                 }
                 if cell.key.tree_id != TREE_RECORD || cell.key.key_kind != KEY_KIND_USER {
@@ -333,7 +333,7 @@ pub fn read_snapshot_windows_with_rows<P: PagerKv>(pager: &mut P, windows: &[Rec
     Ok((snapshot, RowWindow { segments }))
 }
 
-fn insert_row(snapshot: &mut Snapshot, key: database_formats::local::TreeKey, value: Vec<u8>) -> Result<()> {
+fn insert_row(snapshot: &mut Snapshot, key: database_formats::yy::yydb::TreeKey, value: Vec<u8>) -> Result<()> {
     if key.tree_id != TREE_RECORD || key.key_kind != KEY_KIND_USER {
         return Ok(());
     }

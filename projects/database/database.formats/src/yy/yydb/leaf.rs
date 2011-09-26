@@ -2,7 +2,7 @@
 
 use database_types::{Error, Result};
 
-use crate::local::{
+use super::{
     key::TreeKey,
     page::{PAGE_PAYLOAD_LEN, PAGE_TYPE_LEAF, PageHeader, encode_page},
 };
