@@ -16,9 +16,22 @@ use crate::{
     sql_schema::{RegistryState, SchemaField, SchemaTable},
 };
 
-/// PostgreSQL `server_version` reported by the gateway, also returned by
-/// `version()` metadata probes.
-pub const PG_SERVER_VERSION: &str = concat!("集群 ", env!("CARGO_PKG_VERSION"));
+/// Default PostgreSQL `server_version` reported by the gateway, also returned by
+/// `version()` metadata probes. Hosts may replace it with
+/// [`set_pg_server_version`] to present their own identity.
+pub const PG_SERVER_VERSION: &str = concat!("database.rs ", env!("CARGO_PKG_VERSION"));
+
+static PG_SERVER_VERSION_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Installs the host-supplied `server_version` identity. Later calls are ignored.
+pub fn set_pg_server_version(identity: impl Into<String>) {
+    let _ = PG_SERVER_VERSION_OVERRIDE.set(identity.into());
+}
+
+/// The `server_version` identity the gateway reports.
+pub fn pg_server_version() -> &'static str {
+    PG_SERVER_VERSION_OVERRIDE.get().map(String::as_str).unwrap_or(PG_SERVER_VERSION)
+}
 
 const MYSQL_SHAPES: &str = "accepted MySQL metadata shapes: `SHOW TABLES [LIKE '<pattern>']`, \
 `SELECT <columns> FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() [AND TABLE_TYPE = 'BASE TABLE'] \
@@ -47,6 +60,8 @@ pub struct MetaQuery {
     with_pk: bool,
     pk: Option<PkProbe>,
     scalar: Option<ScalarKind>,
+    /// `SELECT COUNT(*)` over the metadata view; the result is a single row.
+    count: bool,
 }
 
 /// Accepted `EXISTS` primary-key probe over `information_schema.columns`.
@@ -82,7 +97,7 @@ impl MetaQuery {
             let value = match scalar {
                 ScalarKind::Database => schema.to_string(),
                 ScalarKind::CurrentSchema => "public".to_string(),
-                ScalarKind::Version => PG_SERVER_VERSION.to_string(),
+                ScalarKind::Version => pg_server_version().to_string(),
             };
             let columns = self.columns.iter().map(|column| self.label(column, schema)).collect();
             return SqlResult { columns, rows: vec![vec![SqlValue::String(value)]], affected_rows: 0 };
@@ -91,6 +106,10 @@ impl MetaQuery {
         let state = registry.snapshot();
         let mut rows = build_rows(self, &state, schema);
         rows.retain(|row| self.matches(row, schema));
+        if self.count {
+            let columns = self.columns.iter().map(|column| self.label(column, schema)).collect();
+            return SqlResult { columns, rows: vec![vec![SqlValue::Integer(rows.len() as i64)]], affected_rows: 0 };
+        }
         if !self.order.is_empty() {
             let nulls_first = self.dialect.nulls_sort_first();
             rows.sort_by(|left, right| {
@@ -126,6 +145,13 @@ impl MetaQuery {
             let actual = value_of(row, *column);
             match filter {
                 FilterValue::Value(value) => equal_values(actual, value),
+                FilterValue::Pattern(pattern) => match actual {
+                    SqlValue::String(text) if self.dialect == SqlDialect::Mysql => {
+                        like_matches(&pattern.to_lowercase(), &text.to_lowercase())
+                    }
+                    SqlValue::String(text) => like_matches(pattern, text),
+                    _ => false,
+                },
                 FilterValue::Database => equal_values(actual, &SqlValue::String(schema.to_string())),
                 FilterValue::CurrentSchema => equal_values(actual, &SqlValue::String("public".to_string())),
             }
@@ -190,10 +216,12 @@ enum ColumnId {
     AttTypMod,
     TypeName,
     ScalarValue,
+    Count,
 }
 
 enum FilterValue {
     Value(SqlValue),
+    Pattern(String),
     Database,
     CurrentSchema,
 }
@@ -483,6 +511,7 @@ fn scalar_query(dialect: SqlDialect, kind: ScalarKind, label: String) -> MetaQue
         with_pk: false,
         pk: None,
         scalar: Some(kind),
+        count: false,
     }
 }
 
@@ -518,6 +547,7 @@ fn analyze_show(show: &oak_sql::ast::ShowStatement, dialect: SqlDialect) -> Resu
             with_pk: false,
             pk: None,
             scalar: None,
+            count: false,
         })),
         "TABLES" => {
             Err(unsupported(format!("`SHOW TABLES` is MySQL-only and the PostgreSQL gateway has no such statement; {}", shapes(dialect))))
@@ -565,7 +595,7 @@ fn analyze_select(select: &SelectStatement, dialect: SqlDialect, sql: &str) -> R
         }
     };
 
-    let projection_ids = project_items(select, view, table.alias.as_deref(), dialect)?;
+    let (projection_ids, count) = project_items(select, view, table.alias.as_deref(), dialect)?;
     let filters = parse_filters(select, view, table.alias.as_deref(), dialect)?;
     let order = parse_order(select, view, table.alias.as_deref(), dialect)?;
     let with_pk = projection_ids.iter().any(|(id, _)| *id == ColumnId::IsPk);
@@ -573,8 +603,13 @@ fn analyze_select(select: &SelectStatement, dialect: SqlDialect, sql: &str) -> R
         return Err(unsupported(format!("primary-key `EXISTS` is only supported on `information_schema.columns`; {}", shapes(dialect))));
     }
     let pk = if with_pk { Some(validate_pk_exists(select, table.alias.as_deref(), dialect, sql)?) } else { None };
-    let columns = projection_ids.into_iter().map(|(id, name)| MetaColumn { id, name, field_type: field_type(id) }).collect();
-    Ok(Some(MetaQuery { view, dialect, columns, filters, order, limit, offset, like: None, with_pk, pk, scalar: None }))
+    let columns = if count {
+        let name = projection_ids.first().map(|(_, name)| name.clone()).unwrap_or_else(|| "count".to_string());
+        vec![MetaColumn { id: ColumnId::Count, name, field_type: SqlFieldType::Int64 }]
+    } else {
+        projection_ids.into_iter().map(|(id, name)| MetaColumn { id, name, field_type: field_type(id) }).collect()
+    };
+    Ok(Some(MetaQuery { view, dialect, columns, filters, order, limit, offset, like: None, with_pk, pk, scalar: None, count }))
 }
 
 fn analyze_scalar_select(select: &SelectStatement, dialect: SqlDialect) -> Result<Option<MetaQuery>, SqlFrontendError> {
@@ -721,8 +756,9 @@ fn project_items(
     view: View,
     alias: Option<&str>,
     dialect: SqlDialect,
-) -> Result<Vec<(ColumnId, String)>, SqlFrontendError> {
+) -> Result<(Vec<(ColumnId, String)>, bool), SqlFrontendError> {
     let mut columns = Vec::with_capacity(select.items.len());
+    let mut count = false;
     for item in &select.items {
         let SelectItem::Expression { expr, alias: item_alias, .. } = item
         else {
@@ -741,13 +777,27 @@ fn project_items(
                 let label = item_alias.as_ref().map(|alias| alias.name.to_string()).unwrap_or_else(|| "is_pk".to_string());
                 columns.push((ColumnId::IsPk, label));
             }
+            Expression::FunctionCall { name, args, distinct, window, .. }
+                if !*distinct
+                    && window.is_none()
+                    && args.len() == 1
+                    && matches!(args[0], Expression::Wildcard { .. })
+                    && name.name.rsplit('.').next().unwrap_or(name.name.as_ref()).eq_ignore_ascii_case("count") =>
+            {
+                if select.items.len() > 1 || count {
+                    return Err(unsupported(format!("`COUNT(*)` must be the only metadata projection; {}", shapes(dialect))));
+                }
+                count = true;
+                let label = item_alias.as_ref().map(|alias| alias.name.to_string()).unwrap_or_else(|| "COUNT(*)".to_string());
+                columns.push((ColumnId::Count, label));
+            }
             _ => return Err(unsupported(format!("`{}` is not a supported metadata projection; {}", expression_text(expr), shapes(dialect)))),
         }
     }
     if columns.is_empty() {
         return Err(unsupported(format!("metadata projection must not be empty; {}", shapes(dialect))));
     }
-    Ok(columns)
+    Ok((columns, count))
 }
 
 fn resolve_identifier(name: &str, view: View, alias: Option<&str>, dialect: SqlDialect) -> Result<(ColumnId, String), SqlFrontendError> {
@@ -814,21 +864,38 @@ fn parse_filters(
         for conjunct in conjuncts(expr) {
             let Expression::Binary { left, op, right, .. } = conjunct
             else {
-                return Err(unsupported(format!("metadata filters accept only `=` comparisons joined with `AND`; {}", shapes(dialect))));
+                return Err(unsupported(format!("metadata filters accept only `=` or `LIKE` comparisons joined with `AND`; {}", shapes(dialect))));
             };
-            if *op != BinaryOperator::Equal {
-                return Err(unsupported(format!(
-                    "metadata filters accept only `=`, found `{}`; {}",
-                    expression_text(conjunct),
-                    shapes(dialect)
-                )));
-            }
+            let like = match op {
+                BinaryOperator::Equal => false,
+                BinaryOperator::Like => true,
+                _ => {
+                    return Err(unsupported(format!(
+                        "metadata filters accept only `=` or `LIKE`, found `{}`; {}",
+                        expression_text(conjunct),
+                        shapes(dialect)
+                    )));
+                }
+            };
             let Expression::Identifier(identifier) = left.as_ref()
             else {
                 return Err(unsupported(format!("metadata filter left side must be a column; {}", shapes(dialect))));
             };
             let (id, _) = resolve_identifier(&identifier.name, view, alias, dialect)?;
-            let value = filter_value(right, dialect)?;
+            let value = if like {
+                match right.as_ref() {
+                    Expression::Literal(Literal::String(value, _)) => FilterValue::Pattern(value.to_string()),
+                    _ => {
+                        return Err(unsupported(format!(
+                            "`LIKE` accepts only a string literal pattern; {}",
+                            shapes(dialect)
+                        )));
+                    }
+                }
+            }
+            else {
+                filter_value(right, dialect)?
+            };
             filters.push((id, value));
         }
     }
@@ -1465,4 +1532,67 @@ fn split_sql_type(sql_type: &str) -> (&str, Option<&str>) {
     let close = sql_type.rfind(')').unwrap_or(sql_type.len());
     let parameters = if open + 1 < close { Some(&sql_type[open + 1..close]) } else { None };
     (sql_type[..open].trim_end(), parameters)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analyzed(sql: &str, dialect: SqlDialect) -> MetaQuery {
+        match analyze_meta_query(sql, dialect) {
+            Ok(Some(query)) => query,
+            Ok(None) => panic!("expected a metadata query: {sql}"),
+            Err(error) => panic!("expected the shape to be supported: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn count_star_metadata_query_returns_one_row() {
+        let registry = SqlSchemaRegistry::new_in_memory();
+        let cases = [
+            ("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()", SqlDialect::Mysql),
+            ("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'", SqlDialect::Postgres),
+        ];
+        for (sql, dialect) in cases {
+            let result = analyzed(sql, dialect).execute(&registry, "app");
+            assert_eq!(result.columns.len(), 1);
+            assert_eq!(result.columns, vec!["COUNT(*)".to_string()]);
+            assert_eq!(result.rows, vec![vec![SqlValue::Integer(0)]]);
+        }
+    }
+
+    #[test]
+    fn like_order_and_paging_are_supported() {
+        let registry = SqlSchemaRegistry::new_in_memory();
+        let cases = [
+            (
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'user%' ORDER BY TABLE_NAME LIMIT 10 OFFSET 2",
+                SqlDialect::Mysql,
+            ),
+            (
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'user%' ORDER BY table_name LIMIT 10 OFFSET 2",
+                SqlDialect::Postgres,
+            ),
+        ];
+        for (sql, dialect) in cases {
+            let result = analyzed(sql, dialect).execute(&registry, "app");
+            assert_eq!(result.columns.len(), 1);
+            assert!(result.rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn unsafe_metadata_shapes_stay_unsupported() {
+        let cases = [
+            ("SELECT COUNT(*) + 1 FROM information_schema.TABLES", SqlDialect::Mysql),
+            ("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_NAME LIKE TABLE_SCHEMA", SqlDialect::Postgres),
+        ];
+        for (sql, dialect) in cases {
+            let error = match analyze_meta_query(sql, dialect) {
+                Err(error) => error,
+                Ok(_) => panic!("expected the shape to be rejected: {sql}"),
+            };
+            assert_eq!(error.kind, crate::sql::SqlErrorKind::Unsupported);
+        }
+    }
 }

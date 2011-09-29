@@ -2,3 +2,4 @@
 
 mod crc32c;
 mod leaf_roundtrip;
+mod yykv;

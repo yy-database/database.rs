@@ -17,11 +17,11 @@ use database_execution::{
     sql_exec::execute_plan,
 };
 use database_query::{
-    DiscardTarget, PG_SERVER_VERSION, SqlBoundExpression, SqlBoundLiteral, SqlCatalog, SqlCatalogBoundStatement, SqlColumn, SqlDialect,
+    DiscardTarget, SqlBoundExpression, SqlBoundLiteral, SqlCatalog, SqlCatalogBoundStatement, SqlColumn, SqlDialect,
     SqlErrorKind, SqlExecutionPlan, SqlFieldType, SqlFrontendError, SqlParameterStyle, SqlSchemaRegistry, SqlSessionCommand,
     SqlTransactionAction, SqlValue, analyze_meta_query, apply_auto_increment, bind_sql_catalog, describe_bound_insert, describe_plan,
-    detect_session_reset_statement, encode_hex, neutralized_sql_parameters, parse_ddl, parse_session_command, plan_statement_for_dialect,
-    split_sql_batch, substitute_sql_parameters,
+    detect_session_reset_statement, encode_hex, neutralized_sql_parameters, parse_ddl, parse_session_command, pg_server_version,
+    plan_statement_for_dialect, split_sql_batch, substitute_sql_parameters,
 };
 
 /// PostgreSQL type OIDs supported by the gateway.
@@ -110,7 +110,7 @@ fn serve_session(mut stream: impl Read + Write, runtime: Option<Arc<PgsqlSqlRunt
     session.database = parameters.database().to_string();
 
     send_authentication_ok(&mut stream)?;
-    send_parameter(&mut stream, "server_version", PG_SERVER_VERSION)?;
+    send_parameter(&mut stream, "server_version", pg_server_version())?;
     send_parameter(&mut stream, "server_encoding", "UTF8")?;
     send_parameter(&mut stream, "client_encoding", "UTF8")?;
     send_parameter(&mut stream, "DateStyle", "ISO, MDY")?;
@@ -1783,7 +1783,6 @@ const PG_PARAMETERS: &[(&str, &str)] = &[
     ("integer_datetimes", "on"),
     ("intervalstyle", "postgres"),
     ("server_encoding", "UTF8"),
-    ("server_version", PG_SERVER_VERSION),
     ("search_path", DEFAULT_SEARCH_PATH),
     ("standard_conforming_strings", "on"),
     ("timezone", "UTC"),
@@ -1795,6 +1794,9 @@ const PG_PARAMETERS: &[(&str, &str)] = &[
 /// Case-insensitive lookup in [`PG_PARAMETERS`].
 fn pg_parameter(name: &str) -> Option<&'static str> {
     let needle = name.trim().to_ascii_lowercase();
+    if needle == "server_version" {
+        return Some(pg_server_version());
+    }
     PG_PARAMETERS.iter().find(|(key, _)| *key == needle).map(|(_, value)| *value)
 }
 

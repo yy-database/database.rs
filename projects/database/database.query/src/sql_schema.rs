@@ -455,6 +455,7 @@ fn catalog_from_state(state: &RegistryState) -> SqlCatalog {
                         field_type: field.field_type.clone(),
                         vos_type_name: None,
                         capacity: field.capacity,
+                        default: field.default.clone(),
                     })
                     .collect(),
                 unique_constraints,
@@ -982,5 +983,27 @@ impl SchemaDocument {
         };
         validate_state(&state)?;
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::SqlDialect;
+
+    fn apply(registry: &SqlSchemaRegistry, sql: &str) {
+        let statement = crate::sql_ddl::parse_ddl(sql, SqlDialect::Postgres).expect("parse").expect("DDL statement");
+        registry.apply_ddl(&statement).expect("apply DDL");
+    }
+
+    #[test]
+    fn added_column_default_reaches_the_catalog() {
+        let registry = SqlSchemaRegistry::new_in_memory();
+        apply(&registry, "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(32))");
+        apply(&registry, "ALTER TABLE users ADD COLUMN status VARCHAR(8) DEFAULT 'active'");
+        let catalog = registry.catalog();
+        let table = catalog.tables().iter().find(|table| table.name == "users").expect("users table");
+        let field = table.fields.iter().find(|field| field.name == "status").expect("status column");
+        assert_eq!(field.default.as_deref(), Some("'active'"));
     }
 }

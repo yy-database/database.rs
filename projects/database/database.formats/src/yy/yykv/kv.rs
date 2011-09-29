@@ -26,7 +26,17 @@ pub struct Snapshot {
 }
 
 /// Encode an in-memory record map to `.yykv` bytes.
+///
+/// `next_revision` is the next revision to allocate, following the PostgreSQL
+/// shard contract: an empty shard starts at `1`, allocated revisions are
+/// strictly below it, and the writer bumps it after every allocation.
 pub fn encode_snapshot(records: &BTreeMap<Key, Record>, next_revision: u64) -> Result<Vec<u8>> {
+    if next_revision == 0 {
+        return Err(Error::Unsupported("yykv next_revision must be at least 1"));
+    }
+    if records.values().any(|record| record.revision == 0 || record.revision >= next_revision) {
+        return Err(Error::Unsupported("yykv revision must be below next_revision"));
+    }
     let mut body = Vec::new();
     body.write_all(&next_revision.to_le_bytes())?;
     write_count(&mut body, records.len())?;
@@ -72,10 +82,11 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
         return Err(Error::Corrupt("yykv checksum mismatch"));
     }
     let mut cursor = Cursor::new(body);
-    let next_revision = read_u64(&mut cursor)?;
+    let mut next_revision = read_u64(&mut cursor)?;
     let count = read_u32(&mut cursor)? as usize;
     let mut records = BTreeMap::new();
     let mut revisions = HashSet::with_capacity(count);
+    let mut legacy_revision = false;
     for _ in 0..count {
         let namespace = String::from_utf8(read_bytes(&mut cursor)?).map_err(|_| Error::Corrupt("shard namespace utf8"))?;
         let key = read_bytes(&mut cursor)?;
@@ -83,6 +94,10 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
         if revision == 0 || revision > next_revision || !revisions.insert(revision) {
             return Err(Error::Corrupt("invalid shard revision"));
         }
+        // Shards written before the PostgreSQL contract used
+        // `next_revision` as the last allocated revision, so its newest
+        // record can match it. Normalize that on read.
+        legacy_revision |= revision == next_revision;
         let encoded_expiry = read_u64(&mut cursor)?;
         let expires_at = (encoded_expiry != 0).then_some(encoded_expiry as i64);
         let value = match read_u8(&mut cursor)? {
@@ -99,6 +114,13 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
     }
     if cursor.position() != body.len() as u64 {
         return Err(Error::Corrupt("trailing shard bytes"));
+    }
+    if next_revision == 0 {
+        // Legacy empty shard: the next allocation was stored as `0`.
+        next_revision = 1;
+    } else if legacy_revision {
+        next_revision =
+            next_revision.checked_add(1).ok_or(Error::Corrupt("legacy shard revision space exhausted"))?;
     }
     Ok(Snapshot { next_revision, records })
 }
@@ -160,4 +182,51 @@ fn read_exact(cursor: &mut Cursor<&[u8]>, bytes: &mut [u8]) -> Result<()> {
     cursor.read_exact(bytes).map_err(|error| {
         if error.kind() == std::io::ErrorKind::UnexpectedEof { Error::Corrupt("unexpected shard eof") } else { Error::Io(error) }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wrap(body: Vec<u8>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&checksum(&body).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    fn legacy_body(next_revision: u64, revision: Option<u64>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&next_revision.to_le_bytes());
+        write_count(&mut body, usize::from(revision.is_some())).expect("count");
+        if let Some(revision) = revision {
+            let key = Key::new("ns", b"k".to_vec());
+            write_bytes(&mut body, key.namespace.0.as_bytes()).expect("namespace");
+            write_bytes(&mut body, &key.bytes).expect("key");
+            body.extend_from_slice(&revision.to_le_bytes());
+            body.extend_from_slice(&0_u64.to_le_bytes());
+            body.push(0);
+            write_bytes(&mut body, b"v").expect("value");
+        }
+        body
+    }
+
+    #[test]
+    fn legacy_empty_shard_zero_becomes_one() {
+        let snapshot = decode_snapshot(&wrap(legacy_body(0, None))).expect("decode");
+        assert_eq!(snapshot.next_revision, 1);
+    }
+
+    #[test]
+    fn legacy_last_allocated_revision_is_bumped() {
+        let snapshot = decode_snapshot(&wrap(legacy_body(1, Some(1)))).expect("decode");
+        assert_eq!(snapshot.next_revision, 2);
+    }
+
+    #[test]
+    fn new_format_next_revision_is_kept() {
+        let snapshot = decode_snapshot(&wrap(legacy_body(2, Some(1)))).expect("decode");
+        assert_eq!(snapshot.next_revision, 2);
+    }
 }

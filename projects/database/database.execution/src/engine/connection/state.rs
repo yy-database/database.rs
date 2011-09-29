@@ -96,6 +96,7 @@ impl Connection {
                 // whole-state scan does not expose are skipped here too, so the
                 // walk is widened until `limit` records remain.
                 let mut want = limit.saturating_add(1);
+                let whole_table = prefix.is_empty();
                 loop {
                     let mut rows =
                         database.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).scan_records(&start, end.as_deref(), want)?;
@@ -104,6 +105,7 @@ impl Connection {
                         key.starts_with(prefix)
                             && after.is_none_or(|cursor| key.as_str() > cursor)
                             && !(self.is_single_file_yydb() && key.starts_with(EMBEDDED_OBJECT_PREFIX))
+                            && !(whole_table && ttl::is_reserved_key(key))
                     });
                     if rows.len() >= limit || fetched < want {
                         rows.truncate(limit);
@@ -114,11 +116,13 @@ impl Connection {
             }
             Backend::Memory { .. } => {
                 let state = self.active_state_unlocked()?;
+                let whole_table = prefix.is_empty();
                 Ok(state
                     .records
                     .range(prefix.to_owned()..)
                     .take_while(|(key, _)| key.starts_with(prefix))
                     .filter(|(key, _)| after.is_none_or(|cursor| key.as_str() > cursor))
+                    .filter(|(key, _)| !(whole_table && ttl::is_reserved_key(key)))
                     .take(limit)
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect())

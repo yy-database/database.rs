@@ -126,11 +126,13 @@ impl Connection {
             return self.read_prefix_unlocked(prefix, after, limit);
         }
         let state = self.active_state_unlocked()?;
+        let whole_table = prefix.is_empty();
         Ok(state
             .records
             .range(prefix.to_owned()..)
             .take_while(|(key, _)| key.starts_with(prefix))
             .filter(|(key, _)| after.is_none_or(|cursor| key.as_str() > cursor))
+            .filter(|(key, _)| !(whole_table && crate::engine::kv::retention::is_reserved_key(key)))
             .take(limit)
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect())

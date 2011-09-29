@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use database_execution::database_execution::engine::Connection;
+use database_execution::engine::Connection;
 
 const USER_SCHEMA: &str = "table User { @@id: i64, name: utf8 }";
 

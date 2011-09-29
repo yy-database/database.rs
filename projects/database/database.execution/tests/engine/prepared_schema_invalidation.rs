@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use database_execution::database_execution::engine::{Connection, catalog::RenameMap};
+use database_execution::engine::{Connection, catalog::RenameMap};
 
 const INITIAL_SCHEMA: &str = "table User { @@id: i64, name: utf8, active: bool }";
 const MIGRATED_SCHEMA: &str = "table User { @@id: i64, name: utf8, active: bool, status: bool }";

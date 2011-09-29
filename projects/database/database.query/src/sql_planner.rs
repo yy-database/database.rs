@@ -49,6 +49,31 @@ pub fn plan_statement_for_dialect(
     }
 }
 
+/// Parse the raw `DEFAULT` literal text stored by the DDL parser into a constant
+/// value. Non-constant defaults such as `CURRENT_TIMESTAMP` return `None`.
+fn parse_default_value(text: &str) -> Option<DefaultValue> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.eq_ignore_ascii_case("null") {
+        return Some(DefaultValue::Null);
+    }
+    if text.eq_ignore_ascii_case("true") {
+        return Some(DefaultValue::Boolean(true));
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(DefaultValue::Boolean(false));
+    }
+    if let Some(inner) = text.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
+        return Some(DefaultValue::String(inner.to_owned()));
+    }
+    if let Ok(value) = text.parse::<i64>() {
+        return Some(DefaultValue::Integer(value));
+    }
+    text.parse::<f64>().ok().map(|value| DefaultValue::NumberBits(value.to_bits()))
+}
+
 /// 计划一个 SELECT（PostgreSQL 排序规则）。
 pub fn plan_select(select: SqlCatalogBoundSelect, catalog: &SqlCatalog) -> Result<SqlExecutionPlan, SqlFrontendError> {
     plan_select_for_dialect(select, catalog, SqlDialect::Postgres)
@@ -152,6 +177,14 @@ pub fn plan_select_for_dialect(
     // 先从 catalog table 收集 row_id → SqlFieldType 映射。
     let field_types: std::collections::BTreeMap<u64, crate::catalog_bind::SqlFieldType> =
         table.fields.iter().map(|f| (source.row_id(f.field_id), f.field_type.clone())).collect();
+    // Rows written before `ALTER TABLE ... ADD COLUMN ... DEFAULT` are shorter
+    // than the current catalog, so the read path fills those columns from the
+    // declared default instead of reporting NULL.
+    let field_defaults: std::collections::BTreeMap<u64, DefaultValue> = table
+        .fields
+        .iter()
+        .filter_map(|field| field.default.as_deref().and_then(parse_default_value).map(|value| (source.row_id(field.field_id), value)))
+        .collect();
 
     if let Some(lit) = pk_equality {
         // 窗口函数需要看到分区里的其余行，单点读无法求值，必须退回扫描。
@@ -167,6 +200,7 @@ pub fn plan_select_for_dialect(
                 // 会跳过这唯一一行，因此也必须在单点读这一层就抑制。
                 suppress_rows: limit == Some(0) || offset.is_some_and(|value| value > 0),
                 field_types: field_types.clone(),
+                field_defaults,
             }));
         }
     }
@@ -205,6 +239,7 @@ pub fn plan_select_for_dialect(
         has_window,
         distinct: select.distinct,
         field_types,
+        field_defaults,
     }))
 }
 
@@ -436,10 +471,20 @@ fn plan_join_select(
 
     // 3. 每个来源只解码自己表的字段。
     let mut field_types: std::collections::BTreeMap<u64, crate::catalog_bind::SqlFieldType> = std::collections::BTreeMap::new();
-    let base = join_source_plan(base, None, crate::sql::SqlBoundJoinKind::Inner, catalog, &needed, &mut field_types)?;
+    let mut field_defaults: std::collections::BTreeMap<u64, DefaultValue> = std::collections::BTreeMap::new();
+    let base =
+        join_source_plan(base, None, crate::sql::SqlBoundJoinKind::Inner, catalog, &needed, &mut field_types, &mut field_defaults)?;
     let mut join_sources = Vec::with_capacity(joins.len());
     for join in joins {
-        join_sources.push(join_source_plan(join.table, Some(join.on), join.kind, catalog, &needed, &mut field_types)?);
+        join_sources.push(join_source_plan(
+            join.table,
+            Some(join.on),
+            join.kind,
+            catalog,
+            &needed,
+            &mut field_types,
+            &mut field_defaults,
+        )?);
     }
 
     Ok(SqlExecutionPlan::Join(JoinPlan {
@@ -455,6 +500,7 @@ fn plan_join_select(
         suppress_rows: limit == Some(0),
         distinct,
         field_types,
+        field_defaults,
     }))
 }
 
@@ -469,6 +515,7 @@ fn join_source_plan(
     catalog: &SqlCatalog,
     needed: &[u64],
     field_types: &mut std::collections::BTreeMap<u64, crate::catalog_bind::SqlFieldType>,
+    field_defaults: &mut std::collections::BTreeMap<u64, DefaultValue>,
 ) -> Result<JoinSourcePlan, SqlFrontendError> {
     let catalog_table = find_table(catalog, table.type_id)?;
     let mut needed_field_ids = Vec::new();
@@ -476,6 +523,9 @@ fn join_source_plan(
     for field in &catalog_table.fields {
         let row_id = table.row_id(field.field_id);
         field_types.insert(row_id, field.field_type.clone());
+        if let Some(value) = field.default.as_deref().and_then(parse_default_value) {
+            field_defaults.insert(row_id, value);
+        }
         if needed.contains(&row_id) {
             needed_field_ids.push(field.field_id);
             row_ids.push(row_id);
@@ -995,6 +1045,35 @@ fn literal_from_expression(expr: &SqlCatalogBoundExpression) -> Result<SqlBoundL
     }
 }
 
+/// Constant column default carried in a plan. `f64` cannot derive `Eq`, so
+/// floating-point defaults keep their bit pattern until execution converts them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultValue {
+    /// SQL `NULL`.
+    Null,
+    /// Integer literal.
+    Integer(i64),
+    /// Floating-point literal kept as its bit pattern so the enum can derive `Eq`.
+    NumberBits(u64),
+    /// String literal, outer quotes already removed.
+    String(String),
+    /// Boolean literal.
+    Boolean(bool),
+}
+
+impl DefaultValue {
+    /// Materializes the default as an execution value.
+    pub fn to_sql_value(&self) -> SqlValue {
+        match self {
+            DefaultValue::Null => SqlValue::Null,
+            DefaultValue::Integer(value) => SqlValue::Integer(*value),
+            DefaultValue::NumberBits(bits) => SqlValue::Number(f64::from_bits(*bits)),
+            DefaultValue::String(value) => SqlValue::String(value.clone()),
+            DefaultValue::Boolean(value) => SqlValue::Boolean(*value),
+        }
+    }
+}
+
 /// 已计划好的 SQL 操作，可以直接翻译为 KeyValueCommand 或 Scan。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlExecutionPlan {
@@ -1041,6 +1120,8 @@ pub struct ReadPlan {
     pub suppress_rows: bool,
     /// field_id → SqlFieldType 映射，execute 层 decode_row 用。
     pub field_types: std::collections::BTreeMap<u64, crate::catalog_bind::SqlFieldType>,
+    /// row_id → declared default for columns absent from the stored row.
+    pub field_defaults: std::collections::BTreeMap<u64, DefaultValue>,
 }
 
 /// SELECT 多行扫描执行计划。
@@ -1087,6 +1168,8 @@ pub struct ScanPlan {
     pub suppress_rows: bool,
     /// field_id → SqlFieldType 映射，execute 层 decode_row 用。
     pub field_types: std::collections::BTreeMap<u64, crate::catalog_bind::SqlFieldType>,
+    /// row_id → declared default for columns absent from the stored row.
+    pub field_defaults: std::collections::BTreeMap<u64, DefaultValue>,
 }
 
 /// SELECT 多表内连接执行计划（嵌套循环合并）。
@@ -1116,6 +1199,8 @@ pub struct JoinPlan {
     pub distinct: bool,
     /// field_id → SqlFieldType 映射，execute 层 decode_row / 求值用。
     pub field_types: std::collections::BTreeMap<u64, crate::catalog_bind::SqlFieldType>,
+    /// row_id → declared default for columns absent from the stored row.
+    pub field_defaults: std::collections::BTreeMap<u64, DefaultValue>,
 }
 
 /// JOIN 的一个数据来源。
@@ -1955,4 +2040,19 @@ fn planner_error(message: &str) -> SqlFrontendError {
 /// 分组语义错误有独立的 SQLSTATE：PostgreSQL `42803`、MySQL `1055`。
 fn grouping_error(message: &str) -> SqlFrontendError {
     SqlFrontendError::new(SqlErrorKind::InvalidGrouping, message)
+}
+
+#[cfg(test)]
+mod default_value_tests {
+    use super::{DefaultValue, parse_default_value};
+
+    #[test]
+    fn parses_constant_default_literals() {
+        assert_eq!(parse_default_value("42"), Some(DefaultValue::Integer(42)));
+        assert_eq!(parse_default_value("'x'"), Some(DefaultValue::String("x".to_owned())));
+        assert_eq!(parse_default_value("NULL"), Some(DefaultValue::Null));
+        assert_eq!(parse_default_value("TRUE"), Some(DefaultValue::Boolean(true)));
+        assert_eq!(parse_default_value("1.5"), Some(DefaultValue::NumberBits(1.5_f64.to_bits())));
+        assert_eq!(parse_default_value("CURRENT_TIMESTAMP"), None);
+    }
 }
