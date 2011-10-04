@@ -1,6 +1,7 @@
 use std::{error, fmt, io, result};
 
 use crate::cluster::fencing::{FenceToken, OwnerEntry};
+use crate::ReasonCode;
 
 /// 分布式 API 通用结果别名。
 pub type Result<T> = result::Result<T, Error>;
@@ -12,6 +13,18 @@ pub enum Error {
     Io(io::Error),
     /// 分片或目录字节与期望布局不符。
     Corrupt(&'static str),
+    /// 分片或目录字节与期望布局不符，并带机器可读原因。
+    CorruptReason {
+        /// 机器可读的失败类别。
+        reason: ReasonCode,
+        /// 人类可读的细节。
+        message: &'static str,
+    },
+    /// 分片标识不是合法单段名称。
+    InvalidShardId {
+        /// 被拒绝的原始取值。
+        value: String,
+    },
     /// 分片中不存在请求的键。
     NotFound {
         /// 缺失的键。
@@ -63,11 +76,23 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// 该错误携带的机器可读损坏原因。
+    pub fn reason(&self) -> Option<ReasonCode> {
+        match self {
+            Self::CorruptReason { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::Corrupt(reason) => write!(f, "corrupt cluster data: {reason}"),
+            Self::CorruptReason { reason, message } => write!(f, "corrupt cluster data ({reason}): {message}"),
+            Self::InvalidShardId { value } => write!(f, "invalid shard id: {value:?}"),
             Self::NotFound { key } => write!(f, "key not found: {key}"),
             Self::SchemaConflict { expected, found } => {
                 write!(f, "catalog schema version conflict: expected {expected}, found {found}")

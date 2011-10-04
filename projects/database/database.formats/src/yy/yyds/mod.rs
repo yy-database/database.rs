@@ -3,7 +3,9 @@
 mod catalog;
 mod replication;
 
-pub use catalog::{MAGIC as CATALOG_MAGIC, decode as decode_catalog, encode as encode_catalog};
+pub use catalog::{
+    MAGIC as CATALOG_MAGIC, decode as decode_catalog, decode_catalog_shard_id, encode as encode_catalog,
+};
 pub use replication::{
     APPEND as REPLICATION_APPEND, COMMIT as REPLICATION_COMMIT, FRAME_HEADER as REPLICATION_FRAME_HEADER,
     FRAME_TRAILER as REPLICATION_FRAME_TRAILER, MAGIC as REPLICATION_MAGIC, checksum as replication_checksum,

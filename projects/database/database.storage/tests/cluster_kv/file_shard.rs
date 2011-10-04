@@ -272,3 +272,32 @@ fn file_shard_budgeted_sweep_persists_partial_progress() {
     assert_eq!(reopened.sweep_expired(now, None).unwrap(), database_types::cluster::SweepReport::default());
     cleanup(&path);
 }
+
+#[test]
+fn file_shard_namespaces_len_and_flush_persist() {
+    let path = temp_path("namespaces");
+    let mut shard = FileShard::open(&path).expect("open");
+    shard.put(Key::new("a", b"1"), StoredValue::Inline(InlineValue(b"v1".to_vec()))).unwrap();
+    shard.put(Key::new("a", b"2"), StoredValue::Inline(InlineValue(b"v2".to_vec()))).unwrap();
+    shard.put(Key::new("b", b"1"), StoredValue::Inline(InlineValue(b"v3".to_vec()))).unwrap();
+
+    assert_eq!(shard.namespaces().unwrap(), vec![Namespace("a".into()), Namespace("b".into())]);
+    assert_eq!(shard.len(&Namespace("a".into())).unwrap(), 2);
+    assert_eq!(KvStore::flush(&mut shard, &Namespace("a".into())).unwrap(), 2);
+    assert_eq!(shard.len(&Namespace("a".into())).unwrap(), 0);
+    drop(shard);
+
+    let reopened = FileShard::open(&path).expect("reopen after flush");
+    assert_eq!(reopened.len(&Namespace("a".into())).unwrap(), 0);
+    assert_eq!(reopened.len(&Namespace("b".into())).unwrap(), 1);
+    assert_eq!(reopened.namespaces().unwrap(), vec![Namespace("b".into())]);
+    cleanup(&path);
+}
+
+#[test]
+fn open_existing_does_not_create_a_missing_shard() {
+    let path = temp_path("missing");
+    assert!(matches!(FileShard::open_existing(&path), Err(database_types::cluster::Error::NotFound { .. })));
+    assert!(!path.exists(), "a read-only open must not install a shard");
+}
+
