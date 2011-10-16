@@ -1,6 +1,6 @@
 //! Value wire shapes reject illegal vector and file descriptors and preserve literal precision.
 
-use odm_types::odm_types::{FileDescriptor, FileManifestRef, Value, VectorValue};
+use odm_types::{FileDescriptor, FileManifestRef, Value, VectorValue};
 
 fn valid_digest(seed: u8) -> String {
     let mut text = String::with_capacity(64);
