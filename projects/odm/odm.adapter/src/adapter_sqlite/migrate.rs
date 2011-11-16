@@ -8,7 +8,9 @@ use std::{
 use odm_types::{LogicalChange, LogicalMigrationPlan, ObservedCatalog};
 use vos::{CanonicalType, FieldContract, SchemaProjection, TypeContract, TypeContractKind};
 
-use crate::{Error, Result, provider::RusqliteProvider};
+use crate::{Error, Result};
+
+use super::provider::RusqliteProvider;
 
 /// Report after applying a managed push.
 #[derive(Debug, Clone, PartialEq, Eq)]

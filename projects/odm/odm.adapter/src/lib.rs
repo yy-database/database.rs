@@ -4,6 +4,9 @@
 
 #![deny(missing_docs)]
 
+mod error;
+pub use error::{Error, Result};
+
 pub mod adapter_mysql;
 pub mod adapter_postgres;
 pub mod adapter_redis;

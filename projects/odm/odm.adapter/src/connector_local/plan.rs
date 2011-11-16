@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use database_query::ir::{CmpOp, LiteralKind, PhysicalOp, PhysicalPlan, Pred, StringMatchOp};
 use odm_types::{RowWrite, Value};
 
-use crate::{Error, Result};
+use super::{Error, Result};
 
 /// A rendered VOS program with its host-bound typed parameters.
 pub(crate) struct Rendered {

@@ -1,6 +1,6 @@
 //! Error mapping for the YYDB connector.
 
-use crate::ReadinessReport;
+use super::ReadinessReport;
 
 /// Connector errors.
 #[derive(Debug)]

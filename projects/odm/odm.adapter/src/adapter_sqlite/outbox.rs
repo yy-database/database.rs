@@ -5,8 +5,10 @@
 use database_query::ir::{CommitToken, DEFAULT_COMMIT_SHARD, OutboxAppend, OutboxEffect, OutboxRecord};
 use odm_types::{RowWrite, Value};
 
-use crate::{
-    Error, Result, execute,
+use crate::{Error, Result};
+
+use super::{
+    execute,
     provider::{RusqliteProvider, SqliteValue},
 };
 

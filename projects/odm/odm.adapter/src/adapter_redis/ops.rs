@@ -2,10 +2,9 @@
 
 use database_client::redis::Client;
 
-use crate::{
-    Error, Result,
-    mapping::{KeyEncoding, KeyspaceMapping},
-};
+use crate::{Error, Result};
+
+use super::mapping::{KeyEncoding, KeyspaceMapping};
 
 pub(crate) fn get_primary(conn: &mut Client, map: &KeyspaceMapping, primary_key: &str) -> Result<Option<String>> {
     let key = map.redis_key(primary_key);

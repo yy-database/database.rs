@@ -3,7 +3,9 @@
 use odm_types::{DriftReport, FieldMapping, MappingManifest, MappingQuality, ObservedCatalog, ObservedColumn, ObservedTable, TableMapping};
 use vos::{CanonicalType, CanonicalTypeArgument, SchemaProjection, TypeContract, TypeContractKind};
 
-use crate::{ADAPTER_VERSION, BACKEND_ID, Result, outbox, provider::RusqliteProvider};
+use crate::Result;
+
+use super::{ADAPTER_VERSION, BACKEND_ID, outbox, provider::RusqliteProvider};
 
 pub(crate) fn inspect_catalog(provider: &RusqliteProvider) -> Result<ObservedCatalog> {
     let snapshot = provider.inspect_catalog()?;

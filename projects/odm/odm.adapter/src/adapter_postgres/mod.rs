@@ -13,6 +13,8 @@ mod outbox;
 
 use std::{sync::Mutex, time::Duration};
 
+use crate::{Error, Result};
+
 pub use database_client::pgsql::Session;
 use database_query::ir::{CommitToken, IrVersion, OutboxRecord, PhysicalPlan};
 use odm_types::{CapabilitySet, DriftReport, LogicalMigrationPlan, MappingManifest, ObservedCatalog, QueryCaps, Row, RowWrite, WriteCaps};
@@ -223,41 +225,3 @@ impl Drop for PostgresTransaction {
 fn parse_vos(vos_schema: &str) -> Result<vos::SchemaProjection> {
     odm_types::parse_schema(vos_schema).map_err(|message| Error::Vos(format!("parse schema: {message}")))
 }
-
-/// Adapter errors.
-#[derive(Debug)]
-pub enum Error {
-    /// Connection / URL parse failure.
-    Config(String),
-    /// YYDS PostgreSQL wire client failure.
-    Wire(yyds_types::Error),
-    /// Historical alias kept for call sites that matched pool errors.
-    Pool(String),
-    /// VOS schema parse / semantic issues.
-    Vos(String),
-    /// Policy / adopt blocker / destructive without review.
-    Policy(String),
-    /// Capability not available until wire client SQL lands.
-    Unsupported(String),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Config(s) | Self::Pool(s) | Self::Vos(s) | Self::Policy(s) | Self::Unsupported(s) => write!(f, "{s}"),
-            Self::Wire(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Wire(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-/// Result alias.
-pub type Result<T> = std::result::Result<T, Error>;

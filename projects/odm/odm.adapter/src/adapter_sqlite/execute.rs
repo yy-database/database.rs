@@ -3,8 +3,9 @@
 use database_query::ir::{CmpOp, PhysicalOp, PhysicalPlan, Pred, ProjectField, StringMatchOp, WriteField};
 use odm_types::{Row, RowWrite, TypedColumn, TypedLogicalPlan, Value};
 
-use crate::{
-    Result,
+use crate::{Error, Result};
+
+use super::{
     provider::{RusqliteProvider, SqliteValue, StatementResult},
     types::{from_sql_value, from_sql_value_typed, literal_to_sql_value, to_sql_value},
 };
@@ -23,7 +24,7 @@ pub(crate) fn execute_typed_plan(provider: &RusqliteProvider, plan: &TypedLogica
         .iter()
         .any(|node| matches!(node.op, PhysicalOp::Insert { .. } | PhysicalOp::Patch { .. } | PhysicalOp::Delete { .. }))
     {
-        return Err(crate::Error::Policy("typed logical plan must be a read plan".into()));
+        return Err(Error::Policy("typed logical plan must be a read plan".into()));
     }
     execute_read_plan_with(provider, &plan.physical, Some(&plan.result_columns))
 }
@@ -62,12 +63,12 @@ fn execute_read_plan_with(provider: &RusqliteProvider, plan: &PhysicalPlan, expe
             PhysicalOp::Take { count } => limit = Some(*count),
             PhysicalOp::Collect => {}
             PhysicalOp::Insert { .. } | PhysicalOp::Patch { .. } | PhysicalOp::Delete { .. } => {
-                return Err(crate::Error::Policy("write op in read plan".into()));
+                return Err(Error::Policy("write op in read plan".into()));
             }
         }
     }
 
-    let table = table.ok_or_else(|| crate::Error::Policy("plan missing Scan".into()))?;
+    let table = table.ok_or_else(|| Error::Policy("plan missing Scan".into()))?;
     let select = projection.map(|p| p.join(", ")).unwrap_or_else(|| "*".into());
     let mut sql = format!("SELECT {select} FROM \"{table}\"");
     if let Some(w) = &where_sql {
@@ -102,7 +103,7 @@ fn execute_write_plan(provider: &RusqliteProvider, plan: &PhysicalPlan) -> Resul
             PhysicalOp::Project { fields } => projection = Some(fields.clone()),
             PhysicalOp::Collect => {}
             other => {
-                return Err(crate::Error::Policy(format!("unexpected op in write plan: {other:?}")));
+                return Err(Error::Policy(format!("unexpected op in write plan: {other:?}")));
             }
         }
     }
@@ -153,7 +154,7 @@ fn statement_to_rows(result: &StatementResult, expected: Option<&[TypedColumn]>)
     if let Some(expected) = expected
         && (result.columns.len() != expected.len() || result.columns.iter().zip(expected).any(|(actual, expected)| actual != &expected.name))
     {
-        return Err(crate::Error::Policy(format!(
+        return Err(Error::Policy(format!(
             "typed result columns {:?} do not match plan columns {}",
             result.columns,
             expected.iter().map(|column| column.name.as_str()).collect::<Vec<_>>().join(", ")
@@ -224,7 +225,7 @@ pub(crate) fn insert_row(provider: &RusqliteProvider, write: &RowWrite) -> Resul
 }
 
 pub(crate) fn update_row(provider: &RusqliteProvider, write: &RowWrite) -> Result<usize> {
-    let key = write.fields.get(&write.primary_key).ok_or_else(|| crate::Error::Policy("update missing primary key value".into()))?;
+    let key = write.fields.get(&write.primary_key).ok_or_else(|| Error::Policy("update missing primary key value".into()))?;
     let sets: Vec<String> = write.fields.keys().filter(|k| *k != &write.primary_key).map(|k| format!("\"{k}\" = ?")).collect();
     if sets.is_empty() {
         return Ok(0);

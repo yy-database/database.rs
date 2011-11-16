@@ -4,7 +4,9 @@ use database_query::ir::LiteralKind;
 use odm_types::{Value, is_date, is_decimal, is_time, is_utc_datetime};
 use vos::types::{CanonicalScalar, ResolvedCanonicalType};
 
-use crate::{Error, Result, provider::SqliteValue};
+use crate::{Error, Result};
+
+use super::provider::SqliteValue;
 
 /// 将 Iris [`Value`] 绑定为 SQLite 线值。
 pub fn to_sql_value(value: &Value) -> Result<SqliteValue> {

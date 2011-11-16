@@ -4,7 +4,9 @@ use database_client::pgsql::{Cell, Session};
 use odm_types::{DriftReport, FieldMapping, MappingManifest, MappingQuality, ObservedCatalog, ObservedColumn, ObservedTable, TableMapping};
 use vos::{CanonicalType, CanonicalTypeArgument, SchemaProjection, TypeContract, TypeContractKind};
 
-use crate::{ADAPTER_VERSION, BACKEND_ID, Error, Result};
+use crate::{Error, Result};
+
+use super::{ADAPTER_VERSION, BACKEND_ID};
 
 pub(crate) fn inspect_catalog(session: &mut Session) -> Result<ObservedCatalog> {
     let result = session

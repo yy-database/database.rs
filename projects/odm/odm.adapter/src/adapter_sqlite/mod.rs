@@ -19,6 +19,8 @@ use std::{
     sync::Mutex,
 };
 
+use crate::{Error, Result};
+
 use database_query::ir::{CommitToken, IrVersion, OutboxRecord, PhysicalPlan};
 use odm_types::{
     CapabilitySet, DriftReport, LogicalMigrationPlan, MappingManifest, ObservedCatalog, QueryCaps, Row, RowWrite, TypedLogicalPlan, WriteCaps,
@@ -224,42 +226,9 @@ impl SqliteSource {
     }
 }
 
-/// Adapter errors.
-#[derive(Debug)]
-pub enum Error {
-    /// SQLite provider failure.
-    Sqlite(SqliteError),
-    /// I/O (journal files, directories).
-    Io(std::io::Error),
-    /// VOS schema parse / semantic issues.
-    Vos(String),
-    /// Policy / adopt blocker / destructive without review.
-    Policy(String),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Sqlite(e) => write!(f, "{e}"),
-            Self::Io(e) => write!(f, "{e}"),
-            Self::Vos(s) | Self::Policy(s) => write!(f, "{s}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Sqlite(e) => Some(e),
-            Self::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
 impl From<SqliteError> for Error {
     fn from(value: SqliteError) -> Self {
-        Self::Sqlite(value)
+        Self::Sqlite(value.to_string())
     }
 }
 
@@ -272,6 +241,3 @@ impl From<std::io::Error> for Error {
 fn parse_vos(vos_schema: &str) -> Result<vos::SchemaProjection> {
     odm_types::parse_schema(vos_schema).map_err(|message| Error::Vos(format!("parse schema: {message}")))
 }
-
-/// Result alias.
-pub type Result<T> = std::result::Result<T, Error>;
