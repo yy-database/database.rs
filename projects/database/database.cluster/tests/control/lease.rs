@@ -119,7 +119,7 @@ fn lease_child() {
 fn child(directory: &PathBuf) -> ChildGuard {
     let mut child = ChildGuard(
         Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "lease_child", "--nocapture"])
+            .args(["--exact", "lease::lease_child", "--nocapture"])
             .env("YYDS_LEASE_TEST_DIR", directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

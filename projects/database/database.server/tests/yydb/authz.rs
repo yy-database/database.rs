@@ -1,7 +1,7 @@
 //! End-to-end authorization tests — verify that dispatch gates honour
 //! Role → Permission mappings for wire frames.
 
-use database_execution::database_execution::engine::Connection;
+use database_execution::engine::Connection;
 use database_protocol_yy::{Frame, MessageType, encode_execute_prepared, encode_kv_get, encode_kv_put, encode_prepare, encode_schema_ensure};
 use database_server::yydb::{Principal, PrincipalKind, Role, Session, SessionState, dispatch};
 

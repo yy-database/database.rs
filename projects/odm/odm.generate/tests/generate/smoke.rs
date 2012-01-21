@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use odm_generate::odm_adapter::odm_types::{GenerationModel, IrisOperationArtifact, write_python_client, write_typescript_client};
+use odm_generate::{GenerationModel, IrisOperationArtifact, write_python_client, write_typescript_client};
 
 const USER_SCHEMA: &str = r#"
 table User {
@@ -91,7 +91,7 @@ fn python_emit_writes_client() {
 fn rust_emit_writes_domain() {
     let model = GenerationModel::from_vos_schema(USER_SCHEMA).expect("schema");
     let dir = scratch("rs");
-    let paths = odm_generate::odm_adapter::odm_types::generate(&model, "rust", &dir, Some("yydb")).expect("rust emit");
+    let paths = odm_generate::generate(&model, "rust", &dir, Some("yydb")).expect("rust emit");
     assert!(!paths.is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }

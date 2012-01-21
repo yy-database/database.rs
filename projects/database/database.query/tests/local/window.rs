@@ -631,7 +631,8 @@ fn window_unimplemented_functions_are_rejected() {
     for call in ["FIRST_VALUE(amount)", "LAST_VALUE(amount)"] {
         let sql = format!("SELECT {call} OVER (PARTITION BY region ORDER BY amount) AS w FROM Sale");
         let error = prepare_sql(&sql).expect_err("an unimplemented window function must be rejected");
-        assert!(format!("{error}").contains("is not supported by 本地引擎"), "unexpected function error: {error}");
+        let message = format!("{error}");
+        assert!(message.contains("is not supported by"), "unexpected function error: {message}");
     }
 }
 

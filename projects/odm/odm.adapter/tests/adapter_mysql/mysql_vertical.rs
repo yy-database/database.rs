@@ -5,10 +5,8 @@
 //! when the client returns `Unsupported`.
 
 use database_query::ir::RealizationClass;
-use odm_adapter::{
-    adapter_mysql::{BACKEND_ID, MysqlSource, adopt_plan, classify_type},
-    odm_types::{MappingQuality, ObservedCatalog, ObservedColumn, ObservedTable, Planner, RowWrite, Value},
-};
+use odm_adapter::adapter_mysql::{BACKEND_ID, MysqlSource, adopt_plan, classify_type};
+use odm_types::{MappingQuality, ObservedCatalog, ObservedColumn, ObservedTable, Planner, RowWrite, Value};
 use std::{collections::BTreeMap, sync::Mutex};
 
 /// Live MySQL tests share one database and mutate the same `User` table.
@@ -30,9 +28,9 @@ fn live_url() -> Option<String> {
     std::env::var("IRIS_TEST_MYSQL_URL").ok().filter(|s| !s.is_empty())
 }
 
-fn drop_user_table(db: &MysqlSource) -> odm_adapter::adapter_mysql::Result<()> {
+fn drop_user_table(db: &MysqlSource) -> odm_adapter::Result<()> {
     db.transaction(|conn| {
-        conn.execute("DROP TABLE IF EXISTS `User`").map_err(odm_adapter::adapter_mysql::Error::Wire)?;
+        conn.execute("DROP TABLE IF EXISTS `User`").map_err(odm_adapter::Error::Wire)?;
         Ok(())
     })
 }
@@ -43,10 +41,10 @@ fn adapter_is_not_sqlite_or_postgres() {
     assert_ne!(BACKEND_ID, "sqlite");
     assert_ne!(BACKEND_ID, "postgres");
     assert_ne!(BACKEND_ID, "yydb");
-    let manifest = include_str!("../Cargo.toml");
-    assert!(manifest.contains("yyds-gateway-mysql"));
+    let manifest = include_str!("../../Cargo.toml");
+    assert!(manifest.contains("database-client"));
     assert!(!manifest.contains("rusqlite"));
-    assert!(!manifest.contains("yyds-gateway-pgsql"));
+    assert!(!manifest.contains("mysql_async"));
 }
 
 #[test]
@@ -66,7 +64,7 @@ fn adopt_plan_blocks_missing_pk_without_live_db() {
             columns: vec![ObservedColumn { name: "name".into(), type_name: "text".into(), nullable: true, primary_key: false }],
         }],
     };
-    let doc = odm_adapter::odm_types::parse_schema(
+    let doc = odm_types::parse_schema(
         r#"
         table Legacy {
             @@id: utf8,
@@ -82,7 +80,8 @@ fn adopt_plan_blocks_missing_pk_without_live_db() {
 
 #[test]
 fn plan_push_emits_add_field_for_missing_columns() {
-    use odm_adapter::{adapter_mysql::plan_push, odm_types::LogicalChange};
+    use odm_adapter::adapter_mysql::plan_push;
+    use odm_types::LogicalChange;
 
     let catalog = ObservedCatalog {
         backend_id: BACKEND_ID.into(),
@@ -94,7 +93,7 @@ fn plan_push_emits_add_field_for_missing_columns() {
             ],
         }],
     };
-    let doc = odm_adapter::odm_types::parse_schema(
+    let doc = odm_types::parse_schema(
         r#"
         table Goods {
             @@sku_id: utf8,
@@ -277,9 +276,9 @@ fn live_same_connection_txn_visible_and_rolls_back_on_err() {
     let ghost_plan =
         Planner::new(MysqlSource::capabilities()).plan_source(&format!(r#"User.filter(x => x.user_id == "{ghost_id}").collect()"#)).unwrap();
     let err = db
-        .transaction(|conn| -> odm_adapter::adapter_mysql::Result<()> {
+        .transaction(|conn| -> odm_adapter::Result<()> {
             db.insert_on(conn, &ghost)?;
-            Err(odm_adapter::adapter_mysql::Error::Policy("force rollback".into()))
+            Err(odm_adapter::Error::Policy("force rollback".into()))
         })
         .expect_err("must roll back");
     assert!(err.to_string().contains("force rollback"));

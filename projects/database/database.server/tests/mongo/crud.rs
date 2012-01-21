@@ -5,18 +5,19 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{atomic::AtomicBool, Arc},
     thread,
     time::Duration,
 };
 
+use database_cluster::topology::ShardMap;
 use database_execution::cluster::LocalExecutor;
 use database_server::yyds::mongo::{
     connection::serve_cancellable_with_executor,
     wire::{self, FrameLimits},
 };
 use database_storage::cluster_kv::MemoryShard;
-use database_types::cluster::{ShardEpoch, ShardId, ShardMap};
+use database_types::cluster::{ShardEpoch, ShardId};
 
 fn executor_server() -> (TcpStream, thread::JoinHandle<()>) {
     let shard = ShardId("mongo-local".into());
