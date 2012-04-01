@@ -1076,18 +1076,30 @@ fn respond(
             stream.write_all(b"-ERR wrong number of arguments for 'getex' command\r\n")?;
             return Ok(true);
         }
-        // At most one expiry option, validated before anything is read so a
-        // malformed command changes no state. `Some(None)` is `PERSIST`.
-        let mut touch: Option<Option<i64>> = None;
+        /// One `GETEX` expiry option, kept unparsed until the key lookup decides whether
+        /// its numeric argument is even relevant.
+        #[derive(Clone, Copy)]
+        enum ExpirySpec<'a> {
+            Persist,
+            Seconds(&'a [u8]),
+            Milliseconds(&'a [u8]),
+            SecondsAt(&'a [u8]),
+            MillisecondsAt(&'a [u8]),
+        }
+        // Option structure (mutual exclusion and argument presence) is checked before the
+        // lookup because Redis reports syntax errors even for a missing key. The numeric
+        // value itself is checked after the lookup, so `GETEX missing EX not-a-number`
+        // returns nil instead of an expiry error, as upstream does.
+        let mut spec: Option<ExpirySpec<'_>> = None;
         let mut index = 2;
         while index < count {
             let option = request.arguments[index];
-            if touch.is_some() {
+            if spec.is_some() {
                 stream.write_all(b"-ERR syntax error\r\n")?;
                 return Ok(true);
             }
             if option.eq_ignore_ascii_case(b"PERSIST") {
-                touch = Some(None);
+                spec = Some(ExpirySpec::Persist);
                 index += 1;
             }
             else if option.eq_ignore_ascii_case(b"EX")
@@ -1100,33 +1112,18 @@ fn respond(
                     stream.write_all(b"-ERR syntax error\r\n")?;
                     return Ok(true);
                 };
-                let Some(value) = parse_integer(raw)
-                else {
-                    stream.write_all(b"-ERR value is not an integer or out of range\r\n")?;
-                    return Ok(true);
-                };
-                if value <= 0 {
-                    stream.write_all(b"-ERR invalid expire time in 'getex' command\r\n")?;
-                    return Ok(true);
-                }
-                let expires_at = if option.eq_ignore_ascii_case(b"EX") {
-                    value.checked_mul(1000).and_then(|delta_ms| now_unix_ms().checked_add(delta_ms))
+                spec = Some(if option.eq_ignore_ascii_case(b"EX") {
+                    ExpirySpec::Seconds(raw)
                 }
                 else if option.eq_ignore_ascii_case(b"PX") {
-                    now_unix_ms().checked_add(value)
+                    ExpirySpec::Milliseconds(raw)
                 }
                 else if option.eq_ignore_ascii_case(b"EXAT") {
-                    value.checked_mul(1000)
+                    ExpirySpec::SecondsAt(raw)
                 }
                 else {
-                    Some(value)
-                };
-                let Some(expires_at) = expires_at
-                else {
-                    stream.write_all(b"-ERR invalid expire time in 'getex' command\r\n")?;
-                    return Ok(true);
-                };
-                touch = Some(Some(expires_at));
+                    ExpirySpec::MillisecondsAt(raw)
+                });
                 index += 2;
             }
             else {
@@ -1153,16 +1150,43 @@ fn respond(
                 return Ok(true);
             }
         };
-        // An absent (or expired) key returns nil and nothing is touched.
+        // An absent (or expired) key returns nil and nothing is touched, so the expiry
+        // argument is deliberately left unparsed in that branch.
         let Some(value) = value
         else {
             write_null(stream, state.protocol)?;
             return Ok(true);
         };
-        if let Some(deadline) = touch {
-            let action = match deadline {
-                Some(expires_at) => database_query::cluster_kv::KeyValueAction::SetExpiry { expires_at },
-                None => database_query::cluster_kv::KeyValueAction::ClearExpiry,
+        if let Some(spec) = spec {
+            let action = match spec {
+                ExpirySpec::Persist => database_query::cluster_kv::KeyValueAction::ClearExpiry,
+                ExpirySpec::Seconds(raw)
+                | ExpirySpec::Milliseconds(raw)
+                | ExpirySpec::SecondsAt(raw)
+                | ExpirySpec::MillisecondsAt(raw) => {
+                    let Some(value) = parse_integer(raw)
+                    else {
+                        stream.write_all(b"-ERR value is not an integer or out of range\r\n")?;
+                        return Ok(true);
+                    };
+                    if value <= 0 {
+                        stream.write_all(b"-ERR invalid expire time in 'getex' command\r\n")?;
+                        return Ok(true);
+                    }
+                    let expires_at = match spec {
+                        ExpirySpec::Seconds(_) => value.checked_mul(1000).and_then(|delta_ms| now_unix_ms().checked_add(delta_ms)),
+                        ExpirySpec::Milliseconds(_) => now_unix_ms().checked_add(value),
+                        ExpirySpec::SecondsAt(_) => value.checked_mul(1000),
+                        ExpirySpec::MillisecondsAt(_) => Some(value),
+                        ExpirySpec::Persist => None,
+                    };
+                    let Some(expires_at) = expires_at
+                    else {
+                        stream.write_all(b"-ERR invalid expire time in 'getex' command\r\n")?;
+                        return Ok(true);
+                    };
+                    database_query::cluster_kv::KeyValueAction::SetExpiry { expires_at }
+                }
             };
             if let Err(error) =
                 executor.execute(None, database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action })
