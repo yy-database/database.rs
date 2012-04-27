@@ -1,0 +1,17 @@
+[package]
+name = "sqlite"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite format-3 facade: read-only inspection and writable snapshot tooling (no YYDB engine)"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+database-formats = { workspace = true }
+database-storage = { workspace = true }
