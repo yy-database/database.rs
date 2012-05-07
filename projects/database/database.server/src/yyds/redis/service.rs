@@ -16,7 +16,7 @@ use database_cluster::control::NodeLease;
 use database_execution::cluster::KeyValueExecutor;
 
 use super::{
-    connection::{serve_cancellable, serve_cancellable_with_executor},
+    connection::{KeyAccessTracker, serve_cancellable, serve_cancellable_with_executor_and_tracker},
     resp::RequestLimits,
 };
 
@@ -137,6 +137,10 @@ fn listen(
     limits: RequestLimits,
     executor: Option<Arc<dyn KeyValueExecutor>>,
 ) -> io::Result<()> {
+    // Access timestamps backing `OBJECT IDLETIME` are per object, so every connection of a
+    // listener shares one tracker. They live in memory only and reset when the listener
+    // restarts, matching an RDB load that does not persist access time.
+    let tracker = Arc::new(KeyAccessTracker::new());
     let mut clients = Clients { workers: Vec::new(), stopping: Arc::clone(&stopping) };
     while !stopping.load(Ordering::Acquire) {
         clients.reap();
@@ -153,9 +157,16 @@ fn listen(
                 }
                 let cancellation = Arc::clone(&stopping);
                 let connection_executor = executor.clone();
+                let connection_tracker = Arc::clone(&tracker);
                 let worker = thread::Builder::new().name("yyds-redis-client".into()).spawn(move || {
                     let _ = match connection_executor {
-                        Some(executor) => serve_cancellable_with_executor(stream, limits, cancellation, executor),
+                        Some(executor) => serve_cancellable_with_executor_and_tracker(
+                            stream,
+                            limits,
+                            cancellation,
+                            executor,
+                            connection_tracker,
+                        ),
                         None => serve_cancellable(stream, limits, cancellation),
                     };
                 })?;

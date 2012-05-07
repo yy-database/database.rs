@@ -2,5 +2,6 @@
 
 mod gateway;
 mod getex;
+mod object;
 mod resp;
 mod watch;
