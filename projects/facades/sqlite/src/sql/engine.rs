@@ -271,6 +271,9 @@ pub struct Engine {
     /// Lowercase table name to its position in [`Engine::tables`].
     table_lookup: BTreeMap<String, usize>,
     indexes: BTreeMap<String, IndexDef>,
+    /// Values bound to `?` / `:name` placeholders for the statement currently
+    /// executing, in declaration order.
+    parameters: Vec<Cell>,
 }
 
 impl Engine {
@@ -278,7 +281,7 @@ impl Engine {
     pub fn new(page_size: Option<u32>) -> Result<Self, SqlError> {
         let page_size = page_size.unwrap_or(4096) as usize;
         let writer = SqliteWriter::create(page_size).map_err(|error| SqlError::new("storage", error.to_string()))?;
-        Ok(Self { writer, tables: Vec::new(), table_lookup: BTreeMap::new(), indexes: BTreeMap::new() })
+        Ok(Self { writer, tables: Vec::new(), table_lookup: BTreeMap::new(), indexes: BTreeMap::new(), parameters: Vec::new() })
     }
 
     /// Executes exactly one statement.
@@ -311,6 +314,15 @@ impl Engine {
             results.push(self.run_statement(statement)?);
         }
         Ok(results)
+    }
+
+    /// Executes a semicolon-separated script with positional parameter values
+    /// bound to `?`, `?NNN` and `:name` placeholders.
+    pub fn execute_with_parameters(&mut self, sql: &str, parameters: &[Cell]) -> Result<Vec<ExecResult>, SqlError> {
+        self.parameters = parameters.to_vec();
+        let result = self.execute(sql);
+        self.parameters.clear();
+        result
     }
 
     /// Current database image, suitable for writing to a `.sqlite3` file.
@@ -550,6 +562,11 @@ impl Engine {
                         rows: returned,
                         affected: slots_by_row.len(),
                     });
+                }
+                if default_values {
+                    // `DEFAULT VALUES` reports neither columns nor rows, like
+                    // SQLite; the stored row is written the same way.
+                    return Ok(ExecResult { statement: "insert", columns: Vec::new(), rows: Vec::new(), affected: slots_by_row.len() });
                 }
                 let rows = rowids.into_iter().map(|rowid| vec![Cell::Integer(rowid)]).collect();
                 Ok(ExecResult { statement: "insert", columns: vec!["rowid".to_string()], rows, affected: slots_by_row.len() })
@@ -2845,6 +2862,9 @@ impl<'a> Relation<'a> {
 /// A projection / `WHERE` / `ORDER BY` expression with every column resolved
 /// to a merged row index.
 enum ResolvedExpr {
+    /// Value of a bound parameter placeholder, or `NULL` when the host did not
+    /// supply one for that slot.
+    Parameter(usize),
     /// Literal value.
     Cell(Cell),
     /// Bound column: owning source plus merged row index.
@@ -2974,6 +2994,7 @@ impl ResolvedExpr {
     fn eval(&self, values: &[Cell], ctx: &EvalContext) -> Result<Cell, SqlError> {
         Ok(match self {
             Self::Cell(cell) => cell.clone(),
+            Self::Parameter(index) => ctx.engine.parameters.get(*index).cloned().unwrap_or(Cell::Null),
             Self::Column { index, .. } => values[*index].clone(),
             Self::OuterColumn { depth, index } => ctx.outer[*depth].columns[*index].value.clone(),
             Self::AggregateRef(index) => ctx.aggregates[*index].clone(),
@@ -3144,6 +3165,7 @@ impl ResolvedExpr {
             Self::Cast { value, .. } => value.collect_sources(out),
             // Window values are already materialized for the current row.
             Self::Window(_) => {}
+            Self::Parameter(_) => {}
             Self::Like { value, pattern, escape, .. } => {
                 value.collect_sources(out);
                 pattern.collect_sources(out);
@@ -3178,7 +3200,7 @@ impl ResolvedExpr {
                     || pattern.contains_subquery()
                     || escape.as_ref().is_some_and(|escape| escape.contains_subquery())
             }
-            Self::Cell(_) | Self::Column { .. } | Self::OuterColumn { .. } | Self::AggregateRef(_) | Self::Window(_) => false,
+            Self::Cell(_) | Self::Parameter(_) | Self::Column { .. } | Self::OuterColumn { .. } | Self::AggregateRef(_) | Self::Window(_) => false,
         }
     }
 }
@@ -3225,6 +3247,7 @@ fn resolve_expr(
             Err(error) => return Err(error),
         },
         Expr::Literal(literal) => ResolvedExpr::Cell(literal_cell(literal)),
+        Expr::Parameter { index, .. } => ResolvedExpr::Parameter(*index),
         // A projection alias only affects the header, which is taken from the
         // unresolved expression, so evaluation delegates straight through.
         Expr::Alias { value, .. } => resolve_expr(value, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?,
@@ -3675,10 +3698,13 @@ fn rows_edge(bound: &ResolvedFrameBound, which: &str, slot: usize, len: usize) -
     let position = slot as i64;
     Ok(match bound.edge {
         FrameEdge::UnboundedPreceding => 0,
-        FrameEdge::UnboundedFollowing => len as i64,
+        FrameEdge::UnboundedFollowing => len.saturating_sub(1) as i64,
         FrameEdge::CurrentRow => position,
-        FrameEdge::Preceding => position.saturating_sub(range_offset(bound, which)?.unwrap_or(0)),
-        FrameEdge::Following => position.saturating_add(range_offset(bound, which)?.unwrap_or(0)),
+        // Frames never extend past either end of the partition.
+        FrameEdge::Preceding => position.saturating_sub(range_offset(bound, which)?.unwrap_or(0)).max(0),
+        FrameEdge::Following => position
+            .saturating_add(range_offset(bound, which)?.unwrap_or(0))
+            .min(len.saturating_sub(1) as i64),
     })
 }
 
@@ -5339,6 +5365,51 @@ mod tests {
     }
 
     #[test]
+    fn limit_placeholders_take_bound_values() {
+        let mut engine = engine();
+        let bound = engine
+            .execute_with_parameters("SELECT a FROM t LIMIT ? OFFSET ?", &[Cell::Integer(2), Cell::Integer(1)])
+            .expect("positional limit");
+        assert_eq!(bound[0].rows, vec![vec![Cell::Integer(2)], vec![Cell::Integer(3)]]);
+        let named = engine
+            .execute_with_parameters("SELECT a FROM t LIMIT :n", &[Cell::Integer(2)])
+            .expect("named limit");
+        assert_eq!(named[0].rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]);
+        // Negative values clamp like SQLite: no upper bound, no skipped rows.
+        let unlimited = engine
+            .execute_with_parameters("SELECT a FROM t LIMIT ?", &[Cell::Integer(-1)])
+            .expect("negative limit");
+        assert_eq!(unlimited[0].rows.len(), 5);
+        let offset = engine
+            .execute_with_parameters("SELECT a FROM t LIMIT 2 OFFSET ?", &[Cell::Integer(-1)])
+            .expect("negative offset");
+        assert_eq!(offset[0].rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]);
+        let oversized = engine
+            .execute_with_parameters("SELECT a FROM t LIMIT ?", &[Cell::Integer(999)])
+            .expect("oversized limit");
+        assert_eq!(oversized[0].rows.len(), 5);
+        // An unbound placeholder is NULL, which SQLite rejects as a limit.
+        assert_eq!(engine.execute_one("SELECT a FROM t LIMIT ?").expect_err("unbound").code, "datatype-mismatch");
+    }
+
+    #[test]
+    fn first_value_frame_clamps_to_the_partition() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE f(a INTEGER); INSERT INTO f VALUES (1), (2), (3);").expect("seed");
+        let results = engine
+            .execute_one("SELECT a, first_value(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM f ORDER BY a")
+            .expect("frame");
+        assert_eq!(
+            results.rows,
+            vec![
+                vec![Cell::Integer(1), Cell::Integer(1)],
+                vec![Cell::Integer(2), Cell::Integer(1)],
+                vec![Cell::Integer(3), Cell::Integer(2)],
+            ]
+        );
+    }
+
+    #[test]
     fn implicit_rowid_aliases_resolve() {
         let mut engine = engine();
         let result = engine.execute_one("SELECT rowid, _rowid_, oid FROM t").expect("rowid aliases resolve");
@@ -5492,7 +5563,9 @@ mod tests {
         engine.execute_one("CREATE TABLE dv(a INTEGER DEFAULT 7, b TEXT DEFAULT 'x', c INTEGER)").expect("defaults");
         let inserted = engine.execute_one("INSERT INTO dv DEFAULT VALUES").expect("default values");
         assert_eq!(inserted.affected, 1);
-        assert_eq!(inserted.rows, vec![vec![Cell::Integer(1)]]);
+        // `DEFAULT VALUES` reports neither columns nor rows, like SQLite.
+        assert!(inserted.columns.is_empty());
+        assert!(inserted.rows.is_empty());
         assert_eq!(
             engine.execute_one("SELECT a, b, c FROM dv").expect("row").rows,
             vec![vec![Cell::Integer(7), Cell::Text("x".to_string()), Cell::Null]]

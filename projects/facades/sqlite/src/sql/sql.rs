@@ -633,6 +633,13 @@ pub enum Expr {
     Column(ColumnRef),
     /// Literal value.
     Literal(Literal),
+    /// Bound parameter placeholder, addressing the statement's binding order.
+    Parameter {
+        /// Zero-based index in declaration order.
+        index: usize,
+        /// Placeholder text as written, used as the derived column label.
+        text: String,
+    },
     /// Prefix `-` or `+`.
     Unary {
         /// Operator.
@@ -820,6 +827,7 @@ impl Expr {
         match self {
             Self::Column(reference) => reference.name.clone(),
             Self::Literal(literal) => literal_label(literal),
+            Self::Parameter { text, .. } => text.clone(),
             Self::Unary { op, value } => format!("{}{}", op.text(), value.label()),
             Self::Binary { left, op, right } => format!("{}{}{}", left.label(), op.text(), right.label()),
             Self::Compare { left, op, right } => format!("{}{}{}", left.label(), op.text(), right.label()),
@@ -1278,7 +1286,17 @@ impl Token {
 /// Parses one or more semicolon-separated statements.
 pub fn parse(source: &str) -> Result<Vec<Statement>, SqlError> {
     let (tokens, offsets) = tokenize(source)?;
-    let mut parser = Parser { source, tokens, offsets, at: 0, end: source.len(), kind: None, statement_start: 0 };
+    let mut parser = Parser {
+        source,
+        tokens,
+        offsets,
+        at: 0,
+        end: source.len(),
+        kind: None,
+        statement_start: 0,
+        next_parameter: 0,
+        parameter_names: std::collections::BTreeMap::new(),
+    };
     let mut statements = Vec::new();
     while !parser.done() {
         if parser.peek() == Some(&Token::Semi) {
@@ -1778,6 +1796,10 @@ struct Parser<'a> {
     kind: Option<&'static str>,
     /// Token index where the current statement started.
     statement_start: usize,
+    /// Next positional index assigned to a `?` or `:name` placeholder.
+    next_parameter: usize,
+    /// Named placeholders already seen, so a repeated name reuses its index.
+    parameter_names: std::collections::BTreeMap<String, usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -2158,6 +2180,51 @@ impl<'a> Parser<'a> {
                 return self.function_expr();
             }
         }
+        if let Some(Token::Operator(operator)) = self.peek() {
+            match operator.as_str() {
+                "?" => {
+                    let marker = self.offset();
+                    self.at += 1;
+                    let (index, text) = match self.peek().cloned() {
+                        Some(Token::Int(value)) if self.offset() == marker + 1 => {
+                            if value <= 0 {
+                                return Err(self.error("syntax", "parameter indexes are one-based"));
+                            }
+                            self.at += 1;
+                            (value as usize - 1, format!("?{value}"))
+                        }
+                        _ => {
+                            let index = self.next_parameter;
+                            self.next_parameter += 1;
+                            (index, "?".to_string())
+                        }
+                    };
+                    // `?NNN` fixes that slot, so later bare `?` placeholders
+                    // continue after the highest index seen so far.
+                    self.next_parameter = self.next_parameter.max(index + 1);
+                    return Ok(Expr::Parameter { index, text });
+                }
+                ":" => {
+                    self.at += 1;
+                    let name = match self.next() {
+                        Some(Token::Word(word)) => word,
+                        _ => return Err(self.error("syntax", "expected a parameter name after `:`")),
+                    };
+                    let text = format!(":{name}");
+                    let index = match self.parameter_names.get(&name) {
+                        Some(index) => *index,
+                        None => {
+                            let index = self.next_parameter;
+                            self.next_parameter += 1;
+                            self.parameter_names.insert(name, index);
+                            index
+                        }
+                    };
+                    return Ok(Expr::Parameter { index, text });
+                }
+                _ => {}
+            }
+        }
         match self.peek() {
             Some(Token::Int(_)) | Some(Token::Real(_)) | Some(Token::Text(_)) | Some(Token::Blob(_)) => {
                 Ok(Expr::Literal(self.literal()?))
@@ -2502,17 +2569,9 @@ impl<'a> Parser<'a> {
         Ok(FrameBound { edge, offset: Some(Box::new(offset)) })
     }
 
-    /// Reads one `LIMIT` / `OFFSET` operand. A bound parameter is rejected by
-    /// name because this engine has no binding layer yet.
-    fn limit_term(&mut self, clause: &str) -> Result<Expr, SqlError> {
-        if matches!(self.peek(), Some(Token::Operator(operator)) if operator == "?" || operator == ":") {
-            let mut error = self.error(
-                "unsupported-parameter",
-                format!("bound parameters are not supported in `{clause}`; the expression must be constant"),
-            );
-            error.clause = Some(clause.to_string());
-            return Err(error);
-        }
+    /// Reads one `LIMIT` / `OFFSET` operand. A placeholder is accepted like any
+    /// other expression and takes its bound integer value at evaluation time.
+    fn limit_term(&mut self, _clause: &str) -> Result<Expr, SqlError> {
         self.or_expr()
     }
 
@@ -3712,7 +3771,7 @@ fn core_references(core: &SelectCore, name: &str) -> bool {
 
 fn expr_references(expr: &Expr, name: &str) -> bool {
     match expr {
-        Expr::Column(_) | Expr::Literal(_) => false,
+        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter { .. } => false,
         Expr::Unary { value, .. } => expr_references(value, name),
         Expr::Binary { left, right, .. } => expr_references(left, name) || expr_references(right, name),
         Expr::Compare { left, right, .. } => expr_references(left, name) || expr_references(right, name),
