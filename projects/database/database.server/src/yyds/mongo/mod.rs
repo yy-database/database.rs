@@ -1,9 +1,22 @@
-//! MongoDB wire disguise gateway for YYDS.
+//! MongoDB 线协议伪装网关。
 //!
-//! Accepts the MongoDB OP_MSG binary frame protocol and answers with YYDS-backed
-//! document responses. Not a full MongoDB server: it presents a minimal CRUD surface
-//! (`insert`, `find`, `delete`) on top of the YYDS KV executor plus the standard
-//! `hello` / `ping` handshake probes.
+//! 接受 MongoDB 的 OP_MSG 帧（握手期也接受 OP_QUERY），用 YYDS KV 执行器承载文档，
+//! 返回 MongoDB 形态的应答。不是完整的 MongoDB 服务端，命令子集如下：
+//!
+//! - 握手：`hello` / `isMaster` / `ismaster` / `ping`
+//! - 写入：`insert` / `delete`
+//! - 读取：`find` / `count` / `aggregate`（仅 `$match`、`$group`、`$project`）
+//! - 游标：`getMore` / `killCursors`
+//!
+//! 与 MongoDB 参考实现（`mongo-core`）的固定语料对账基线在
+//! `tests/mongo/reconcile.rs`：38 条语料中 34 条逐字节一致。以下差异按「已知差异」
+//! 固化在测试里，当前不补实现——补 `update` 或索引属于命令层是否上收的结构裁决：
+//!
+//! - 不实现 `update`，该命令与替换式更新都只回通用的 `59 unsupported`。
+//! - 不实现索引（`createIndexes`），唯一性只在 `_id` 上由网关自己维护。因此唯一
+//!   索引与 `{a: []}` 触发的 `undefined` 键路径无法在本网关触发。
+//! - `aggregate` 遇到未支持 stage 时 `errmsg` 只回 stage 名（如 `$out`），参考
+//!   实现会在 `errmsg` 里附支持列表。
 #![warn(missing_docs)]
 
 use std::{
