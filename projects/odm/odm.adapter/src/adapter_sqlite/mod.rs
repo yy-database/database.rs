@@ -1,8 +1,11 @@
 //! Iris 的 SQLite 外存适配器。
 //!
-//! 后端命令文本留在本 crate 私有；公开面只谈 Iris 物理计划、观测目录与
-//! 映射清单。执行依赖 SQLite 产品 L3 接续内核；内核未就绪时 open / 写路径
-//! fail-closed，禁止用官方引擎顶档。
+//! SQL 解析与执行都在 `sqlite` 产品门面（`projects/facades/sqlite`）内；本 crate
+//! 只做连接持有、参数/结果类型映射与 Iris 物理计划编排。不引入 `rusqlite`。
+//!
+//! 内存库已可执行；门面尚未提供的能力仍 fail-closed：文件打开（`Engine` 没有
+//! 从既有镜像构造的入口）、事务（`Engine` 没有 `begin` / `commit` / `rollback`）、
+//! `last_insert_rowid` 取值。缺口坐标见 `provider.rs` 模块文档。
 
 #![deny(missing_docs)]
 
@@ -71,10 +74,11 @@ impl SqliteSource {
     /// Open or create a file-backed SQLite database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let provider = SqliteProvider::open(&path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Self { provider: Mutex::new(SqliteProvider::open(&path)?), path: Some(path) })
+        Ok(Self { provider: Mutex::new(provider), path: Some(path) })
     }
 
     /// On-disk path when file-backed.
