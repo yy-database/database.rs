@@ -15,9 +15,9 @@ use super::error::SqlError;
 use super::json_string;
 use super::sql::{
     AggregateFunction, AlterAction, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm, Expr,
-    ForeignKey, FrameEdge, FrameUnits, IndexColumn, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems,
-    Statement, TableRef, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column, rewrite_create_index_table,
-    rewrite_create_table_column, rewrite_create_table_name, statement_references,
+    ForeignKey, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore,
+    SelectItems, Statement, TableRef, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column,
+    rewrite_create_index_table, rewrite_create_table_column, rewrite_create_table_name, statement_references,
 };
 
 /// One cell surfaced to the host.
@@ -525,7 +525,16 @@ impl Engine {
                     slots_by_row.push(vec![None; def.columns.len()]);
                 }
                 for values in &rows {
-                    slots_by_row.push(self_contained_arity(def, &table, columns.as_deref(), values)?);
+                    let resolved: Vec<crate::WriteValue> = values
+                        .iter()
+                        .map(|value| match value {
+                            InsertValue::Literal(literal) => literal.to_write_value(),
+                            InsertValue::Parameter { index, .. } => {
+                                cell_write_value(self.parameters.get(*index).unwrap_or(&Cell::Null))
+                            },
+                        })
+                        .collect();
+                    slots_by_row.push(self_contained_arity(def, &table, columns.as_deref(), &resolved)?);
                 }
                 // One row at a time inside a transaction: a failing `CHECK`
                 // must undo every row of a multi-row statement, as SQLite does.
@@ -5613,7 +5622,7 @@ fn self_contained_arity(
     def: &TableDef,
     table: &str,
     columns: Option<&[String]>,
-    values: &[Literal],
+    values: &[crate::WriteValue],
 ) -> Result<Vec<Option<crate::WriteValue>>, SqlError> {
     let mut slots = vec![None; def.columns.len()];
     match columns {
@@ -5634,7 +5643,7 @@ fn self_contained_arity(
                     return Err(SqlError::new("duplicate-column", format!("column `{name}` is listed twice in the insert")).in_statement("insert"));
                 }
                 seen.push(index);
-                slots[index] = Some(value.to_write_value());
+                slots[index] = Some(value.clone());
             }
         }
         None => {
@@ -5646,7 +5655,7 @@ fn self_contained_arity(
                 .in_statement("insert"));
             }
             for (index, value) in values.iter().enumerate() {
-                slots[index] = Some(value.to_write_value());
+                slots[index] = Some(value.clone());
             }
         }
     }
@@ -6291,6 +6300,44 @@ mod tests {
         assert_eq!(failed.code, "storage");
         // An explicit column list may not be combined with `DEFAULT VALUES`.
         assert_eq!(engine.execute_one("INSERT INTO dv(a) DEFAULT VALUES").expect_err("column list").code, "syntax");
+    }
+
+    #[test]
+    fn insert_values_accepts_bound_parameters() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute_one("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)").expect("users");
+
+        let inserted = engine
+            .execute_with_parameters("INSERT INTO users (id, name) VALUES (?1, ?2)", &[Cell::Integer(1), Cell::Text("ada".to_string())])
+            .expect("parameter insert");
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].affected, 1);
+        assert_eq!(inserted[0].rows, vec![vec![Cell::Integer(1)]]);
+        assert_eq!(
+            engine.execute_one("SELECT id, name FROM users").expect("read").rows,
+            vec![vec![Cell::Integer(1), Cell::Text("ada".to_string())]]
+        );
+
+        // Every tuple of one multi-row statement binds its own placeholders.
+        engine
+            .execute_with_parameters(
+                "INSERT INTO users (id, name) VALUES (?1, ?2), (?3, ?4)",
+                &[Cell::Integer(2), Cell::Text("bob".to_string()), Cell::Integer(3), Cell::Text("cy".to_string())],
+            )
+            .expect("multi-row insert");
+        assert_eq!(engine.execute_one("SELECT count(*) FROM users").expect("count").rows, vec![vec![Cell::Integer(3)]]);
+
+        // Named placeholders address the same binding order.
+        engine
+            .execute_with_parameters("INSERT INTO users (id, name) VALUES (:id, :name)", &[Cell::Integer(4), Cell::Text("dee".to_string())])
+            .expect("named insert");
+        assert_eq!(engine.execute_one("SELECT id FROM users WHERE id = 4").expect("read").rows, vec![vec![Cell::Integer(4)]]);
+
+        // Literal tuples keep working, and `DEFAULT VALUES` still ignores bindings.
+        engine.execute_one("INSERT INTO users (id, name) VALUES (5, 'eve')").expect("literal insert");
+        engine.execute_one("CREATE TABLE defaults_only(a INTEGER DEFAULT 9)").expect("defaults table");
+        engine.execute_with_parameters("INSERT INTO defaults_only DEFAULT VALUES", &[Cell::Integer(6)]).expect("default values");
+        assert_eq!(engine.execute_one("SELECT a FROM defaults_only").expect("default row").rows, vec![vec![Cell::Integer(9)]]);
     }
 
     #[test]
