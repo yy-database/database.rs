@@ -349,6 +349,8 @@ pub enum ScalarFunction {
     Random,
     /// `randomblob(n)`, a blob of `n` random bytes (`n < 1` means one byte).
     RandomBlob,
+    /// `instr(x, y)`, the one-based character position of `y` inside `x`.
+    Instr,
 }
 
 impl ScalarFunction {
@@ -367,6 +369,7 @@ impl ScalarFunction {
             "quote" => Some(Self::Quote),
             "random" => Some(Self::Random),
             "randomblob" => Some(Self::RandomBlob),
+            "instr" => Some(Self::Instr),
             _ => None,
         }
     }
@@ -386,6 +389,7 @@ impl ScalarFunction {
             Self::Quote => "quote",
             Self::Random => "random",
             Self::RandomBlob => "randomblob",
+            Self::Instr => "instr",
         }
     }
 
@@ -397,6 +401,7 @@ impl ScalarFunction {
             Self::Substr => (2..=3).contains(&count),
             Self::Round | Self::RandomBlob => (1..=2).contains(&count),
             Self::Random => count == 0,
+            Self::Instr => count == 2,
         }
     }
 }
