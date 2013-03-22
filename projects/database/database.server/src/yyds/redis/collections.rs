@@ -213,7 +213,7 @@ pub(crate) fn decode_list(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
 
 /// hash 命令名集合。
 pub(crate) fn is_hash_command(command: &[u8]) -> bool {
-    for name in [b"HSET".as_slice(), b"HGET", b"HGETALL", b"HDEL", b"HLEN"] {
+    for name in [b"HSET".as_slice(), b"HGET", b"HGETALL", b"HDEL", b"HLEN", b"HINCRBY"] {
         if command.eq_ignore_ascii_case(name) {
             return true;
         }
@@ -223,7 +223,7 @@ pub(crate) fn is_hash_command(command: &[u8]) -> bool {
 
 /// list 命令名集合。
 pub(crate) fn is_list_command(command: &[u8]) -> bool {
-    for name in [b"LPUSH".as_slice(), b"RPUSH", b"LRANGE", b"LPOP", b"RPOP", b"LLEN"] {
+    for name in [b"LPUSH".as_slice(), b"RPUSH", b"LRANGE", b"LPOP", b"RPOP", b"LLEN", b"LINDEX"] {
         if command.eq_ignore_ascii_case(name) {
             return true;
         }
@@ -430,6 +430,54 @@ pub(crate) fn handle_hash(
         }
         return write_integer(stream, removed);
     }
+    if command.eq_ignore_ascii_case(b"HINCRBY") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "hincrby");
+        }
+        let delta = match parse_index(request.arguments[3]) {
+            Some(delta) => delta,
+            None => return write_error(stream, "value is not an integer or out of range"),
+        };
+        let key = request.arguments[1];
+        match find_kind(executor, base, key) {
+            Ok(None) | Ok(Some(KeyKind::Hash)) => {}
+            Ok(Some(_)) => return write_wrong_type(stream),
+            Err(message) => return write_storage_error(stream, &message),
+        }
+        let mut fields = match load_value(executor, &KeyKind::Hash.namespace(base), key) {
+            Ok(Some(bytes)) => match decode_hash(&bytes) {
+                Some(fields) => fields,
+                None => return write_error(stream, "stored hash value is corrupt"),
+            },
+            Ok(None) => Vec::new(),
+            Err(message) => return write_storage_error(stream, &message),
+        };
+        let field = request.arguments[2].to_vec();
+        let current = match fields.iter().find(|(name, _)| *name == field) {
+            Some((_, value)) => match parse_index(value) {
+                Some(current) => current,
+                None => return write_error(stream, "hash value is not an integer"),
+            },
+            None => 0,
+        };
+        let Some(updated) = current.checked_add(delta)
+        else {
+            return write_error(stream, "increment or decrement would overflow");
+        };
+        let encoded = updated.to_string().into_bytes();
+        match fields.iter_mut().find(|(name, _)| *name == field) {
+            Some(entry) => entry.1 = encoded,
+            None => fields.push((field, encoded)),
+        }
+        let Some(bytes) = encode_hash(&fields)
+        else {
+            return write_error(stream, "hash exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::Hash.namespace(base), key, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_integer(stream, updated);
+    }
     // HLEN
     if request.arguments.len() != 2 {
         return write_arity_error(stream, "hlen");
@@ -491,6 +539,30 @@ pub(crate) fn handle_list(
             return write_storage_error(stream, &message);
         }
         return write_integer(stream, elements.len() as i64);
+    }
+    if command.eq_ignore_ascii_case(b"LINDEX") {
+        if request.arguments.len() != 3 {
+            return write_arity_error(stream, "lindex");
+        }
+        let index = match parse_index(request.arguments[2]) {
+            Some(index) => index,
+            None => return write_error(stream, "value is not an integer or out of range"),
+        };
+        let key = request.arguments[1];
+        return match load_list(stream, executor, base, key)? {
+            Loaded::Missing => write_null(stream, protocol),
+            Loaded::Found(elements) => {
+                let length = elements.len() as i64;
+                let position = if index < 0 { length.saturating_add(index) } else { index };
+                if position < 0 || position >= length {
+                    write_null(stream, protocol)
+                }
+                else {
+                    write_bulk(stream, &elements[position as usize])
+                }
+            }
+            Loaded::Rejected => Ok(()),
+        };
     }
     if command.eq_ignore_ascii_case(b"LRANGE") {
         if request.arguments.len() != 4 {
