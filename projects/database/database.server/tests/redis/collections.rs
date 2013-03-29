@@ -494,6 +494,83 @@ fn hash_incrby_and_list_index() {
     assert_eq!(expect_integer(&mut client), 0);
 }
 
+/// Set members, cross-type rejection, key-level commands and restart persistence.
+#[test]
+fn set_members_and_key_ops() {
+    let (mut client, _server) = memory_server("redis-set");
+    send(&mut client, &["SADD", "s", "a", "b", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SADD", "s", "a", "d"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SADD", "s", "a", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SCARD", "s"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["SISMEMBER", "s", "a"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SISMEMBER", "s", "missing"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SMEMBERS", "s"]);
+    expect_array(&mut client, &["a", "b", "c", "d"]);
+    send(&mut client, &["SMEMBERS", "no-such-key"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["SCARD", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SISMEMBER", "no-such-key", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SREM", "no-such-key", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    // Duplicate names count once, and deleting every member removes the key.
+    send(&mut client, &["SREM", "s", "a", "a", "c"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["SCARD", "s"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["SREM", "s", "b", "d"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["EXISTS", "s"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["TYPE", "s"]);
+    expect_status(&mut client, "none");
+
+    // Cross-type reads and writes reject each other.
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SADD", "str", "m"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["HSET", "h", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SADD", "h", "m"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["SADD", "s2", "m"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HGET", "s2", "f"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["LPUSH", "s2", "x"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["GET", "s2"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["TYPE", "s2"]);
+    expect_status(&mut client, "set");
+
+    send(&mut client, &["EXPIRE", "s2", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TTL", "s2"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "unexpected set TTL: {ttl}");
+    send(&mut client, &["SADD", "s2", "n"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TTL", "s2"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "SADD dropped the set TTL: {ttl}");
+    send(&mut client, &["PERSIST", "s2"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["DEL", "s2"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "s2"]);
+    assert_eq!(expect_integer(&mut client), 0);
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
@@ -508,6 +585,8 @@ fn restart_preserves_types_and_contents() {
     assert_eq!(expect_integer(&mut first), 2);
     send(&mut first, &["HINCRBY", "h", "f3", "9"]);
     assert_eq!(expect_integer(&mut first), 9);
+    send(&mut first, &["SADD", "ps", "x", "y"]);
+    assert_eq!(expect_integer(&mut first), 2);
 
     let (mut second, _second_server) = file_server(&path);
     send(&mut second, &["TYPE", "s"]);
@@ -526,4 +605,10 @@ fn restart_preserves_types_and_contents() {
     expect_bulk(&mut second, Some("a"));
     send(&mut second, &["GET", "h"]);
     expect_error(&mut second, WRONGTYPE);
+    send(&mut second, &["TYPE", "ps"]);
+    expect_status(&mut second, "set");
+    send(&mut second, &["SMEMBERS", "ps"]);
+    expect_array(&mut second, &["x", "y"]);
+    send(&mut second, &["SCARD", "ps"]);
+    assert_eq!(expect_integer(&mut second), 2);
 }
