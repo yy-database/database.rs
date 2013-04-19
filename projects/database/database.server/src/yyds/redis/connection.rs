@@ -1591,6 +1591,9 @@ fn respond(
     else if collections::is_set_command(command) {
         collections::handle_set(stream, request, executor, namespace)?;
     }
+    else if collections::is_zset_command(command) {
+        collections::handle_zset(stream, request, executor, namespace, state.protocol)?;
+    }
     else if command.eq_ignore_ascii_case(b"OBJECT") {
         handle_object(stream, request, probe, tracker, namespace, state.protocol)?;
     }
@@ -2011,7 +2014,11 @@ fn validate_command_for_queue(
     }
     // Hash / list value commands: they need the executor. Their arity and type checks
     // are runtime semantics and stay deferred to EXEC, like upstream queueing.
-    if collections::is_hash_command(command) || collections::is_list_command(command) || collections::is_set_command(command) {
+    if collections::is_hash_command(command)
+        || collections::is_list_command(command)
+        || collections::is_set_command(command)
+        || collections::is_zset_command(command)
+    {
         if executor.is_none() {
             return Err(b"-ERR unsupported command\r\n".to_vec());
         }

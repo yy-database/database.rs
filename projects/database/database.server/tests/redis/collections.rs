@@ -571,6 +571,85 @@ fn set_members_and_key_ops() {
     assert_eq!(expect_integer(&mut client), 0);
 }
 
+/// Sorted-set ordering, score updates, `WITHSCORES`, tie-breaking and key operations.
+#[test]
+fn zset_order_and_key_ops() {
+    let (mut client, _server) = memory_server("redis-zset");
+    send(&mut client, &["ZADD", "z", "1", "a", "2", "b", "2", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZADD", "z", "5", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZSCORE", "z", "a"]);
+    expect_bulk(&mut client, Some("5"));
+    send(&mut client, &["ZSCORE", "z", "missing"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["ZSCORE", "no-such-key", "a"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["ZCARD", "z"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZCARD", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZRANGE", "z", "0", "-1"]);
+    expect_array(&mut client, &["b", "c", "a"]);
+    send(&mut client, &["ZRANGE", "z", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["b", "2", "c", "2", "a", "5"]);
+    send(&mut client, &["ZRANGE", "z", "-2", "-1"]);
+    expect_array(&mut client, &["c", "a"]);
+    send(&mut client, &["ZRANGE", "z", "9", "10"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["ZRANGE", "no-such-key", "0", "-1"]);
+    expect_empty_array(&mut client);
+
+    // A bad score rejects the whole call without touching the stored set.
+    send(&mut client, &["ZADD", "z", "not-a-float", "m"]);
+    expect_error(&mut client, "ERR value is not a valid float");
+    send(&mut client, &["ZCARD", "z"]);
+    assert_eq!(expect_integer(&mut client), 3);
+
+    send(&mut client, &["ZREM", "z", "b", "b"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZREM", "z", "c", "a"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["EXISTS", "z"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["TYPE", "z"]);
+    expect_status(&mut client, "none");
+    send(&mut client, &["ZREM", "no-such-key", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    // Cross-type rejection and key-level commands.
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["ZADD", "str", "1", "m"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["ZADD", "z2", "1", "m"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["GET", "z2"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["SADD", "z2", "x"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["ZSCORE", "z2", "m"]);
+    expect_bulk(&mut client, Some("1"));
+    send(&mut client, &["TYPE", "z2"]);
+    expect_status(&mut client, "zset");
+    send(&mut client, &["EXPIRE", "z2", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TTL", "z2"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "unexpected zset TTL: {ttl}");
+    send(&mut client, &["ZADD", "z2", "2", "n"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TTL", "z2"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "ZADD dropped the zset TTL: {ttl}");
+    send(&mut client, &["PERSIST", "z2"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["DEL", "z2"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "z2"]);
+    assert_eq!(expect_integer(&mut client), 0);
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
@@ -586,6 +665,8 @@ fn restart_preserves_types_and_contents() {
     send(&mut first, &["HINCRBY", "h", "f3", "9"]);
     assert_eq!(expect_integer(&mut first), 9);
     send(&mut first, &["SADD", "ps", "x", "y"]);
+    assert_eq!(expect_integer(&mut first), 2);
+    send(&mut first, &["ZADD", "pz", "2", "b", "1", "a"]);
     assert_eq!(expect_integer(&mut first), 2);
 
     let (mut second, _second_server) = file_server(&path);
@@ -610,5 +691,11 @@ fn restart_preserves_types_and_contents() {
     send(&mut second, &["SMEMBERS", "ps"]);
     expect_array(&mut second, &["x", "y"]);
     send(&mut second, &["SCARD", "ps"]);
+    assert_eq!(expect_integer(&mut second), 2);
+    send(&mut second, &["TYPE", "pz"]);
+    expect_status(&mut second, "zset");
+    send(&mut second, &["ZRANGE", "pz", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut second, &["a", "1", "b", "2"]);
+    send(&mut second, &["ZCARD", "pz"]);
     assert_eq!(expect_integer(&mut second), 2);
 }

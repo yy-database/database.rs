@@ -1,10 +1,10 @@
-//! Redis 的 hash / list / set 值类型，落在既有扁平键值合同之上。
+//! Redis 的 hash / list / set / zset 值类型，落在既有扁平键值合同之上。
 //!
 //! `.yykv` v3 的字节布局不能改动，`Record` 也没有类型字段。这里把类型编码在
 //! **命名空间** 上：字符串继续使用逻辑库命名空间（`redis:<db>`），hash 落在
-//! `redis:<db>:hash`，list 落在 `redis:<db>:list`，set 落在 `redis:<db>:set`。
-//! 命名空间本来就是 `Record.key` 的一部分，所以不新增字段、不升格式版本，重启后随
-//! 快照恢复。
+//! `redis:<db>:hash`，list 落在 `redis:<db>:list`，set 落在 `redis:<db>:set`，
+//! zset 落在 `redis:<db>:zset`。命名空间本来就是 `Record.key` 的一部分，所以不新增
+//! 字段、不升格式版本，重启后随快照恢复。
 //!
 //! 这样不会把既有字符串键误判成集合：两类数据位于互不相交的命名空间，
 //! 字符串内容再特殊也不会被当成 hash/list；判定类型只是逐个命名空间探测可见记录，
@@ -32,11 +32,13 @@ pub(crate) enum KeyKind {
     List,
     /// 集合，成员按插入顺序保存在一个值 blob 内（真机小集合同样保持插入顺序）。
     Set,
+    /// 有序集合，成员与 `f64` 分数保存在一个值 blob 内，读取时按分数再按成员排序。
+    ZSet,
 }
 
 impl KeyKind {
     /// 所有已知类型，按探测顺序排列（字符串优先，保持既有语义）。
-    pub(crate) const ALL: [KeyKind; 4] = [KeyKind::String, KeyKind::Hash, KeyKind::List, KeyKind::Set];
+    pub(crate) const ALL: [KeyKind; 5] = [KeyKind::String, KeyKind::Hash, KeyKind::List, KeyKind::Set, KeyKind::ZSet];
 
     /// `TYPE` 回复里使用的类型名。
     pub(crate) fn name(self) -> &'static str {
@@ -45,6 +47,7 @@ impl KeyKind {
             KeyKind::Hash => "hash",
             KeyKind::List => "list",
             KeyKind::Set => "set",
+            KeyKind::ZSet => "zset",
         }
     }
 
@@ -57,6 +60,7 @@ impl KeyKind {
             KeyKind::Hash => Namespace(format!("{}:hash", base.0)),
             KeyKind::List => Namespace(format!("{}:list", base.0)),
             KeyKind::Set => Namespace(format!("{}:set", base.0)),
+            KeyKind::ZSet => Namespace(format!("{}:zset", base.0)),
         }
     }
 }
@@ -227,6 +231,34 @@ pub(crate) fn decode_set(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
     decode_list(bytes)
 }
 
+/// zset 值编码：`u32 成员数`，随后每个成员 `u32 长度 + 成员 + 8 字节 f64 分数`。
+pub(crate) fn encode_zset(entries: &[(Vec<u8>, f64)]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    push_u32(&mut out, entries.len())?;
+    for (member, score) in entries {
+        push_u32(&mut out, member.len())?;
+        out.extend_from_slice(member);
+        out.extend_from_slice(&score.to_bits().to_le_bytes());
+    }
+    Some(out)
+}
+
+/// 解码 zset 值；尾随字节非空或数据截断时返回 `None`。
+pub(crate) fn decode_zset(bytes: &[u8]) -> Option<Vec<(Vec<u8>, f64)>> {
+    let (count, mut rest) = read_u32(bytes)?;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (member, tail) = read_field(rest)?;
+        if tail.len() < 8 {
+            return None;
+        }
+        let bits = u64::from_le_bytes([tail[0], tail[1], tail[2], tail[3], tail[4], tail[5], tail[6], tail[7]]);
+        entries.push((member, f64::from_bits(bits)));
+        rest = &tail[8..];
+    }
+    if rest.is_empty() { Some(entries) } else { None }
+}
+
 /// hash 命令名集合。
 pub(crate) fn is_hash_command(command: &[u8]) -> bool {
     for name in [b"HSET".as_slice(), b"HGET", b"HGETALL", b"HDEL", b"HLEN", b"HINCRBY"] {
@@ -250,6 +282,16 @@ pub(crate) fn is_list_command(command: &[u8]) -> bool {
 /// set 命令名集合。
 pub(crate) fn is_set_command(command: &[u8]) -> bool {
     for name in [b"SADD".as_slice(), b"SREM", b"SMEMBERS", b"SCARD", b"SISMEMBER"] {
+        if command.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// zset 命令名集合。
+pub(crate) fn is_zset_command(command: &[u8]) -> bool {
+    for name in [b"ZADD".as_slice(), b"ZSCORE", b"ZREM", b"ZCARD", b"ZRANGE"] {
         if command.eq_ignore_ascii_case(name) {
             return true;
         }
@@ -362,11 +404,63 @@ fn load_set(
     }
 }
 
+/// 载入 zset 成员并校验类型。
+fn load_zset(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    key: &[u8],
+) -> io::Result<Loaded<Vec<(Vec<u8>, f64)>>> {
+    match find_kind(executor, base, key) {
+        Ok(None) => return Ok(Loaded::Missing),
+        Ok(Some(KeyKind::ZSet)) => {}
+        Ok(Some(_)) => {
+            write_wrong_type(stream)?;
+            return Ok(Loaded::Rejected);
+        }
+        Err(message) => {
+            write_storage_error(stream, &message)?;
+            return Ok(Loaded::Rejected);
+        }
+    }
+    match load_value(executor, &KeyKind::ZSet.namespace(base), key) {
+        Ok(Some(bytes)) => match decode_zset(&bytes) {
+            Some(entries) => Ok(Loaded::Found(entries)),
+            None => {
+                write_error(stream, "stored zset value is corrupt")?;
+                Ok(Loaded::Rejected)
+            }
+        },
+        Ok(None) => Ok(Loaded::Missing),
+        Err(message) => {
+            write_storage_error(stream, &message)?;
+            Ok(Loaded::Rejected)
+        }
+    }
+}
+
 /// 整数参数校验，与真机 `ERR value is not an integer or out of range` 对齐。
 fn parse_index(raw: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(raw).ok()?;
     let value = text.parse::<i64>().ok()?;
     if value.to_string() != text { None } else { Some(value) }
+}
+
+/// zset 分数解析：接受浮点字面量，拒绝 `NaN`（真机不允许 NaN 分数）。
+fn parse_score(raw: &[u8]) -> Option<f64> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let score = text.parse::<f64>().ok()?;
+    if score.is_nan() { None } else { Some(score) }
+}
+
+/// zset 排序：先按分数升序，同分再按成员字节字典序。
+fn sort_zset(entries: &mut [(Vec<u8>, f64)]) {
+    entries.sort_by(|left, right| left.1.total_cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+}
+
+/// 分数回复格式：最短十进制表示，与真机 `ZSCORE` 一致（整数分数不带 `.0`）。
+fn write_score(stream: &mut dyn io::Write, score: f64) -> io::Result<()> {
+    write_bulk(stream, score.to_string().as_bytes())
 }
 
 /// `HSET` / `HGET` / `HGETALL` / `HDEL` / `HLEN` 的分派入口。
@@ -858,4 +952,156 @@ pub(crate) fn handle_set(
         }
         Loaded::Rejected => Ok(()),
     }
+}
+
+/// `ZADD` / `ZSCORE` / `ZREM` / `ZCARD` / `ZRANGE` 的分派入口。
+pub(crate) fn handle_zset(
+    stream: &mut dyn io::Write,
+    request: &Request<'_>,
+    executor: Option<&dyn KeyValueExecutor>,
+    base: &Namespace,
+    protocol: u8,
+) -> io::Result<()> {
+    let command = request.arguments[0];
+    let Some(executor) = executor
+    else {
+        return write_error(stream, "unsupported command");
+    };
+    if command.eq_ignore_ascii_case(b"ZADD") {
+        if request.arguments.len() < 4 || (request.arguments.len() - 2) % 2 != 0 {
+            return write_arity_error(stream, "zadd");
+        }
+        let key = request.arguments[1];
+        match find_kind(executor, base, key) {
+            Ok(None) | Ok(Some(KeyKind::ZSet)) => {}
+            Ok(Some(_)) => return write_wrong_type(stream),
+            Err(message) => return write_storage_error(stream, &message),
+        }
+        let mut entries = match load_value(executor, &KeyKind::ZSet.namespace(base), key) {
+            Ok(Some(bytes)) => match decode_zset(&bytes) {
+                Some(entries) => entries,
+                None => return write_error(stream, "stored zset value is corrupt"),
+            },
+            Ok(None) => Vec::new(),
+            Err(message) => return write_storage_error(stream, &message),
+        };
+        let mut added = 0_i64;
+        for pair in request.arguments[2..].chunks(2) {
+            // 全部分数先校验：任一非法都不写入，避免半截修改。
+            let Some(score) = parse_score(pair[0])
+            else {
+                return write_error(stream, "value is not a valid float");
+            };
+            let member = pair[1].to_vec();
+            match entries.iter_mut().find(|(existing, _)| *existing == member) {
+                Some(entry) => entry.1 = score,
+                None => {
+                    entries.push((member, score));
+                    added += 1;
+                }
+            }
+        }
+        let Some(bytes) = encode_zset(&entries)
+        else {
+            return write_error(stream, "zset exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::ZSet.namespace(base), key, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_integer(stream, added);
+    }
+    if command.eq_ignore_ascii_case(b"ZSCORE") {
+        if request.arguments.len() != 3 {
+            return write_arity_error(stream, "zscore");
+        }
+        let key = request.arguments[1];
+        return match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => write_null(stream, protocol),
+            Loaded::Found(entries) => match entries.iter().find(|(member, _)| member.as_slice() == request.arguments[2]) {
+                Some((_, score)) => write_score(stream, *score),
+                None => write_null(stream, protocol),
+            },
+            Loaded::Rejected => Ok(()),
+        };
+    }
+    if command.eq_ignore_ascii_case(b"ZREM") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "zrem");
+        }
+        let key = request.arguments[1];
+        let mut entries = match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => return write_integer(stream, 0),
+            Loaded::Found(entries) => entries,
+            Loaded::Rejected => return Ok(()),
+        };
+        let mut removed = 0_i64;
+        entries.retain(|(member, _)| {
+            let hit = request.arguments[2..].iter().any(|candidate| candidate == member);
+            if hit {
+                removed += 1;
+            }
+            !hit
+        });
+        if entries.is_empty() {
+            if let Err(message) = remove_value(executor, &KeyKind::ZSet.namespace(base), key) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        else {
+            let Some(bytes) = encode_zset(&entries)
+            else {
+                return write_error(stream, "zset exceeds the storage limit");
+            };
+            if let Err(message) = store_value(executor, &KeyKind::ZSet.namespace(base), key, bytes) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        return write_integer(stream, removed);
+    }
+    if command.eq_ignore_ascii_case(b"ZCARD") {
+        if request.arguments.len() != 2 {
+            return write_arity_error(stream, "zcard");
+        }
+        let key = request.arguments[1];
+        return match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => write_integer(stream, 0),
+            Loaded::Found(entries) => write_integer(stream, entries.len() as i64),
+            Loaded::Rejected => Ok(()),
+        };
+    }
+    // ZRANGE
+    let with_scores = match request.arguments.len() {
+        4 => false,
+        5 if request.arguments[4].eq_ignore_ascii_case(b"WITHSCORES") => true,
+        5 => return write_error(stream, "syntax error"),
+        _ => return write_arity_error(stream, "zrange"),
+    };
+    let (Some(start), Some(stop)) = (parse_index(request.arguments[2]), parse_index(request.arguments[3]))
+    else {
+        return write_error(stream, "value is not an integer or out of range");
+    };
+    let key = request.arguments[1];
+    let mut entries = match load_zset(stream, executor, base, key)? {
+        Loaded::Missing => return write_array_header(stream, 0),
+        Loaded::Found(entries) => entries,
+        Loaded::Rejected => return Ok(()),
+    };
+    sort_zset(&mut entries);
+    let length = entries.len() as i64;
+    let mut begin = if start < 0 { length.saturating_add(start) } else { start };
+    let end = if stop < 0 { length.saturating_add(stop) } else { stop };
+    begin = begin.max(0);
+    let end = end.min(length - 1);
+    if begin > end || begin >= length || end < 0 {
+        return write_array_header(stream, 0);
+    }
+    let slice = &entries[begin as usize..=end as usize];
+    write_array_header(stream, if with_scores { slice.len() * 2 } else { slice.len() })?;
+    for (member, score) in slice {
+        write_bulk(stream, member)?;
+        if with_scores {
+            write_score(stream, *score)?;
+        }
+    }
+    Ok(())
 }
