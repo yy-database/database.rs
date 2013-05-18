@@ -694,6 +694,146 @@ fn clear_other_kinds(executor: &dyn KeyValueExecutor, namespace: &Namespace, key
     Ok(())
 }
 
+/// 简易 Redis glob：支持 `*`、`?` 与反斜杠转义，其余字符按字面量比较。
+///
+/// `MATCH` 只影响本次返回的键，不改变游标推进，与真机的过滤语义一致。
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut pattern_index, mut text_index) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while text_index < text.len() {
+        if pattern_index < pattern.len() {
+            match pattern[pattern_index] {
+                b'*' => {
+                    star = Some((pattern_index, text_index));
+                    pattern_index += 1;
+                    continue;
+                }
+                b'?' => {
+                    pattern_index += 1;
+                    text_index += 1;
+                    continue;
+                }
+                b'\\' if pattern_index + 1 < pattern.len() && pattern[pattern_index + 1] == text[text_index] => {
+                    pattern_index += 2;
+                    text_index += 1;
+                    continue;
+                }
+                byte if byte == text[text_index] => {
+                    pattern_index += 1;
+                    text_index += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match star {
+            Some((star_index, resume)) => {
+                pattern_index = star_index + 1;
+                text_index = resume + 1;
+                star = Some((star_index, text_index));
+            }
+            None => return false,
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+/// `SCAN cursor [MATCH pattern] [COUNT count]`。
+///
+/// 游标是「已检查键数」的十进制下标：每次返回 `COUNT` 个键（不足则到末尾），返回 0
+/// 表示迭代结束。所有值类型都参与扫描，键按字节序合并后去重，因此一次调用不保证
+/// 返回全部键，但持续回传游标直到 0 能覆盖当前键空间。
+fn handle_scan(
+    stream: &mut dyn Write,
+    request: &Request<'_>,
+    executor: Option<&dyn KeyValueExecutor>,
+    namespace: &Namespace,
+) -> io::Result<()> {
+    let Some(executor) = executor
+    else {
+        stream.write_all(b"-ERR unsupported command\r\n")?;
+        return Ok(());
+    };
+    if request.arguments.len() < 2 {
+        stream.write_all(b"-ERR wrong number of arguments for 'scan' command\r\n")?;
+        return Ok(());
+    }
+    let cursor_text = match std::str::from_utf8(request.arguments[1]) {
+        Ok(text) if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) => text,
+        _ => {
+            write_error(stream, "invalid cursor")?;
+            return Ok(());
+        }
+    };
+    let Ok(cursor) = cursor_text.parse::<u64>()
+    else {
+        write_error(stream, "invalid cursor")?;
+        return Ok(());
+    };
+    let mut pattern: Option<Vec<u8>> = None;
+    let mut count = 10usize;
+    let mut index = 2;
+    while index < request.arguments.len() {
+        if index + 1 >= request.arguments.len() {
+            write_error(stream, "syntax error")?;
+            return Ok(());
+        }
+        if request.arguments[index].eq_ignore_ascii_case(b"MATCH") {
+            pattern = Some(request.arguments[index + 1].to_vec());
+        }
+        else if request.arguments[index].eq_ignore_ascii_case(b"COUNT") {
+            let Ok(value) = std::str::from_utf8(request.arguments[index + 1]).unwrap_or("").parse::<u64>()
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(());
+            };
+            if value == 0 {
+                write_error(stream, "syntax error")?;
+                return Ok(());
+            }
+            count = value.min(usize::MAX as u64) as usize;
+        }
+        else {
+            write_error(stream, "syntax error")?;
+            return Ok(());
+        }
+        index += 2;
+    }
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for kind in KeyKind::ALL {
+        match executor.execute_scan(None, &kind.namespace(namespace), &[], None, None, 0) {
+            Ok(records) => keys.extend(records.into_iter().map(|(key, _)| key)),
+            Err(error) => {
+                write_error(stream, &error.to_string())?;
+                return Ok(());
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    let start = cursor as usize;
+    if start >= keys.len() {
+        stream.write_all(b"*2\r\n")?;
+        write_bulk(stream, b"0")?;
+        stream.write_all(b"*0\r\n")?;
+        return Ok(());
+    }
+    let end = start.saturating_add(count).min(keys.len());
+    let next = if end >= keys.len() { "0".to_string() } else { end.to_string() };
+    let matched: Vec<&Vec<u8>> =
+        keys[start..end].iter().filter(|key| pattern.as_ref().map_or(true, |pattern| glob_match(pattern, key))).collect();
+    stream.write_all(b"*2\r\n")?;
+    write_bulk(stream, next.as_bytes())?;
+    write!(stream, "*{}\r\n", matched.len())?;
+    for key in matched {
+        write_bulk(stream, key)?;
+    }
+    Ok(())
+}
+
 /// `OBJECT IDLETIME` / `OBJECT REFCOUNT` / `OBJECT FREQ`.
 ///
 /// 三个子命令先按真机的 `LOOKUP_NOTOUCH` 口径查键：缺键回 null（RESP2 `$-1`、RESP3 `_`），
@@ -1594,6 +1734,9 @@ fn respond(
     else if collections::is_zset_command(command) {
         collections::handle_zset(stream, request, executor, namespace, state.protocol)?;
     }
+    else if command.eq_ignore_ascii_case(b"SCAN") {
+        handle_scan(stream, request, executor, namespace)?;
+    }
     else if command.eq_ignore_ascii_case(b"OBJECT") {
         handle_object(stream, request, probe, tracker, namespace, state.protocol)?;
     }
@@ -2021,6 +2164,16 @@ fn validate_command_for_queue(
     {
         if executor.is_none() {
             return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        return Ok(());
+    }
+    // SCAN: cursor iteration, options are validated at runtime like upstream.
+    if command.eq_ignore_ascii_case(b"SCAN") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if count < 2 {
+            return Err(b"-ERR wrong number of arguments for 'scan' command\r\n".to_vec());
         }
         return Ok(());
     }
