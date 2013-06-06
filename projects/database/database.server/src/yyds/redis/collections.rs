@@ -440,7 +440,7 @@ fn load_zset(
 }
 
 /// 整数参数校验，与真机 `ERR value is not an integer or out of range` 对齐。
-fn parse_index(raw: &[u8]) -> Option<i64> {
+pub(crate) fn parse_index(raw: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(raw).ok()?;
     let value = text.parse::<i64>().ok()?;
     if value.to_string() != text { None } else { Some(value) }
