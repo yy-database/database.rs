@@ -786,6 +786,121 @@ fn lowercase_command(command: &[u8]) -> String {
     String::from_utf8_lossy(command).to_ascii_lowercase()
 }
 
+/// `EXPIRE` 家族尾部的条件选项。
+#[derive(Debug, Clone, Copy, Default)]
+struct ExpireFlags {
+    /// 仅当键当前没有过期时间时生效。
+    nx: bool,
+    /// 仅当键当前已有过期时间时生效。
+    xx: bool,
+    /// 仅当新截止时间大于当前截止时间时生效。
+    gt: bool,
+    /// 仅当新截止时间小于当前截止时间时生效；无过期时间视为无限大。
+    lt: bool,
+}
+
+impl ExpireFlags {
+    /// 是否带了任意一个条件。
+    fn any(self) -> bool {
+        self.nx || self.xx || self.gt || self.lt
+    }
+}
+
+/// 条件选项解析失败的原因。
+enum ExpireFlagError {
+    /// `NX` 与 `XX` / `GT` / `LT` 冲突，或 `GT` 与 `LT` 冲突。
+    Conflict,
+    /// 不认识的选项原文。
+    Unsupported(Vec<u8>),
+}
+
+/// 解析 `EXPIRE key seconds [NX|XX|GT|LT ...]` 中第二个参数之后的条件选项。
+///
+/// 与真机一致：选项大小写不敏感、允许重复，但 `NX` 不能和 `XX` / `GT` / `LT`
+/// 同时出现，`GT` 与 `LT` 也不能同时出现。
+fn parse_expire_flags(arguments: &[&[u8]]) -> Result<ExpireFlags, ExpireFlagError> {
+    let mut flags = ExpireFlags::default();
+    for raw in &arguments[3..] {
+        if raw.eq_ignore_ascii_case(b"NX") {
+            flags.nx = true;
+        }
+        else if raw.eq_ignore_ascii_case(b"XX") {
+            flags.xx = true;
+        }
+        else if raw.eq_ignore_ascii_case(b"GT") {
+            flags.gt = true;
+        }
+        else if raw.eq_ignore_ascii_case(b"LT") {
+            flags.lt = true;
+        }
+        else {
+            return Err(ExpireFlagError::Unsupported(raw.to_vec()));
+        }
+    }
+    if flags.nx && (flags.xx || flags.gt || flags.lt) {
+        return Err(ExpireFlagError::Conflict);
+    }
+    if flags.gt && flags.lt {
+        return Err(ExpireFlagError::Conflict);
+    }
+    Ok(flags)
+}
+
+/// 把条件选项的错误写回客户端，消息与真机逐字一致。
+fn write_expire_flag_error(stream: &mut dyn Write, error: ExpireFlagError) -> io::Result<()> {
+    match error {
+        ExpireFlagError::Conflict => write_error(stream, "NX and XX, GT or LT options at the same time are not compatible"),
+        ExpireFlagError::Unsupported(option) => {
+            let text = String::from_utf8_lossy(&option);
+            write_error(stream, &format!("Unsupported option {text}"))
+        }
+    }
+}
+
+/// 判定条件选项是否允许把截止时间设为 `expires_at`；`Ok(None)` 表示错误已经写出。
+///
+/// 真机的条件是相对「当前截止时间」比较：`NX` 要求当前无过期，`XX` 要求当前有过期，
+/// `GT` 要求严格更大，`LT` 要求严格更小，而当前无过期时 `LT` 视为无限大所以总成立。
+fn expire_condition_allows(
+    stream: &mut dyn Write,
+    executor: &dyn KeyValueExecutor,
+    namespace: &Namespace,
+    key: &[u8],
+    flags: ExpireFlags,
+    expires_at: i64,
+) -> io::Result<Option<bool>> {
+    if !flags.any() {
+        return Ok(Some(true));
+    }
+    let current = match executor.execute(
+        None,
+        KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::GetExpiry },
+    ) {
+        Ok(KeyValueResult::Expiry { expires_at, .. }) => expires_at,
+        Ok(_) => {
+            write_error(stream, "EXPIRE executor returned unexpected result")?;
+            return Ok(None);
+        }
+        Err(error) => {
+            write_error(stream, &error.to_string())?;
+            return Ok(None);
+        }
+    };
+    let allowed = if flags.nx {
+        current.is_none()
+    }
+    else if flags.xx {
+        current.is_some()
+    }
+    else if flags.gt {
+        current.is_some_and(|current| expires_at > current)
+    }
+    else {
+        current.map_or(true, |current| expires_at < current)
+    };
+    Ok(Some(allowed))
+}
+
 /// 简易 Redis glob：支持 `*`、`?` 与反斜杠转义，其余字符按字面量比较。
 ///
 /// `MATCH` 只影响本次返回的键，不改变游标推进，与真机的过滤语义一致。
@@ -1195,10 +1310,17 @@ fn respond(
             stream.write_all(b"-ERR unsupported command\r\n")?;
             return Ok(true);
         };
-        if count != 3 {
+        if count < 3 {
             stream.write_all(b"-ERR wrong number of arguments for 'expire' command\r\n")?;
             return Ok(true);
         }
+        let flags = match parse_expire_flags(&request.arguments) {
+            Ok(flags) => flags,
+            Err(error) => {
+                write_expire_flag_error(stream, error)?;
+                return Ok(true);
+            }
+        };
         let key = request.arguments[1];
         let delta = match parse_integer(request.arguments[2]) {
             Some(v) => v,
@@ -1207,7 +1329,6 @@ fn respond(
                 return Ok(true);
             }
         };
-        // Non-positive TTLs delete the key, matching Redis.
         let target = match resolve_kind(stream, executor, namespace, key)? {
             Resolved::Rejected => return Ok(true),
             Resolved::Missing => {
@@ -1216,7 +1337,25 @@ fn respond(
             }
             Resolved::Kind(kind) => kind.namespace(namespace),
         };
-        if delta <= 0 {
+        let unit_ms: i64 = if command.eq_ignore_ascii_case(b"PEXPIRE") { 1 } else { 1000 };
+        let Some(offset) = delta.checked_mul(unit_ms)
+        else {
+            stream.write_all(b"-ERR invalid expire time in 'expire' command\r\n")?;
+            return Ok(true);
+        };
+        let now = now_unix_ms();
+        let expires_at = now.saturating_add(offset);
+        // 条件先于删除生效：`GT` 在相对过去的截止时间上会拒绝，键必须被保留。
+        match expire_condition_allows(stream, executor, &target, key, flags, expires_at)? {
+            None => return Ok(true),
+            Some(false) => {
+                stream.write_all(b":0\r\n")?;
+                return Ok(true);
+            }
+            Some(true) => {}
+        }
+        // Non-positive or past deadlines delete the key, matching Redis.
+        if expires_at <= now {
             let removed = match executor.execute(
                 None,
                 database_query::cluster_kv::KeyValueCommand {
@@ -1238,8 +1377,6 @@ fn respond(
             stream.write_all(if removed { b":1\r\n" } else { b":0\r\n" })?;
             return Ok(true);
         }
-        let unit_ms: i64 = if command.eq_ignore_ascii_case(b"PEXPIRE") { 1 } else { 1000 };
-        let expires_at = now_unix_ms() + delta.saturating_mul(unit_ms);
         let applied = match executor.execute(
             None,
             database_query::cluster_kv::KeyValueCommand {
@@ -1266,10 +1403,17 @@ fn respond(
             stream.write_all(b"-ERR unsupported command\r\n")?;
             return Ok(true);
         };
-        if count != 3 {
+        if count < 3 {
             stream.write_all(b"-ERR wrong number of arguments for 'expireat' command\r\n")?;
             return Ok(true);
         }
+        let flags = match parse_expire_flags(&request.arguments) {
+            Ok(flags) => flags,
+            Err(error) => {
+                write_expire_flag_error(stream, error)?;
+                return Ok(true);
+            }
+        };
         let key = request.arguments[1];
         let at = match parse_integer(request.arguments[2]) {
             Some(v) => v,
@@ -1278,7 +1422,6 @@ fn respond(
                 return Ok(true);
             }
         };
-        // Non-positive absolute deadlines delete the key, matching Redis.
         let target = match resolve_kind(stream, executor, namespace, key)? {
             Resolved::Rejected => return Ok(true),
             Resolved::Missing => {
@@ -1287,7 +1430,24 @@ fn respond(
             }
             Resolved::Kind(kind) => kind.namespace(namespace),
         };
-        if at <= 0 {
+        let unit_ms: i64 = if command.eq_ignore_ascii_case(b"PEXPIREAT") { 1 } else { 1000 };
+        let Some(expires_at) = at.checked_mul(unit_ms)
+        else {
+            stream.write_all(b"-ERR invalid expire time in 'expireat' command\r\n")?;
+            return Ok(true);
+        };
+        let now = now_unix_ms();
+        // 条件先于删除生效，理由同 `EXPIRE`。
+        match expire_condition_allows(stream, executor, &target, key, flags, expires_at)? {
+            None => return Ok(true),
+            Some(false) => {
+                stream.write_all(b":0\r\n")?;
+                return Ok(true);
+            }
+            Some(true) => {}
+        }
+        // Non-positive or past absolute deadlines delete the key, matching Redis.
+        if expires_at <= now {
             let removed = match executor.execute(
                 None,
                 database_query::cluster_kv::KeyValueCommand {
@@ -1309,12 +1469,6 @@ fn respond(
             stream.write_all(if removed { b":1\r\n" } else { b":0\r\n" })?;
             return Ok(true);
         }
-        let unit_ms: i64 = if command.eq_ignore_ascii_case(b"PEXPIREAT") { 1 } else { 1000 };
-        let Some(expires_at) = at.checked_mul(unit_ms)
-        else {
-            stream.write_all(b"-ERR invalid expire time in 'expireat' command\r\n")?;
-            return Ok(true);
-        };
         let applied = match executor.execute(
             None,
             database_query::cluster_kv::KeyValueCommand {
@@ -2505,12 +2659,13 @@ fn validate_command_for_queue(
         }
         return Ok(());
     }
-    // EXPIRE / PEXPIRE: exactly 3, need executor, integer check
+    // EXPIRE / PEXPIRE: at least 3, need executor, integer check. Conditional options
+    // are validated when the command runs, like upstream.
     if command.eq_ignore_ascii_case(b"EXPIRE") || command.eq_ignore_ascii_case(b"PEXPIRE") {
         if executor.is_none() {
             return Err(b"-ERR unsupported command\r\n".to_vec());
         }
-        if count != 3 {
+        if count < 3 {
             return Err(b"-ERR wrong number of arguments for 'expire' command\r\n".to_vec());
         }
         if parse_integer(arguments[2]).is_none() {
@@ -2518,12 +2673,12 @@ fn validate_command_for_queue(
         }
         return Ok(());
     }
-    // EXPIREAT / PEXPIREAT: exactly 3, need executor, integer check
+    // EXPIREAT / PEXPIREAT: at least 3, need executor, integer check.
     if command.eq_ignore_ascii_case(b"EXPIREAT") || command.eq_ignore_ascii_case(b"PEXPIREAT") {
         if executor.is_none() {
             return Err(b"-ERR unsupported command\r\n".to_vec());
         }
-        if count != 3 {
+        if count < 3 {
             return Err(b"-ERR wrong number of arguments for 'expireat' command\r\n".to_vec());
         }
         if parse_integer(arguments[2]).is_none() {

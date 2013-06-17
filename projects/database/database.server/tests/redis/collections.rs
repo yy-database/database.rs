@@ -1203,7 +1203,8 @@ fn restart_preserves_types_and_contents() {
     expect_bulk(&mut first, Some("2.5"));
     send(&mut first, &["SETBIT", "bitk", "3", "1"]);
     assert_eq!(expect_integer(&mut first), 0);
-    send(&mut first, &["EXPIRE", "app", "100"]);
+    // `LT` applies because a key without a deadline counts as infinite.
+    send(&mut first, &["EXPIRE", "app", "100", "LT"]);
     assert_eq!(expect_integer(&mut first), 1);
 
     let (mut second, _second_server) = file_server(&path);

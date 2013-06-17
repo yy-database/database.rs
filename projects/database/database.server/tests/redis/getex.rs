@@ -274,6 +274,171 @@ fn getex_validates_expiry_arguments() {
     assert_eq!(expect_integer(&mut client), -1);
 }
 
+/// `EXPIRE NX` only lands when the key has no deadline, and `XX` only when it has one.
+#[test]
+fn expire_nx_and_xx_conditions() {
+    let (mut client, _server) = executor_server();
+    send(&mut client, &["SET", "k", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["EXPIRE", "k", "100", "NX"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PTTL", "k"]);
+    let remaining = expect_integer(&mut client);
+    assert!((98_000..=100_000).contains(&remaining), "NX left {remaining} ms");
+
+    // A second `NX` sees the existing deadline and refuses without changing it.
+    send(&mut client, &["EXPIRE", "k", "200", "NX"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["PTTL", "k"]);
+    let remaining = expect_integer(&mut client);
+    assert!((98_000..=100_000).contains(&remaining), "failed NX moved the TTL to {remaining} ms");
+
+    // `XX` replaces an existing deadline.
+    send(&mut client, &["EXPIRE", "k", "200", "XX"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PTTL", "k"]);
+    let remaining = expect_integer(&mut client);
+    assert!((198_000..=200_000).contains(&remaining), "XX left {remaining} ms");
+
+    // `XX` on a key without a deadline is a no-op, and a missing key is always 0.
+    send(&mut client, &["SET", "plain", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["EXPIRE", "plain", "100", "XX"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["PTTL", "plain"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    send(&mut client, &["EXPIRE", "missing", "100", "NX"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    // Options work the same on the collection types.
+    send(&mut client, &["HSET", "h", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXPIRE", "h", "100", "NX"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXPIRE", "h", "200", "NX"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["TTL", "h"]);
+    let remaining = expect_integer(&mut client);
+    assert!((98..=100).contains(&remaining), "hash TTL is {remaining} s");
+}
+
+/// `GT` requires a strictly later deadline and `LT` a strictly earlier one, with a
+/// missing deadline treated as infinite.
+#[test]
+fn expire_gt_and_lt_conditions() {
+    let (mut client, _server) = executor_server();
+    send(&mut client, &["SET", "g", "v"]);
+    expect_status(&mut client, "OK");
+    // No deadline means infinite, so GT cannot beat it while LT always can.
+    send(&mut client, &["EXPIRE", "g", "100", "GT"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXPIRE", "g", "100", "LT"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PTTL", "g"]);
+    let remaining = expect_integer(&mut client);
+    assert!((98_000..=100_000).contains(&remaining), "LT left {remaining} ms");
+
+    send(&mut client, &["EXPIRE", "g", "50", "GT"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXPIRE", "g", "200", "GT"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PTTL", "g"]);
+    let remaining = expect_integer(&mut client);
+    assert!((198_000..=200_000).contains(&remaining), "GT left {remaining} ms");
+
+    send(&mut client, &["EXPIRE", "g", "300", "LT"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXPIRE", "g", "150", "LT"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PTTL", "g"]);
+    let remaining = expect_integer(&mut client);
+    assert!((148_000..=150_000).contains(&remaining), "LT left {remaining} ms");
+
+    // Option names are case insensitive and duplicates are allowed.
+    send(&mut client, &["EXPIRE", "g", "400", "gt", "GT"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    // `PEXPIRE` uses the same absolute comparison in milliseconds.
+    send(&mut client, &["PEXPIRE", "g", "1000", "LT"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PTTL", "g"]);
+    let remaining = expect_integer(&mut client);
+    assert!((0..=1_000).contains(&remaining), "PEXPIRE LT left {remaining} ms");
+}
+
+/// Conditions are checked before the delete branch, so a past deadline with `GT` keeps
+/// the key while `LT` and `NX` remove it.
+#[test]
+fn expire_conditions_guard_negative_deadlines() {
+    let (mut client, _server) = executor_server();
+    send(&mut client, &["SET", "d", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["EXPIRE", "d", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXPIRE", "d", "-1", "GT"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "d"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXPIRE", "d", "-1", "LT"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "d"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    send(&mut client, &["SET", "e", "v"]);
+    expect_status(&mut client, "OK");
+    // No deadline: NX applies and the non-positive TTL removes the key.
+    send(&mut client, &["EXPIRE", "e", "-1", "NX"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "e"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    send(&mut client, &["SET", "f", "v"]);
+    expect_status(&mut client, "OK");
+    // No deadline: XX refuses, so a past deadline must not delete the key.
+    send(&mut client, &["EXPIRE", "f", "-1", "XX"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "f"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    // `EXPIREAT` past deadlines follow the same rule.
+    send(&mut client, &["EXPIREAT", "f", "1", "LT"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "f"]);
+    assert_eq!(expect_integer(&mut client), 0);
+}
+
+/// Invalid option combinations and unknown options use the upstream messages.
+#[test]
+fn expire_condition_option_errors() {
+    let (mut client, _server) = executor_server();
+    send(&mut client, &["SET", "k", "v"]);
+    expect_status(&mut client, "OK");
+    for arguments in [
+        ["EXPIRE", "k", "100", "NX", "XX"].as_slice(),
+        ["EXPIRE", "k", "100", "NX", "GT"].as_slice(),
+        ["EXPIRE", "k", "100", "XX", "NX"].as_slice(),
+        ["EXPIRE", "k", "100", "GT", "LT"].as_slice(),
+        ["EXPIREAT", "k", "100", "LT", "GT"].as_slice(),
+        ["PEXPIRE", "k", "100", "NX", "LT"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, "ERR NX and XX, GT or LT options at the same time are not compatible");
+    }
+    send(&mut client, &["EXPIRE", "k", "100", "BOGUS"]);
+    expect_error(&mut client, "ERR Unsupported option BOGUS");
+    send(&mut client, &["PEXPIREAT", "k", "100", "ZZ"]);
+    expect_error(&mut client, "ERR Unsupported option ZZ");
+    send(&mut client, &["EXPIRE", "k", "abc", "NX"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["EXPIRE", "k"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'expire' command");
+    send(&mut client, &["EXPIRE", "k", "9223372036854775807"]);
+    expect_error(&mut client, "ERR invalid expire time in 'expire' command");
+    // Failed option validation leaves the key untouched.
+    send(&mut client, &["PTTL", "k"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    send(&mut client, &["GET", "k"]);
+    expect_bulk(&mut client, Some("v"));
+}
+
 /// A missing key returns nil and creates nothing. The numeric expiry argument is only
 /// checked after the lookup, so a bad number on a missing key is nil rather than an
 /// error, while option syntax is still validated first.
