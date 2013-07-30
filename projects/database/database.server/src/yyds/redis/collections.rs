@@ -306,7 +306,24 @@ pub(crate) fn is_set_command(command: &[u8]) -> bool {
 
 /// zset 命令名集合。
 pub(crate) fn is_zset_command(command: &[u8]) -> bool {
-    for name in [b"ZADD".as_slice(), b"ZSCORE", b"ZREM", b"ZCARD", b"ZRANGE"] {
+    for name in [
+        b"ZADD".as_slice(),
+        b"ZSCORE",
+        b"ZREM",
+        b"ZCARD",
+        b"ZRANGE",
+        b"ZRANGEBYSCORE",
+        b"ZREVRANGEBYSCORE",
+        b"ZRANGEBYLEX",
+        b"ZREVRANGEBYLEX",
+        b"ZRANK",
+        b"ZREVRANK",
+        b"ZINCRBY",
+        b"ZCOUNT",
+        b"ZREMRANGEBYRANK",
+        b"ZREMRANGEBYSCORE",
+        b"ZSCAN",
+    ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
         }
@@ -1404,7 +1421,227 @@ pub(crate) fn handle_set(
     }
 }
 
-/// `ZADD` / `ZSCORE` / `ZREM` / `ZCARD` / `ZRANGE` 的分派入口。
+/// 分数区间端点：`(` 前缀表示开区间，`-inf` / `+inf` 表示无穷。
+#[derive(Clone, Copy)]
+struct ScoreBound {
+    value: f64,
+    exclusive: bool,
+}
+
+/// 解析浮点字面量，接受 `-inf` / `+inf` / `inf` 并拒绝 `NaN`。
+fn parse_float_literal(text: &str) -> Option<f64> {
+    let normalized = text.to_ascii_lowercase();
+    if normalized == "-inf" {
+        return Some(f64::NEG_INFINITY);
+    }
+    if normalized == "+inf" || normalized == "inf" {
+        return Some(f64::INFINITY);
+    }
+    let value = text.parse::<f64>().ok()?;
+    if value.is_nan() { None } else { Some(value) }
+}
+
+fn parse_score_bound(raw: &[u8]) -> Option<ScoreBound> {
+    let text = std::str::from_utf8(raw).ok()?;
+    if let Some(rest) = text.strip_prefix('(') {
+        let value = parse_float_literal(rest)?;
+        return Some(ScoreBound { value, exclusive: true });
+    }
+    let value = parse_float_literal(text)?;
+    Some(ScoreBound { value, exclusive: false })
+}
+
+fn score_at_least(score: f64, bound: ScoreBound) -> bool {
+    if bound.exclusive { score > bound.value } else { score >= bound.value }
+}
+
+fn score_at_most(score: f64, bound: ScoreBound) -> bool {
+    if bound.exclusive { score < bound.value } else { score <= bound.value }
+}
+
+fn in_score_range(score: f64, min: ScoreBound, max: ScoreBound) -> bool {
+    score_at_least(score, min) && score_at_most(score, max)
+}
+
+/// 字典区间端点：`-` / `+` 表示无界，`[x` 闭区间，`(x` 开区间。
+#[derive(Clone)]
+enum LexBound {
+    NegInf,
+    PosInf,
+    Value { bytes: Vec<u8>, exclusive: bool },
+}
+
+fn parse_lex_bound(raw: &[u8]) -> Option<LexBound> {
+    match raw {
+        b"-" => Some(LexBound::NegInf),
+        b"+" => Some(LexBound::PosInf),
+        _ => {
+            let (exclusive, rest) = match raw.split_first() {
+                Some((b'[', rest)) => (false, rest),
+                Some((b'(', rest)) => (true, rest),
+                _ => return None,
+            };
+            Some(LexBound::Value { bytes: rest.to_vec(), exclusive })
+        }
+    }
+}
+
+fn lex_at_least(member: &[u8], bound: &LexBound) -> bool {
+    match bound {
+        LexBound::NegInf => true,
+        LexBound::PosInf => false,
+        LexBound::Value { bytes, exclusive } => {
+            if *exclusive {
+                member > bytes.as_slice()
+            }
+            else {
+                member >= bytes.as_slice()
+            }
+        }
+    }
+}
+
+fn lex_at_most(member: &[u8], bound: &LexBound) -> bool {
+    match bound {
+        LexBound::NegInf => false,
+        LexBound::PosInf => true,
+        LexBound::Value { bytes, exclusive } => {
+            if *exclusive {
+                member < bytes.as_slice()
+            }
+            else {
+                member <= bytes.as_slice()
+            }
+        }
+    }
+}
+
+/// 把 `start` / `stop` 归一化为可切片的排名区间；空区间回 `None`。
+fn entry_rank_range(start: i64, stop: i64, length: usize) -> Option<(usize, usize)> {
+    let length = length as i64;
+    let begin = if start < 0 { length.saturating_add(start) } else { start }.max(0);
+    let end = if stop < 0 { length.saturating_add(stop) } else { stop }.min(length - 1);
+    if begin > end || begin >= length || end < 0 { None } else { Some((begin as usize, end as usize)) }
+}
+
+/// 按 `LIMIT` 截取一段结果；offset 为负按 0 处理，count 为负表示取到末尾。
+fn apply_limit<T: Clone>(items: &[T], offset: i64, count: i64) -> Vec<T> {
+    let offset = offset.max(0) as usize;
+    if offset >= items.len() {
+        return Vec::new();
+    }
+    let remaining = &items[offset..];
+    if count < 0 {
+        return remaining.to_vec();
+    }
+    remaining[..(count as usize).min(remaining.len())].to_vec()
+}
+
+/// 输出一段 zset 结果，`WITHSCORES` 时成员与分数交替排列。
+fn write_zset_entries(stream: &mut dyn io::Write, entries: &[(Vec<u8>, f64)], with_scores: bool) -> io::Result<()> {
+    write_array_header(stream, if with_scores { entries.len() * 2 } else { entries.len() })?;
+    for (member, score) in entries {
+        write_bulk(stream, member)?;
+        if with_scores {
+            write_score(stream, *score)?;
+        }
+    }
+    Ok(())
+}
+
+/// 解析 `ZRANGEBYSCORE` 的 `WITHSCORES` 与 `LIMIT offset count` 选项。
+fn parse_score_range_options(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    start: usize,
+) -> io::Result<Option<(bool, Option<(i64, i64)>)>> {
+    let mut with_scores = false;
+    let mut limit: Option<(i64, i64)> = None;
+    let mut index = start;
+    while index < arguments.len() {
+        if arguments[index].eq_ignore_ascii_case(b"WITHSCORES") {
+            with_scores = true;
+            index += 1;
+        }
+        else if arguments[index].eq_ignore_ascii_case(b"LIMIT") {
+            if index + 2 >= arguments.len() {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            }
+            let (Some(offset), Some(count)) =
+                (parse_index(arguments[index + 1]), parse_index(arguments[index + 2]))
+            else {
+                write_error(stream, "value is not an integer or out of range")?;
+                return Ok(None);
+            };
+            limit = Some((offset, count));
+            index += 3;
+        }
+        else {
+            write_error(stream, "syntax error")?;
+            return Ok(None);
+        }
+    }
+    Ok(Some((with_scores, limit)))
+}
+
+/// 解析 `ZRANGEBYLEX` 的 `LIMIT offset count` 选项，字典族不接受 `WITHSCORES`。
+fn parse_lex_options(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    start: usize,
+) -> io::Result<Option<Option<(i64, i64)>>> {
+    let mut limit: Option<(i64, i64)> = None;
+    let mut index = start;
+    while index < arguments.len() {
+        if arguments[index].eq_ignore_ascii_case(b"LIMIT") && index + 2 < arguments.len() {
+            let (Some(offset), Some(count)) =
+                (parse_index(arguments[index + 1]), parse_index(arguments[index + 2]))
+            else {
+                write_error(stream, "value is not an integer or out of range")?;
+                return Ok(None);
+            };
+            limit = Some((offset, count));
+            index += 3;
+        }
+        else {
+            write_error(stream, "syntax error")?;
+            return Ok(None);
+        }
+    }
+    Ok(Some(limit))
+}
+
+/// 写出一段 zset 扫描结果：`[next-cursor, [member, score, ...]]`。
+fn write_zscan_page(
+    stream: &mut dyn io::Write,
+    entries: &[(Vec<u8>, f64)],
+    cursor: usize,
+    count: usize,
+    pattern: Option<&[u8]>,
+) -> io::Result<()> {
+    if cursor >= entries.len() {
+        stream.write_all(b"*2\r\n")?;
+        write_bulk(stream, b"0")?;
+        return write_array_header(stream, 0);
+    }
+    let end = cursor.saturating_add(count).min(entries.len());
+    let next = if end >= entries.len() { "0".to_string() } else { end.to_string() };
+    let matched: Vec<&(Vec<u8>, f64)> = entries[cursor..end]
+        .iter()
+        .filter(|(member, _)| pattern.map_or(true, |pattern| glob_match_local(pattern, member)))
+        .collect();
+    stream.write_all(b"*2\r\n")?;
+    write_bulk(stream, next.as_bytes())?;
+    write_array_header(stream, matched.len() * 2)?;
+    for (member, score) in matched {
+        write_bulk(stream, member)?;
+        write_score(stream, *score)?;
+    }
+    Ok(())
+}
+
+/// `ZADD` / `ZSCORE` / `ZREM` / `ZCARD` / `ZRANGE` 及排序族、排名、计数与扫描的分派入口。
 pub(crate) fn handle_zset(
     stream: &mut dyn io::Write,
     request: &Request<'_>,
@@ -1518,6 +1755,265 @@ pub(crate) fn handle_zset(
             Loaded::Found(entries) => write_integer(stream, entries.len() as i64),
             Loaded::Rejected => Ok(()),
         };
+    }
+    if command.eq_ignore_ascii_case(b"ZRANGEBYSCORE") || command.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE") {
+        let reverse = command.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE");
+        if request.arguments.len() < 4 {
+            let name = if reverse { "zrevrangebyscore" } else { "zrangebyscore" };
+            return write_arity_error(stream, name);
+        }
+        let key = request.arguments[1];
+        let (high, low) =
+            if reverse { (request.arguments[2], request.arguments[3]) } else { (request.arguments[3], request.arguments[2]) };
+        let (Some(min), Some(max)) = (parse_score_bound(low), parse_score_bound(high))
+        else {
+            return write_error(stream, "min or max is not a float");
+        };
+        let Some((with_scores, limit)) = parse_score_range_options(stream, &request.arguments, 4)?
+        else {
+            return Ok(());
+        };
+        let mut entries = match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => return write_array_header(stream, 0),
+            Loaded::Found(entries) => entries,
+            Loaded::Rejected => return Ok(()),
+        };
+        sort_zset(&mut entries);
+        let mut selected: Vec<(Vec<u8>, f64)> =
+            entries.into_iter().filter(|(_, score)| in_score_range(*score, min, max)).collect();
+        if reverse {
+            selected.reverse();
+        }
+        if let Some((offset, count)) = limit {
+            selected = apply_limit(&selected, offset, count);
+        }
+        return write_zset_entries(stream, &selected, with_scores);
+    }
+    if command.eq_ignore_ascii_case(b"ZRANGEBYLEX") || command.eq_ignore_ascii_case(b"ZREVRANGEBYLEX") {
+        let reverse = command.eq_ignore_ascii_case(b"ZREVRANGEBYLEX");
+        if request.arguments.len() < 4 {
+            let name = if reverse { "zrevrangebylex" } else { "zrangebylex" };
+            return write_arity_error(stream, name);
+        }
+        let key = request.arguments[1];
+        let (high, low) =
+            if reverse { (request.arguments[2], request.arguments[3]) } else { (request.arguments[3], request.arguments[2]) };
+        let (Some(min), Some(max)) = (parse_lex_bound(low), parse_lex_bound(high))
+        else {
+            return write_error(stream, "min or max not valid string range item");
+        };
+        let Some(limit) = parse_lex_options(stream, &request.arguments, 4)?
+        else {
+            return Ok(());
+        };
+        let entries = match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => return write_array_header(stream, 0),
+            Loaded::Found(entries) => entries,
+            Loaded::Rejected => return Ok(()),
+        };
+        // 字典族假定所有分数相同，因此只按成员字节比较。
+        let mut members: Vec<Vec<u8>> = entries.into_iter().map(|(member, _)| member).collect();
+        members.sort();
+        members.retain(|member| lex_at_least(member, &min) && lex_at_most(member, &max));
+        if reverse {
+            members.reverse();
+        }
+        if let Some((offset, count)) = limit {
+            members = apply_limit(&members, offset, count);
+        }
+        write_array_header(stream, members.len())?;
+        for member in &members {
+            write_bulk(stream, member)?;
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"ZRANK") || command.eq_ignore_ascii_case(b"ZREVRANK") {
+        let reverse = command.eq_ignore_ascii_case(b"ZREVRANK");
+        if request.arguments.len() != 3 && request.arguments.len() != 4 {
+            let name = if reverse { "zrevrank" } else { "zrank" };
+            return write_arity_error(stream, name);
+        }
+        let with_score = request.arguments.len() == 4;
+        if with_score && !request.arguments[3].eq_ignore_ascii_case(b"WITHSCORE") {
+            return write_error(stream, "syntax error");
+        }
+        let key = request.arguments[1];
+        let mut entries = match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => {
+                return if with_score { write_null_array(stream, protocol) } else { write_null(stream, protocol) };
+            }
+            Loaded::Found(entries) => entries,
+            Loaded::Rejected => return Ok(()),
+        };
+        sort_zset(&mut entries);
+        match entries.iter().position(|(member, _)| member.as_slice() == request.arguments[2]) {
+            Some(index) => {
+                let rank = if reverse { entries.len() - 1 - index } else { index } as i64;
+                if with_score {
+                    stream.write_all(b"*2\r\n")?;
+                    write_integer(stream, rank)?;
+                    write_score(stream, entries[index].1)?;
+                }
+                else {
+                    write_integer(stream, rank)?;
+                }
+            }
+            None => {
+                if with_score {
+                    write_null_array(stream, protocol)?;
+                }
+                else {
+                    write_null(stream, protocol)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"ZINCRBY") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "zincrby");
+        }
+        let Some(increment) = parse_score(request.arguments[2])
+        else {
+            return write_error(stream, "value is not a valid float");
+        };
+        let key = request.arguments[1];
+        match find_kind(executor, base, key) {
+            Ok(None) | Ok(Some(KeyKind::ZSet)) => {}
+            Ok(Some(_)) => return write_wrong_type(stream),
+            Err(message) => return write_storage_error(stream, &message),
+        }
+        let mut entries = match load_value(executor, &KeyKind::ZSet.namespace(base), key) {
+            Ok(Some(bytes)) => match decode_zset(&bytes) {
+                Some(entries) => entries,
+                None => return write_error(stream, "stored zset value is corrupt"),
+            },
+            Ok(None) => Vec::new(),
+            Err(message) => return write_storage_error(stream, &message),
+        };
+        let member = request.arguments[3].to_vec();
+        let new_score = match entries.iter().find(|(existing, _)| *existing == member) {
+            Some((_, score)) => *score + increment,
+            None => increment,
+        };
+        if new_score.is_nan() {
+            return write_error(stream, "resulting score is not a number (NaN)");
+        }
+        match entries.iter_mut().find(|(existing, _)| *existing == member) {
+            Some(entry) => entry.1 = new_score,
+            None => entries.push((member, new_score)),
+        }
+        let Some(bytes) = encode_zset(&entries)
+        else {
+            return write_error(stream, "zset exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::ZSet.namespace(base), key, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_score(stream, new_score);
+    }
+    if command.eq_ignore_ascii_case(b"ZCOUNT") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "zcount");
+        }
+        let (Some(min), Some(max)) = (parse_score_bound(request.arguments[2]), parse_score_bound(request.arguments[3]))
+        else {
+            return write_error(stream, "min or max is not a float");
+        };
+        let key = request.arguments[1];
+        return match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => write_integer(stream, 0),
+            Loaded::Found(entries) => {
+                write_integer(stream, entries.iter().filter(|(_, score)| in_score_range(*score, min, max)).count() as i64)
+            }
+            Loaded::Rejected => Ok(()),
+        };
+    }
+    if command.eq_ignore_ascii_case(b"ZREMRANGEBYRANK") || command.eq_ignore_ascii_case(b"ZREMRANGEBYSCORE") {
+        let by_score = command.eq_ignore_ascii_case(b"ZREMRANGEBYSCORE");
+        if request.arguments.len() != 4 {
+            let name = if by_score { "zremrangebyscore" } else { "zremrangebyrank" };
+            return write_arity_error(stream, name);
+        }
+        let mut min = ScoreBound { value: f64::NEG_INFINITY, exclusive: false };
+        let mut max = ScoreBound { value: f64::INFINITY, exclusive: false };
+        let mut rank_range: Option<(i64, i64)> = None;
+        if by_score {
+            match (parse_score_bound(request.arguments[2]), parse_score_bound(request.arguments[3])) {
+                (Some(low), Some(high)) => {
+                    min = low;
+                    max = high;
+                }
+                _ => return write_error(stream, "min or max is not a float"),
+            }
+        }
+        else {
+            let (Some(low), Some(high)) = (parse_index(request.arguments[2]), parse_index(request.arguments[3]))
+            else {
+                return write_error(stream, "value is not an integer or out of range");
+            };
+            rank_range = Some((low, high));
+        }
+        let key = request.arguments[1];
+        let mut removed = 0_i64;
+        let mut entries = match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => return write_integer(stream, 0),
+            Loaded::Found(entries) => entries,
+            Loaded::Rejected => return Ok(()),
+        };
+        if by_score {
+            entries.retain(|(_, score)| {
+                let hit = in_score_range(*score, min, max);
+                if hit {
+                    removed += 1;
+                }
+                !hit
+            });
+        }
+        else {
+            sort_zset(&mut entries);
+            if let Some((start, stop)) = rank_range {
+                if let Some((begin, end)) = entry_rank_range(start, stop, entries.len()) {
+                    entries.drain(begin..=end);
+                    removed = (end - begin + 1) as i64;
+                }
+            }
+        }
+        if entries.is_empty() {
+            if let Err(message) = remove_value(executor, &KeyKind::ZSet.namespace(base), key) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        else {
+            let Some(bytes) = encode_zset(&entries)
+            else {
+                return write_error(stream, "zset exceeds the storage limit");
+            };
+            if let Err(message) = store_value(executor, &KeyKind::ZSet.namespace(base), key, bytes) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        return write_integer(stream, removed);
+    }
+    if command.eq_ignore_ascii_case(b"ZSCAN") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "zscan");
+        }
+        let Some(cursor) = parse_scan_cursor(stream, request.arguments[2])?
+        else {
+            return Ok(());
+        };
+        let Some((pattern, count)) = parse_scan_tail(stream, &request.arguments, 3)?
+        else {
+            return Ok(());
+        };
+        let key = request.arguments[1];
+        let entries = match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => Vec::new(),
+            Loaded::Found(entries) => entries,
+            Loaded::Rejected => return Ok(()),
+        };
+        return write_zscan_page(stream, &entries, cursor, count, pattern.as_deref());
     }
     // ZRANGE
     let with_scores = match request.arguments.len() {

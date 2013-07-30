@@ -1405,6 +1405,261 @@ fn set_algebra_survives_reopen() {
     expect_array(&mut second, &["n"]);
 }
 
+fn read_rank_with_score(client: &mut TcpStream) -> Option<(i64, String)> {
+    match read_reply(client) {
+        Reply::Array(Some(items)) => {
+            assert_eq!(items.len(), 2, "WITHSCORE reply must hold rank and score");
+            match (&items[0], &items[1]) {
+                (Reply::Integer(rank), Reply::Bulk(Some(score))) => {
+                    Some((*rank, String::from_utf8(score.clone()).unwrap()))
+                }
+                other => panic!("unexpected rank reply {:?}", other),
+            }
+        }
+        Reply::Array(None) => None,
+        other => panic!("expected rank array, got {}", describe(&other)),
+    }
+}
+
+/// Score ranges honour open intervals, infinities, `LIMIT` and `WITHSCORES`; `ZCOUNT`
+/// uses the same bounds.
+#[test]
+fn zset_score_ranges_and_limits() {
+    let (mut client, _server) = memory_server("redis-zset-score-range");
+    send(&mut client, &["ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZRANGEBYSCORE", "z", "-inf", "+inf"]);
+    expect_array(&mut client, &["a", "b", "c", "d"]);
+    send(&mut client, &["ZRANGEBYSCORE", "z", "(1", "+inf"]);
+    expect_array(&mut client, &["b", "c", "d"]);
+    send(&mut client, &["ZRANGEBYSCORE", "z", "-inf", "(3", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "1", "b", "2"]);
+    send(&mut client, &["ZRANGEBYSCORE", "z", "-inf", "+inf", "LIMIT", "1", "2"]);
+    expect_array(&mut client, &["b", "c"]);
+    send(&mut client, &["ZRANGEBYSCORE", "z", "-inf", "+inf", "LIMIT", "2", "-1"]);
+    expect_array(&mut client, &["c", "d"]);
+    send(&mut client, &["ZREVRANGEBYSCORE", "z", "+inf", "-inf"]);
+    expect_array(&mut client, &["d", "c", "b", "a"]);
+    send(&mut client, &["ZREVRANGEBYSCORE", "z", "3", "(1"]);
+    expect_array(&mut client, &["c", "b"]);
+    send(&mut client, &["ZREVRANGEBYSCORE", "z", "+inf", "-inf", "LIMIT", "0", "2", "WITHSCORES"]);
+    expect_array(&mut client, &["d", "4", "c", "3"]);
+    send(&mut client, &["ZRANGEBYSCORE", "no-such-key", "-inf", "+inf"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["ZREVRANGEBYSCORE", "no-such-key", "+inf", "-inf"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["ZRANGEBYSCORE", "z", "bad", "+inf"]);
+    expect_error(&mut client, "ERR min or max is not a float");
+    send(&mut client, &["ZRANGEBYSCORE", "z", "-inf", "+inf", "LIMIT", "x", "1"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["ZRANGEBYSCORE", "z", "-inf", "+inf", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZCOUNT", "z", "1", "3"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZCOUNT", "z", "(1", "(3"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZCOUNT", "z", "4", "1"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZCOUNT", "no-such-key", "-inf", "+inf"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    for arguments in [
+        ["ZRANGEBYSCORE", "str", "-inf", "+inf"].as_slice(),
+        ["ZREVRANGEBYSCORE", "str", "+inf", "-inf"].as_slice(),
+        ["ZCOUNT", "str", "-inf", "+inf"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, WRONGTYPE);
+    }
+}
+
+/// Lex ranges compare member bytes with `[` / `(` / `-` / `+`, and ranks report the
+/// optional score.
+#[test]
+fn zset_lex_ranges_and_rank() {
+    let (mut client, _server) = memory_server("redis-zset-lex-rank");
+    send(&mut client, &["ZADD", "lex", "0", "a", "0", "b", "0", "c", "0", "d"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZRANGEBYLEX", "lex", "-", "+"]);
+    expect_array(&mut client, &["a", "b", "c", "d"]);
+    send(&mut client, &["ZRANGEBYLEX", "lex", "[b", "(d"]);
+    expect_array(&mut client, &["b", "c"]);
+    send(&mut client, &["ZRANGEBYLEX", "lex", "(a", "+"]);
+    expect_array(&mut client, &["b", "c", "d"]);
+    send(&mut client, &["ZRANGEBYLEX", "lex", "-", "[b"]);
+    expect_array(&mut client, &["a", "b"]);
+    send(&mut client, &["ZRANGEBYLEX", "lex", "-", "+", "LIMIT", "1", "2"]);
+    expect_array(&mut client, &["b", "c"]);
+    send(&mut client, &["ZREVRANGEBYLEX", "lex", "+", "-"]);
+    expect_array(&mut client, &["d", "c", "b", "a"]);
+    send(&mut client, &["ZREVRANGEBYLEX", "lex", "(d", "[a"]);
+    expect_array(&mut client, &["c", "b", "a"]);
+    send(&mut client, &["ZREVRANGEBYLEX", "lex", "+", "-", "LIMIT", "1", "2"]);
+    expect_array(&mut client, &["c", "b"]);
+    send(&mut client, &["ZRANGEBYLEX", "lex", "-", "+", "WITHSCORES"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZRANGEBYLEX", "lex", "a", "+"]);
+    expect_error(&mut client, "ERR min or max not valid string range item");
+    send(&mut client, &["ZRANGEBYLEX", "no-such-key", "-", "+"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["ZREVRANGEBYLEX", "no-such-key", "+", "-"]);
+    expect_empty_array(&mut client);
+
+    send(&mut client, &["ZRANK", "lex", "b"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZREVRANK", "lex", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZRANK", "lex", "b", "WITHSCORE"]);
+    assert_eq!(read_rank_with_score(&mut client), Some((1, "0".to_string())));
+    send(&mut client, &["ZREVRANK", "lex", "b", "WITHSCORE"]);
+    assert_eq!(read_rank_with_score(&mut client), Some((2, "0".to_string())));
+    send(&mut client, &["ZRANK", "lex", "missing"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["ZRANK", "lex", "missing", "WITHSCORE"]);
+    assert_eq!(read_rank_with_score(&mut client), None);
+    send(&mut client, &["ZRANK", "no-such-key", "a"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["ZREVRANK", "no-such-key", "a", "WITHSCORE"]);
+    assert_eq!(read_rank_with_score(&mut client), None);
+    send(&mut client, &["ZRANK", "lex", "b", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    for arguments in [
+        ["ZRANGEBYLEX", "str", "-", "+"].as_slice(),
+        ["ZREVRANGEBYLEX", "str", "+", "-"].as_slice(),
+        ["ZRANK", "str", "a"].as_slice(),
+        ["ZREVRANK", "str", "a"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, WRONGTYPE);
+    }
+}
+
+/// `ZINCRBY` creates missing keys, formats scores like `ZSCORE` and rejects NaN results.
+#[test]
+fn zset_incrby_and_nan_rejection() {
+    let (mut client, _server) = memory_server("redis-zset-incrby");
+    send(&mut client, &["ZINCRBY", "inc", "2", "m"]);
+    expect_bulk(&mut client, Some("2"));
+    send(&mut client, &["ZINCRBY", "inc", "0.5", "m"]);
+    expect_bulk(&mut client, Some("2.5"));
+    send(&mut client, &["ZINCRBY", "inc", "1", "other"]);
+    expect_bulk(&mut client, Some("1"));
+    send(&mut client, &["ZSCORE", "inc", "m"]);
+    expect_bulk(&mut client, Some("2.5"));
+    send(&mut client, &["ZINCRBY", "inc", "not-a-float", "m"]);
+    expect_error(&mut client, "ERR value is not a valid float");
+    send(&mut client, &["ZADD", "inf", "+inf", "x"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZINCRBY", "inf", "-inf", "x"]);
+    expect_error(&mut client, "ERR resulting score is not a number (NaN)");
+    send(&mut client, &["ZSCORE", "inf", "x"]);
+    expect_bulk(&mut client, Some("inf"));
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["ZINCRBY", "str", "1", "m"]);
+    expect_error(&mut client, WRONGTYPE);
+    // Incrementing keeps the existing TTL.
+    send(&mut client, &["EXPIRE", "inc", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZINCRBY", "inc", "1", "m"]);
+    expect_bulk(&mut client, Some("3.5"));
+    send(&mut client, &["TTL", "inc"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "ZINCRBY dropped the TTL: {ttl}");
+}
+
+/// Range removals return the removed count, delete emptied keys and survive `ZSCAN`.
+#[test]
+fn zset_remove_ranges_and_scan() {
+    let (mut client, _server) = memory_server("redis-zset-remove-scan");
+    send(&mut client, &["ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e"]);
+    assert_eq!(expect_integer(&mut client), 5);
+    send(&mut client, &["ZREMRANGEBYRANK", "z", "0", "1"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZRANGE", "z", "0", "-1"]);
+    expect_array(&mut client, &["c", "d", "e"]);
+    send(&mut client, &["ZREMRANGEBYRANK", "z", "-1", "-1"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZRANGE", "z", "0", "-1"]);
+    expect_array(&mut client, &["c", "d"]);
+    send(&mut client, &["ZREMRANGEBYSCORE", "z", "(3", "4"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZRANGE", "z", "0", "-1"]);
+    expect_array(&mut client, &["c"]);
+    send(&mut client, &["ZREMRANGEBYSCORE", "z", "-inf", "+inf"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "z"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZREMRANGEBYRANK", "no-such-key", "0", "-1"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZREMRANGEBYSCORE", "no-such-key", "-inf", "+inf"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZREMRANGEBYSCORE", "z", "bad", "+inf"]);
+    expect_error(&mut client, "ERR min or max is not a float");
+    send(&mut client, &["ZREMRANGEBYRANK", "z", "not-an-index", "0"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+
+    send(&mut client, &["ZADD", "scan", "1", "a", "2", "b", "3", "c", "4", "d"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    let mut cursor = "0".to_string();
+    let mut seen = Vec::new();
+    loop {
+        send(&mut client, &["ZSCAN", "scan", &cursor, "COUNT", "2"]);
+        let (next, items) = expect_scan(&mut client);
+        assert_eq!(items.len() % 2, 0, "ZSCAN must reply member/score pairs");
+        seen.extend(items.into_iter().step_by(2));
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort();
+    assert_eq!(seen, ["a", "b", "c", "d"]);
+    send(&mut client, &["ZSCAN", "scan", "0", "MATCH", "b*", "COUNT", "100"]);
+    let (cursor, items) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert_eq!(items, ["b", "2"]);
+    send(&mut client, &["ZSCAN", "no-such-key", "0"]);
+    let (cursor, items) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert!(items.is_empty());
+    send(&mut client, &["ZSCAN", "scan", "not-a-cursor"]);
+    expect_error(&mut client, "ERR invalid cursor");
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["ZSCAN", "str", "0"]);
+    expect_error(&mut client, WRONGTYPE);
+}
+
+/// zset mutations keep the key TTL, and range removals plus increments survive reopen.
+#[test]
+fn zset_mutations_survive_reopen() {
+    let path = temp_path("zset-reopen");
+    let (mut first, _first_server) = file_server(&path);
+    send(&mut first, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    assert_eq!(expect_integer(&mut first), 3);
+    send(&mut first, &["EXPIRE", "z", "100"]);
+    assert_eq!(expect_integer(&mut first), 1);
+    send(&mut first, &["ZINCRBY", "z", "1", "a"]);
+    expect_bulk(&mut first, Some("2"));
+    send(&mut first, &["ZREMRANGEBYRANK", "z", "0", "0"]);
+    assert_eq!(expect_integer(&mut first), 1);
+
+    let (mut second, _second_server) = file_server(&path);
+    send(&mut second, &["TYPE", "z"]);
+    expect_status(&mut second, "zset");
+    send(&mut second, &["ZRANGE", "z", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut second, &["b", "2", "c", "3"]);
+    send(&mut second, &["TTL", "z"]);
+    let ttl = expect_integer(&mut second);
+    assert!((1..=100).contains(&ttl), "zset TTL missing after reopen: {ttl}");
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
