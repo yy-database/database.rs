@@ -1660,6 +1660,126 @@ fn zset_mutations_survive_reopen() {
     assert!((1..=100).contains(&ttl), "zset TTL missing after reopen: {ttl}");
 }
 
+/// `HKEYS` / `HVALS` / `HEXISTS` and `HINCRBYFLOAT` cover missing keys, non-numeric
+/// fields and infinite results.
+#[test]
+fn hash_keys_values_exists_and_float_increment() {
+    let (mut client, _server) = memory_server("redis-hash-extras");
+    send(&mut client, &["HSET", "h", "a", "1", "b", "2", "c", "3"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["HKEYS", "h"]);
+    expect_array(&mut client, &["a", "b", "c"]);
+    send(&mut client, &["HVALS", "h"]);
+    expect_array(&mut client, &["1", "2", "3"]);
+    send(&mut client, &["HEXISTS", "h", "a"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HEXISTS", "h", "missing"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["HEXISTS", "no-such-key", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["HKEYS", "no-such-key"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["HVALS", "no-such-key"]);
+    expect_empty_array(&mut client);
+
+    send(&mut client, &["HINCRBYFLOAT", "h", "f", "1.5"]);
+    expect_bulk(&mut client, Some("1.5"));
+    send(&mut client, &["HINCRBYFLOAT", "h", "f", "0.25"]);
+    expect_bulk(&mut client, Some("1.75"));
+    send(&mut client, &["HINCRBYFLOAT", "fresh", "n", "2"]);
+    expect_bulk(&mut client, Some("2"));
+    send(&mut client, &["TYPE", "fresh"]);
+    expect_status(&mut client, "hash");
+    send(&mut client, &["HSET", "h", "bad", "not-a-number"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HINCRBYFLOAT", "h", "bad", "1"]);
+    expect_error(&mut client, "ERR hash value is not a float");
+    send(&mut client, &["HINCRBYFLOAT", "h", "f", "not-a-float"]);
+    expect_error(&mut client, "ERR value is not a valid float");
+    send(&mut client, &["HSET", "h", "big", "1e308"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HINCRBYFLOAT", "h", "big", "1e308"]);
+    expect_error(&mut client, "ERR increment would produce NaN or Infinity");
+    send(&mut client, &["HGET", "h", "big"]);
+    expect_bulk(&mut client, Some("1e308"));
+
+    // Float increments keep the existing TTL.
+    send(&mut client, &["EXPIRE", "h", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HINCRBYFLOAT", "h", "f", "1"]);
+    expect_bulk(&mut client, Some("2.75"));
+    send(&mut client, &["TTL", "h"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "HINCRBYFLOAT dropped the TTL: {ttl}");
+
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    for arguments in [
+        ["HKEYS", "str"].as_slice(),
+        ["HVALS", "str"].as_slice(),
+        ["HEXISTS", "str", "a"].as_slice(),
+        ["HINCRBYFLOAT", "str", "f", "1"].as_slice(),
+        ["HSCAN", "str", "0"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, WRONGTYPE);
+    }
+}
+
+/// `HSCAN` walks field/value pairs in pages and honours `MATCH`.
+#[test]
+fn hash_scan_pages_and_match() {
+    let (mut client, _server) = memory_server("redis-hscan");
+    send(&mut client, &["HSET", "h", "a1", "v1", "a2", "v2", "b1", "v3", "b2", "v4"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    let mut cursor = "0".to_string();
+    let mut seen = Vec::new();
+    loop {
+        send(&mut client, &["HSCAN", "h", &cursor, "COUNT", "2"]);
+        let (next, items) = expect_scan(&mut client);
+        assert_eq!(items.len() % 2, 0, "HSCAN must reply field/value pairs");
+        seen.extend(items.into_iter().step_by(2));
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort();
+    assert_eq!(seen, ["a1", "a2", "b1", "b2"]);
+    send(&mut client, &["HSCAN", "h", "0", "MATCH", "a*", "COUNT", "100"]);
+    let (cursor, items) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert_eq!(items, ["a1", "v1", "a2", "v2"]);
+    send(&mut client, &["HSCAN", "no-such-key", "0"]);
+    let (cursor, items) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert!(items.is_empty());
+    send(&mut client, &["HSCAN", "h", "not-a-cursor"]);
+    expect_error(&mut client, "ERR invalid cursor");
+}
+
+/// Float increments and field visibility survive a `FileShard` reopen with their TTL.
+#[test]
+fn hash_extras_survive_reopen() {
+    let path = temp_path("hash-extras");
+    let (mut first, _first_server) = file_server(&path);
+    send(&mut first, &["HSET", "h", "a", "1"]);
+    assert_eq!(expect_integer(&mut first), 1);
+    send(&mut first, &["HINCRBYFLOAT", "h", "a", "0.5"]);
+    expect_bulk(&mut first, Some("1.5"));
+    send(&mut first, &["EXPIRE", "h", "100"]);
+    assert_eq!(expect_integer(&mut first), 1);
+
+    let (mut second, _second_server) = file_server(&path);
+    send(&mut second, &["HGET", "h", "a"]);
+    expect_bulk(&mut second, Some("1.5"));
+    send(&mut second, &["HKEYS", "h"]);
+    expect_array(&mut second, &["a"]);
+    send(&mut second, &["TTL", "h"]);
+    let ttl = expect_integer(&mut second);
+    assert!((1..=100).contains(&ttl), "hash TTL missing after reopen: {ttl}");
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
