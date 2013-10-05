@@ -1780,6 +1780,183 @@ fn hash_extras_survive_reopen() {
     assert!((1..=100).contains(&ttl), "hash TTL missing after reopen: {ttl}");
 }
 
+/// `LREM` honours the count sign, `LSET` rejects missing keys and bad indexes, `LTRIM`
+/// deletes emptied ranges and `LINSERT` reports the pivot miss.
+#[test]
+fn list_remove_set_trim_and_insert() {
+    let (mut client, _server) = memory_server("redis-list-extras");
+    send(&mut client, &["RPUSH", "l", "a", "b", "a", "c", "a"]);
+    assert_eq!(expect_integer(&mut client), 5);
+    send(&mut client, &["LREM", "l", "2", "a"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["LRANGE", "l", "0", "-1"]);
+    expect_array(&mut client, &["b", "c", "a"]);
+    send(&mut client, &["LREM", "l", "-1", "a"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["LRANGE", "l", "0", "-1"]);
+    expect_array(&mut client, &["b", "c"]);
+    send(&mut client, &["LREM", "l", "0", "missing"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LREM", "no-such-key", "0", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LREM", "l", "not-a-count", "a"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+
+    send(&mut client, &["LSET", "l", "0", "B"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["LSET", "l", "-1", "C"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["LRANGE", "l", "0", "-1"]);
+    expect_array(&mut client, &["B", "C"]);
+    send(&mut client, &["LSET", "l", "2", "x"]);
+    expect_error(&mut client, "ERR index out of range");
+    send(&mut client, &["LSET", "l", "-3", "x"]);
+    expect_error(&mut client, "ERR index out of range");
+    send(&mut client, &["LSET", "no-such-key", "0", "x"]);
+    expect_error(&mut client, "ERR no such key");
+
+    send(&mut client, &["LTRIM", "l", "0", "0"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["LRANGE", "l", "0", "-1"]);
+    expect_array(&mut client, &["B"]);
+    send(&mut client, &["LTRIM", "l", "5", "10"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["EXISTS", "l"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LTRIM", "no-such-key", "0", "1"]);
+    expect_status(&mut client, "OK");
+
+    send(&mut client, &["RPUSH", "l", "a", "b", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["LINSERT", "l", "BEFORE", "b", "B"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["LINSERT", "l", "AFTER", "c", "D"]);
+    assert_eq!(expect_integer(&mut client), 5);
+    send(&mut client, &["LRANGE", "l", "0", "-1"]);
+    expect_array(&mut client, &["a", "B", "b", "c", "D"]);
+    send(&mut client, &["LINSERT", "l", "BEFORE", "missing", "x"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    send(&mut client, &["LINSERT", "no-such-key", "BEFORE", "a", "x"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LINSERT", "l", "SIDEWAYS", "b", "x"]);
+    expect_error(&mut client, "ERR syntax error");
+
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    for arguments in [
+        ["LREM", "str", "0", "a"].as_slice(),
+        ["LSET", "str", "0", "a"].as_slice(),
+        ["LTRIM", "str", "0", "1"].as_slice(),
+        ["LINSERT", "str", "BEFORE", "a", "b"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, WRONGTYPE);
+    }
+
+    // Edits keep the list TTL.
+    send(&mut client, &["EXPIRE", "l", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["LSET", "l", "0", "Z"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["TTL", "l"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "LSET dropped the TTL: {ttl}");
+}
+
+/// `RPOPLPUSH` / `LMOVE` move across keys, rotate in place and preserve TTLs.
+#[test]
+fn list_move_between_keys() {
+    let (mut client, _server) = memory_server("redis-list-move");
+    send(&mut client, &["RPUSH", "src", "a", "b", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["RPOPLPUSH", "src", "dst"]);
+    expect_bulk(&mut client, Some("c"));
+    send(&mut client, &["LRANGE", "dst", "0", "-1"]);
+    expect_array(&mut client, &["c"]);
+    send(&mut client, &["RPOPLPUSH", "src", "dst"]);
+    expect_bulk(&mut client, Some("b"));
+    send(&mut client, &["LRANGE", "dst", "0", "-1"]);
+    expect_array(&mut client, &["b", "c"]);
+    send(&mut client, &["LMOVE", "src", "dst", "LEFT", "LEFT"]);
+    expect_bulk(&mut client, Some("a"));
+    send(&mut client, &["EXISTS", "src"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LRANGE", "dst", "0", "-1"]);
+    expect_array(&mut client, &["a", "b", "c"]);
+    send(&mut client, &["LMOVE", "no-such-key", "dst", "LEFT", "LEFT"]);
+    expect_bulk(&mut client, None);
+
+    // Same key rotates instead of deleting.
+    send(&mut client, &["RPUSH", "one", "x"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["RPOPLPUSH", "one", "one"]);
+    expect_bulk(&mut client, Some("x"));
+    send(&mut client, &["LRANGE", "one", "0", "-1"]);
+    expect_array(&mut client, &["x"]);
+    send(&mut client, &["RPUSH", "multi", "1", "2", "3"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["LMOVE", "multi", "multi", "RIGHT", "LEFT"]);
+    expect_bulk(&mut client, Some("3"));
+    send(&mut client, &["LRANGE", "multi", "0", "-1"]);
+    expect_array(&mut client, &["3", "1", "2"]);
+
+    // A missing destination is created on the fly.
+    send(&mut client, &["RPUSH", "s2", "a"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["RPOPLPUSH", "s2", "fresh"]);
+    expect_bulk(&mut client, Some("a"));
+    send(&mut client, &["LRANGE", "fresh", "0", "-1"]);
+    expect_array(&mut client, &["a"]);
+
+    // Destination TTL is reused, not reset.
+    send(&mut client, &["EXPIRE", "dst", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["RPUSH", "donor", "z"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["RPOPLPUSH", "donor", "dst"]);
+    expect_bulk(&mut client, Some("z"));
+    send(&mut client, &["TTL", "dst"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "move reset the destination TTL: {ttl}");
+
+    send(&mut client, &["LMOVE", "multi", "dst", "UP", "LEFT"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["RPOPLPUSH", "str", "dst"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["RPOPLPUSH", "dst", "str"]);
+    expect_error(&mut client, WRONGTYPE);
+}
+
+/// List edits and cross-key moves survive a `FileShard` reopen with their TTL.
+#[test]
+fn list_extras_survive_reopen() {
+    let path = temp_path("list-extras");
+    let (mut first, _first_server) = file_server(&path);
+    send(&mut first, &["RPUSH", "l", "a", "b", "a", "c"]);
+    assert_eq!(expect_integer(&mut first), 4);
+    send(&mut first, &["LREM", "l", "1", "a"]);
+    assert_eq!(expect_integer(&mut first), 1);
+    send(&mut first, &["LSET", "l", "1", "B"]);
+    expect_status(&mut first, "OK");
+    send(&mut first, &["RPOPLPUSH", "l", "l2"]);
+    expect_bulk(&mut first, Some("c"));
+    send(&mut first, &["EXPIRE", "l", "100"]);
+    assert_eq!(expect_integer(&mut first), 1);
+
+    let (mut second, _second_server) = file_server(&path);
+    send(&mut second, &["TYPE", "l"]);
+    expect_status(&mut second, "list");
+    send(&mut second, &["LRANGE", "l", "0", "-1"]);
+    expect_array(&mut second, &["b", "B"]);
+    send(&mut second, &["LRANGE", "l2", "0", "-1"]);
+    expect_array(&mut second, &["c"]);
+    send(&mut second, &["TTL", "l"]);
+    let ttl = expect_integer(&mut second);
+    assert!((1..=100).contains(&ttl), "list TTL missing after reopen: {ttl}");
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
