@@ -96,6 +96,9 @@ struct TableDef {
     checks: Vec<CheckDef>,
     /// `REFERENCES` clauses, table- and column-level, in declaration order.
     foreign_keys: Vec<ForeignKeyDef>,
+    /// `STRICT` table option was present, so every non-NULL value has to
+    /// conform to its column's declared type after affinity.
+    strict: bool,
 }
 
 /// One resolved `REFERENCES` clause of a table.
@@ -458,8 +461,8 @@ impl Engine {
             let Some(sql) = object.sql.as_deref() else { continue };
             let mut statements = parse(sql)?.into_iter();
             match statements.next() {
-                Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, .. }) => {
-                    let def = Self::catalog_table(name.clone(), columns, primary_key, checks, foreign_keys)?;
+                Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, .. }) => {
+                    let def = Self::catalog_table(name.clone(), columns, primary_key, checks, foreign_keys, strict)?;
                     let key = name.to_ascii_lowercase();
                     if !self.table_lookup.contains_key(&key) {
                         let position = self.tables.len();
@@ -500,7 +503,22 @@ impl Engine {
         primary_key: Vec<String>,
         checks: Vec<CheckConstraint>,
         foreign_keys: Vec<ForeignKey>,
+        strict: bool,
     ) -> Result<TableDef, SqlError> {
+        if strict {
+            // SQLite limits STRICT columns to its five storage classes plus
+            // `ANY`; the message quotes the declared text exactly as written.
+            for column in &columns {
+                let declared = column.declared_type.to_ascii_uppercase();
+                if !matches!(declared.as_str(), "INT" | "INTEGER" | "REAL" | "TEXT" | "BLOB" | "ANY") {
+                    return Err(SqlError::new(
+                        "unknown-datatype",
+                        format!("unknown datatype for {}.{}: \"{}\"", name, column.name, column.declared_type),
+                    )
+                    .in_statement("create-table"));
+                }
+            }
+        }
         let mut key_positions = Vec::with_capacity(primary_key.len());
         for column in &primary_key {
             let position = columns
@@ -534,6 +552,7 @@ impl Engine {
             primary_key: key_positions,
             checks: resolved_checks,
             foreign_keys: resolved_foreign_keys,
+            strict,
         })
     }
 
@@ -666,7 +685,7 @@ impl Engine {
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         match statement {
             Statement::Transaction { action } => self.transaction(action),
-            Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, sql } => {
+            Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, sql } => {
                 let key = name.to_ascii_lowercase();
                 check_reserved_object_name(&name, "create-table")?;
                 if self.indexes.contains_key(&key) {
@@ -684,6 +703,7 @@ impl Engine {
                     primary_key.clone(),
                     checks.clone(),
                     foreign_keys.clone(),
+                    strict,
                 )?;
                 self.writer
                     .create_table_with_primary_key_sql(&name, &columns, &primary_key, Some(&sql))
@@ -725,6 +745,18 @@ impl Engine {
                         })
                         .collect();
                     slots_by_row.push(self_contained_arity(def, &table, columns.as_deref(), &resolved)?);
+                }
+                // A `STRICT` table rejects a value whose post-affinity storage
+                // class differs from the declared type, before any row is
+                // written.
+                for slots in &slots_by_row {
+                    for (position, slot) in slots.iter().enumerate() {
+                        if let Some(value) = slot {
+                            if let Some(error) = strict_value_violation(def, position, value, "insert") {
+                                return Err(error);
+                            }
+                        }
+                    }
                 }
                 // One row at a time inside a transaction: a failing `CHECK`
                 // must undo every row of a multi-row statement, as SQLite does.
@@ -921,6 +953,15 @@ impl Engine {
                 let old_rows = self.live_rows(def, "update")?;
                 let assigned: Vec<bool> =
                     def.columns.iter().enumerate().map(|(index, _)| targets.iter().any(|(target, _)| *target == index)).collect();
+                for (_, values) in &plan.writes {
+                    for (position, value) in values.iter().enumerate() {
+                        if let crate::UpdateValue::Set(value) = value {
+                            if let Some(error) = strict_value_violation(def, position, value, "update") {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
                 for (rowid, values) in &plan.writes {
                     if let Err(error) = self.writer.update(&table, *rowid, values) {
@@ -5986,6 +6027,7 @@ fn resolve_checks(
         primary_key: Vec::new(),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
+        strict: false,
     };
     let source = Source {
         label: table.to_string(),
@@ -6109,6 +6151,38 @@ fn check_row(def: &TableDef, slots: &[Option<crate::WriteValue>], rowid: i64) ->
     }
     cells.push(Cell::Integer(rowid));
     cells
+}
+
+/// Reports one `STRICT` storage-class violation: the value is first converted
+/// by the column affinity, then has to land in the declared storage class.
+fn strict_value_violation(def: &TableDef, position: usize, value: &crate::WriteValue, statement: &'static str) -> Option<SqlError> {
+    if !def.strict || matches!(value, crate::WriteValue::Null) {
+        return None;
+    }
+    let column = &def.columns[position];
+    let converted = crate::apply_write_affinity(&column.declared_type, value.clone());
+    let declared = column.declared_type.to_ascii_uppercase();
+    let conforms = match declared.as_str() {
+        "INT" | "INTEGER" => matches!(converted, crate::WriteValue::Integer(_)),
+        "REAL" => matches!(converted, crate::WriteValue::Real(_)),
+        "TEXT" => matches!(converted, crate::WriteValue::Text(_)),
+        "BLOB" => matches!(converted, crate::WriteValue::Blob(_)),
+        _ => true,
+    };
+    if conforms {
+        return None;
+    }
+    let stored = match converted {
+        crate::WriteValue::Real(_) => "REAL",
+        crate::WriteValue::Text(_) => "TEXT",
+        crate::WriteValue::Blob(_) => "BLOB",
+        _ => "INTEGER",
+    };
+    Some(SqlError::new(
+        "constraint-datatype",
+        format!("cannot store {stored} value in {declared} column {}.{}", def.name, column.name),
+    )
+    .in_statement(statement))
 }
 
 fn cell_write_value(cell: &Cell) -> crate::WriteValue {
@@ -7871,11 +7945,20 @@ mod tests {
     }
 
     #[test]
-    fn modulo_truncates_operands_and_keeps_the_dividend_sign() {
-        let mut engine = engine();
+    fn strict_tables_reject_values_outside_the_declared_type() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE s(a INTEGER, b TEXT, c BLOB) STRICT").expect("strict table");
+        engine.execute("INSERT INTO s VALUES ('12', 5, X'00')").expect("affinity keeps strict rows valid");
         assert_eq!(
-            engine.execute_one("SELECT 7 % 3, -7 % 3, 7.5 % 2, 7 % 2.5, 5 % 0").expect("select").rows,
-            vec![vec![Cell::Integer(1), Cell::Integer(-1), Cell::Real(1.0), Cell::Real(1.0), Cell::Null]]
+            engine.execute_one("SELECT a, b FROM s").expect("read").rows,
+            vec![vec![Cell::Integer(12), Cell::Text("5".to_string())]]
         );
+        let real = engine.execute_one("INSERT INTO s(a) VALUES (1.5)").expect_err("real into integer");
+        assert_eq!(real.code, "constraint-datatype");
+        assert_eq!(real.message, "cannot store REAL value in INTEGER column s.a");
+        let text = engine.execute_one("INSERT INTO s(c) VALUES ('z')").expect_err("text into blob");
+        assert_eq!(text.message, "cannot store TEXT value in BLOB column s.c");
+        let unknown = engine.execute_one("CREATE TABLE bad(a varchar(10)) STRICT").expect_err("bad datatype");
+        assert_eq!(unknown.message, "unknown datatype for bad.a: \"varchar(10)\"");
     }
 }
