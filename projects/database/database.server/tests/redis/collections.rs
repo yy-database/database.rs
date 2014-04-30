@@ -2375,3 +2375,103 @@ fn zset_set_operations() {
     send(&mut client, &["ZINTERCARD", "2", "z2", "z3", "LIMIT"]);
     expect_error(&mut client, "ERR syntax error");
 }
+
+/// `SORT` / `SORT_RO` cover numeric and `ALPHA` ordering, `BY` / `GET` patterns,
+/// `LIMIT`, `DESC` and the `STORE` destination type.
+#[test]
+fn sort_commands() {
+    let (mut client, _server) = memory_server("redis-sort");
+    send(&mut client, &["RPUSH", "nums", "3", "1", "2", "10"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["SORT", "nums"]);
+    expect_array(&mut client, &["1", "2", "3", "10"]);
+    send(&mut client, &["SORT", "nums", "DESC"]);
+    expect_array(&mut client, &["10", "3", "2", "1"]);
+    send(&mut client, &["SORT", "nums", "LIMIT", "1", "2"]);
+    expect_array(&mut client, &["2", "3"]);
+    send(&mut client, &["SORT", "nums", "LIMIT", "5", "2"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["SORT_RO", "nums"]);
+    expect_array(&mut client, &["1", "2", "3", "10"]);
+
+    send(&mut client, &["RPUSH", "words", "banana", "apple", "cherry"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SORT", "words", "ALPHA"]);
+    expect_array(&mut client, &["apple", "banana", "cherry"]);
+    send(&mut client, &["SORT", "words", "ALPHA", "DESC"]);
+    expect_array(&mut client, &["cherry", "banana", "apple"]);
+
+    send(&mut client, &["RPUSH", "items", "a", "b", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SET", "weight_a", "10"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SET", "weight_b", "1"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SET", "weight_c", "5"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SORT", "items", "BY", "weight_*"]);
+    expect_array(&mut client, &["b", "c", "a"]);
+    send(&mut client, &["SORT", "items", "BY", "weight_*", "DESC"]);
+    expect_array(&mut client, &["a", "c", "b"]);
+    send(&mut client, &["SORT", "items", "BY", "weight_*", "GET", "#"]);
+    expect_array(&mut client, &["b", "c", "a"]);
+
+    // 哈希模式：`BY key_*->field` 与 `GET` 的哈希字段取值。
+    send(&mut client, &["HSET", "h_a", "v", "7"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HSET", "h_b", "v", "9"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HSET", "h_c", "v", "1"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SORT", "items", "BY", "h_*->v"]);
+    expect_array(&mut client, &["c", "a", "b"]);
+
+    // 不带 `*` 的 BY 关闭排序；zset 仍按自身分数顺序输出。
+    send(&mut client, &["ZADD", "zs", "5", "3", "9", "1", "1", "2"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SORT", "zs", "BY", "nosort"]);
+    expect_array(&mut client, &["2", "3", "1"]);
+    send(&mut client, &["SORT", "zs"]);
+    expect_array(&mut client, &["1", "2", "3"]);
+    send(&mut client, &["SORT", "zs", "DESC"]);
+    expect_array(&mut client, &["3", "2", "1"]);
+
+    send(&mut client, &["SADD", "opts", "3", "1", "2"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SORT", "opts"]);
+    expect_array(&mut client, &["1", "2", "3"]);
+
+    // STORE 覆盖目标为 list，并清掉目标原有的类型与 TTL。
+    send(&mut client, &["SET", "out", "old", "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SORT", "nums", "STORE", "out"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["LRANGE", "out", "0", "-1"]);
+    expect_array(&mut client, &["1", "2", "3", "10"]);
+    send(&mut client, &["TYPE", "out"]);
+    expect_status(&mut client, "list");
+    send(&mut client, &["TTL", "out"]);
+    assert_eq!(expect_integer(&mut client), -1);
+
+    send(&mut client, &["SORT", "no-such-key", "STORE", "out"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "out"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    send(&mut client, &["SET", "plain", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SORT", "plain"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["RPUSH", "bad", "x", "1"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["SORT", "bad"]);
+    expect_error(&mut client, "ERR One or more scores can't be converted into double");
+    send(&mut client, &["SORT_RO", "nums", "STORE", "out"]);
+    expect_error(&mut client, "ERR SORT_RO does not support the STORE option");
+    send(&mut client, &["SORT", "nums", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["SORT", "nums", "LIMIT", "1", "x"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["SORT"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'sort' command");
+}
