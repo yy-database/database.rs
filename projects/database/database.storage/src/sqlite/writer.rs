@@ -1030,6 +1030,35 @@ impl SqliteWriter {
         Ok(DropIndexOutcome::Dropped)
     }
 
+    /// Creates a view: a `sqlite_master` row of kind `view` with root page 0,
+    /// exactly as SQLite stores a view definition. Reading the view is the SQL
+    /// surface's job.
+    pub fn create_view(&mut self, name: &str, sql: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::Unsupported("sqlite view name must not be empty"));
+        }
+        for object in self.master_rows()? {
+            if eq_ignore_ascii_case(&object.name, name) {
+                return Err(Error::Unsupported("sqlite schema object already exists"));
+            }
+        }
+        self.insert_master_row("view", name, name, 0, Some(sql))?;
+        self.bump_cookie();
+        Ok(())
+    }
+
+    /// Drops one view's schema row; returns whether a view was removed.
+    pub fn drop_view(&mut self, name: &str) -> Result<bool> {
+        let rows = self.master_rows()?;
+        let Some(view) = rows.iter().find(|row| row.kind == "view" && eq_ignore_ascii_case(&row.name, name)).cloned()
+        else {
+            return Ok(false);
+        };
+        self.table_delete(1, view.rowid)?;
+        self.bump_cookie();
+        Ok(true)
+    }
+
     /// Drops a table, every index attached to it, and its `sqlite_sequence`
     /// row. The b-tree pages return to the freelist before the catalog rows
     /// disappear, so the image stays consistent for an external reader.

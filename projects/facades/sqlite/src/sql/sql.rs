@@ -1184,6 +1184,26 @@ pub enum Statement {
         /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
         sql: String,
     },
+    /// `CREATE VIEW ... AS SELECT ...`.
+    CreateView {
+        /// View name as written.
+        name: String,
+        /// `IF NOT EXISTS` was present.
+        if_not_exists: bool,
+        /// Optional `(a, b)` column list that renames the query output.
+        columns: Option<Vec<String>>,
+        /// The query the view stores and re-runs on every read.
+        query: Box<Statement>,
+        /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
+        sql: String,
+    },
+    /// `DROP VIEW [IF EXISTS] name`.
+    DropView {
+        /// View name as written.
+        name: String,
+        /// `IF EXISTS` was present.
+        if_exists: bool,
+    },
     /// `CREATE [UNIQUE] INDEX ... ON ... (...)`.
     CreateIndex {
         /// Index name as written.
@@ -1322,6 +1342,8 @@ impl Statement {
     pub fn name(&self) -> &'static str {
         match self {
             Self::CreateTable { .. } => "create-table",
+            Self::CreateView { .. } => "create-view",
+            Self::DropView { .. } => "drop-view",
             Self::CreateIndex { .. } => "create-index",
             Self::Insert { .. } => "insert",
             Self::Update { .. } => "update",
@@ -2797,6 +2819,10 @@ impl<'a> Parser<'a> {
                 self.kind = Some("create-index");
                 return self.create_index(false);
             }
+            if self.eat_word("view") {
+                self.kind = Some("create-view");
+                return self.create_view();
+            }
             self.kind = Some("create-table");
             return self.create_table();
         }
@@ -2940,24 +2966,111 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Reads `DROP TABLE [IF EXISTS] name` and `DROP INDEX [IF EXISTS] name`.
-    fn drop(&mut self) -> Result<Statement, SqlError> {
-        let table = if self.eat_word("table") {
+    /// Reads `VIEW [IF NOT EXISTS] <name> [(a, b)] AS <select>`.
+    ///
+    /// The query is parsed once here and kept as an ordinary `SELECT`, so a
+    /// later read re-evaluates it through the same evaluator as any other
+    /// query. As in SQLite, the base tables are not resolved at DDL time.
+    fn create_view(&mut self) -> Result<Statement, SqlError> {
+        let if_not_exists = if self.eat_word("if") {
+            self.expect_word("not")?;
+            self.expect_word("exists")?;
             true
         }
-        else if self.eat_word("index") {
+        else {
             false
+        };
+        let name_token = self.at;
+        let name = self.name()?;
+        self.reject_qualified(&name)?;
+        // The piece between the name token and the following token is the
+        // verbatim name spelling plus any whitespace before `(` or `AS`.
+        let name_start = self.offsets.get(name_token).copied().unwrap_or(0);
+        let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
+        let raw_name = self.source[name_start..name_gap_end].trim_end().to_string();
+        let columns = if self.peek() == Some(&Token::LParen) {
+            self.at += 1;
+            let mut columns = Vec::new();
+            loop {
+                columns.push(self.name()?);
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.at += 1;
+                    }
+                    Some(Token::RParen) => {
+                        self.at += 1;
+                        break;
+                    }
+                    Some(token) => {
+                        return Err(self.error(
+                            "syntax",
+                            format!("expected `,` or `)` in the view column list but found {}", token.describe()),
+                        ))
+                    }
+                    None => return Err(self.error("syntax", "view column list is not closed")),
+                }
+            }
+            Some(columns)
+        }
+        else {
+            None
+        };
+        self.expect_word("as")?;
+        let query = if self.peek_keyword("with") {
+            self.with_select()?
+        }
+        else {
+            self.expect_word("select")?;
+            self.select()?
+        };
+        if !matches!(query, Statement::Select { .. }) {
+            return Err(self.error("syntax", "a view definition must be a `SELECT` query"));
+        }
+        self.expect_end("CREATE VIEW")?;
+        // SQLite stores `CREATE VIEW <name>` with canonical keyword case and
+        // keeps the rest of the statement exactly as written. Rebuild that text
+        // so `sqlite_master.sql` reads back like SQLite's.
+        let end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
+        let name_end = name_start + raw_name.len();
+        let sql = format!("CREATE VIEW {}{}", raw_name, self.source[name_end..end].trim_end());
+        Ok(Statement::CreateView { name, if_not_exists, columns, query: Box::new(query), sql })
+    }
+
+    /// Reads `DROP TABLE [IF EXISTS] name` and `DROP INDEX [IF EXISTS] name`.
+    fn drop(&mut self) -> Result<Statement, SqlError> {
+        enum Object {
+            Table,
+            Index,
+            View,
+        }
+        let object = if self.eat_word("table") {
+            Object::Table
+        }
+        else if self.eat_word("index") {
+            Object::Index
+        }
+        else if self.eat_word("view") {
+            Object::View
         }
         else {
             let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
             let mut error = self.error(
                 "unsupported-clause",
-                format!("unsupported `DROP` object {found}; this engine accepts `DROP TABLE` and `DROP INDEX` only"),
+                format!("unsupported `DROP` object {found}; this engine accepts `DROP TABLE`, `DROP INDEX` and `DROP VIEW` only"),
             );
             error.clause = Some("DROP".to_string());
             return Err(error);
         };
-        self.kind = Some(if table { "drop-table" } else { "drop-index" });
+        let label = match object {
+            Object::Table => "DROP TABLE",
+            Object::Index => "DROP INDEX",
+            Object::View => "DROP VIEW",
+        };
+        self.kind = Some(match object {
+            Object::Table => "drop-table",
+            Object::Index => "drop-index",
+            Object::View => "drop-view",
+        });
         let if_exists = if self.eat_word("if") {
             self.expect_word("exists")?;
             true
@@ -2967,13 +3080,12 @@ impl<'a> Parser<'a> {
         };
         let name = self.name()?;
         self.reject_qualified(&name)?;
-        self.expect_end(if table { "DROP TABLE" } else { "DROP INDEX" })?;
-        if table {
-            Ok(Statement::DropTable { name, if_exists })
-        }
-        else {
-            Ok(Statement::DropIndex { name, if_exists })
-        }
+        self.expect_end(label)?;
+        Ok(match object {
+            Object::Table => Statement::DropTable { name, if_exists },
+            Object::Index => Statement::DropIndex { name, if_exists },
+            Object::View => Statement::DropView { name, if_exists },
+        })
     }
 
     /// Reads the three `ALTER TABLE` forms this engine understands. `DROP
