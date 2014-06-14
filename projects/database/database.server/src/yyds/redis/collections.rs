@@ -291,6 +291,7 @@ pub(crate) fn is_list_command(command: &[u8]) -> bool {
         b"RPOP",
         b"LLEN",
         b"LINDEX",
+        b"LPOS",
         b"LREM",
         b"LSET",
         b"LTRIM",
@@ -834,8 +835,121 @@ fn parse_side(raw: &[u8]) -> Option<ListSide> {
     }
 }
 
-/// `LPUSH` / `RPUSH` / `LRANGE` / `LPOP` / `RPOP` / `LLEN` 及 `LREM` / `LSET` /
-/// `LTRIM` / `LINSERT` / `RPOPLPUSH` / `LMOVE` 的分派入口。
+/// `LPOS` 选项。
+struct LposOptions {
+    /// 正数从头部计次，负数从尾部计次，`0` 已在解析阶段拒绝。
+    rank: i64,
+    /// `Some` 时回复数组，`usize::MAX` 表示 `COUNT 0`（取全部命中）。
+    count: Option<usize>,
+    /// 最多比较的元素数，`usize::MAX` 表示 `MAXLEN 0`（不限）。
+    maxlen: usize,
+}
+
+/// 执行 `LPOS`。
+fn handle_lpos(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    arguments: &[&[u8]],
+    protocol: u8,
+) -> io::Result<()> {
+    if arguments.len() < 3 {
+        return write_arity_error(stream, "lpos");
+    }
+    let key = arguments[1];
+    let element = arguments[2];
+    let mut options = LposOptions { rank: 1, count: None, maxlen: usize::MAX };
+    let mut index = 3;
+    while index < arguments.len() {
+        let option = arguments[index];
+        if option.eq_ignore_ascii_case(b"RANK") {
+            let Some(raw) = arguments.get(index + 1)
+            else {
+                return write_error(stream, "syntax error");
+            };
+            let Some(rank) = parse_index(raw)
+            else {
+                return write_error(stream, "value is not an integer or out of range");
+            };
+            if rank == 0 {
+                return write_error(stream, "RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list");
+            }
+            options.rank = rank;
+            index += 2;
+            continue;
+        }
+        if option.eq_ignore_ascii_case(b"COUNT") {
+            let Some(raw) = arguments.get(index + 1)
+            else {
+                return write_error(stream, "syntax error");
+            };
+            let Some(count) = parse_index(raw)
+            else {
+                return write_error(stream, "value is not an integer or out of range");
+            };
+            if count < 0 {
+                return write_error(stream, "COUNT can't be negative");
+            }
+            options.count = Some(if count == 0 { usize::MAX } else { count as usize });
+            index += 2;
+            continue;
+        }
+        if option.eq_ignore_ascii_case(b"MAXLEN") {
+            let Some(raw) = arguments.get(index + 1)
+            else {
+                return write_error(stream, "syntax error");
+            };
+            let Some(length) = parse_index(raw)
+            else {
+                return write_error(stream, "value is not an integer or out of range");
+            };
+            if length < 0 {
+                return write_error(stream, "MAXLEN can't be negative");
+            }
+            options.maxlen = if length == 0 { usize::MAX } else { length as usize };
+            index += 2;
+            continue;
+        }
+        return write_error(stream, "syntax error");
+    }
+    let elements = match load_list(stream, executor, base, key)? {
+        Loaded::Rejected => return Ok(()),
+        Loaded::Missing => Vec::new(),
+        Loaded::Found(elements) => elements,
+    };
+    let forward = options.rank > 0;
+    let skip = (options.rank.unsigned_abs() - 1) as usize;
+    let mut matches: Vec<usize> = Vec::new();
+    let mut hits = 0_usize;
+    let length = elements.len();
+    for step in 0..length.min(options.maxlen) {
+        let position = if forward { step } else { length - 1 - step };
+        if elements[position].as_slice() == element {
+            hits += 1;
+            if hits > skip {
+                matches.push(position);
+                match options.count {
+                    None => break,
+                    Some(wanted) if matches.len() >= wanted => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    if options.count.is_some() {
+        write_array_header(stream, matches.len())?;
+        for position in matches {
+            write_integer(stream, position as i64)?;
+        }
+        return Ok(());
+    }
+    match matches.first() {
+        Some(position) => write_integer(stream, *position as i64),
+        None => write_null(stream, protocol),
+    }
+}
+
+/// 列表命令的分派入口。
 pub(crate) fn handle_list(
     stream: &mut dyn io::Write,
     request: &Request<'_>,
@@ -848,6 +962,9 @@ pub(crate) fn handle_list(
     else {
         return write_error(stream, "unsupported command");
     };
+    if command.eq_ignore_ascii_case(b"LPOS") {
+        return handle_lpos(stream, executor, base, &request.arguments, protocol);
+    }
     if command.eq_ignore_ascii_case(b"LPUSH") || command.eq_ignore_ascii_case(b"RPUSH") {
         let insert_at_head = command.eq_ignore_ascii_case(b"LPUSH");
         let name = if insert_at_head { "lpush" } else { "rpush" };

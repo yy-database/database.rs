@@ -2595,3 +2595,91 @@ fn bitfield_commands() {
     send(&mut client, &["BITFIELD"]);
     expect_error(&mut client, "ERR wrong number of arguments for 'bitfield' command");
 }
+
+#[test]
+fn list_position_commands() {
+    fn expect_positions(client: &mut TcpStream, expected: &[i64]) {
+        match read_reply(client) {
+            Reply::Array(Some(items)) => {
+                assert_eq!(items.len(), expected.len());
+                for (item, wanted) in items.iter().zip(expected) {
+                    match item {
+                        Reply::Integer(value) => assert_eq!(*value, *wanted),
+                        other => panic!("unexpected LPOS reply {other:?}"),
+                    }
+                }
+            }
+            other => panic!("unexpected LPOS reply {other:?}"),
+        }
+    }
+
+    let (mut client, _server) = memory_server("redis-lpos");
+    send(&mut client, &["RPUSH", "l", "a", "b", "c", "a", "b", "c"]);
+    expect_integer(&mut client);
+
+    // 默认从头部找第一次命中。
+    send(&mut client, &["LPOS", "l", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LPOS", "l", "d"]);
+    expect_bulk(&mut client, None);
+
+    // 正 rank 从头部跳过前 n-1 次命中，负 rank 从尾部计次。
+    send(&mut client, &["LPOS", "l", "a", "RANK", "2"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["LPOS", "l", "a", "RANK", "-1"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["LPOS", "l", "a", "RANK", "-2"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LPOS", "l", "a", "RANK", "-3"]);
+    expect_bulk(&mut client, None);
+
+    // COUNT 0 取全部命中，正数只取前 n 次，负 rank 时按尾部到头部排序。
+    send(&mut client, &["LPOS", "l", "a", "COUNT", "0"]);
+    expect_positions(&mut client, &[0, 3]);
+    send(&mut client, &["LPOS", "l", "a", "COUNT", "1"]);
+    expect_positions(&mut client, &[0]);
+    send(&mut client, &["LPOS", "l", "a", "RANK", "-1", "COUNT", "0"]);
+    expect_positions(&mut client, &[3, 0]);
+    send(&mut client, &["LPOS", "l", "d", "COUNT", "0"]);
+    expect_positions(&mut client, &[]);
+
+    // MAXLEN 只比较指定数量的元素，0 表示不限。
+    send(&mut client, &["LPOS", "l", "a", "MAXLEN", "3"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LPOS", "l", "a", "RANK", "2", "MAXLEN", "4"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["LPOS", "l", "a", "RANK", "2", "MAXLEN", "2"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["LPOS", "l", "a", "MAXLEN", "0"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LPOS", "l", "a", "RANK", "-1", "MAXLEN", "1"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["LPOS", "l", "a", "RANK", "-1", "MAXLEN", "3"]);
+    assert_eq!(expect_integer(&mut client), 3);
+
+    // 空键：不带 COUNT 回复 null，带 COUNT 回复空数组。
+    send(&mut client, &["LPOS", "missing", "a"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["LPOS", "missing", "a", "COUNT", "0"]);
+    expect_empty_array(&mut client);
+
+    // 负参数与非法参数。
+    send(&mut client, &["LPOS", "l", "a", "RANK", "0"]);
+    expect_error(&mut client, "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list");
+    send(&mut client, &["LPOS", "l", "a", "COUNT", "-1"]);
+    expect_error(&mut client, "ERR COUNT can't be negative");
+    send(&mut client, &["LPOS", "l", "a", "MAXLEN", "-1"]);
+    expect_error(&mut client, "ERR MAXLEN can't be negative");
+    send(&mut client, &["LPOS", "l", "a", "RANK"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["LPOS", "l", "a", "BOGUS", "1"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["LPOS", "l"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'lpos' command");
+
+    // 类型错误与非列表键。
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["LPOS", "str", "v"]);
+    expect_error(&mut client, "WRONGTYPE Operation against a key holding the wrong kind of value");
+}
