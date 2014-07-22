@@ -1151,6 +1151,8 @@ pub enum AlterAction {
         column: ColumnSpec,
         /// `CHECK` constraints carried by the definition, in source order.
         checks: Vec<CheckConstraint>,
+        /// `REFERENCES` clauses carried by the definition, in source order.
+        foreign_keys: Vec<ForeignKey>,
         /// Source text of the definition, trimmed exactly as SQLite appends it
         /// to `sqlite_master.sql`.
         sql: String,
@@ -2983,11 +2985,9 @@ impl<'a> Parser<'a> {
         let name_token = self.at;
         let name = self.name()?;
         self.reject_qualified(&name)?;
-        // The piece between the name token and the following token is the
-        // verbatim name spelling plus any whitespace before `(` or `AS`.
-        let name_start = self.offsets.get(name_token).copied().unwrap_or(0);
+        // The token gap after the name preserves its verbatim spelling before
+        // the optional column list or `AS`.
         let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
-        let raw_name = self.source[name_start..name_gap_end].trim_end().to_string();
         let columns = if self.peek() == Some(&Token::LParen) {
             self.at += 1;
             let mut columns = Vec::new();
@@ -3027,12 +3027,7 @@ impl<'a> Parser<'a> {
             return Err(self.error("syntax", "a view definition must be a `SELECT` query"));
         }
         self.expect_end("CREATE VIEW")?;
-        // SQLite stores `CREATE VIEW <name>` with canonical keyword case and
-        // keeps the rest of the statement exactly as written. Rebuild that text
-        // so `sqlite_master.sql` reads back like SQLite's.
-        let end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
-        let name_end = name_start + raw_name.len();
-        let sql = format!("CREATE VIEW {}{}", raw_name, self.source[name_end..end].trim_end());
+        let sql = self.canonical_create_sql("CREATE VIEW", name_token, name_gap_end);
         Ok(Statement::CreateView { name, if_not_exists, columns, query: Box::new(query), sql })
     }
 
@@ -3122,17 +3117,9 @@ impl<'a> Parser<'a> {
             let mut checks = Vec::new();
             let mut foreign_keys = Vec::new();
             let column = self.column_spec(&mut checks, &mut foreign_keys)?;
-            if let Some(key) = foreign_keys.first() {
-                let mut error = self.error(
-                    "unsupported-column-constraint",
-                    format!("adding the foreign key on `{}` with `ALTER TABLE ADD COLUMN` is not supported", key.columns.join(", ")),
-                );
-                error.clause = Some("REFERENCES".to_string());
-                return Err(error);
-            }
             let end = self.offset();
             let sql = self.source.get(start..end).unwrap_or_default().trim_end().to_string();
-            AlterAction::AddColumn { column, checks, sql }
+            AlterAction::AddColumn { column, checks, foreign_keys, sql }
         }
         else if self.eat_word("drop") {
             self.eat_word("column");
@@ -3184,7 +3171,9 @@ impl<'a> Parser<'a> {
         else {
             false
         };
+        let name_token = self.at;
         let name = self.name()?;
+        let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
         self.expect_char(&Token::LParen)?;
         let mut columns = Vec::new();
         let mut primary_key: Vec<String> = Vec::new();
@@ -3265,7 +3254,7 @@ impl<'a> Parser<'a> {
         if self.eat_word("strict") {
             strict = true;
         }
-        let sql = self.raw_statement();
+        let sql = self.canonical_create_sql("CREATE TABLE", name_token, name_gap_end);
         Ok(Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, sql })
     }
 
@@ -3280,6 +3269,20 @@ impl<'a> Parser<'a> {
         let text = self.source.get(start..end).unwrap_or_default().trim().to_string();
         self.expect_char(&Token::RParen)?;
         Ok(CheckConstraint { name, expr, text })
+    }
+
+    /// Rebuilds `<prefix> <name>` with canonical keyword case and keeps the
+    /// rest of the statement exactly as written. SQLite stores `CREATE TABLE`,
+    /// `CREATE INDEX` and `CREATE VIEW` rows in `sqlite_master.sql` this way:
+    /// the leading keywords are normalized, the name and tail are verbatim,
+    /// and `IF NOT EXISTS` does not appear.
+    fn canonical_create_sql(&self, prefix: &str, name_token: usize, name_gap_end: usize) -> String {
+        let name_start = self.offsets.get(name_token).copied().unwrap_or(0);
+        let gap_end = name_gap_end.min(self.source.len());
+        let raw_name = self.source[name_start..gap_end].trim_end();
+        let name_end = name_start + raw_name.len();
+        let end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
+        format!("{prefix} {}{}", raw_name, self.source[name_end..end].trim_end())
     }
 
     /// Reads `INDEX <name> ON <table> ( <column> [ASC] , ... )`.
@@ -3298,7 +3301,9 @@ impl<'a> Parser<'a> {
         else {
             false
         };
+        let name_token = self.at;
         let name = self.name()?;
+        let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
         self.expect_word("on")?;
         let table = self.name()?;
         self.expect_char(&Token::LParen)?;
@@ -3329,7 +3334,8 @@ impl<'a> Parser<'a> {
         }
         match self.peek() {
             None | Some(Token::Semi) => {
-                let sql = self.raw_statement();
+                let prefix = if unique { "CREATE UNIQUE INDEX" } else { "CREATE INDEX" };
+                let sql = self.canonical_create_sql(prefix, name_token, name_gap_end);
                 Ok(Statement::CreateIndex { name, table, if_not_exists, unique, columns, sql })
             }
             Some(token) => {

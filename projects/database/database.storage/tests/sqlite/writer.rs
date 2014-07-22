@@ -279,9 +279,13 @@ fn rollback_restores_the_image_and_commit_keeps_it() {
     writer.commit().expect("commit");
     let rows = writer.table_rows("txn", limits()).expect("read after commit");
     assert_eq!(rows.len(), 2);
-    assert!(writer.begin().is_ok());
-    assert!(writer.begin().is_err(), "nested transactions are rejected");
-    writer.rollback().expect("cleanup");
+    // Nested `begin` levels are supported: the inner level rolls back only
+    // its own work, exactly as a nested savepoint does.
+    writer.begin().expect("nested begin");
+    writer.insert("txn", &[integer(4), text("inner")]).expect("insert inside nested txn");
+    writer.rollback().expect("rollback the nested level");
+    let rows = writer.table_rows("txn", limits()).expect("read after nested rollback");
+    assert_eq!(rows.len(), 2);
 }
 
 #[test]
