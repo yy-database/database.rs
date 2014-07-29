@@ -367,6 +367,16 @@ pub(crate) fn is_zset_command(command: &[u8]) -> bool {
     false
 }
 
+/// HyperLogLog 命令名集合。
+pub(crate) fn is_hyperloglog_command(command: &[u8]) -> bool {
+    for name in [b"PFADD".as_slice(), b"PFCOUNT", b"PFMERGE"] {
+        if command.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 载入 hash 字段并校验类型。
 fn load_hash(
     stream: &mut dyn io::Write,
@@ -3472,4 +3482,332 @@ pub(crate) fn handle_zset(
         }
     }
     Ok(())
+}
+
+/// HyperLogLog 的精度参数 `P`，寄存器数量为 `1 << P`。
+const HLL_P: u32 = 14;
+/// 估计所需的 `Q = 64 - P`，寄存器值的上限是 `Q + 1`。
+const HLL_Q: usize = 50;
+/// 寄存器数量。
+const HLL_REGISTERS: usize = 1 << HLL_P;
+/// 每个寄存器占用的位数。
+const HLL_BITS: usize = 6;
+/// 单个寄存器能表示的最大值。
+const HLL_REGISTER_MAX: u8 = 63;
+/// dense 编码的 16 字节头长度。
+const HLL_HEADER_SIZE: usize = 16;
+/// 16384 个 6 位寄存器正好占 12288 字节。
+const HLL_REGISTER_BYTES: usize = HLL_REGISTERS * HLL_BITS / 8;
+/// dense 编码的完整长度。
+const HLL_DENSE_SIZE: usize = HLL_HEADER_SIZE + HLL_REGISTER_BYTES;
+/// 估计量里的 `alpha`，等同 `0.5 / ln(2)`。
+const HLL_ALPHA_INF: f64 = 0.721347520444481703680;
+/// 新写入后把缓存的基数标记为失效的位。
+const HLL_CACHE_INVALID: u8 = 0x80;
+
+/// 报出「不是合法 HyperLogLog」的类型错误。
+///
+/// 真机对普通字符串与非 dense 编码统一用这条文案，而不是常规的 `WRONGTYPE` 文案。
+fn write_invalid_hll(stream: &mut dyn io::Write) -> io::Result<()> {
+    stream.write_all(b"-WRONGTYPE Key is not a valid HyperLogLog string value.\r\n")
+}
+
+/// 创建一个空的 dense HyperLogLog：`"HYLL"` 头、dense 编码、全零寄存器。
+fn new_hll() -> Vec<u8> {
+    let mut bytes = vec![0_u8; HLL_DENSE_SIZE];
+    bytes[0..4].copy_from_slice(b"HYLL");
+    bytes[4] = 0;
+    bytes
+}
+
+/// 校验字符串内容是否是一个 dense HyperLogLog，并切出寄存器区。
+///
+/// 只接受与真机 dense 编码长度一致的对象；稀疏编码不生成也不接受。
+fn hll_registers(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() != HLL_DENSE_SIZE || &bytes[0..4] != b"HYLL" || bytes[4] != 0 {
+        return None;
+    }
+    Some(&bytes[HLL_HEADER_SIZE..])
+}
+
+/// 一次 HLL 读取的结果。
+enum HllLoaded {
+    /// 键不存在或已过期。
+    Missing,
+    /// 合法的 dense HLL 原始字节。
+    Found(Vec<u8>),
+    /// 已回复错误，调用方不应再追加字节。
+    Rejected,
+}
+
+/// 读取一个 HLL 键。
+///
+/// HLL 在真机上就是一个字符串，所以它落在字符串命名空间，`TYPE` 也回复 `string`。
+fn load_hll(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    key: &[u8],
+) -> io::Result<HllLoaded> {
+    match find_kind(executor, base, key) {
+        Ok(None) => return Ok(HllLoaded::Missing),
+        Ok(Some(KeyKind::String)) => {}
+        Ok(Some(_)) => {
+            write_wrong_type(stream)?;
+            return Ok(HllLoaded::Rejected);
+        }
+        Err(message) => {
+            write_storage_error(stream, &message)?;
+            return Ok(HllLoaded::Rejected);
+        }
+    }
+    match load_value(executor, base, key) {
+        Ok(Some(bytes)) => {
+            if hll_registers(&bytes).is_none() {
+                write_invalid_hll(stream)?;
+                return Ok(HllLoaded::Rejected);
+            }
+            Ok(HllLoaded::Found(bytes))
+        }
+        Ok(None) => Ok(HllLoaded::Missing),
+        Err(message) => {
+            write_storage_error(stream, &message)?;
+            Ok(HllLoaded::Rejected)
+        }
+    }
+}
+
+/// Redis 使用的 MurmurHash64A，种子固定为 `0xadc83b19`。
+fn murmur_hash64a(bytes: &[u8], seed: u64) -> u64 {
+    const M: u64 = 0xc6a4a7935bd1e995;
+    const R: u32 = 47;
+    let length = bytes.len();
+    let mut hash = seed ^ (length as u64).wrapping_mul(M);
+    let mut offset = 0;
+    while offset + 8 <= length {
+        let mut block = u64::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]);
+        block = block.wrapping_mul(M);
+        block ^= block >> R;
+        block = block.wrapping_mul(M);
+        hash ^= block;
+        hash = hash.wrapping_mul(M);
+        offset += 8;
+    }
+    let tail = &bytes[offset..];
+    if !tail.is_empty() {
+        let mut extra = 0_u64;
+        for (index, byte) in tail.iter().enumerate() {
+            extra |= (*byte as u64) << (8 * index);
+        }
+        hash ^= extra;
+        hash = hash.wrapping_mul(M);
+    }
+    hash ^= hash >> R;
+    hash = hash.wrapping_mul(M);
+    hash ^= hash >> R;
+    hash
+}
+
+/// 读取一个 dense 寄存器。
+fn hll_get_register(registers: &[u8], index: usize) -> u8 {
+    let bit = index * HLL_BITS;
+    let byte = bit / 8;
+    let shift = bit % 8;
+    let low = registers[byte] as u16;
+    let high = registers.get(byte + 1).copied().unwrap_or(0) as u16;
+    (((low >> shift) | (high << (8 - shift)) & 0xffff) & HLL_REGISTER_MAX as u16) as u8
+}
+
+/// 写入一个 dense 寄存器。
+fn hll_set_register(registers: &mut [u8], index: usize, value: u8) {
+    let value = value & HLL_REGISTER_MAX;
+    let bit = index * HLL_BITS;
+    let byte = bit / 8;
+    let shift = bit % 8;
+    let low_bits = (8 - shift).min(HLL_BITS);
+    let low_mask = (((1_u16 << low_bits) - 1) as u8) << shift;
+    registers[byte] = (registers[byte] & !low_mask) | (((value as u16) << shift) as u8 & low_mask);
+    if shift + HLL_BITS > 8 {
+        let spill = shift + HLL_BITS - 8;
+        let mask = (1_u8 << spill) - 1;
+        if let Some(next) = registers.get_mut(byte + 1) {
+            *next = (*next & !mask) | ((value >> (8 - shift)) & mask);
+        }
+    }
+}
+
+/// 把一个元素映射为「寄存器下标 + 尾零计数」。
+fn hll_pat_len(element: &[u8]) -> (usize, u8) {
+    let mut hash = murmur_hash64a(element, 0xadc83b19);
+    let index = (hash & (HLL_REGISTERS as u64 - 1)) as usize;
+    hash >>= HLL_P;
+    hash |= 1_u64 << HLL_Q;
+    let mut bit = 1_u64;
+    let mut count = 1_u8;
+    while hash & bit == 0 {
+        count += 1;
+        bit <<= 1;
+    }
+    (index, count)
+}
+
+/// Ertl 的 `tau` 修正项。
+fn hll_tau(mut x: f64) -> f64 {
+    if x == 0.0 || x == 1.0 {
+        return 0.0;
+    }
+    let mut y = 1.0_f64;
+    let mut z = 1.0 - x;
+    loop {
+        x = x.sqrt();
+        let previous = z;
+        y *= 0.5;
+        z -= (1.0 - x) * (1.0 - x) * y;
+        if previous == z {
+            break;
+        }
+    }
+    z / 3.0
+}
+
+/// Ertl 的 `sigma` 修正项。
+fn hll_sigma(mut x: f64) -> f64 {
+    if x == 1.0 {
+        return f64::INFINITY;
+    }
+    let mut y = 1.0_f64;
+    let mut z = x;
+    loop {
+        x *= x;
+        let previous = z;
+        z += x * y;
+        y += y;
+        if previous == z {
+            break;
+        }
+    }
+    z
+}
+
+/// 从寄存器直方图做基数估计，公式与真机一致。
+fn hll_estimate(registers: &[u8]) -> i64 {
+    let m = HLL_REGISTERS as f64;
+    let mut histogram = [0_u64; 64];
+    for index in 0..HLL_REGISTERS {
+        histogram[hll_get_register(registers, index) as usize] += 1;
+    }
+    let mut z = m * hll_tau((m - histogram[HLL_Q + 1] as f64) / m);
+    for j in (1..=HLL_Q).rev() {
+        z += histogram[j] as f64;
+        z *= 0.5;
+    }
+    z += m * hll_sigma(histogram[0] as f64 / m);
+    (HLL_ALPHA_INF * m * m / z).round() as i64
+}
+
+/// 把来源寄存器取最大值合并进目标寄存器。
+fn hll_merge_max(registers: &mut [u8], source: &[u8]) {
+    for index in 0..HLL_REGISTERS {
+        let value = hll_get_register(source, index);
+        if value > hll_get_register(registers, index) {
+            hll_set_register(registers, index, value);
+        }
+    }
+}
+
+/// `PFADD` / `PFCOUNT` / `PFMERGE` 的实现。
+///
+/// 值本身是 dense HyperLogLog 字符串，创建时写入完整 12304 字节，读写只碰寄存器区。
+pub(crate) fn handle_hyperloglog(
+    stream: &mut dyn io::Write,
+    request: &Request<'_>,
+    executor: Option<&dyn KeyValueExecutor>,
+    base: &Namespace,
+) -> io::Result<()> {
+    let Some(executor) = executor else {
+        return write_error(stream, "unsupported command");
+    };
+    let command = request.arguments[0];
+    if command.eq_ignore_ascii_case(b"PFADD") {
+        if request.arguments.len() < 2 {
+            return write_arity_error(stream, "pfadd");
+        }
+        let key = request.arguments[1];
+        let (mut object, created) = match load_hll(stream, executor, base, key)? {
+            HllLoaded::Rejected => return Ok(()),
+            HllLoaded::Missing => (new_hll(), true),
+            HllLoaded::Found(bytes) => (bytes, false),
+        };
+        let mut modified = created;
+        {
+            let registers = &mut object[HLL_HEADER_SIZE..];
+            for element in &request.arguments[2..] {
+                let (index, count) = hll_pat_len(element);
+                if hll_get_register(registers, index) < count {
+                    hll_set_register(registers, index, count);
+                    modified = true;
+                }
+            }
+        }
+        if modified {
+            object[15] |= HLL_CACHE_INVALID;
+            if let Err(message) = store_value(executor, base, key, object) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        return write_integer(stream, i64::from(modified));
+    }
+    if command.eq_ignore_ascii_case(b"PFCOUNT") {
+        if request.arguments.len() < 2 {
+            return write_arity_error(stream, "pfcount");
+        }
+        if request.arguments.len() == 2 {
+            return match load_hll(stream, executor, base, request.arguments[1])? {
+                HllLoaded::Rejected => Ok(()),
+                HllLoaded::Missing => write_integer(stream, 0),
+                HllLoaded::Found(bytes) => write_integer(stream, hll_estimate(hll_registers(&bytes).unwrap())),
+            };
+        }
+        let mut merged = vec![0_u8; HLL_REGISTER_BYTES];
+        for key in &request.arguments[1..] {
+            match load_hll(stream, executor, base, key)? {
+                HllLoaded::Rejected => return Ok(()),
+                HllLoaded::Missing => {}
+                HllLoaded::Found(bytes) => hll_merge_max(&mut merged, hll_registers(&bytes).unwrap()),
+            }
+        }
+        return write_integer(stream, hll_estimate(&merged));
+    }
+    if request.arguments.len() < 3 {
+        return write_arity_error(stream, "pfmerge");
+    }
+    let mut merged = vec![0_u8; HLL_REGISTER_BYTES];
+    for key in &request.arguments[1..] {
+        match load_hll(stream, executor, base, key)? {
+            HllLoaded::Rejected => return Ok(()),
+            HllLoaded::Missing => {}
+            HllLoaded::Found(bytes) => hll_merge_max(&mut merged, hll_registers(&bytes).unwrap()),
+        }
+    }
+    let destination = request.arguments[1];
+    let mut object = match load_hll(stream, executor, base, destination)? {
+        HllLoaded::Rejected => return Ok(()),
+        HllLoaded::Missing => new_hll(),
+        HllLoaded::Found(bytes) => bytes,
+    };
+    object[HLL_HEADER_SIZE..].copy_from_slice(&merged);
+    object[15] |= HLL_CACHE_INVALID;
+    if let Err(message) = store_value(executor, base, destination, object) {
+        return write_storage_error(stream, &message);
+    }
+    stream.write_all(b"+OK\r\n")
 }

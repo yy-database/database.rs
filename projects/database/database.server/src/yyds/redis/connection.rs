@@ -2275,6 +2275,9 @@ fn respond(
             }
         }
     }
+    else if collections::is_hyperloglog_command(command) {
+        collections::handle_hyperloglog(stream, request, executor, namespace)?;
+    }
     else if command.eq_ignore_ascii_case(b"SET") {
         handle_set(stream, request, executor, namespace, state.protocol)?;
     }
@@ -3134,6 +3137,7 @@ fn validate_command_for_queue(
         || collections::is_list_command(command)
         || collections::is_set_command(command)
         || collections::is_zset_command(command)
+        || collections::is_hyperloglog_command(command)
     {
         if executor.is_none() {
             return Err(b"-ERR unsupported command\r\n".to_vec());
