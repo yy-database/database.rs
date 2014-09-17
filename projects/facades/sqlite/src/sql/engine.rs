@@ -16,8 +16,8 @@ use super::json_string;
 use super::sql::{
     AggregateFunction, AlterAction, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm, Expr,
     ForeignKey, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore,
-    SelectItems, Statement, TableRef, TransactionAction, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column,
-    rewrite_create_index_table, rewrite_create_table_column, rewrite_create_table_name, statement_references,
+    SelectItems, Statement, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp, WindowFunction, WindowSpec, core_references, parse,
+    rewrite_create_index_column, rewrite_create_index_table, rewrite_create_table_column, rewrite_create_table_name, statement_references,
 };
 
 /// One cell surfaced to the host.
@@ -170,6 +170,23 @@ struct ViewDef {
     query: Statement,
 }
 
+/// One trigger in the engine catalog.
+#[derive(Clone)]
+struct TriggerDef {
+    /// Trigger name as written, used for diagnostics.
+    name: String,
+    /// Lowercase table the trigger is attached to.
+    table: String,
+    /// `BEFORE`, `AFTER` or `INSTEAD OF`.
+    timing: TriggerTiming,
+    /// Statement event that fires the trigger.
+    event: TriggerEvent,
+    /// Optional `WHEN` predicate; rejected rather than ignored when present.
+    when: Option<Expr>,
+    /// Body statements run in order.
+    body: Vec<Statement>,
+}
+
 thread_local! {
     /// Views can be nested, but a view that reaches itself would recurse
     /// forever. SQLite rejects the circular definition at prepare time; this
@@ -197,6 +214,18 @@ impl ViewDepthGuard {
 impl Drop for ViewDepthGuard {
     fn drop(&mut self) {
         VIEW_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Whether a definition's event covers an incoming statement event.
+fn trigger_event_matches(defined: &TriggerEvent, incoming: &TriggerEvent) -> bool {
+    match (defined, incoming) {
+        (TriggerEvent::Insert, TriggerEvent::Insert) | (TriggerEvent::Delete, TriggerEvent::Delete) => true,
+        (TriggerEvent::Update(defined), TriggerEvent::Update(assigned)) => {
+            defined.is_empty()
+                || defined.iter().any(|column| assigned.iter().any(|assigned| assigned.eq_ignore_ascii_case(column)))
+        }
+        _ => false,
     }
 }
 
@@ -358,6 +387,13 @@ pub struct Engine {
     /// Views keyed by lowercase name. A view shares the object namespace with
     /// tables and indexes and re-evaluates its query on every read.
     views: BTreeMap<String, ViewDef>,
+    /// Triggers keyed by lowercase name, shared with the other object names.
+    triggers: BTreeMap<String, TriggerDef>,
+    /// Lowercase names of the triggers whose body is executing right now.
+    /// With SQLite's default `recursive_triggers = OFF` a trigger program is
+    /// not re-invoked by changes it caused itself, directly or indirectly,
+    /// while the other triggers still fire.
+    active_triggers: Vec<String>,
     /// Values bound to `?` / `:name` placeholders for the statement currently
     /// executing, in declaration order.
     parameters: Vec<Cell>,
@@ -398,6 +434,8 @@ impl Engine {
             table_lookup: BTreeMap::new(),
             indexes: BTreeMap::new(),
             views: BTreeMap::new(),
+            triggers: BTreeMap::new(),
+            active_triggers: Vec::new(),
             parameters: Vec::new(),
             foreign_keys: true,
             last_insert_rowid: 0,
@@ -495,6 +533,7 @@ impl Engine {
         self.table_lookup.clear();
         self.indexes.clear();
         self.views.clear();
+        self.triggers.clear();
         self.load_catalog()
     }
 
@@ -538,6 +577,12 @@ impl Engine {
                     let key = name.to_ascii_lowercase();
                     if !self.table_lookup.contains_key(&key) && !self.views.contains_key(&key) {
                         self.views.insert(key, ViewDef { name, columns, query: *query });
+                    }
+                }
+                Some(Statement::CreateTrigger { name, timing, event, table, when, body, .. }) => {
+                    let key = name.to_ascii_lowercase();
+                    if !self.triggers.contains_key(&key) {
+                        self.triggers.insert(key, TriggerDef { name, table: table.to_ascii_lowercase(), timing, event, when, body });
                     }
                 }
                 _ => {}
@@ -614,7 +659,7 @@ impl Engine {
         match statements.len() {
             1 => {
                 let only = statements.into_iter().next().expect("length checked");
-                self.run_statement(only)
+                self.run_triggered(only)
             }
             0 => Err(SqlError::new("empty-statement", "expected exactly one statement but found 0")),
             count => Err(SqlError::new("multiple-statements", format!("expected exactly one statement but found {count}"))),
@@ -635,7 +680,7 @@ impl Engine {
         let statements = parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
-            results.push(self.run_statement(statement)?);
+            results.push(self.run_triggered(statement)?);
         }
         Ok(results)
     }
@@ -733,6 +778,64 @@ impl Engine {
         }
     }
 
+    /// Runs one statement and fires the row triggers attached to its table.
+    ///
+    /// Trigger bodies run through this same entry point, so a body statement
+    /// still fires the other triggers. The trigger whose body is executing is
+    /// skipped, which matches SQLite's default `recursive_triggers = OFF`.
+    fn run_triggered(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
+        let fired = match &statement {
+            Statement::Insert { table, .. } => Some((table.clone(), TriggerEvent::Insert)),
+            Statement::Update { table, assignments, .. } => {
+                let assigned = assignments.iter().map(|assignment| assignment.column.clone()).collect();
+                Some((table.clone(), TriggerEvent::Update(assigned)))
+            }
+            Statement::Delete { table, .. } => Some((table.clone(), TriggerEvent::Delete)),
+            _ => None,
+        };
+        let Some((table, event)) = fired else {
+            return self.run_statement(statement);
+        };
+        self.fire_triggers(&table, &event, TriggerTiming::Before)?;
+        let result = self.run_statement(statement)?;
+        self.fire_triggers(&table, &event, TriggerTiming::After)?;
+        Ok(result)
+    }
+
+    /// Runs every trigger attached to `table` whose event and timing match.
+    fn fire_triggers(&mut self, table: &str, event: &TriggerEvent, timing: TriggerTiming) -> Result<(), SqlError> {
+        let table = table.to_ascii_lowercase();
+        let mut matched = Vec::new();
+        for (key, trigger) in &self.triggers {
+            if trigger.table != table || trigger.timing != timing || !trigger_event_matches(&trigger.event, event) {
+                continue;
+            }
+            if self.active_triggers.contains(key) {
+                continue;
+            }
+            matched.push((key.clone(), trigger.clone()));
+        }
+        for (key, trigger) in matched {
+            if trigger.when.is_some() {
+                return Err(SqlError::new(
+                    "unsupported-trigger",
+                    format!("the WHEN clause of trigger `{}` is not supported yet", trigger.name),
+                ));
+            }
+            self.active_triggers.push(key);
+            let mut outcome = Ok(());
+            for statement in trigger.body.clone() {
+                outcome = self.run_triggered(statement).map(|_| ());
+                if outcome.is_err() {
+                    break;
+                }
+            }
+            self.active_triggers.pop();
+            outcome?;
+        }
+        Ok(())
+    }
+
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         match statement {
             Statement::Transaction { action } => self.transaction(action),
@@ -744,6 +847,9 @@ impl Engine {
                 }
                 if self.views.contains_key(&key) {
                     return Err(SqlError::new("view-exists", format!("there is already a view named `{name}`")).in_statement("create-table"));
+                }
+                if self.triggers.contains_key(&key) {
+                    return Err(SqlError::new("trigger-exists", format!("there is already a trigger named `{name}`")).in_statement("create-table"));
                 }
                 if self.table_lookup.contains_key(&key) {
                     if if_not_exists {
@@ -775,6 +881,7 @@ impl Engine {
                 if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name))
                     || self.indexes.contains_key(&key)
                     || self.views.contains_key(&key)
+                    || self.triggers.contains_key(&key)
                 {
                     if if_not_exists {
                         return Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 0 });
@@ -805,6 +912,64 @@ impl Engine {
                     .drop_view(&name)
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-view"))?;
                 Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
+            }
+            Statement::CreateTrigger { name, if_not_exists, timing, event, table, when, body, sql } => {
+                let key = name.to_ascii_lowercase();
+                check_reserved_object_name(&name, "create-trigger")?;
+                let table_key = table.to_ascii_lowercase();
+                let Some(position) = self.table_lookup.get(&table_key).copied() else {
+                    return Err(SqlError::new("unknown-table", format!("no such table: {table}")).in_statement("create-trigger"));
+                };
+                if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name))
+                    || self.indexes.contains_key(&key)
+                    || self.views.contains_key(&key)
+                    || self.triggers.contains_key(&key)
+                {
+                    if if_not_exists {
+                        return Ok(ExecResult { statement: "create-trigger", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                    }
+                    return Err(SqlError::new("table-exists", format!("trigger `{name}` already exists")).in_statement("create-trigger"));
+                }
+                if matches!(timing, TriggerTiming::InsteadOf) {
+                    return Err(SqlError::new("unsupported-trigger", "INSTEAD OF triggers are not supported yet").in_statement("create-trigger"));
+                }
+                if when.is_some() {
+                    return Err(SqlError::new("unsupported-trigger", "the WHEN clause is not supported yet").in_statement("create-trigger"));
+                }
+                if let TriggerEvent::Update(columns) = &event {
+                    for column in columns {
+                        if !self.tables[position].columns.iter().any(|def| def.name.eq_ignore_ascii_case(column)) {
+                            return Err(SqlError::new("unknown-column", format!("no such column: {column}")).in_statement("create-trigger"));
+                        }
+                    }
+                }
+                self.writer
+                    .create_trigger(&name, &table, &sql)
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-trigger"))?;
+                self.triggers.insert(key, TriggerDef { name, table: table_key, timing, event, when, body });
+                Ok(ExecResult { statement: "create-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
+            }
+            Statement::DropTrigger { name, if_exists } => {
+                let key = name.to_ascii_lowercase();
+                if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name)) {
+                    return Err(SqlError::new("wrong-object", format!("use DROP TABLE to delete table `{name}`")).in_statement("drop-trigger"));
+                }
+                if self.indexes.contains_key(&key) {
+                    return Err(SqlError::new("wrong-object", format!("use DROP INDEX to delete index `{name}`")).in_statement("drop-trigger"));
+                }
+                if self.views.contains_key(&key) {
+                    return Err(SqlError::new("wrong-object", format!("use DROP VIEW to delete view `{name}`")).in_statement("drop-trigger"));
+                }
+                if self.triggers.remove(&key).is_none() {
+                    if if_exists {
+                        return Ok(ExecResult { statement: "drop-trigger", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                    }
+                    return Err(SqlError::new("unknown-trigger", format!("no such trigger: {name}")).in_statement("drop-trigger"));
+                }
+                self.writer
+                    .drop_trigger(&name)
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-trigger"))?;
+                Ok(ExecResult { statement: "drop-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             Statement::Insert { table, columns, rows, default_values, returning } => {
                 let key = table.to_ascii_lowercase();
@@ -992,6 +1157,9 @@ impl Engine {
                         return Ok(ExecResult { statement: "create-index", columns: Vec::new(), rows: Vec::new(), affected: 0 });
                     }
                     return Err(SqlError::new("index-exists", format!("index `{name}` already exists")).in_statement("create-index"));
+                }
+                if self.views.contains_key(&key) || self.triggers.contains_key(&key) {
+                    return Err(SqlError::new("index-exists", format!("there is already an object named `{name}`")).in_statement("create-index"));
                 }
                 let mut positions = Vec::with_capacity(columns.len());
                 for column in &columns {
@@ -1208,6 +1376,7 @@ impl Engine {
                 self.tables.remove(position);
                 self.reindex_tables();
                 self.indexes.retain(|_, index| index.table != key);
+                self.triggers.retain(|_, trigger| trigger.table != key);
                 Ok(ExecResult { statement: "drop-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             Statement::DropIndex { name, if_exists } => {
@@ -8117,5 +8286,29 @@ mod tests {
         engine.execute("DROP VIEW v").expect("drop view");
         let missing = engine.execute_one("SELECT * FROM v").expect_err("dropped");
         assert_eq!(missing.code, "unknown-table");
+    }
+
+    #[test]
+    fn triggers_fire_once_and_keep_catalog_rows() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE scratch(id INTEGER, label TEXT)").expect("scratch");
+        engine.execute("CREATE TABLE audit(id INTEGER)").expect("audit");
+        engine.execute("CREATE TRIGGER probe AFTER INSERT ON scratch BEGIN INSERT INTO audit VALUES (1); END").expect("trigger");
+        engine
+            .execute("CREATE TRIGGER probe_self AFTER INSERT ON scratch BEGIN INSERT INTO scratch VALUES (9, 'self'); END")
+            .expect("self trigger");
+        engine.execute("INSERT INTO scratch VALUES (1, 'x')").expect("insert");
+        // One user insert plus one body insert. The body insert fires the
+        // other trigger but not the one whose body is running, because
+        // recursive triggers are off.
+        assert_eq!(engine.execute_one("SELECT count(*) FROM scratch").expect("count scratch").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(engine.execute_one("SELECT count(*) FROM audit").expect("count audit").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(
+            engine.execute_one("SELECT type, name, tbl_name FROM sqlite_master WHERE name = 'probe'").expect("master").rows,
+            vec![vec![Cell::Text("trigger".to_string()), Cell::Text("probe".to_string()), Cell::Text("scratch".to_string())]]
+        );
+        engine.execute("DROP TRIGGER probe").expect("drop trigger");
+        engine.execute("INSERT INTO scratch VALUES (2, 'y')").expect("insert after drop");
+        assert_eq!(engine.execute_one("SELECT count(*) FROM audit").expect("count after drop").rows, vec![vec![Cell::Integer(2)]]);
     }
 }

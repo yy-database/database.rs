@@ -1059,6 +1059,34 @@ impl SqliteWriter {
         Ok(true)
     }
 
+    /// Creates a trigger: a `sqlite_master` row of kind `trigger` attached to a
+    /// table, with root page 0. Firing the body is the SQL surface's job.
+    pub fn create_trigger(&mut self, name: &str, table: &str, sql: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::Unsupported("sqlite trigger name must not be empty"));
+        }
+        for object in self.master_rows()? {
+            if eq_ignore_ascii_case(&object.name, name) {
+                return Err(Error::Unsupported("sqlite schema object already exists"));
+            }
+        }
+        self.insert_master_row("trigger", name, table, 0, Some(sql))?;
+        self.bump_cookie();
+        Ok(())
+    }
+
+    /// Drops one trigger's schema row; returns whether a trigger was removed.
+    pub fn drop_trigger(&mut self, name: &str) -> Result<bool> {
+        let rows = self.master_rows()?;
+        let Some(trigger) = rows.iter().find(|row| row.kind == "trigger" && eq_ignore_ascii_case(&row.name, name)).cloned()
+        else {
+            return Ok(false);
+        };
+        self.table_delete(1, trigger.rowid)?;
+        self.bump_cookie();
+        Ok(true)
+    }
+
     /// Drops a table, every index attached to it, and its `sqlite_sequence`
     /// row. The b-tree pages return to the freelist before the catalog rows
     /// disappear, so the image stays consistent for an external reader.
@@ -1089,6 +1117,11 @@ impl SqliteWriter {
         }
         for index in &indexes {
             self.table_delete(1, index.rowid)?;
+        }
+        let triggers: Vec<MasterRow> =
+            rows.iter().filter(|row| row.kind == "trigger" && eq_ignore_ascii_case(&row.table_name, &table.table_name)).cloned().collect();
+        for trigger in &triggers {
+            self.table_delete(1, trigger.rowid)?;
         }
         self.table_delete(1, table.rowid)?;
         if table.sql.as_deref().is_some_and(has_autoincrement) {
