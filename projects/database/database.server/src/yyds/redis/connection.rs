@@ -2641,6 +2641,27 @@ fn respond(
         }
         write!(stream, ":{removed}\r\n")?;
     }
+    else if command.eq_ignore_ascii_case(b"KEYS") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 2 {
+            write_error(stream, "wrong number of arguments for 'keys' command")?;
+            return Ok(true);
+        }
+        match collect_keys(executor, namespace) {
+            Ok(keys) => {
+                let matched: Vec<Vec<u8>> = keys.into_iter().filter(|key| glob_match(request.arguments[1], key)).collect();
+                stream.write_all(format!("*{}\r\n", matched.len()).as_bytes())?;
+                for key in &matched {
+                    write_bulk(stream, key)?;
+                }
+            }
+            Err(message) => write_error(stream, &message)?,
+        }
+    }
     else if command.eq_ignore_ascii_case(b"RANDOMKEY") {
         let Some(executor) = executor
         else {
@@ -3185,6 +3206,16 @@ fn validate_command_for_queue(
         }
         if count < 2 {
             return Err(b"-ERR wrong number of arguments for 'scan' command\r\n".to_vec());
+        }
+        return Ok(());
+    }
+    // KEYS: exactly one pattern, needs executor.
+    if command.eq_ignore_ascii_case(b"KEYS") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if count != 2 {
+            return Err(b"-ERR wrong number of arguments for 'keys' command\r\n".to_vec());
         }
         return Ok(());
     }

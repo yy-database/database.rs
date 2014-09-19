@@ -2803,3 +2803,100 @@ fn hyperloglog_commands() {
     send(&mut client, &["PFMERGE", "dest"]);
     expect_error(&mut client, "ERR wrong number of arguments for 'pfmerge' command");
 }
+
+/// `KEYS` / `TYPE` / `SCAN` 共用同一个逻辑键空间：五种集合类型与 HLL 都参与列举，
+/// `MATCH` 只过滤返回项，读数类命令不改动既有 TTL。
+#[test]
+fn key_space_commands() {
+    let (mut client, _server) = memory_server("redis-keyspace");
+
+    send(&mut client, &["KEYS", "*"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["KEYS"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'keys' command");
+
+    send(&mut client, &["SET", "user:1", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["HSET", "user:2", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["RPUSH", "user:3", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SADD", "order:1", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZADD", "order:2", "1", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFADD", "order:3", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+
+    send(&mut client, &["KEYS", "user:*"]);
+    expect_array(&mut client, &["user:1", "user:2", "user:3"]);
+    send(&mut client, &["KEYS", "order:*"]);
+    expect_array(&mut client, &["order:1", "order:2", "order:3"]);
+    send(&mut client, &["KEYS", "user:?"]);
+    expect_array(&mut client, &["user:1", "user:2", "user:3"]);
+    send(&mut client, &["KEYS", "*"]);
+    expect_array(&mut client, &["order:1", "order:2", "order:3", "user:1", "user:2", "user:3"]);
+    send(&mut client, &["KEYS", "user:1"]);
+    expect_array(&mut client, &["user:1"]);
+    send(&mut client, &["KEYS", "nomatch*"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["KEYS", "user:1", "extra"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'keys' command");
+
+    for (key, expected) in [
+        ("user:1", "string"),
+        ("user:2", "hash"),
+        ("user:3", "list"),
+        ("order:1", "set"),
+        ("order:2", "zset"),
+        ("order:3", "string"),
+        ("ghost", "none"),
+    ] {
+        send(&mut client, &["TYPE", key]);
+        expect_status(&mut client, expected);
+    }
+
+    // 读数类命令不改动 TTL：过期时间仍保留，SCAN 也能看到该键。
+    send(&mut client, &["EXPIRE", "user:2", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TYPE", "user:2"]);
+    expect_status(&mut client, "hash");
+    send(&mut client, &["TTL", "user:2"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "TYPE changed the TTL: {ttl}");
+
+    send(&mut client, &["SCAN", "0", "MATCH", "user:*", "COUNT", "100"]);
+    let (cursor, keys) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert_eq!(keys, ["user:1", "user:2", "user:3"]);
+    send(&mut client, &["TTL", "user:2"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "SCAN changed the TTL: {ttl}");
+
+    send(&mut client, &["KEYS", "user:*"]);
+    expect_array(&mut client, &["user:1", "user:2", "user:3"]);
+    send(&mut client, &["TTL", "user:2"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "KEYS changed the TTL: {ttl}");
+
+    // 游标进位：每页 3 个键连续推进，直到 0。
+    let mut cursor = "0".to_string();
+    let mut seen = Vec::new();
+    let mut rounds = 0;
+    loop {
+        send(&mut client, &["SCAN", &cursor, "COUNT", "3"]);
+        let (next, keys) = expect_scan(&mut client);
+        seen.extend(keys);
+        rounds += 1;
+        assert!(rounds <= 10, "SCAN did not terminate");
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort();
+    assert_eq!(seen, ["order:1", "order:2", "order:3", "user:1", "user:2", "user:3"]);
+
+    send(&mut client, &["SCAN", "0", "COUNT", "-1"]);
+    expect_error(&mut client, "ERR syntax error");
+}
