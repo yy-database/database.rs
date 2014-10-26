@@ -2899,4 +2899,28 @@ fn key_space_commands() {
 
     send(&mut client, &["SCAN", "0", "COUNT", "-1"]);
     expect_error(&mut client, "ERR syntax error");
+
+    // 字符类：`[abc]`、`[^...]`、`[a-z]`、类内 `\` 转义与未闭合类。
+    send(&mut client, &["SET", "star-*", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["KEYS", "user:[12]"]);
+    expect_array(&mut client, &["user:1", "user:2"]);
+    send(&mut client, &["KEYS", "user:[^1]"]);
+    expect_array(&mut client, &["user:2", "user:3"]);
+    send(&mut client, &["KEYS", "user:[1-2]"]);
+    expect_array(&mut client, &["user:1", "user:2"]);
+    send(&mut client, &["KEYS", "user:[1"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["KEYS", "star-\\*"]);
+    expect_array(&mut client, &["star-*"]);
+    send(&mut client, &["KEYS", "star-[*]"]);
+    expect_array(&mut client, &["star-*"]);
+    send(&mut client, &["SCAN", "0", "MATCH", "user:[12]", "COUNT", "100"]);
+    let (cursor, keys) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert_eq!(keys, ["user:1", "user:2"]);
+    send(&mut client, &["SCAN", "0", "MATCH", "order:[^12]", "COUNT", "100"]);
+    let (cursor, keys) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert_eq!(keys, ["order:3"]);
 }
