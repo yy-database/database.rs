@@ -13,9 +13,9 @@
 use std::{fs, path::Path};
 
 use database_formats::sqlite::{
-    TextEncoding, WriteValue, blank_with_page_size, bump_change_counter, decode_record, decode_varint, encode_record, encode_varint_into,
-    read_freelist_count, read_freelist_trunk, read_schema_cookie, set_freelist_count, set_freelist_trunk, set_page_count, set_schema_cookie,
-    validate_database,
+    RecordValue, TextEncoding, WriteValue, blank_with_page_size, bump_change_counter, decode_record, decode_varint, encode_record,
+    encode_varint_into, read_freelist_count, read_freelist_trunk, read_schema_cookie, set_freelist_count, set_freelist_trunk, set_page_count,
+    set_schema_cookie, validate_database,
 };
 use database_types::{Error, Result};
 
@@ -899,6 +899,45 @@ impl SqliteWriter {
             self.index_entries.entry(index_meta.master_rowid).or_default().insert(key);
         }
         Ok(true)
+    }
+
+    /// Removes one column slot from every stored row of a table.
+    ///
+    /// Records are decoded and re-encoded in place, so rowids, page order and
+    /// the index trees stay untouched; the caller is responsible for proving
+    /// that no surviving index or constraint reads the column, and for
+    /// rewriting the stored `CREATE TABLE` text afterwards.
+    pub fn drop_column(&mut self, table: &str, position: usize) -> Result<()> {
+        let meta = self.table_meta(table)?;
+        if meta.without_rowid {
+            return Err(Error::Unsupported("sqlite WITHOUT ROWID drop column"));
+        }
+        let rows = self.table_rows(table, TableLimits::default())?;
+        let mut root = meta.root_page;
+        for row in rows {
+            let mut values: Vec<WriteValue> = decode_record(&row.payload, self.encoding, Default::default())
+                .map_err(|_| Error::Corrupt("sqlite record decode failed"))?
+                .into_iter()
+                .map(|value| match value {
+                    RecordValue::Null => WriteValue::Null,
+                    RecordValue::Integer(number) => WriteValue::Integer(number),
+                    RecordValue::Real(number) => WriteValue::Real(number),
+                    RecordValue::Blob(bytes) => WriteValue::Blob(bytes.to_vec()),
+                    RecordValue::Text(text) => WriteValue::Text(text),
+                })
+                .collect();
+            if position >= values.len() {
+                return Err(Error::Corrupt("sqlite record has no such column"));
+            }
+            values.remove(position);
+            let payload = encode_record(&values, self.encoding);
+            root = self.table_delete(root, row.rowid)?;
+            root = self.table_insert(root, row.rowid, &payload)?;
+        }
+        if root != meta.root_page {
+            self.set_master_root(meta.master_rowid, root)?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
