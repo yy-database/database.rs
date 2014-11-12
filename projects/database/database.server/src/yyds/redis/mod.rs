@@ -8,6 +8,7 @@ use database_protocol::{GatewayConfig, GatewayKind, startup_banner as protocol_s
 use database_query::version_label;
 use database_types::{Error, Result};
 
+pub mod blocking;
 pub mod connection;
 mod collections;
 pub mod service;

@@ -27,6 +27,7 @@ use database_types::cluster::{FenceToken, Namespace};
 
 use super::{
     bind::{BindError, BoundAction, BoundCommand, SetCondition, SetExpiry, bind, bind_mget, bind_set},
+    blocking::BlockingRegistry,
     collections::{self, KeyKind},
     resp::{Request, RequestLimits, decode_request},
 };
@@ -109,11 +110,17 @@ struct ConnectionState {
     /// Keys pinned by `WATCH`, in first-watch order. Cleared by `UNWATCH`, `DISCARD`
     /// and every `EXEC`, including an aborted one.
     watched: Vec<WatchedKey>,
+    /// Whether blocking commands must answer immediately instead of waiting.
+    ///
+    /// Commands replayed by `EXEC` run with this set: upstream Redis executes a queued
+    /// `BLPOP` like a non-blocking variant and answers nil at once, and waiting inside
+    /// `EXEC` would also block the connection that owns the transaction.
+    defer_blocking: bool,
 }
 
 impl Default for ConnectionState {
     fn default() -> Self {
-        Self { protocol: 2, in_multi: false, queue: Vec::new(), client_name: None, watched: Vec::new() }
+        Self { protocol: 2, in_multi: false, queue: Vec::new(), client_name: None, watched: Vec::new(), defer_blocking: false }
     }
 }
 
@@ -269,13 +276,19 @@ pub fn serve_connection(stream: TcpStream, limits: RequestLimits) -> io::Result<
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    serve_io(stream, limits, None, Arc::new(KeyAccessTracker::new()))
+    serve_io(stream, limits, None, Arc::new(KeyAccessTracker::new()), Arc::new(BlockingRegistry::new()))
 }
 
 /// Serves a node-owned connection with cooperative cancellation of all socket I/O.
 pub fn serve_cancellable(stream: TcpStream, limits: RequestLimits, stopping: Arc<AtomicBool>) -> io::Result<()> {
     stream.set_nonblocking(true)?;
-    serve_io(CancellableSocket { stream, stopping }, limits, None, Arc::new(KeyAccessTracker::new()))
+    serve_io(
+        CancellableSocket { stream, stopping },
+        limits,
+        None,
+        Arc::new(KeyAccessTracker::new()),
+        Arc::new(BlockingRegistry::new()),
+    )
 }
 
 /// Serves a node-owned RESP2 connection using the YYDS key/value execution contract.
@@ -286,23 +299,31 @@ pub fn serve_cancellable_with_executor(
     executor: Arc<dyn KeyValueExecutor>,
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
-    serve_io(CancellableSocket { stream, stopping }, limits, Some(executor), Arc::new(KeyAccessTracker::new()))
+    serve_io(
+        CancellableSocket { stream, stopping },
+        limits,
+        Some(executor),
+        Arc::new(KeyAccessTracker::new()),
+        Arc::new(BlockingRegistry::new()),
+    )
 }
 
 /// Serves a node-owned RESP2 connection while sharing one access tracker with its listener.
 ///
 /// The tracker holds `OBJECT IDLETIME` state, which is per-object in Redis and therefore
 /// has to be shared by every connection of the same listener rather than recreated per
-/// socket.
+/// socket. `registry` carries the blocking wait table and has to be shared for the same
+/// reason: waiters on one connection are woken by pushes performed on another.
 pub fn serve_cancellable_with_executor_and_tracker(
     stream: TcpStream,
     limits: RequestLimits,
     stopping: Arc<AtomicBool>,
     executor: Arc<dyn KeyValueExecutor>,
     tracker: Arc<KeyAccessTracker>,
+    registry: Arc<BlockingRegistry>,
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
-    serve_io(CancellableSocket { stream, stopping }, limits, Some(executor), tracker)
+    serve_io(CancellableSocket { stream, stopping }, limits, Some(executor), tracker, registry)
 }
 
 struct CancellableSocket {
@@ -352,6 +373,7 @@ fn serve_io(
     limits: RequestLimits,
     executor: Option<Arc<dyn KeyValueExecutor>>,
     tracker: Arc<KeyAccessTracker>,
+    registry: Arc<BlockingRegistry>,
 ) -> io::Result<()> {
     let mut pending = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -372,6 +394,7 @@ fn serve_io(
                         tracked_view,
                         executor.as_deref(),
                         tracker.as_ref(),
+                        registry.as_ref(),
                         &mut namespace,
                         &mut state,
                     );
@@ -1307,6 +1330,7 @@ fn respond(
     executor: Option<&dyn KeyValueExecutor>,
     probe: Option<&dyn KeyValueExecutor>,
     tracker: &KeyAccessTracker,
+    registry: &BlockingRegistry,
     namespace: &mut Namespace,
     state: &mut ConnectionState,
 ) -> io::Result<bool> {
@@ -1366,7 +1390,7 @@ fn respond(
                 }
             }
         }
-        execute_transaction(stream, executor, probe, tracker, namespace, state)?;
+        execute_transaction(stream, executor, probe, tracker, registry, namespace, state)?;
         return Ok(true);
     }
 
@@ -2565,7 +2589,7 @@ fn respond(
         collections::handle_hash(stream, request, executor, namespace, state.protocol)?;
     }
     else if collections::is_list_command(command) {
-        collections::handle_list(stream, request, executor, namespace, state.protocol)?;
+        collections::handle_list(stream, request, executor, namespace, state.protocol, registry, !state.defer_blocking)?;
     }
     else if collections::is_set_command(command) {
         collections::handle_set(stream, request, executor, namespace, state.protocol)?;
@@ -2946,6 +2970,7 @@ fn execute_transaction(
     executor: Option<&dyn KeyValueExecutor>,
     probe: Option<&dyn KeyValueExecutor>,
     tracker: &KeyAccessTracker,
+    registry: &BlockingRegistry,
     namespace: &mut Namespace,
     state: &mut ConnectionState,
 ) -> io::Result<()> {
@@ -2967,14 +2992,16 @@ fn execute_transaction(
         // do not pollute the parent transaction. The negotiated protocol is inherited, so
         // replayed nulls keep the shape the client handshaked for. Key expiry lives in the
         // KV records, so queued commands see and write it through the executor like any
-        // other state.
-        let mut inner_state = ConnectionState { protocol, ..ConnectionState::new() };
+        // other state. Blocking commands never wait inside `EXEC`; they take the queued
+        // command's immediate answer, which is the same as upstream.
+        let mut inner_state = ConnectionState { protocol, defer_blocking: true, ..ConnectionState::new() };
         let _ = respond(
             &mut buf as &mut dyn Write,
             &inner_request,
             executor,
             probe,
             tracker,
+            registry,
             &mut inner_namespace,
             &mut inner_state,
         );

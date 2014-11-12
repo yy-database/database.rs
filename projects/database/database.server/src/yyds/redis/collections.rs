@@ -10,13 +10,14 @@
 //! 字符串内容再特殊也不会被当成 hash/list；判定类型只是逐个命名空间探测可见记录，
 //! 同一逻辑键在任一时刻至多存在一种表示（写入时强制互斥，删除时清干净）。
 
-use std::io;
+use std::{io, time::Duration};
 
 use database_execution::cluster::KeyValueExecutor;
 use database_query::cluster_kv::{KeyValueAction, KeyValueCommand, KeyValueResult};
 use database_types::cluster::Namespace;
 
 use super::{
+    blocking::{BlockingRegistry, WaitOutcome, Waiter, timeout_deadline},
     connection::{write_bulk, write_error, write_null, write_null_array},
     resp::Request,
 };
@@ -298,6 +299,11 @@ pub(crate) fn is_list_command(command: &[u8]) -> bool {
         b"LINSERT",
         b"RPOPLPUSH",
         b"LMOVE",
+        b"BLPOP",
+        b"BRPOP",
+        b"BLMOVE",
+        b"BRPOPLPUSH",
+        b"BLMPOP",
     ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
@@ -959,6 +965,429 @@ fn handle_lpos(
     }
 }
 
+/// 阻塞命令的一次取值尝试。
+enum Blocked<T> {
+    /// 取到值，可以回复。
+    Ready(T),
+    /// 键不存在或列表为空，继续等。
+    Empty,
+    /// 已回复错误（`WRONGTYPE`、存储错误或损坏）。
+    Rejected,
+}
+
+/// 阻塞取值的最终结果。
+enum BlockOutcome<T> {
+    /// 从第几个键取到了值。
+    Claimed(usize, T),
+    /// 截止时间先到，回复 null。
+    TimedOut,
+    /// 已回复错误。
+    Rejected,
+}
+
+/// 阻塞取值的公共骨架。
+///
+/// 先按参数顺序尝试（同一键上只有队首有权取，保证 FIFO），都没取到就睡在
+/// 监听器级等待表上，直到某个键被推入或超时。`allow_blocking` 为假时只在
+/// `EXEC` 内复放的阻塞命令上出现，按真机的非阻塞语义立刻回一次结果。
+fn block_until<T>(
+    registry: &BlockingRegistry,
+    base: &Namespace,
+    keys: &[&[u8]],
+    timeout: Option<Duration>,
+    allow_blocking: bool,
+    mut claim: impl FnMut(usize) -> io::Result<Blocked<T>>,
+) -> io::Result<BlockOutcome<T>> {
+    if !allow_blocking {
+        for index in 0..keys.len() {
+            match claim(index)? {
+                Blocked::Ready(value) => return Ok(BlockOutcome::Claimed(index, value)),
+                Blocked::Empty => {}
+                Blocked::Rejected => return Ok(BlockOutcome::Rejected),
+            }
+        }
+        return Ok(BlockOutcome::TimedOut);
+    }
+    let deadline = timeout_deadline(timeout);
+    let mut waiters: Vec<Waiter> = keys.iter().map(|key| registry.register(base, key)).collect();
+    loop {
+        for (index, waiter) in waiters.iter().enumerate() {
+            if !registry.is_head(waiter) {
+                continue;
+            }
+            match claim(index)? {
+                Blocked::Ready(value) => {
+                    registry.unregister_all(&waiters);
+                    return Ok(BlockOutcome::Claimed(index, value));
+                }
+                Blocked::Empty => {}
+                Blocked::Rejected => {
+                    registry.unregister_all(&waiters);
+                    return Ok(BlockOutcome::Rejected);
+                }
+            }
+        }
+        match registry.wait_any(&mut waiters, deadline) {
+            WaitOutcome::TimedOut => {
+                registry.unregister_all(&waiters);
+                return Ok(BlockOutcome::TimedOut);
+            }
+            WaitOutcome::Signaled => {}
+        }
+    }
+}
+
+/// 解析阻塞命令的超时参数。`0` 表示无限等待。
+///
+/// 真机把超时按浮点秒解析，负数与非数字分别回不同的错误文案；返回 `None` 表示错误
+/// 已经写进连接。
+fn parse_timeout(stream: &mut dyn io::Write, raw: &[u8]) -> io::Result<Option<Option<Duration>>> {
+    let Ok(text) = std::str::from_utf8(raw)
+    else {
+        write_error(stream, "timeout is not a float or out of range")?;
+        return Ok(None);
+    };
+    let Ok(value) = text.parse::<f64>()
+    else {
+        write_error(stream, "timeout is not a float or out of range")?;
+        return Ok(None);
+    };
+    if !value.is_finite() {
+        write_error(stream, "timeout is not a float or out of range")?;
+        return Ok(None);
+    }
+    if value < 0.0 {
+        write_error(stream, "timeout is negative")?;
+        return Ok(None);
+    }
+    if value == 0.0 {
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(Duration::from_secs_f64(value))))
+}
+
+/// 阻塞命令开始前的类型扫描。
+///
+/// 与真机一致：按参数顺序逐键检查，遇到第一个非空列表就停止，因此它前面的键必须先
+/// 通过类型检查；返回 `false` 表示错误已经写出。
+fn precheck_lists(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    keys: &[&[u8]],
+) -> io::Result<bool> {
+    for key in keys {
+        match find_kind(executor, base, key) {
+            Ok(None) => {}
+            Ok(Some(KeyKind::List)) => match load_value(executor, &KeyKind::List.namespace(base), key) {
+                Ok(Some(bytes)) => match decode_list(&bytes) {
+                    Some(elements) if elements.is_empty() => {}
+                    Some(_) => return Ok(true),
+                    None => {
+                        write_error(stream, "stored list value is corrupt")?;
+                        return Ok(false);
+                    }
+                },
+                Ok(None) => {}
+                Err(message) => {
+                    write_storage_error(stream, &message)?;
+                    return Ok(false);
+                }
+            },
+            Ok(Some(_)) => {
+                write_wrong_type(stream)?;
+                return Ok(false);
+            }
+            Err(message) => {
+                write_storage_error(stream, &message)?;
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// 把内存里的列表写回存储；列表空时删除键，对应真机不允许空列表存在。
+fn persist_list(executor: &dyn KeyValueExecutor, base: &Namespace, key: &[u8], elements: &[Vec<u8>]) -> Result<(), String> {
+    if elements.is_empty() {
+        remove_value(executor, &KeyKind::List.namespace(base), key)?;
+        return Ok(());
+    }
+    let bytes = encode_list(elements).ok_or_else(|| "list exceeds the storage limit".to_string())?;
+    store_value(executor, &KeyKind::List.namespace(base), key, bytes)
+}
+
+/// `BLPOP` / `BRPOP`。
+fn handle_blocking_pop(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    arguments: &[&[u8]],
+    protocol: u8,
+    registry: &BlockingRegistry,
+    allow_blocking: bool,
+) -> io::Result<()> {
+    let pop_head = arguments[0].eq_ignore_ascii_case(b"BLPOP");
+    let name = if pop_head { "blpop" } else { "brpop" };
+    if arguments.len() < 3 {
+        return write_arity_error(stream, name);
+    }
+    let Some(timeout) = parse_timeout(stream, arguments[arguments.len() - 1])?
+    else {
+        return Ok(());
+    };
+    let keys: Vec<&[u8]> = arguments[1..arguments.len() - 1].iter().copied().collect();
+    if !precheck_lists(stream, executor, base, &keys)? {
+        return Ok(());
+    }
+    let outcome = block_until(registry, base, &keys, timeout, allow_blocking, |index| {
+        let key = keys[index];
+        let mut elements = match load_list(stream, executor, base, key)? {
+            Loaded::Missing => return Ok(Blocked::Empty),
+            Loaded::Found(elements) => elements,
+            Loaded::Rejected => return Ok(Blocked::Rejected),
+        };
+        if elements.is_empty() {
+            return Ok(Blocked::Empty);
+        }
+        let element = if pop_head { elements.remove(0) } else { elements.pop().unwrap_or_default() };
+        if let Err(message) = persist_list(executor, base, key, &elements) {
+            write_storage_error(stream, &message)?;
+            return Ok(Blocked::Rejected);
+        }
+        Ok(Blocked::Ready(element))
+    })?;
+    match outcome {
+        BlockOutcome::Claimed(index, element) => {
+            write_array_header(stream, 2)?;
+            write_bulk(stream, keys[index])?;
+            write_bulk(stream, &element)
+        }
+        BlockOutcome::TimedOut => write_null_array(stream, protocol),
+        BlockOutcome::Rejected => Ok(()),
+    }
+}
+
+/// 把源列表的一个元素搬到目标端；失败时错误已经写出。
+#[allow(clippy::too_many_arguments)]
+fn claim_move(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    registry: &BlockingRegistry,
+    source: &[u8],
+    destination: &[u8],
+    from: ListSide,
+    to: ListSide,
+) -> io::Result<Blocked<Vec<u8>>> {
+    let mut source_elements = match load_list(stream, executor, base, source)? {
+        Loaded::Missing => return Ok(Blocked::Empty),
+        Loaded::Found(elements) => elements,
+        Loaded::Rejected => return Ok(Blocked::Rejected),
+    };
+    if source_elements.is_empty() {
+        return Ok(Blocked::Empty);
+    }
+    // 目标类型在真正搬运时才校验，与真机一致：源为空时先阻塞，不会因为目标类型出错。
+    let mut destination_elements = if source == destination {
+        Vec::new()
+    }
+    else {
+        match find_kind(executor, base, destination) {
+            Ok(None) | Ok(Some(KeyKind::List)) => {}
+            Ok(Some(_)) => {
+                write_wrong_type(stream)?;
+                return Ok(Blocked::Rejected);
+            }
+            Err(message) => {
+                write_storage_error(stream, &message)?;
+                return Ok(Blocked::Rejected);
+            }
+        }
+        match load_value(executor, &KeyKind::List.namespace(base), destination) {
+            Ok(Some(bytes)) => match decode_list(&bytes) {
+                Some(elements) => elements,
+                None => {
+                    write_error(stream, "stored list value is corrupt")?;
+                    return Ok(Blocked::Rejected);
+                }
+            },
+            Ok(None) => Vec::new(),
+            Err(message) => {
+                write_storage_error(stream, &message)?;
+                return Ok(Blocked::Rejected);
+            }
+        }
+    };
+    let element = match from {
+        ListSide::Left => source_elements.remove(0),
+        ListSide::Right => source_elements.pop().unwrap_or_default(),
+    };
+    if source == destination {
+        match to {
+            ListSide::Left => source_elements.insert(0, element.clone()),
+            ListSide::Right => source_elements.push(element.clone()),
+        }
+        if let Err(message) = persist_list(executor, base, source, &source_elements) {
+            write_storage_error(stream, &message)?;
+            return Ok(Blocked::Rejected);
+        }
+        return Ok(Blocked::Ready(element));
+    }
+    match to {
+        ListSide::Left => destination_elements.insert(0, element.clone()),
+        ListSide::Right => destination_elements.push(element.clone()),
+    }
+    if let Err(message) = persist_list(executor, base, source, &source_elements) {
+        write_storage_error(stream, &message)?;
+        return Ok(Blocked::Rejected);
+    }
+    if let Err(message) = persist_list(executor, base, destination, &destination_elements) {
+        write_storage_error(stream, &message)?;
+        return Ok(Blocked::Rejected);
+    }
+    // 目标列表多了一个元素，唤醒排在它上面的阻塞消费者。
+    registry.notify(base, destination);
+    Ok(Blocked::Ready(element))
+}
+
+/// `BLMOVE` / `BRPOPLPUSH`。
+fn handle_blocking_move(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    arguments: &[&[u8]],
+    protocol: u8,
+    registry: &BlockingRegistry,
+    allow_blocking: bool,
+) -> io::Result<()> {
+    let lmove = arguments[0].eq_ignore_ascii_case(b"BLMOVE");
+    let (from, to, timeout_raw) = if lmove {
+        if arguments.len() != 6 {
+            return write_arity_error(stream, "blmove");
+        }
+        let (Some(from), Some(to)) = (parse_side(arguments[3]), parse_side(arguments[4]))
+        else {
+            return write_error(stream, "syntax error");
+        };
+        (from, to, arguments[5])
+    }
+    else {
+        if arguments.len() != 4 {
+            return write_arity_error(stream, "brpoplpush");
+        }
+        (ListSide::Right, ListSide::Left, arguments[3])
+    };
+    let Some(timeout) = parse_timeout(stream, timeout_raw)?
+    else {
+        return Ok(());
+    };
+    let source = arguments[1];
+    let destination = arguments[2];
+    match find_kind(executor, base, source) {
+        Ok(None) | Ok(Some(KeyKind::List)) => {}
+        Ok(Some(_)) => return write_wrong_type(stream),
+        Err(message) => return write_storage_error(stream, &message),
+    }
+    let keys = [source];
+    let outcome = block_until(registry, base, &keys, timeout, allow_blocking, |_| {
+        claim_move(stream, executor, base, registry, source, destination, from, to)
+    })?;
+    match outcome {
+        BlockOutcome::Claimed(_, element) => write_bulk(stream, &element),
+        BlockOutcome::TimedOut => write_null(stream, protocol),
+        BlockOutcome::Rejected => Ok(()),
+    }
+}
+
+/// `BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]`。
+fn handle_blocking_mpop(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    arguments: &[&[u8]],
+    protocol: u8,
+    registry: &BlockingRegistry,
+    allow_blocking: bool,
+) -> io::Result<()> {
+    if arguments.len() < 5 {
+        return write_arity_error(stream, "blmpop");
+    }
+    let Some(timeout) = parse_timeout(stream, arguments[1])?
+    else {
+        return Ok(());
+    };
+    let Some(numkeys) = parse_index(arguments[2])
+    else {
+        return write_error(stream, "value is not an integer or out of range");
+    };
+    if numkeys <= 0 {
+        return write_error(stream, "numkeys should be greater than 0");
+    }
+    let numkeys = numkeys as usize;
+    let keys_end = 3 + numkeys;
+    if arguments.len() < keys_end + 1 {
+        return write_error(stream, "syntax error");
+    }
+    let keys: Vec<&[u8]> = arguments[3..keys_end].to_vec();
+    let Some(side) = parse_side(arguments[keys_end])
+    else {
+        return write_error(stream, "syntax error");
+    };
+    let mut count = 1_usize;
+    if arguments.len() > keys_end + 1 {
+        if arguments.len() != keys_end + 3 || !arguments[keys_end + 1].eq_ignore_ascii_case(b"COUNT") {
+            return write_error(stream, "syntax error");
+        }
+        let Some(value) = parse_index(arguments[keys_end + 2])
+        else {
+            return write_error(stream, "value is not an integer or out of range");
+        };
+        if value <= 0 {
+            return write_error(stream, "count should be greater than 0");
+        }
+        count = value as usize;
+    }
+    if !precheck_lists(stream, executor, base, &keys)? {
+        return Ok(());
+    }
+    let outcome = block_until(registry, base, &keys, timeout, allow_blocking, |index| {
+        let key = keys[index];
+        let mut elements = match load_list(stream, executor, base, key)? {
+            Loaded::Missing => return Ok(Blocked::Empty),
+            Loaded::Found(elements) => elements,
+            Loaded::Rejected => return Ok(Blocked::Rejected),
+        };
+        if elements.is_empty() {
+            return Ok(Blocked::Empty);
+        }
+        let take = count.min(elements.len());
+        let popped: Vec<Vec<u8>> = match side {
+            ListSide::Left => elements.drain(..take).collect(),
+            // 与 `RPOP key count` 一致：从表尾逐个弹出，回复是尾端在前。
+            ListSide::Right => elements.drain(elements.len() - take..).rev().collect(),
+        };
+        if let Err(message) = persist_list(executor, base, key, &elements) {
+            write_storage_error(stream, &message)?;
+            return Ok(Blocked::Rejected);
+        }
+        Ok(Blocked::Ready(popped))
+    })?;
+    match outcome {
+        BlockOutcome::Claimed(index, popped) => {
+            write_array_header(stream, 2)?;
+            write_bulk(stream, keys[index])?;
+            write_array_header(stream, popped.len())?;
+            for element in &popped {
+                write_bulk(stream, element)?;
+            }
+            Ok(())
+        }
+        BlockOutcome::TimedOut => write_null_array(stream, protocol),
+        BlockOutcome::Rejected => Ok(()),
+    }
+}
+
 /// 列表命令的分派入口。
 pub(crate) fn handle_list(
     stream: &mut dyn io::Write,
@@ -966,12 +1395,23 @@ pub(crate) fn handle_list(
     executor: Option<&dyn KeyValueExecutor>,
     base: &Namespace,
     protocol: u8,
+    registry: &BlockingRegistry,
+    allow_blocking: bool,
 ) -> io::Result<()> {
     let command = request.arguments[0];
     let Some(executor) = executor
     else {
         return write_error(stream, "unsupported command");
     };
+    if command.eq_ignore_ascii_case(b"BLPOP") || command.eq_ignore_ascii_case(b"BRPOP") {
+        return handle_blocking_pop(stream, executor, base, &request.arguments, protocol, registry, allow_blocking);
+    }
+    if command.eq_ignore_ascii_case(b"BLMOVE") || command.eq_ignore_ascii_case(b"BRPOPLPUSH") {
+        return handle_blocking_move(stream, executor, base, &request.arguments, protocol, registry, allow_blocking);
+    }
+    if command.eq_ignore_ascii_case(b"BLMPOP") {
+        return handle_blocking_mpop(stream, executor, base, &request.arguments, protocol, registry, allow_blocking);
+    }
     if command.eq_ignore_ascii_case(b"LPOS") {
         return handle_lpos(stream, executor, base, &request.arguments, protocol);
     }
@@ -1010,6 +1450,8 @@ pub(crate) fn handle_list(
         if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), key, bytes) {
             return write_storage_error(stream, &message);
         }
+        // 新元素到达，唤醒排在该键上的阻塞消费者。
+        registry.notify(base, key);
         return write_integer(stream, elements.len() as i64);
     }
     if command.eq_ignore_ascii_case(b"LINDEX") {
@@ -1290,6 +1732,8 @@ pub(crate) fn handle_list(
         if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), key, bytes) {
             return write_storage_error(stream, &message);
         }
+        // 新元素到达，唤醒排在该键上的阻塞消费者。
+        registry.notify(base, key);
         return write_integer(stream, elements.len() as i64);
     }
     if command.eq_ignore_ascii_case(b"RPOPLPUSH") || command.eq_ignore_ascii_case(b"LMOVE") {
@@ -1385,6 +1829,8 @@ pub(crate) fn handle_list(
         if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), destination, bytes) {
             return write_storage_error(stream, &message);
         }
+        // 目标端多了一个元素，唤醒排在该键上的阻塞消费者。
+        registry.notify(base, destination);
         return write_bulk(stream, &element);
     }
     // LLEN
