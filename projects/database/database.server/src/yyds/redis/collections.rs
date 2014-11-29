@@ -1295,7 +1295,7 @@ fn handle_blocking_move(
     })?;
     match outcome {
         BlockOutcome::Claimed(_, element) => write_bulk(stream, &element),
-        BlockOutcome::TimedOut => write_null(stream, protocol),
+        BlockOutcome::TimedOut => write_null_array(stream, protocol),
         BlockOutcome::Rejected => Ok(()),
     }
 }
