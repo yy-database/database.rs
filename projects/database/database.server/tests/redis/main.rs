@@ -5,5 +5,6 @@ mod collections;
 mod gateway;
 mod getex;
 mod object;
+mod pubsub;
 mod resp;
 mod watch;

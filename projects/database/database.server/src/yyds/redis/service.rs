@@ -18,6 +18,7 @@ use database_execution::cluster::KeyValueExecutor;
 use super::{
     blocking::BlockingRegistry,
     connection::{KeyAccessTracker, serve_cancellable, serve_cancellable_with_executor_and_tracker},
+    pubsub::PubSubRegistry,
     resp::RequestLimits,
 };
 
@@ -145,6 +146,9 @@ fn listen(
     // Blocking commands wait for pushes performed by other connections, so the wait table
     // has to be listener-scoped like the access tracker.
     let registry = Arc::new(BlockingRegistry::new());
+    // Channel and pattern subscriptions are reached from the publishing connection, so the
+    // pub/sub table is listener-scoped for the same reason.
+    let pubsub = Arc::new(PubSubRegistry::new());
     let mut clients = Clients { workers: Vec::new(), stopping: Arc::clone(&stopping) };
     while !stopping.load(Ordering::Acquire) {
         clients.reap();
@@ -163,6 +167,7 @@ fn listen(
                 let connection_executor = executor.clone();
                 let connection_tracker = Arc::clone(&tracker);
                 let connection_registry = Arc::clone(&registry);
+                let connection_pubsub = Arc::clone(&pubsub);
                 let worker = thread::Builder::new().name("yyds-redis-client".into()).spawn(move || {
                     let _ = match connection_executor {
                         Some(executor) => serve_cancellable_with_executor_and_tracker(
@@ -172,6 +177,7 @@ fn listen(
                             executor,
                             connection_tracker,
                             connection_registry,
+                            connection_pubsub,
                         ),
                         None => serve_cancellable(stream, limits, cancellation),
                     };

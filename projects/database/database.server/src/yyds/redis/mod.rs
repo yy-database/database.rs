@@ -11,6 +11,7 @@ use database_types::{Error, Result};
 pub mod blocking;
 pub mod connection;
 mod collections;
+pub mod pubsub;
 pub mod service;
 
 /// 命令绑定（来自 `database-protocol-redis`）。
