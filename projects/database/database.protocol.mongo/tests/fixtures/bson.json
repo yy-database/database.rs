@@ -1996,6 +1996,365 @@
                     }
                 }
             ]
+        },
+        {
+            "id": "bson.decode.date",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000096100cb04fb711f01000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$date": {
+                                "$numberLong": "1234567890123"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.timestamp",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000116100030000000700000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$timestamp": {
+                                "t": 7,
+                                "i": 3
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.minkey",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "08000000ff610000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$minKey": 1
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.maxkey",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "080000007f610000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$maxKey": 1
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.decimal",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "180000001361000f000000000000000000000000003e3000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberDecimal": "1.5"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.symbol",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "100000000e61000400000073796d0000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$symbol": "sym"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.regex",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0f0000000b610061626300696d0000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$regularExpression": {
+                                "pattern": "abc",
+                                "options": "im"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.code",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "190000000d61000d00000066756e6374696f6e28297b7d0000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$code": "function(){}"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.codescope",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "290000000f6100210000000d00000066756e6374696f6e28297b7d000c000000106100010000000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$code": "function(){}",
+                            "$scope": {
+                                "a": {
+                                    "$numberInt": "1"
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.dbpointer",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "1f0000000c61000700000064622e636f6c00aabbccddeeff00112233445500",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$dbPointer": {
+                                "$ref": "db.col",
+                                "$id": {
+                                    "$oid": "aabbccddeeff001122334455"
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.undefined",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0800000006610000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$undefined": true
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.date",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$date": {
+                                "$numberLong": "1234567890123"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000096100cb04fb711f01000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.timestamp",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$timestamp": {
+                                "t": 7,
+                                "i": 3
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000116100030000000700000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.minkey",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$minKey": 1
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "08000000ff610000"
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.maxkey",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$maxKey": 1
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "080000007f610000"
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.decimal",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberDecimal": "1.5"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "180000001361000f000000000000000000000000003e3000"
+                }
+            ]
         }
     ]
 }
