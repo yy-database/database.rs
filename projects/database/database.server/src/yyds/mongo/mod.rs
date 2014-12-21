@@ -886,47 +886,12 @@ fn number_of(value: &BsonValue) -> Option<f64> {
     }
 }
 
-/// Total order used by `sort`: numbers compare numerically, strings
-/// lexicographically, and cross-type pairs follow MongoDB's canonical order
-/// (null, numbers, strings, documents, arrays, binary, object ids, booleans).
+/// Total order used by `sort` and the query operators.
+///
+/// `BsonValue::compare` 已按 BSON 规范给出覆盖全部变体的全序，这里直接复用，
+/// 避免两套排序在新增类型时漂移。
 fn compare_values(left: &BsonValue, right: &BsonValue) -> Ordering {
-    let rank = |value: &BsonValue| match value {
-        // Undefined 已废弃，真机也不再产出，这里只给它一个稳定且低于 Null 的槽位。
-        BsonValue::Undefined => 0,
-        BsonValue::Null => 1,
-        BsonValue::Int32(_) | BsonValue::Int64(_) | BsonValue::Double(_) => 2,
-        BsonValue::String(_) => 3,
-        BsonValue::Document(_) => 4,
-        BsonValue::Array(_) => 5,
-        BsonValue::Binary(_) => 6,
-        BsonValue::ObjectId(_) => 7,
-        BsonValue::Bool(_) => 8,
-    };
-    if rank(left) != rank(right) {
-        return rank(left).cmp(&rank(right));
-    }
-    match (left, right) {
-        (BsonValue::Int32(_) | BsonValue::Int64(_) | BsonValue::Double(_), _) => {
-            let left = number_of(left).unwrap_or(0.0);
-            let right = number_of(right).unwrap_or(0.0);
-            left.partial_cmp(&right).unwrap_or(Ordering::Equal)
-        }
-        (BsonValue::String(left), BsonValue::String(right)) => left.cmp(right),
-        (BsonValue::Bool(left), BsonValue::Bool(right)) => left.cmp(right),
-        (BsonValue::ObjectId(left), BsonValue::ObjectId(right)) => left.cmp(right),
-        (BsonValue::Binary(left), BsonValue::Binary(right)) => (left.subtype, &left.bytes).cmp(&(right.subtype, &right.bytes)),
-        (BsonValue::Document(left), BsonValue::Document(right)) => encode_bson(left).cmp(&encode_bson(right)),
-        (BsonValue::Array(left), BsonValue::Array(right)) => {
-            for (left, right) in left.iter().zip(right.iter()) {
-                let ordering = compare_values(left, right);
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-            left.len().cmp(&right.len())
-        }
-        _ => Ordering::Equal,
-    }
+    left.compare(right)
 }
 
 fn parse_count(value: Option<&BsonValue>) -> usize {
