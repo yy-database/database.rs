@@ -1207,6 +1207,9 @@ pub enum Statement {
         foreign_keys: Vec<ForeignKey>,
         /// `STRICT` table option was present.
         strict: bool,
+        /// `TEMP` / `TEMPORARY`: the table lives in `sqlite_temp_master` and
+        /// disappears with the connection.
+        temp: bool,
         /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
         sql: String,
     },
@@ -2972,6 +2975,13 @@ impl<'a> Parser<'a> {
     fn statement(&mut self) -> Result<Statement, SqlError> {
         self.statement_start = self.at;
         if self.eat_word("create") {
+            if self.eat_word("temp") || self.eat_word("temporary") {
+                if self.eat_word("table") {
+                    self.kind = Some("create-table");
+                    return self.create_table(true);
+                }
+                return Err(self.error("unsupported-clause", "`TEMP` is only accepted on `CREATE TABLE`"));
+            }
             if self.eat_word("unique") {
                 self.kind = Some("create-index");
                 return self.create_index(true);
@@ -2989,7 +2999,7 @@ impl<'a> Parser<'a> {
                 return self.create_trigger();
             }
             self.kind = Some("create-table");
-            return self.create_table();
+            return self.create_table(false);
         }
         if self.eat_word("insert") {
             self.kind = Some("insert");
@@ -3419,8 +3429,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn create_table(&mut self) -> Result<Statement, SqlError> {
-        self.expect_word("table")?;
+    fn create_table(&mut self, temp: bool) -> Result<Statement, SqlError> {
+        if !temp {
+            self.expect_word("table")?;
+        }
         let if_not_exists = if self.eat_word("if") {
             self.expect_word("not")?;
             self.expect_word("exists")?;
@@ -3513,7 +3525,7 @@ impl<'a> Parser<'a> {
             strict = true;
         }
         let sql = self.canonical_create_sql("CREATE TABLE", name_token, name_gap_end);
-        Ok(Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, sql })
+        Ok(Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, temp, sql })
     }
 
     /// Reads `CHECK ( expr )` after an optional `CONSTRAINT name`, and keeps the
