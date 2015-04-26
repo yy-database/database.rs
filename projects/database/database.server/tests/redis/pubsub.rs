@@ -55,6 +55,7 @@ fn start_server(clients: usize) -> SocketAddr {
                     tracker,
                     registry,
                     pubsub,
+                    None,
                 );
             }));
         }

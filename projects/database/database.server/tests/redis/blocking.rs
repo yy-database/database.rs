@@ -60,6 +60,7 @@ fn start_server(clients: usize) -> (SocketAddr, Arc<dyn KeyValueExecutor>) {
                     tracker,
                     registry,
                     pubsub,
+                    None,
                 );
             }));
         }
