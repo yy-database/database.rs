@@ -1,10 +1,13 @@
 //! In-memory execution layer: SQL subset over the pure-Rust format-3 writer.
 //!
-//! The engine keeps the whole database image in `SqliteWriter::pages()`; it
-//! never opens a file and never imports an upstream SQLite engine.
+//! The engine keeps the whole database image in `SqliteWriter::pages()`. It
+//! never imports an upstream SQLite engine; [`Engine::from_writer`] wraps an
+//! image read by `SqliteWriter::open`, and [`Engine::save`] flushes the current
+//! image back to a file.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::{
     ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue, decode_library_version,
@@ -19,6 +22,7 @@ use super::sql::{
     OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp,
     WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column, rewrite_create_index_table,
     rewrite_create_table_column, rewrite_create_table_drop_column, rewrite_create_table_name, statement_references,
+    strip_schema_qualifiers,
 };
 
 /// One cell surfaced to the host.
@@ -204,6 +208,131 @@ struct TriggerDef {
     when: Option<Expr>,
     /// Body statements run in order.
     body: Vec<Statement>,
+}
+
+/// One database attached with `ATTACH DATABASE`.
+struct AttachedDb {
+    /// Schema name as written.
+    name: String,
+    /// File the database lives in; `None` for an in-memory or temporary one.
+    file: Option<PathBuf>,
+    /// Text `PRAGMA database_list` reports in the `file` column.
+    display: String,
+    /// The attached database runs through the same engine as `main`, so every
+    /// statement shape keeps working inside it without a second parser.
+    engine: Box<Engine>,
+    /// The in-memory image differs from the file on disk.
+    dirty: bool,
+}
+
+/// Which schema a statement resolves its unqualified names in. The default
+/// follows SQLite's search order (temp, then main, then attached databases).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableScope {
+    Default,
+    Main,
+    Temp,
+}
+
+/// Object family an unqualified `DROP` or `ALTER` statement may target in an
+/// attached database.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    Table,
+    Index,
+    View,
+    Trigger,
+}
+
+/// Reserved table names of one schema. `main.` never reaches the temp master
+/// and `temp.` never reaches the main master, matching SQLite's isolation.
+fn system_for_scope(scope: TableScope, name: &str) -> Option<SystemTable> {
+    let system = SystemTable::from_name(name)?;
+    match (scope, system) {
+        (TableScope::Main, SystemTable::TempMaster) => None,
+        (TableScope::Temp, SystemTable::Master | SystemTable::Sequence) => None,
+        _ => Some(system),
+    }
+}
+
+/// The schema qualifier that decides where a statement runs.
+fn leading_schema(statement: &Statement) -> Option<&str> {
+    let primary = match statement {
+        Statement::CreateTable { schema, .. }
+        | Statement::CreateView { schema, .. }
+        | Statement::CreateIndex { schema, .. }
+        | Statement::DropTable { schema, .. }
+        | Statement::DropIndex { schema, .. }
+        | Statement::DropView { schema, .. }
+        | Statement::DropTrigger { schema, .. }
+        | Statement::AlterTable { schema, .. }
+        | Statement::Insert { schema, .. }
+        | Statement::Update { schema, .. }
+        | Statement::Delete { schema, .. }
+        | Statement::Pragma { schema, .. }
+        | Statement::CreateTrigger { schema, .. } => schema.as_deref(),
+        _ => None,
+    };
+    if primary.is_some() {
+        return primary;
+    }
+    match statement {
+        Statement::CreateTrigger { table_schema, .. } => table_schema.as_deref(),
+        _ => None,
+    }
+}
+
+/// Drops the qualifier that matches `schema` from a statement so it can run
+/// inside that schema.
+fn clear_statement_schema(statement: &mut Statement, schema: &str) {
+    fn clear(slot: &mut Option<String>, schema: &str) {
+        if slot.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(schema)) {
+            *slot = None;
+        }
+    }
+    match statement {
+        Statement::CreateTable { schema: slot, .. }
+        | Statement::CreateView { schema: slot, .. }
+        | Statement::CreateIndex { schema: slot, .. }
+        | Statement::DropTable { schema: slot, .. }
+        | Statement::DropIndex { schema: slot, .. }
+        | Statement::DropView { schema: slot, .. }
+        | Statement::DropTrigger { schema: slot, .. }
+        | Statement::AlterTable { schema: slot, .. }
+        | Statement::Insert { schema: slot, .. }
+        | Statement::Update { schema: slot, .. }
+        | Statement::Delete { schema: slot, .. }
+        | Statement::Pragma { schema: slot, .. } => clear(slot, schema),
+        Statement::CreateTrigger { schema: slot, table_schema, .. } => {
+            clear(slot, schema);
+            clear(table_schema, schema);
+        }
+        _ => {}
+    }
+}
+
+/// SQLite stores an attached database's objects without their schema
+/// qualifier; the same rewrite keeps the stored text reloadable.
+fn strip_statement_sql(statement: &mut Statement, schema: &str) {
+    match statement {
+        Statement::CreateTable { sql, .. }
+        | Statement::CreateView { sql, .. }
+        | Statement::CreateTrigger { sql, .. }
+        | Statement::CreateIndex { sql, .. } => {
+            *sql = strip_schema_qualifiers(sql, schema);
+        }
+        _ => {}
+    }
+}
+
+/// Error for a schema name that is neither `main`, `temp`, nor attached.
+fn unknown_schema_error(statement: &Statement, schema: &str) -> SqlError {
+    match statement {
+        Statement::Insert { table, .. } | Statement::Update { table, .. } | Statement::Delete { table, .. } => {
+            SqlError::new("unknown-table", format!("no such table: {schema}.{table}")).in_statement(statement.name())
+        }
+        _ => SqlError::new("unknown-database", format!("unknown database {schema}")).in_statement(statement.name()),
+    }
 }
 
 thread_local! {
@@ -423,6 +552,18 @@ pub struct Engine {
     temp_free_pages: BTreeSet<u32>,
     /// Next `sqlite_temp_master.rowid`, monotonic like SQLite's.
     temp_next_rowid: i64,
+    /// The temp database was materialized once, so `PRAGMA database_list`
+    /// keeps listing it even after its last object was dropped.
+    temp_created: bool,
+    /// Databases attached with `ATTACH DATABASE`, in attach order.
+    attached: Vec<AttachedDb>,
+    /// Lowercase attached schema name to its position in [`Engine::attached`].
+    attached_lookup: BTreeMap<String, usize>,
+    /// Schema name this database was attached under. A reference to that name
+    /// inside the database itself resolves like an unqualified one.
+    alias: Option<String>,
+    /// `main.` / `temp.` qualifier of the statement being executed.
+    scope: TableScope,
     /// Lowercase names of the triggers whose body is executing right now.
     /// With SQLite's default `recursive_triggers = OFF` a trigger program is
     /// not re-invoked by changes it caused itself, directly or indirectly,
@@ -474,6 +615,11 @@ impl Engine {
             temp_next_page: 2,
             temp_free_pages: BTreeSet::new(),
             temp_next_rowid: 1,
+            temp_created: false,
+            attached: Vec::new(),
+            attached_lookup: BTreeMap::new(),
+            alias: None,
+            scope: TableScope::Default,
             active_triggers: Vec::new(),
             parameters: Vec::new(),
             foreign_keys: true,
@@ -496,6 +642,9 @@ impl Engine {
                         .in_statement("begin"));
                 }
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("begin"))?;
+                for attached in &mut self.attached {
+                    attached.engine.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("begin"))?;
+                }
                 self.transaction = Some(TransactionState { from_begin: true, savepoints: Vec::new() });
             }
             TransactionAction::Commit => {
@@ -504,24 +653,57 @@ impl Engine {
                         .in_statement("commit"));
                 }
                 self.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
+                for attached in &mut self.attached {
+                    attached
+                        .engine
+                        .writer
+                        .commit_all()
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
+                }
+                self.persist_attached_databases()?;
             }
             TransactionAction::Rollback => {
                 if self.transaction.take().is_none() {
                     return Err(SqlError::new("transaction-missing", "cannot rollback - no transaction is active")
                         .in_statement("rollback"));
                 }
-                self.writer.rollback_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback"))?;
+                self.writer
+                    .rollback_all()
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback"))?;
                 self.reload_catalog()?;
+                for index in 0..self.attached.len() {
+                    self.attached[index]
+                        .engine
+                        .writer
+                        .rollback_all()
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback"))?;
+                    self.attached[index].dirty = false;
+                    self.attached[index].engine.reload_catalog()?;
+                }
             }
             TransactionAction::Savepoint(name) => {
                 if self.transaction.is_none() {
                     // A savepoint outside `BEGIN` opens its own transaction.
                     self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                    for attached in &mut self.attached {
+                        attached
+                            .engine
+                            .writer
+                            .begin()
+                            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                    }
                     self.transaction = Some(TransactionState { from_begin: false, savepoints: Vec::new() });
                 }
                 self.writer
                     .savepoint(&name)
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                for attached in &mut self.attached {
+                    attached
+                        .engine
+                        .writer
+                        .savepoint(&name)
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                }
                 self.transaction.as_mut().expect("savepoint opened a transaction").savepoints.push(name);
             }
             TransactionAction::Release(name) => {
@@ -529,6 +711,13 @@ impl Engine {
                 self.writer
                     .release(&name)
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
+                for attached in &mut self.attached {
+                    attached
+                        .engine
+                        .writer
+                        .release(&name)
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
+                }
                 let closing = {
                     let state = self.transaction.as_mut().expect("an open savepoint implies a transaction");
                     state.savepoints.truncate(index);
@@ -539,6 +728,7 @@ impl Engine {
                     // `BEGIN` opened commits it, as in SQLite.
                     self.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
                     self.transaction = None;
+                    self.persist_attached_databases()?;
                 }
             }
             TransactionAction::RollbackTo(name) => {
@@ -547,6 +737,14 @@ impl Engine {
                     .rollback_to(&name)
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback-to"))?;
                 self.reload_catalog()?;
+                for index in 0..self.attached.len() {
+                    self.attached[index]
+                        .engine
+                        .writer
+                        .rollback_to(&name)
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback-to"))?;
+                    self.attached[index].engine.reload_catalog()?;
+                }
                 self.transaction.as_mut().expect("an open savepoint implies a transaction").savepoints.truncate(index + 1);
             }
         }
@@ -754,6 +952,19 @@ impl Engine {
         self.last_insert_rowid
     }
 
+    /// Whether an explicit transaction or savepoint scope is open.
+    pub fn in_transaction(&self) -> bool {
+        self.transaction.is_some()
+    }
+
+    /// Flushes the current database image to `path`.
+    ///
+    /// Reads of an existing file go through [`Engine::from_writer`]; this is
+    /// the matching write-back so a file-backed session survives reopening.
+    pub fn save(&mut self, path: impl AsRef<Path>) -> Result<(), SqlError> {
+        self.writer.save(path).map_err(|error| SqlError::new("storage", error.to_string()))
+    }
+
     /// Configured page size.
     pub fn page_size(&self) -> u32 {
         self.writer.page_size() as u32
@@ -838,21 +1049,44 @@ impl Engine {
     /// skipped, which matches SQLite's default `recursive_triggers = OFF`.
     fn run_triggered(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         let fired = match &statement {
-            Statement::Insert { table, .. } => Some((table.clone(), TriggerEvent::Insert)),
-            Statement::Update { table, assignments, .. } => {
+            Statement::Insert { schema, table, .. } => Some((
+                schema.as_deref(),
+                table.clone(),
+                TriggerEvent::Insert,
+            )),
+            Statement::Update { schema, table, assignments, .. } => {
                 let assigned = assignments.iter().map(|assignment| assignment.column.clone()).collect();
-                Some((table.clone(), TriggerEvent::Update(assigned)))
+                Some((schema.as_deref(), table.clone(), TriggerEvent::Update(assigned)))
             }
-            Statement::Delete { table, .. } => Some((table.clone(), TriggerEvent::Delete)),
+            Statement::Delete { schema, table, .. } => Some((schema.as_deref(), table.clone(), TriggerEvent::Delete)),
             _ => None,
         };
-        let Some((table, event)) = fired else {
+        let Some((schema, table, event)) = fired else {
             return self.run_statement(statement);
         };
+        if !self.target_is_local(schema, &table) {
+            return self.run_statement(statement);
+        }
         self.fire_triggers(&table, &event, TriggerTiming::Before)?;
         let result = self.run_statement(statement)?;
         self.fire_triggers(&table, &event, TriggerTiming::After)?;
         Ok(result)
+    }
+
+    /// Whether an unqualified or schema-qualified target table lives in one of
+    /// the schemas this engine owns; an attached target runs in its own engine
+    /// and must not fire the triggers of `main`.
+    fn target_is_local(&self, schema: Option<&str>, table: &str) -> bool {
+        let key = table.to_ascii_lowercase();
+        match schema {
+            Some(qualifier) => {
+                let lower = qualifier.to_ascii_lowercase();
+                lower == "main"
+                    || lower == "temp"
+                    || self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+            }
+            None => self.temp_lookup.contains_key(&key) || self.table_lookup.contains_key(&key) || self.attached.is_empty(),
+        }
     }
 
     /// Runs every trigger attached to `table` whose event and timing match.
@@ -890,9 +1124,208 @@ impl Engine {
     }
 
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
+        let Some(schema) = leading_schema(&statement).map(str::to_owned) else {
+            if let Some(index) = self.attached_target(&statement) {
+                return self.run_attached(index, statement);
+            }
+            return self.run_statement_inner(statement);
+        };
+        let lower = schema.to_ascii_lowercase();
+        if self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(&schema)) {
+            let mut statement = statement;
+            clear_statement_schema(&mut statement, &schema);
+            return self.run_statement_inner(statement);
+        }
+        if lower == "main" || lower == "temp" {
+            let mut statement = statement;
+            clear_statement_schema(&mut statement, &schema);
+            let previous = std::mem::replace(&mut self.scope, if lower == "main" { TableScope::Main } else { TableScope::Temp });
+            let result = self.run_statement_inner(statement);
+            self.scope = previous;
+            return result;
+        }
+        match self.attached_lookup.get(&lower).copied() {
+            Some(index) => {
+                let mut statement = statement;
+                clear_statement_schema(&mut statement, &schema);
+                strip_statement_sql(&mut statement, &schema);
+                self.run_attached(index, statement)
+            }
+            None => Err(unknown_schema_error(&statement, &schema)),
+        }
+    }
+
+    /// The position of the attached database an unqualified statement resolves
+    /// to, following SQLite's search order after temp and main miss.
+    fn attached_target(&self, statement: &Statement) -> Option<usize> {
+        // A trigger body resolves unqualified names in the schema of the
+        // trigger, never in an attached database.
+        if !self.active_triggers.is_empty() {
+            return None;
+        }
+        let (name, kind) = match statement {
+            Statement::Insert { schema: None, table, .. }
+            | Statement::Update { schema: None, table, .. }
+            | Statement::Delete { schema: None, table, .. }
+            | Statement::DropTable { schema: None, name: table, .. }
+            | Statement::AlterTable { schema: None, table, .. } => (table, TargetKind::Table),
+            Statement::DropIndex { schema: None, name, .. } => (name, TargetKind::Index),
+            Statement::DropView { schema: None, name, .. } => (name, TargetKind::View),
+            Statement::DropTrigger { schema: None, name, .. } => (name, TargetKind::Trigger),
+            _ => return None,
+        };
+        let key = name.to_ascii_lowercase();
+        if kind == TargetKind::Table && (self.temp_lookup.contains_key(&key) || self.table_lookup.contains_key(&key)) {
+            return None;
+        }
+        self.attached.iter().position(|attached| match kind {
+            TargetKind::Table => attached.engine.table_lookup.contains_key(&key),
+            TargetKind::Index => attached.engine.indexes.contains_key(&key),
+            TargetKind::View => attached.engine.views.contains_key(&key),
+            TargetKind::Trigger => attached.engine.triggers.contains_key(&key),
+        })
+    }
+
+    /// Runs one statement inside an attached database with the parameters and
+    /// the connection-wide last rowid carried over.
+    fn run_attached(&mut self, index: usize, statement: Statement) -> Result<ExecResult, SqlError> {
+        let parameters = self.parameters.clone();
+        let attached = &mut self.attached[index];
+        attached.engine.parameters = parameters;
+        let result = attached.engine.run_statement(statement);
+        let rowid = attached.engine.last_insert_rowid;
+        attached.engine.parameters.clear();
+        let result = result?;
+        self.last_insert_rowid = rowid;
+        self.attached[index].dirty = true;
+        if self.transaction.is_none() {
+            self.persist_attached(index)?;
+        }
+        Ok(result)
+    }
+
+    /// Flushes one attached database image back to its file.
+    fn persist_attached(&mut self, index: usize) -> Result<(), SqlError> {
+        if !self.attached.get(index).is_some_and(|attached| attached.dirty) {
+            return Ok(());
+        }
+        if let Some(path) = self.attached[index].file.clone() {
+            self.attached[index]
+                .engine
+                .save(&path)
+                .map_err(|error| SqlError::new("storage", error.to_string()))?;
+        }
+        self.attached[index].dirty = false;
+        Ok(())
+    }
+
+    /// Flushes every attached database that changed inside a transaction.
+    fn persist_attached_databases(&mut self) -> Result<(), SqlError> {
+        for index in 0..self.attached.len() {
+            self.persist_attached(index)?;
+        }
+        Ok(())
+    }
+
+    /// Table name as reported by diagnostics under the active schema scope.
+    fn scoped_name(&self, table: &str) -> String {
+        match self.scope {
+            TableScope::Default => table.to_string(),
+            TableScope::Main => format!("main.{table}"),
+            TableScope::Temp => format!("temp.{table}"),
+        }
+    }
+
+    /// Error for a table that the active `main.` / `temp.` qualifier cannot
+    /// find; an unqualified miss keeps the existing diagnostic.
+    fn table_missing(&self, table: &str, statement: &'static str) -> SqlError {
+        let message = match self.scope {
+            TableScope::Default => format!("unknown table `{table}`"),
+            _ => format!("no such table: {}", self.scoped_name(table)),
+        };
+        SqlError::new("unknown-table", message).in_statement(statement)
+    }
+
+    /// `ATTACH [DATABASE] file AS name`.
+    fn attach_database(&mut self, file: &str, name: &str) -> Result<ExecResult, SqlError> {
+        let key = name.to_ascii_lowercase();
+        if key == "main" || key == "temp" || self.attached_lookup.contains_key(&key) {
+            return Err(SqlError::new("database-in-use", format!("database {name} is already in use")).in_statement("attach"));
+        }
+        if self.attached.len() >= 10 {
+            return Err(SqlError::new("too-many-databases", "too many attached databases - max 10").in_statement("attach"));
+        }
+        let memory = file.is_empty() || file.eq_ignore_ascii_case(":memory:");
+        let (engine, path, display) = if memory {
+            (Engine::new(Some(self.page_size()))?, None, String::new())
+        }
+        else {
+            let requested = PathBuf::from(file);
+            let path = if requested.is_absolute() {
+                requested.clone()
+            }
+            else {
+                std::env::current_dir().map(|cwd| cwd.join(&requested)).unwrap_or_else(|_| requested.clone())
+            };
+            let writer = if requested.is_dir() {
+                return Err(SqlError::new("unable-to-open", format!("unable to open database: {file}")).in_statement("attach"));
+            }
+            else if requested.exists() && std::fs::metadata(&requested).map(|meta| meta.len() > 0).unwrap_or(false) {
+                SqliteWriter::open(&requested).map_err(|_| SqlError::new("not-a-database", "file is not a database").in_statement("attach"))?
+            }
+            else {
+                // SQLite creates the file at ATTACH time but leaves it empty
+                // until the first change.
+                if let Some(parent) = requested.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        return Err(
+                            SqlError::new("unable-to-open", format!("unable to open database: {file}")).in_statement("attach")
+                        );
+                    }
+                }
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&requested)
+                    .map_err(|_| SqlError::new("unable-to-open", format!("unable to open database: {file}")))?;
+                SqliteWriter::create(self.page_size() as usize).map_err(|error| SqlError::new("storage", error.to_string()))?
+            };
+            let engine = Engine::from_writer(writer)?;
+            (engine, Some(path.clone()), path.to_string_lossy().into_owned())
+        };
+        let mut engine = Box::new(engine);
+        engine.alias = Some(name.to_string());
+        let index = self.attached.len();
+        self.attached.push(AttachedDb { name: name.to_string(), file: path, display, engine, dirty: false });
+        self.attached_lookup.insert(key, index);
+        Ok(ExecResult { statement: "attach", columns: Vec::new(), rows: Vec::new(), affected: 0 })
+    }
+
+    /// `DETACH [DATABASE] name`.
+    fn detach_database(&mut self, name: &str) -> Result<ExecResult, SqlError> {
+        let key = name.to_ascii_lowercase();
+        if key == "main" || key == "temp" {
+            return Err(SqlError::new("cannot-detach", format!("cannot detach database {name}")).in_statement("detach"));
+        }
+        let Some(index) = self.attached_lookup.get(&key).copied() else {
+            return Err(SqlError::new("unknown-database", format!("no such database: {name}")).in_statement("detach"));
+        };
+        self.persist_attached(index)?;
+        self.attached.remove(index);
+        self.attached_lookup.clear();
+        for (position, attached) in self.attached.iter().enumerate() {
+            self.attached_lookup.insert(attached.name.to_ascii_lowercase(), position);
+        }
+        Ok(ExecResult { statement: "detach", columns: Vec::new(), rows: Vec::new(), affected: 0 })
+    }
+
+    fn run_statement_inner(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         match statement {
             Statement::Transaction { action } => self.transaction(action),
-            Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, temp, sql } => {
+            Statement::Attach { file, name } => self.attach_database(&file, &name),
+            Statement::Detach { name } => self.detach_database(&name),
+            Statement::CreateTable { schema: _, name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, temp, sql } => {
                 let key = name.to_ascii_lowercase();
                 check_reserved_object_name(&name, "create-table")?;
                 if temp {
@@ -922,6 +1355,7 @@ impl Engine {
                     let position = self.temp_tables.len();
                     self.temp_lookup.insert(key, position);
                     self.temp_tables.push(TempTable { def, sql, rootpage, master_rowid, rows: BTreeMap::new() });
+                    self.temp_created = true;
                     return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 1 });
                 }
                 if self.indexes.contains_key(&key) {
@@ -957,7 +1391,7 @@ impl Engine {
                 self.tables.push(def);
                 Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::CreateView { name, if_not_exists, columns, query, sql } => {
+            Statement::CreateView { schema: _, name, if_not_exists, columns, query, sql } => {
                 let key = name.to_ascii_lowercase();
                 check_reserved_object_name(&name, "create-view")?;
                 if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name))
@@ -976,7 +1410,7 @@ impl Engine {
                 self.views.insert(key, ViewDef { name, columns, query: *query });
                 Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::DropView { name, if_exists } => {
+            Statement::DropView { schema: _, name, if_exists } => {
                 let key = name.to_ascii_lowercase();
                 if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name)) {
                     return Err(SqlError::new("wrong-object", format!("use DROP TABLE to delete table `{name}`")).in_statement("drop-view"));
@@ -995,7 +1429,7 @@ impl Engine {
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-view"))?;
                 Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::CreateTrigger { name, if_not_exists, timing, event, table, when, body, sql } => {
+            Statement::CreateTrigger { schema: _, name, if_not_exists, timing, event, table_schema: _, table, when, body, sql } => {
                 let key = name.to_ascii_lowercase();
                 check_reserved_object_name(&name, "create-trigger")?;
                 let table_key = table.to_ascii_lowercase();
@@ -1031,7 +1465,7 @@ impl Engine {
                 self.triggers.insert(key, TriggerDef { name, table: table_key, timing, event, when, body });
                 Ok(ExecResult { statement: "create-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::DropTrigger { name, if_exists } => {
+            Statement::DropTrigger { schema: _, name, if_exists } => {
                 let key = name.to_ascii_lowercase();
                 if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name)) {
                     return Err(SqlError::new("wrong-object", format!("use DROP TABLE to delete table `{name}`")).in_statement("drop-trigger"));
@@ -1053,21 +1487,21 @@ impl Engine {
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-trigger"))?;
                 Ok(ExecResult { statement: "drop-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::Insert { table, columns, rows, default_values, returning } => {
+            Statement::Insert { schema: _, table, columns, rows, default_values, returning } => {
                 let key = table.to_ascii_lowercase();
                 check_readonly_table(&table, "insert")?;
                 if self.views.contains_key(&key) {
                     return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("insert"));
                 }
-                let temp_position = self.temp_lookup.get(&key).copied();
-                let main_position = match temp_position {
-                    Some(_) => None,
-                    None => Some(
-                        *self
-                            .table_lookup
-                            .get(&key)
-                            .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("insert"))?,
-                    ),
+                let temp_position = if self.scope == TableScope::Main { None } else { self.temp_lookup.get(&key).copied() };
+                let main_position = if self.scope == TableScope::Temp {
+                    None
+                }
+                else {
+                    match temp_position {
+                        Some(_) => None,
+                        None => Some(*self.table_lookup.get(&key).ok_or_else(|| self.table_missing(&table, "insert"))?),
+                    }
                 };
                 // Temp tables are mutated in memory, so their definition is
                 // cloned: the loop below needs the catalog while it borrows
@@ -1253,7 +1687,7 @@ impl Engine {
                 let rows = rowids.into_iter().map(|rowid| vec![Cell::Integer(rowid)]).collect();
                 Ok(ExecResult { statement: "insert", columns: vec!["rowid".to_string()], rows, affected: slots_by_row.len() })
             }
-            Statement::CreateIndex { name, table, if_not_exists, unique, columns, sql } => {
+            Statement::CreateIndex { schema: _, name, table, if_not_exists, unique, columns, sql } => {
                 let table_key = table.to_ascii_lowercase();
                 if is_schema_table(&table) {
                     return Err(SqlError::new("readonly-system-table", format!("table {table} may not be indexed")).in_statement("create-index"));
@@ -1301,20 +1735,21 @@ impl Engine {
                 self.indexes.insert(key, IndexDef { table: table_key, columns: positions, unique });
                 Ok(ExecResult { statement: "create-index", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::Update { table, alias, assignments, filter, returning } => {
+            Statement::Update { schema: _, table, alias, assignments, filter, returning } => {
                 check_readonly_table(&table, "update")?;
                 let key = table.to_ascii_lowercase();
                 if self.views.contains_key(&key) {
                     return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("update"));
                 }
-                let temp_position = self.temp_lookup.get(&key).copied();
-                let main_position = match temp_position {
-                    Some(_) => None,
-                    None => Some(
-                        *self.table_lookup.get(&key).ok_or_else(|| {
-                            SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("update")
-                        })?,
-                    ),
+                let temp_position = if self.scope == TableScope::Main { None } else { self.temp_lookup.get(&key).copied() };
+                let main_position = if self.scope == TableScope::Temp {
+                    None
+                }
+                else {
+                    match temp_position {
+                        Some(_) => None,
+                        None => Some(*self.table_lookup.get(&key).ok_or_else(|| self.table_missing(&table, "update"))?),
+                    }
                 };
                 let def_storage = match temp_position {
                     Some(position) => self.temp_tables[position].def.clone(),
@@ -1404,21 +1839,21 @@ impl Engine {
                     affected: plan.affected,
                 })
             }
-            Statement::Delete { table, alias, filter, returning } => {
+            Statement::Delete { schema: _, table, alias, filter, returning } => {
                 check_readonly_table(&table, "delete")?;
                 let key = table.to_ascii_lowercase();
                 if self.views.contains_key(&key) {
                     return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("delete"));
                 }
-                let temp_position = self.temp_lookup.get(&key).copied();
-                let main_position = match temp_position {
-                    Some(_) => None,
-                    None => Some(
-                        *self
-                            .table_lookup
-                            .get(&key)
-                            .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("delete"))?,
-                    ),
+                let temp_position = if self.scope == TableScope::Main { None } else { self.temp_lookup.get(&key).copied() };
+                let main_position = if self.scope == TableScope::Temp {
+                    None
+                }
+                else {
+                    match temp_position {
+                        Some(_) => None,
+                        None => Some(*self.table_lookup.get(&key).ok_or_else(|| self.table_missing(&table, "delete"))?),
+                    }
                 };
                 // Temp rows are removed from the in-memory map, so their
                 // definition is cloned to keep the catalog readable while the
@@ -1486,7 +1921,26 @@ impl Engine {
                     affected: plan.removed.len(),
                 })
             }
-            Statement::Pragma { name, value } => {
+            Statement::Pragma { schema: _, name, value } => {
+                if name.eq_ignore_ascii_case("database_list") {
+                    let mut rows = vec![vec![Cell::Integer(0), Cell::Text("main".to_string()), Cell::Text(String::new())]];
+                    if self.temp_created {
+                        rows.push(vec![Cell::Integer(1), Cell::Text("temp".to_string()), Cell::Text(String::new())]);
+                    }
+                    for (index, attached) in self.attached.iter().enumerate() {
+                        rows.push(vec![
+                            Cell::Integer(2 + index as i64),
+                            Cell::Text(attached.name.clone()),
+                            Cell::Text(attached.display.clone()),
+                        ]);
+                    }
+                    return Ok(ExecResult {
+                        statement: "pragma",
+                        columns: vec!["seq".to_string(), "name".to_string(), "file".to_string()],
+                        rows,
+                        affected: 0,
+                    });
+                }
                 if !name.eq_ignore_ascii_case("foreign_keys") {
                     return Err(SqlError::new(
                         "unsupported-pragma",
@@ -1517,14 +1971,15 @@ impl Engine {
                     }
                 }
             }
-            Statement::DropTable { name, if_exists } => {
+            Statement::DropTable { schema: _, name, if_exists } => {
                 if is_schema_table(&name) {
                     return Err(SqlError::new("readonly-system-table", format!("table {name} may not be dropped")).in_statement("drop-table"));
                 }
                 let key = name.to_ascii_lowercase();
                 // The temp schema is searched before main, so `DROP TABLE`
                 // removes the temp object when both schemas share the name.
-                if let Some(position) = self.temp_lookup.get(&key).copied() {
+                let temp_position = if self.scope == TableScope::Main { None } else { self.temp_lookup.get(&key).copied() };
+                if let Some(position) = temp_position {
                     let dropped = self.temp_tables.remove(position);
                     // The freed page goes back to the temp allocator, so the
                     // next temp table reuses it like SQLite does.
@@ -1542,7 +1997,7 @@ impl Engine {
                     if if_exists {
                         return Ok(ExecResult { statement: "drop-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
                     }
-                    return Err(SqlError::new("unknown-table", format!("no such table: {name}")).in_statement("drop-table"));
+                    return Err(SqlError::new("unknown-table", format!("no such table: {}", self.scoped_name(&name))).in_statement("drop-table"));
                 }
                 if name.eq_ignore_ascii_case("sqlite_sequence") {
                     return Err(SqlError::new("readonly-system-table", format!("table {name} may not be dropped")).in_statement("drop-table"));
@@ -1571,7 +2026,7 @@ impl Engine {
                 self.triggers.retain(|_, trigger| trigger.table != key);
                 Ok(ExecResult { statement: "drop-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::DropIndex { name, if_exists } => {
+            Statement::DropIndex { schema: _, name, if_exists } => {
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-index"))?;
                 let outcome = match self.writer.drop_index(&name) {
                     Ok(outcome) => outcome,
@@ -1602,7 +2057,7 @@ impl Engine {
                 self.indexes.remove(&name.to_ascii_lowercase());
                 Ok(ExecResult { statement: "drop-index", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::AlterTable { table, action } => self.run_alter_table(table, action),
+            Statement::AlterTable { schema: _, table, action } => self.run_alter_table(table, action),
             Statement::Select { with, recursive, first, compounds, order, limit } => {
                 // One budget per statement, shared by every nested subquery, so
                 // deep correlation reports a structured error instead of
@@ -2429,80 +2884,7 @@ impl Engine {
         let mut tables: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(from.len());
         let mut offset = 0;
         for table in from {
-            let (columns, rows) = if let Some(query) = &table.query {
-                let result = self.select_statement(query, &[], budget, ctes)?;
-                (SourceColumns::Materialized { names: result.columns, rowid: false }, result.rows)
-            }
-            else if let Some(materialized) = ctes.and_then(|env| env.lookup(&table.name)) {
-                (SourceColumns::Materialized { names: materialized.columns.clone(), rowid: false }, materialized.rows.clone())
-            }
-            else if let Some(system) = SystemTable::from_name(&table.name) {
-                let (columns, rows, rowid) = self.system_rows(system, &table.name)?;
-                (SourceColumns::Materialized { names: columns, rowid }, rows)
-            }
-            else {
-                let key = table.name.to_ascii_lowercase();
-                if let Some(view) = self.views.get(&key) {
-                    // A view re-runs its stored query against the current contents
-                    // of every base table, exactly like SQLite. Views are not
-                    // correlated, so they see no outer row or CTE from this query.
-                    let _depth = ViewDepthGuard::enter()?;
-                    let result = self.select_statement(&view.query, &[], budget, None)?;
-                    let names = match &view.columns {
-                        Some(declared) => {
-                            if declared.len() != result.columns.len() {
-                                return Err(SqlError::new(
-                                    "view-arity",
-                                    format!(
-                                        "view {} has {} columns but {} declared",
-                                        view.name,
-                                        result.columns.len(),
-                                        declared.len()
-                                    ),
-                                )
-                                .in_statement("select"));
-                            }
-                            declared.clone()
-                        }
-                        None => result.columns.clone(),
-                    };
-                    (SourceColumns::Materialized { names, rowid: false }, result.rows)
-                }
-                else if let Some(position) = self.temp_lookup.get(&key).copied() {
-                    let def = &self.temp_tables[position].def;
-                    let decoded = self.temp_tables[position]
-                        .rows
-                        .iter()
-                        .map(|(rowid, cells)| {
-                            let mut cells = cells.clone();
-                            cells.push(Cell::Integer(*rowid));
-                            cells
-                        })
-                        .collect::<Vec<Vec<Cell>>>();
-                    (SourceColumns::Table(def), decoded)
-                }
-                else {
-                    let position = *self
-                        .table_lookup
-                        .get(&key)
-                        .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{}`", table.name)).in_statement("select"))?;
-                    let def = &self.tables[position];
-                    let stored = self.writer.table_rows(&def.name, TableLimits::default()).map_err(|error| {
-                        SqlError::new("storage", error.to_string()).in_statement("select")
-                    })?;
-                    let decoded = stored
-                        .iter()
-                        .map(|row| {
-                            let mut cells = decode_row(&row.payload, def, row.rowid)?;
-                            // Rowid tables expose the implicit integer primary key
-                            // through `rowid`, `_rowid_` and `oid`.
-                            cells.push(Cell::Integer(row.rowid));
-                            Ok(cells)
-                        })
-                        .collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
-                    (SourceColumns::Table(def), decoded)
-                }
-            };
+            let (columns, rows) = self.select_source(table, budget, ctes)?;
             let width = columns.width();
             let source = Source {
                 label: table.label().to_string(),
@@ -3725,6 +4107,185 @@ impl Engine {
 
     /// Runs a nested `SELECT` statement through the same entry point as a
     /// top-level one, so its own `WITH` entries work as well.
+    /// Resolves one `FROM` entry against the schema it names, if any. An
+    /// unqualified name follows SQLite's order: temp, main, then attached
+    /// databases; `main.` and `temp.` pin the search to one schema.
+    fn select_source<'b>(
+        &'b self,
+        table: &TableRef,
+        budget: &Budget,
+        ctes: Option<&CteEnv>,
+    ) -> Result<(SourceColumns<'b>, Vec<Vec<Cell>>), SqlError> {
+        if let Some(query) = &table.query {
+            let result = self.select_statement(query, &[], budget, ctes)?;
+            return Ok((SourceColumns::Materialized { names: result.columns, rowid: false }, result.rows));
+        }
+        let scope = match table.schema.as_deref() {
+            None => Some(TableScope::Default),
+            Some(qualifier) => {
+                let lower = qualifier.to_ascii_lowercase();
+                if lower == "main" {
+                    Some(TableScope::Main)
+                }
+                else if lower == "temp" {
+                    Some(TableScope::Temp)
+                }
+                else if self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier)) {
+                    Some(TableScope::Default)
+                }
+                else {
+                    None
+                }
+            }
+        };
+        let Some(scope) = scope else {
+            let qualifier = table.schema.as_deref().unwrap_or_default();
+            let index = match self.attached_lookup.get(&qualifier.to_ascii_lowercase()).copied() {
+                Some(index) => index,
+                None => {
+                    return Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{}", table.name))
+                        .in_statement("select"));
+                }
+            };
+            return self.attached_source(index, qualifier, table, budget);
+        };
+        if table.schema.is_none() {
+            if let Some(materialized) = ctes.and_then(|env| env.lookup(&table.name)) {
+                return Ok((
+                    SourceColumns::Materialized { names: materialized.columns.clone(), rowid: false },
+                    materialized.rows.clone(),
+                ));
+            }
+        }
+        if let Some(system) = system_for_scope(scope, &table.name) {
+            let (columns, rows, rowid) = self.system_rows(system, &table.name)?;
+            return Ok((SourceColumns::Materialized { names: columns, rowid }, rows));
+        }
+        let key = table.name.to_ascii_lowercase();
+        if scope != TableScope::Temp {
+            if let Some(view) = self.views.get(&key) {
+                // A view re-runs its stored query against the current contents
+                // of every base table, exactly like SQLite. Views are not
+                // correlated, so they see no outer row or CTE from this query.
+                let _depth = ViewDepthGuard::enter()?;
+                let result = self.select_statement(&view.query, &[], budget, None)?;
+                let names = match &view.columns {
+                    Some(declared) => {
+                        if declared.len() != result.columns.len() {
+                            return Err(SqlError::new(
+                                "view-arity",
+                                format!("view {} has {} columns but {} declared", view.name, result.columns.len(), declared.len()),
+                            )
+                            .in_statement("select"));
+                        }
+                        declared.clone()
+                    }
+                    None => result.columns.clone(),
+                };
+                return Ok((SourceColumns::Materialized { names, rowid: false }, result.rows));
+            }
+        }
+        if scope != TableScope::Main {
+            if let Some(position) = self.temp_lookup.get(&key).copied() {
+                let def = &self.temp_tables[position].def;
+                let decoded = self.temp_tables[position]
+                    .rows
+                    .iter()
+                    .map(|(rowid, cells)| {
+                        let mut cells = cells.clone();
+                        cells.push(Cell::Integer(*rowid));
+                        cells
+                    })
+                    .collect::<Vec<Vec<Cell>>>();
+                return Ok((SourceColumns::Table(def), decoded));
+            }
+        }
+        let position = if scope == TableScope::Temp { None } else { self.table_lookup.get(&key).copied() };
+        if let Some(position) = position {
+            let def = &self.tables[position];
+            let stored = self
+                .writer
+                .table_rows(&def.name, TableLimits::default())
+                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+            let decoded = stored
+                .iter()
+                .map(|row| {
+                    let mut cells = decode_row(&row.payload, def, row.rowid)?;
+                    // Rowid tables expose the implicit integer primary key
+                    // through `rowid`, `_rowid_` and `oid`.
+                    cells.push(Cell::Integer(row.rowid));
+                    Ok(cells)
+                })
+                .collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
+            return Ok((SourceColumns::Table(def), decoded));
+        }
+        if table.schema.is_none() {
+            // The attached databases come after temp and main in the search
+            // order, and the first one that defines the name wins.
+            for index in 0..self.attached.len() {
+                if let Ok(source) = self.attached_source(index, &self.attached[index].name, table, budget) {
+                    return Ok(source);
+                }
+            }
+        }
+        let message = match table.schema.as_deref() {
+            None => format!("unknown table `{}`", table.name),
+            Some(qualifier) => format!("no such table: {qualifier}.{}", table.name),
+        };
+        Err(SqlError::new("unknown-table", message).in_statement("select"))
+    }
+
+    /// Reads one table, view or system table of an attached database.
+    fn attached_source<'b>(
+        &'b self,
+        index: usize,
+        qualifier: &str,
+        table: &TableRef,
+        budget: &Budget,
+    ) -> Result<(SourceColumns<'b>, Vec<Vec<Cell>>), SqlError> {
+        let engine = &self.attached[index].engine;
+        if let Some(system) = SystemTable::from_name(&table.name) {
+            let (columns, rows, rowid) = engine.system_rows(system, &table.name)?;
+            return Ok((SourceColumns::Materialized { names: columns, rowid }, rows));
+        }
+        let key = table.name.to_ascii_lowercase();
+        if let Some(view) = engine.views.get(&key) {
+            let _depth = ViewDepthGuard::enter()?;
+            let result = engine.select_statement(&view.query, &[], budget, None)?;
+            let names = match &view.columns {
+                Some(declared) => {
+                    if declared.len() != result.columns.len() {
+                        return Err(SqlError::new(
+                            "view-arity",
+                            format!("view {} has {} columns but {} declared", view.name, result.columns.len(), declared.len()),
+                        )
+                        .in_statement("select"));
+                    }
+                    declared.clone()
+                }
+                None => result.columns.clone(),
+            };
+            return Ok((SourceColumns::Materialized { names, rowid: false }, result.rows));
+        }
+        if let Some(position) = engine.table_lookup.get(&key).copied() {
+            let def = &engine.tables[position];
+            let stored = engine
+                .writer
+                .table_rows(&def.name, TableLimits::default())
+                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+            let decoded = stored
+                .iter()
+                .map(|row| {
+                    let mut cells = decode_row(&row.payload, def, row.rowid)?;
+                    cells.push(Cell::Integer(row.rowid));
+                    Ok(cells)
+                })
+                .collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
+            return Ok((SourceColumns::Table(def), decoded));
+        }
+        Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{}", table.name)).in_statement("select"))
+    }
+
     fn select_statement(
         &self,
         statement: &Statement,
@@ -8327,7 +8888,9 @@ mod tests {
         engine.execute_one("CREATE TABLE c(id INTEGER PRIMARY KEY AUTOINCREMENT)").expect("create c");
         assert_eq!(engine.execute_one("DROP TABLE sqlite_sequence").expect_err("sequence").code, "readonly-system-table");
         assert_eq!(engine.execute_one("DROP TABLE nope").expect_err("missing").code, "unknown-table");
-        assert_eq!(engine.execute_one("DROP TABLE main.c").expect_err("qualified").code, "unsupported-clause");
+        assert_eq!(engine.execute_one("DROP TABLE nope.c").expect_err("unknown schema").code, "unknown-database");
+        engine.execute_one("DROP TABLE main.c").expect("drop main.c");
+        assert_eq!(engine.execute_one("SELECT * FROM main.c").expect_err("gone").code, "unknown-table");
     }
 
     #[test]
@@ -8551,6 +9114,106 @@ mod tests {
             engine.execute_one("SELECT name, rootpage FROM sqlite_temp_master").expect("temp master").rows,
             vec![vec![text("b"), Cell::Integer(3)], vec![text("c"), Cell::Integer(2)]]
         );
+    }
+
+    #[test]
+    fn attached_databases_resolve_qualified_names_and_list_themselves() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let attached = engine.execute_one("ATTACH DATABASE ':memory:' AS aux").expect("attach");
+        assert_eq!(attached.statement, "attach");
+        assert_eq!(attached.affected, 0);
+        // The temp slot is reserved but only listed once the temp schema exists.
+        assert_eq!(
+            engine.execute_one("PRAGMA database_list").expect("database list").rows,
+            vec![
+                vec![Cell::Integer(0), text("main"), text("")],
+                vec![Cell::Integer(2), text("aux"), text("")],
+            ]
+        );
+        engine.execute("CREATE TEMP TABLE tt (v INTEGER)").expect("temp");
+        engine.execute("CREATE TABLE local (v INTEGER)").expect("main");
+        engine.execute("INSERT INTO local VALUES (1)").expect("main insert");
+        engine.execute("CREATE TABLE aux.remote (v INTEGER)").expect("aux create");
+        engine.execute("INSERT INTO aux.remote VALUES (2)").expect("aux insert");
+        assert_eq!(engine.execute_one("SELECT * FROM aux.remote").expect("qualified").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(
+            engine.execute_one("SELECT type, name FROM aux.sqlite_master").expect("aux master").rows,
+            vec![vec![text("table"), text("remote")]]
+        );
+        // A schema-qualified source joins a main table in the same statement.
+        assert_eq!(
+            engine.execute_one("SELECT r.v, l.v FROM aux.remote AS r JOIN local AS l ON r.rowid = l.rowid")
+                .expect("cross-database join")
+                .rows,
+            vec![vec![Cell::Integer(2), Cell::Integer(1)]]
+        );
+        // An unqualified name falls through temp and main to the attached
+        // database, and inserts there as well.
+        assert_eq!(engine.execute_one("SELECT * FROM remote").expect("fallback select").rows, vec![vec![Cell::Integer(2)]]);
+        engine.execute("INSERT INTO remote VALUES (3)").expect("fallback insert");
+        assert_eq!(engine.execute_one("SELECT count(*) FROM aux.remote").expect("count").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(
+            engine.execute_one("PRAGMA database_list").expect("database list").rows,
+            vec![
+                vec![Cell::Integer(0), text("main"), text("")],
+                vec![Cell::Integer(1), text("temp"), text("")],
+                vec![Cell::Integer(2), text("aux"), text("")],
+            ]
+        );
+    }
+
+    #[test]
+    fn main_and_temp_qualifiers_pin_the_schema() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TEMP TABLE t (v TEXT); CREATE TABLE t (v TEXT)").expect("both schemas");
+        engine.execute("INSERT INTO temp.t VALUES ('temp'); INSERT INTO main.t VALUES ('main')").expect("inserts");
+        assert_eq!(engine.execute_one("SELECT v FROM t").expect("default").rows, vec![vec![text("temp")]]);
+        assert_eq!(engine.execute_one("SELECT v FROM main.t").expect("main").rows, vec![vec![text("main")]]);
+        assert_eq!(engine.execute_one("SELECT v FROM temp.t").expect("temp").rows, vec![vec![text("temp")]]);
+        engine.execute_one("UPDATE t SET v = 'changed'").expect("update temp");
+        assert_eq!(engine.execute_one("SELECT v FROM main.t").expect("main untouched").rows, vec![vec![text("main")]]);
+        engine.execute_one("DELETE FROM main.t").expect("delete main");
+        assert!(engine.execute_one("SELECT v FROM main.t").expect("main empty").rows.is_empty());
+        engine.execute_one("DROP TABLE temp.t").expect("drop temp");
+        assert!(engine.execute_one("SELECT v FROM t").expect("main fallback").rows.is_empty());
+        assert!(engine.execute_one("SELECT name FROM temp.sqlite_temp_master").expect("temp master").rows.is_empty());
+        assert_eq!(engine.execute_one("SELECT * FROM main.missing").expect_err("missing").code, "unknown-table");
+        assert_eq!(engine.execute_one("SELECT * FROM temp.missing").expect_err("missing temp").code, "unknown-table");
+    }
+
+    #[test]
+    fn attached_files_are_created_and_keep_their_rows_across_reattach() {
+        let dir = std::env::temp_dir().join(format!("sqlite-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("attached.sqlite3");
+        let file_text = file.to_string_lossy().replace('\\', "/");
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute_one(&format!("ATTACH DATABASE '{file_text}' AS aux")).expect("attach");
+        assert!(file.exists(), "attach creates the file");
+        assert_eq!(std::fs::metadata(&file).expect("metadata").len(), 0, "sqlite leaves it empty until a write");
+        engine.execute("CREATE TABLE aux.t (v INTEGER); INSERT INTO aux.t VALUES (7)").expect("write");
+        assert!(std::fs::metadata(&file).expect("metadata").len() > 0, "a write materializes the image");
+        engine.execute_one("DETACH DATABASE aux").expect("detach");
+        engine.execute_one(&format!("ATTACH DATABASE '{file_text}' AS again")).expect("reattach");
+        assert_eq!(engine.execute_one("SELECT * FROM again.t").expect("read").rows, vec![vec![Cell::Integer(7)]]);
+        engine.execute_one("DETACH DATABASE again").expect("detach again");
+        assert_eq!(engine.execute_one("DETACH DATABASE again").expect_err("gone").code, "unknown-database");
+        assert_eq!(engine.execute_one("DETACH DATABASE main").expect_err("main").code, "cannot-detach");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn attaching_more_than_ten_databases_is_rejected() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        for index in 0..10 {
+            engine.execute_one(&format!("ATTACH ':memory:' AS a{index}")).expect("attach");
+        }
+        let error = engine.execute_one("ATTACH ':memory:' AS extra").expect_err("limit");
+        assert_eq!(error.message, "too many attached databases - max 10");
+        assert_eq!(engine.execute_one("ATTACH ':memory:' AS a0").expect_err("duplicate").code, "database-in-use");
+        engine.execute_one("DETACH DATABASE a0").expect("detach");
+        engine.execute_one("ATTACH ':memory:' AS a10").expect("room again");
     }
 
     #[test]
