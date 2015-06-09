@@ -1,15 +1,33 @@
-# `odm` 是对象—数据库映射（ODM）能力域的唯一公开门面。
+# `iris` 是对象—数据库映射（ODM）能力域的唯一公开门面，
+# 也是 `iris-orm` 唯一依赖的 Rust 门面 crate（历史包名即 `iris`）。
 [package]
-name = "odm"
+name = "iris"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "readme.md"
 publish = false
 
+[lib]
+name = "iris"
+
 [features]
-default = ["types", "adapter", "generate", "input-vos", "input-sql", "input-graphql"]
+default = ["types", "adapter", "generate", "input-vos", "input-sql", "input-graphql", "host", "wasm-bridge", "migrate"]
+# 宿主会话门面：`iris::host`。
+host = ["types", "adapter"]
+# 代码生成：`iris::generator`（Dejavu 模板）。
+generator = ["generate"]
+generator-aot = ["generate", "odm-generate/aot", "odm-generate/templates-host"]
+# 浏览器 / 边缘 wasm 桥：`iris::wasm`。
+wasm-bridge = ["generate", "dep:serde_json"]
+# 托管推送迁移：`iris::migrate_plan` / `iris::migrate_run`。
+migrate = ["types", "adapter", "dep:von"]
+# 完整 Node 绑定面。
+napi = ["host", "generator-aot", "wasm-bridge", "migrate"]
+# 完整 Python 绑定面。
+pyo3 = ["host", "generator"]
 types = ["dep:odm-types"]
 adapter = ["dep:odm-adapter"]
 generate = ["dep:odm-generate"]
@@ -24,3 +42,5 @@ odm-generate = { workspace = true, optional = true }
 odm-input-vos = { workspace = true, optional = true }
 odm-input-sql = { workspace = true, optional = true }
 odm-input-graphql = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+von = { workspace = true, optional = true }

@@ -13,3 +13,4 @@ pub mod adapter_redis;
 pub mod adapter_sqlite;
 pub mod connector_cluster;
 pub mod connector_local;
+pub mod host;
