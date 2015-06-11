@@ -20,14 +20,23 @@ pub struct PushReport {
     pub created_tables: Vec<String>,
 }
 
-/// Build a non-destructive create plan for tables missing physically.
+/// Build a non-destructive plan: create missing tables + add missing fields.
 pub fn plan_push(document: &SchemaProjection, observed: &ObservedCatalog) -> Result<LogicalMigrationPlan> {
     let target = fingerprint_document(document);
     let mut changes = Vec::new();
     for table in document.types.iter().filter(|item| item.kind == TypeContractKind::Table) {
         let name = table_name(table);
-        if observed.table(name).is_none() {
-            changes.push(LogicalChange::CreateTable { vos_table: name.to_owned() });
+        match observed.table(name) {
+            None => {
+                changes.push(LogicalChange::CreateTable { vos_table: name.to_owned() });
+            }
+            Some(obs) => {
+                for field in &table.fields {
+                    if !obs.columns.iter().any(|column| column.name == field.canonical_name) {
+                        changes.push(LogicalChange::AddField { vos_table: name.to_owned(), vos_field: field.canonical_name.clone() });
+                    }
+                }
+            }
         }
     }
     Ok(LogicalMigrationPlan {
@@ -50,17 +59,23 @@ pub fn apply_push(session: &mut Session, plan: &LogicalMigrationPlan, document: 
         for change in &plan.changes {
             match change {
                 LogicalChange::CreateTable { vos_table } => {
-                    let table = document
-                        .types
-                        .iter()
-                        .find(|item| item.kind == TypeContractKind::Table && table_name(item) == vos_table)
-                        .ok_or_else(|| Error::Policy(format!("plan references unknown VOS table `{vos_table}`")))?;
+                    let table = find_table(document, vos_table)?;
                     let ddl = create_table_sql(table)?;
                     session.execute(&ddl).map_err(Error::Wire)?;
                     created.push(vos_table.clone());
                 }
-                LogicalChange::AddField { .. } => {
-                    return Err(Error::Policy("AddField apply is not implemented in Phase 4 slice".into()));
+                LogicalChange::AddField { vos_table, vos_field } => {
+                    let table = find_table(document, vos_table)?;
+                    let field = table
+                        .fields
+                        .iter()
+                        .find(|field| field.canonical_name == *vos_field)
+                        .ok_or_else(|| Error::Policy(format!("plan references unknown VOS field `{vos_table}.{vos_field}`")))?;
+                    if is_primary(field) {
+                        return Err(Error::Policy(format!("refusing AddField for primary key `{vos_table}.{vos_field}` — recreate table")));
+                    }
+                    let ddl = add_field_sql(vos_table, field)?;
+                    session.execute(&ddl).map_err(Error::Wire)?;
                 }
             }
         }
@@ -76,6 +91,14 @@ pub fn apply_push(session: &mut Session, plan: &LogicalMigrationPlan, document: 
             Err(e)
         }
     }
+}
+
+fn find_table<'a>(document: &'a SchemaProjection, name: &str) -> Result<&'a TypeContract> {
+    document
+        .types
+        .iter()
+        .find(|item| item.kind == TypeContractKind::Table && table_name(item) == name)
+        .ok_or_else(|| Error::Policy(format!("plan references unknown VOS table `{name}`")))
 }
 
 fn create_table_sql(table: &TypeContract) -> Result<String> {
@@ -98,6 +121,33 @@ fn create_table_sql(table: &TypeContract) -> Result<String> {
     }
     cols.push(format!("PRIMARY KEY ({})", pks.join(", ")));
     Ok(format!("CREATE TABLE IF NOT EXISTS \"{name}\" ({});", cols.join(", ")))
+}
+
+fn add_field_sql(table: &str, field: &FieldContract) -> Result<String> {
+    let (sql_ty, not_null) = map_field_type(field)?;
+    let mut piece = format!("\"{}\" {sql_ty}", field.canonical_name);
+    if not_null {
+        piece.push_str(" NOT NULL");
+        piece.push_str(&format!(" DEFAULT {}", default_literal(field)?));
+    }
+    else {
+        piece.push_str(" NULL");
+    }
+    Ok(format!("ALTER TABLE \"{table}\" ADD COLUMN {piece};"))
+}
+
+fn default_literal(field: &FieldContract) -> Result<String> {
+    let (inner, _) = strip_optional(&field.canonical_type);
+    match inner {
+        CanonicalType::Named(path) => match path.last().map(String::as_str).unwrap_or_default() {
+            "bool" => Ok("FALSE".into()),
+            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" | "f32" | "f64" => Ok("0".into()),
+            "utf8" | "utf16" | "decimal" | "d128" | "date" | "time" | "datetime" | "datetimeUtc" | "bytes" => Ok("''".into()),
+            "uuid" => Ok("'00000000-0000-0000-0000-000000000000'".into()),
+            other => Err(Error::Policy(format!("no AddField default for VOS type {other}"))),
+        },
+        other => Err(Error::Policy(format!("no AddField default for VOS type {other:?}"))),
+    }
 }
 
 fn map_field_type(field: &FieldContract) -> Result<(String, bool)> {

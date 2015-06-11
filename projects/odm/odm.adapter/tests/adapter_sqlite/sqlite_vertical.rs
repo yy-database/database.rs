@@ -177,6 +177,33 @@ fn insert_reports_last_insert_rowid() {
 }
 
 #[test]
+fn managed_push_adds_missing_columns_through_the_facade() {
+    use odm_adapter::adapter_sqlite::SqliteSource;
+    use odm_types::LogicalChange;
+
+    const BASE: &str = r#"table User { @@user_id: utf8, @user_name: utf8, active: bool }"#;
+    const NEXT: &str = r#"table User { @@user_id: utf8, @user_name: utf8, active: bool, age: i64, nick: utf8 }"#;
+
+    let source = SqliteSource::open_in_memory().unwrap();
+    source.managed_push(BASE).unwrap();
+
+    let plan = source.plan_managed_push(NEXT).unwrap();
+    assert!(!plan.destructive);
+    assert!(
+        plan.changes
+            .iter()
+            .any(|change| matches!(change, LogicalChange::AddField { vos_table, vos_field } if vos_table == "User" && vos_field == "age")),
+        "the plan must add the missing field"
+    );
+    source.apply_managed_push(&plan, NEXT).unwrap();
+
+    let catalog = source.inspect().unwrap();
+    let table = catalog.table("User").expect("User table");
+    assert!(table.columns.iter().any(|column| column.name == "age"));
+    assert!(table.columns.iter().any(|column| column.name == "nick"));
+}
+
+#[test]
 fn execute_one_rejects_scripts() {
     let provider = SqliteProvider::open_in_memory().unwrap();
     let error = provider.execute_one("SELECT 1; SELECT 2;", &[]).expect_err("execute_one takes one statement");
