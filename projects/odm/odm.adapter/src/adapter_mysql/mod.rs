@@ -61,9 +61,15 @@ impl MysqlSource {
     }
 
     /// Connect using a mysql URL (`mysql://user:pass@host:3306/db`).
+    ///
+    /// The gateway wire client has no handshake / `COM_QUERY` extraction in
+    /// this dev line, so every execute path would fail after a successful
+    /// open. The session is refused here instead of exposing a half-open
+    /// backend.
     pub fn connect(url: &str) -> Result<Self> {
-        let session = Session::connect(url, Duration::from_secs(5)).map_err(Error::Wire)?;
-        Ok(Self { url: url.to_owned(), session: Mutex::new(session), uuid_fields: HashSet::new() })
+        Err(Error::Unsupported(format!(
+            "mysql session refused for `{url}` — gateway wire client handshake/COM_QUERY is not available in this dev line (use sqlite)"
+        )))
     }
 
     /// Register VOS schema so `uuid` columns encode/decode as MySQL `BINARY(16)`.

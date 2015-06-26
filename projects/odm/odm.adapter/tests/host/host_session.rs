@@ -1,8 +1,8 @@
 //! Host session facade — profile dispatch, real SQLite execution, envelopes.
 
 use odm_adapter::host::{
-    AUTHOR_CODES, CODE_INVALID_ARGUMENT, CODE_UNIQUE_CONFLICT, DIAG_SESSION_CLOSED, DIAG_TRANSACTION_ALREADY_OPEN, DIAG_TRANSACTION_NOT_OPEN,
-    ErrorEnvelope, ExecuteOutcome, HostSession, version,
+    AUTHOR_CODES, CODE_CONNECTION_FAILED, CODE_INVALID_ARGUMENT, CODE_UNIQUE_CONFLICT, DIAG_BACKEND_UNSUPPORTED, DIAG_SESSION_CLOSED,
+    DIAG_TRANSACTION_ALREADY_OPEN, DIAG_TRANSACTION_NOT_OPEN, ErrorEnvelope, ExecuteOutcome, HostSession, version,
 };
 
 const USER_SCHEMA: &str = r#"
@@ -75,6 +75,21 @@ fn sqlite_transactions_commit_and_roll_back() {
     assert!(commit.ok);
     assert_eq!(session.query("User.collect()", None).rows.len(), 1);
     session.close();
+}
+
+#[test]
+fn foreign_sql_profiles_are_refused_at_open() {
+    for (profile, opened) in [
+        ("postgres", HostSession::open_postgres("postgres://127.0.0.1:5432/iris")),
+        ("mysql", HostSession::open_mysql("mysql://127.0.0.1:3306/iris")),
+    ] {
+        let error = match opened {
+            Ok(_) => panic!("{profile} must be refused instead of opening a half-dead session"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, CODE_CONNECTION_FAILED, "{profile}");
+        assert_eq!(error.diagnostic_code.as_deref(), Some(DIAG_BACKEND_UNSUPPORTED), "{profile}");
+    }
 }
 
 #[test]
