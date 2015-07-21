@@ -4,15 +4,27 @@
 //! module is the matching client surface so adapters never depend on the
 //! third-party `postgres` / `r2d2` crates.
 //!
-//! Status: session + endpoint parse are live; startup / simple-query execution
-//! are the next extraction from [`crate::wire`].
+//! The protocol semantics live in `database-protocol-pgsql`; this module owns
+//! the TCP session and maps wire errors into [`database_types::Error`].
 
 use std::{
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    io,
+    net::{SocketAddr, ToSocketAddrs},
     time::Duration,
 };
 
+use database_protocol_pgsql::PostgresError;
 use database_types::{Error, Result};
+
+/// PostgreSQL wire errors, shared with `database-protocol-pgsql`.
+pub mod error;
+
+#[allow(missing_docs)]
+mod client;
+
+pub use client::{
+    BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Param, Portal, PortalReport, Prepared, Report,
+};
 
 /// One textual cell from a result set (bytes preserved when non-UTF-8).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,21 +51,19 @@ pub struct QueryResult {
 /// Single PostgreSQL wire session (one TCP connection).
 #[derive(Debug)]
 pub struct Session {
-    stream: TcpStream,
+    connection: Connection,
     address: SocketAddr,
 }
 
 impl Session {
     /// Open a TCP session from a `postgres://` URL or `host=…` libpq-style string.
     ///
-    /// Startup / auth / simple query are not filled yet; [`Self::ping`] and
-    /// query helpers return [`Error::Unsupported`] until that path lands.
-    pub fn connect(endpoint: &str, timeout: Duration) -> Result<Self> {
-        let address = parse_postgres_endpoint(endpoint)?;
-        let stream = TcpStream::connect_timeout(&address, timeout).map_err(Error::Io)?;
-        stream.set_read_timeout(Some(timeout)).map_err(Error::Io)?;
-        stream.set_write_timeout(Some(timeout)).map_err(Error::Io)?;
-        Ok(Self { stream, address })
+    /// The startup handshake runs immediately, so an unauthenticated or
+    /// unreachable server fails here instead of at the first query.
+    pub fn connect(endpoint: &str, _timeout: Duration) -> Result<Self> {
+        let (config, address) = parse_postgres_endpoint(endpoint)?;
+        let connection = Connection::open(&config).map_err(map_wire_error)?;
+        Ok(Self { connection, address })
     }
 
     /// Peer address used for this session.
@@ -61,16 +71,16 @@ impl Session {
         self.address
     }
 
-    /// Connectivity probe once startup exists.
+    /// Connectivity probe: run `SELECT 1` through the live session.
     pub fn ping(&mut self) -> Result<()> {
-        let _ = &self.stream;
-        Err(Error::Unsupported("PostgreSQL wire client startup / simple query not extracted yet (server side is yyds-gateway-pgsql)"))
+        self.connection.execute("SELECT 1").map_err(map_wire_error)?;
+        Ok(())
     }
 
     /// Run a simple-query statement.
-    pub fn query(&mut self, _sql: &str) -> Result<QueryResult> {
-        self.ping()?;
-        unreachable!()
+    pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
+        let results = self.connection.execute(sql).map_err(map_wire_error)?;
+        Ok(results.into_iter().last().map(convert_result).unwrap_or_default())
     }
 
     /// Run a statement that should not return rows.
@@ -79,23 +89,91 @@ impl Session {
     }
 }
 
-fn parse_postgres_endpoint(endpoint: &str) -> Result<SocketAddr> {
+fn convert_result(result: client::QueryResult) -> QueryResult {
+    let columns = result.columns.iter().map(|column| column.name.clone()).collect();
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| row.into_iter().map(|value| value.map(|text| Cell::Bytes(text.into_bytes())).unwrap_or(Cell::Null)).collect())
+        .collect();
+    QueryResult { columns, rows, affected_rows: affected_rows(&result.tag), sqlstate: None }
+}
+
+fn affected_rows(tag: &str) -> u64 {
+    if !tag.starts_with("INSERT") && !tag.starts_with("UPDATE") && !tag.starts_with("DELETE") && !tag.starts_with("COPY") {
+        return 0;
+    }
+    tag.split_whitespace().last().and_then(|value| value.parse().ok()).unwrap_or(0)
+}
+
+fn map_wire_error(error: PostgresError) -> Error {
+    match error {
+        PostgresError::Io(message) => Error::Io(io::Error::other(message)),
+        PostgresError::Server { code, message, .. } => Error::Protocol { message: format!("{code}: {message}") },
+        PostgresError::Protocol(message) => Error::Protocol { message },
+        PostgresError::Unsupported(feature) => Error::Protocol { message: format!("unsupported: {feature}") },
+    }
+}
+
+fn parse_postgres_endpoint(endpoint: &str) -> Result<(ClientConfig, SocketAddr)> {
     if let Some(rest) = endpoint.strip_prefix("postgres://").or_else(|| endpoint.strip_prefix("postgresql://")) {
-        let hostport = rest.rsplit('@').next().unwrap_or(rest);
-        let hostport = hostport.split('/').next().unwrap_or(hostport).split('?').next().unwrap_or(hostport);
-        let defaulted = if hostport.contains(':') { hostport.to_owned() } else { format!("{hostport}:5432") };
-        return defaulted.to_socket_addrs().map_err(Error::Io)?.next().ok_or(Error::Corrupt("postgres URL host did not resolve"));
+        let rest = rest.split('?').next().unwrap_or(rest);
+        let (authority, database) = match rest.split_once('/') {
+            Some((authority, database)) => (authority, database),
+            None => (rest, ""),
+        };
+        let (userinfo, hostport) = match authority.rsplit_once('@') {
+            Some((userinfo, hostport)) => (userinfo, hostport),
+            None => ("", authority),
+        };
+        let user = userinfo.split(':').next().filter(|user| !user.is_empty()).unwrap_or("postgres");
+        let (host, port) = split_host_port(hostport)?;
+        let database = if database.is_empty() { user } else { database };
+        let config = ClientConfig::new(host.clone(), port, user, database);
+        let address = resolve(&host, port)?;
+        return Ok((config, address));
     }
 
-    let mut host = "127.0.0.1";
+    let mut host = "127.0.0.1".to_owned();
     let mut port = 5432u16;
+    let mut user = "postgres".to_owned();
+    let mut database = String::new();
     for part in endpoint.split_whitespace() {
         if let Some(value) = part.strip_prefix("host=") {
-            host = value;
+            host = value.to_owned();
         }
         else if let Some(value) = part.strip_prefix("port=") {
-            port = value.parse().map_err(|_| Error::Corrupt("postgres port is not a u16"))?;
+            port = value.parse().map_err(|_| Error::Protocol { message: "postgres port is not a u16".into() })?;
+        }
+        else if let Some(value) = part.strip_prefix("user=") {
+            user = value.to_owned();
+        }
+        else if let Some(value) = part.strip_prefix("dbname=") {
+            database = value.to_owned();
         }
     }
-    format!("{host}:{port}").to_socket_addrs().map_err(Error::Io)?.next().ok_or(Error::Corrupt("postgres host did not resolve"))
+    if database.is_empty() {
+        database = user.clone();
+    }
+    let address = resolve(&host, port)?;
+    Ok((ClientConfig::new(host, port, user, database), address))
+}
+
+fn split_host_port(hostport: &str) -> Result<(String, u16)> {
+    match hostport.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port.parse().map_err(|_| Error::Protocol { message: "postgres port is not a u16".into() })?;
+            Ok((host.to_owned(), port))
+        }
+        None if hostport.is_empty() => Ok(("127.0.0.1".into(), 5432)),
+        None => Ok((hostport.to_owned(), 5432)),
+    }
+}
+
+fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
+    format!("{host}:{port}")
+        .to_socket_addrs()
+        .map_err(Error::Io)?
+        .next()
+        .ok_or(Error::Protocol { message: "postgres host did not resolve".into() })
 }
