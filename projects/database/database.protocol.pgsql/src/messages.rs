@@ -38,6 +38,31 @@ pub fn startup_packet(user: &str, database: &str) -> Vec<u8> {
     packet
 }
 
+/// `PasswordMessage` carrying a cleartext or MD5 password response.
+///
+/// The response is a null-terminated string, and PostgreSQL rejects a packet
+/// whose length does not include that terminator.
+pub fn password_packet(password: impl AsRef<[u8]>) -> Result<Vec<u8>, PostgresError> {
+    let mut payload = password.as_ref().to_vec();
+    payload.push(0);
+    frame(b'p', payload)
+}
+
+/// `SASLInitialResponse` for the selected mechanism.
+pub fn sasl_initial_packet(mechanism: &str, response: &[u8]) -> Result<Vec<u8>, PostgresError> {
+    let mut payload = Vec::with_capacity(mechanism.len() + 5 + response.len());
+    payload.extend_from_slice(mechanism.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&(response.len() as u32).to_be_bytes());
+    payload.extend_from_slice(response);
+    frame(b'p', payload)
+}
+
+/// `SASLResponse` carrying the client-final SCRAM message.
+pub fn sasl_response_packet(response: &[u8]) -> Result<Vec<u8>, PostgresError> {
+    frame(b'p', response.to_vec())
+}
+
 /// One `Query` message in the simple-query protocol.
 pub fn query_packet(sql: &str) -> Result<Vec<u8>, PostgresError> {
     let payload = sql.len() + 1;
@@ -722,6 +747,27 @@ mod tests {
         assert_eq!(&packet[4..8], &PROTOCOL_VERSION.to_be_bytes());
         assert_eq!(packet.len() as u32, u32::from_be_bytes([packet[0], packet[1], packet[2], packet[3]]));
         assert_eq!(packet[packet.len() - 1], 0);
+    }
+
+    #[test]
+    fn password_packet_is_a_null_terminated_password_message() {
+        let packet = password_packet("md5deadbeef").unwrap();
+        assert_eq!(packet[0], b'p');
+        assert_eq!(&packet[1..5], &((packet.len() - 1) as u32).to_be_bytes());
+        assert_eq!(&packet[5..], b"md5deadbeef\0");
+    }
+
+    #[test]
+    fn sasl_initial_packet_names_the_mechanism_then_the_response() {
+        let response = b"n,,n=user,r=abc";
+        let packet = sasl_initial_packet("SCRAM-SHA-256", response).unwrap();
+        assert_eq!(packet[0], b'p');
+        assert_eq!(&packet[1..5], &((packet.len() - 1) as u32).to_be_bytes());
+        let body = &packet[5..];
+        assert_eq!(&body[..13], b"SCRAM-SHA-256");
+        assert_eq!(body[13], 0);
+        assert_eq!(&body[14..18], &(response.len() as u32).to_be_bytes());
+        assert_eq!(&body[18..], response);
     }
 
     #[test]

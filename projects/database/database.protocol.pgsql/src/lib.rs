@@ -11,9 +11,9 @@ pub use error::{MessageField, Notice, PostgresError};
 pub use messages::{
     bind_packet, bind_packet_with_formats, cancel_request_packet, close_packet, column_names, command_tag, copy_data_packet,
     copy_done_packet, copy_fail_packet, copy_response, data_row, data_row_with_formats, describe_packet, encode_bytea, error_response,
-    execute_packet, message_fields, notice_response, parameter_description, parameter_type_oid, parse_packet,
-    query_packet, row_description, startup_packet, sync_packet, ColumnDescription, CopyResponse, CANCEL_REQUEST_BYTES,
-    CANCEL_REQUEST_CODE, MAX_MESSAGE_BYTES, MAX_PARAMETERS, PROTOCOL_VERSION,
+    execute_packet, message_fields, notice_response, parameter_description, parameter_type_oid, parse_packet, password_packet,
+    query_packet, row_description, sasl_initial_packet, sasl_response_packet, startup_packet, sync_packet, ColumnDescription,
+    CopyResponse, CANCEL_REQUEST_BYTES, CANCEL_REQUEST_CODE, MAX_MESSAGE_BYTES, MAX_PARAMETERS, PROTOCOL_VERSION,
 };
 
 use std::collections::BTreeMap;
