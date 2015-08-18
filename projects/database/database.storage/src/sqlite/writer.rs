@@ -1105,8 +1105,8 @@ impl SqliteWriter {
             return Err(Error::Unsupported("sqlite trigger name must not be empty"));
         }
         for object in self.master_rows()? {
-            if eq_ignore_ascii_case(&object.name, name) {
-                return Err(Error::Unsupported("sqlite schema object already exists"));
+            if object.kind == "trigger" && eq_ignore_ascii_case(&object.name, name) {
+                return Err(Error::Unsupported("sqlite trigger already exists"));
             }
         }
         self.insert_master_row("trigger", name, table, 0, Some(sql))?;

@@ -140,6 +140,9 @@ pub enum InsertValue {
         /// Placeholder text as written.
         text: String,
     },
+    /// A general expression, used by trigger bodies such as
+    /// `INSERT INTO log VALUES (new.a)`.
+    Expression(Expr),
 }
 
 /// Projection of a `SELECT` statement.
@@ -3348,11 +3351,7 @@ impl<'a> Parser<'a> {
             TriggerTiming::InsteadOf
         }
         else {
-            let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
-            return Err(self.error(
-                "unsupported-clause",
-                format!("expected `BEFORE`, `AFTER` or `INSTEAD OF` in the trigger definition but found {found}"),
-            ));
+            return Err(self.near_syntax_error());
         };
         let event = if self.eat_word("insert") {
             TriggerEvent::Insert
@@ -3376,8 +3375,7 @@ impl<'a> Parser<'a> {
             TriggerEvent::Delete
         }
         else {
-            let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
-            return Err(self.error("unsupported-clause", format!("expected `INSERT`, `UPDATE` or `DELETE` in the trigger definition but found {found}")));
+            return Err(self.near_syntax_error());
         };
         self.expect_word("on")?;
         let (table_schema, table) = self.qualified_name()?;
@@ -3405,7 +3403,20 @@ impl<'a> Parser<'a> {
             }
             body.push(self.statement()?);
         }
-        let sql = self.canonical_create_sql("CREATE TRIGGER", name_token, name_gap_end);
+        let gap_end = name_gap_end.min(self.source.len());
+        let end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
+        // SQLite stores a temp trigger without its `temp.` qualifier while the
+        // body keeps the text it was written with.
+        let name_start = self.offsets.get(name_token).copied().unwrap_or(0);
+        let raw_name = self.source[name_start..gap_end].trim_end();
+        let name_end = name_start + raw_name.len();
+        let stored_name = if schema.is_some() {
+            name.clone()
+        }
+        else {
+            raw_name.to_string()
+        };
+        let sql = format!("CREATE TRIGGER {stored_name}{}", self.source[name_end..end].trim_end());
         Ok(Statement::CreateTrigger { schema, name, if_not_exists, timing, event, table_schema, table, when, body, sql })
     }
 
@@ -3671,6 +3682,18 @@ impl<'a> Parser<'a> {
         let name_end = name_start + raw_name.len();
         let end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
         format!("{prefix} {}{}", raw_name, self.source[name_end..end].trim_end())
+    }
+
+    /// Reports the token the parser stopped on with SQLite's own wording, used
+    /// where the grammar has a closed keyword set and anything else is a plain
+    /// syntax error (`near "on": syntax error`).
+    fn near_syntax_error(&self) -> SqlError {
+        let message = match self.peek() {
+            Some(Token::Word(word)) => format!("near \"{word}\": syntax error"),
+            Some(token) => format!("near {}: syntax error", token.describe()),
+            None => "incomplete input".to_string(),
+        };
+        self.error("syntax", message)
     }
 
     /// Reads `INDEX <name> ON <table> ( <column> [ASC] , ... )`.
@@ -4067,7 +4090,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parses one `VALUES` tuple element: a bound placeholder or a literal.
+    /// Parses one `VALUES` tuple element: a bound placeholder, a literal, or a
+    /// general expression when the token cannot start a literal.
     fn insert_value(&mut self) -> Result<InsertValue, SqlError> {
         if let Some(Token::Operator(operator)) = self.peek() {
             let operator = operator.clone();
@@ -4075,7 +4099,18 @@ impl<'a> Parser<'a> {
                 return Ok(InsertValue::Parameter { index, text });
             }
         }
-        Ok(InsertValue::Literal(self.literal()?))
+        let literal_head = match self.peek() {
+            Some(Token::Int(_)) | Some(Token::Real(_)) | Some(Token::Text(_)) | Some(Token::Blob(_)) => true,
+            Some(Token::Word(word)) => {
+                word.eq_ignore_ascii_case("null") || word.eq_ignore_ascii_case("true") || word.eq_ignore_ascii_case("false")
+            }
+            Some(Token::Minus) => matches!(self.tokens.get(self.at + 1), Some(Token::Int(_)) | Some(Token::Real(_))),
+            _ => false,
+        };
+        if literal_head {
+            return Ok(InsertValue::Literal(self.literal()?));
+        }
+        Ok(InsertValue::Expression(self.or_expr()?))
     }
 
     fn literal(&mut self) -> Result<Literal, SqlError> {
