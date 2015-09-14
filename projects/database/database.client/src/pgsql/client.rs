@@ -63,6 +63,41 @@ impl QueryResult {
     }
 }
 
+/// One result column together with the type OID the server assigned to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedColumn {
+    /// Column label from `RowDescription`.
+    pub name: String,
+    /// PostgreSQL type OID from `RowDescription`.
+    pub type_oid: u32,
+}
+
+/// Result set that keeps each column's type OID.
+///
+/// The simple-query path only carries labels, so a caller that has to decode
+/// text cells back into typed values needs the extended protocol's
+/// `RowDescription` type OIDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypedResult {
+    /// Columns with their type OIDs.
+    pub columns: Vec<TypedColumn>,
+    /// Row-major cells; `None` is SQL `NULL`.
+    pub rows: Vec<Vec<Option<String>>>,
+    /// `CommandComplete` tag.
+    pub tag: String,
+}
+
+impl TypedResult {
+    /// Drops the type OIDs when only the textual result is needed.
+    pub fn into_query_result(self) -> QueryResult {
+        QueryResult {
+            columns: self.columns.into_iter().map(|column| Column { name: column.name }).collect(),
+            rows: self.rows,
+            tag: self.tag,
+        }
+    }
+}
+
 /// A named prepared statement living on one connection's session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
@@ -185,7 +220,7 @@ struct CopyOutcome {
 
 /// Response of one extended-protocol round trip.
 struct ExtendedOutcome {
-    results: Vec<QueryResult>,
+    results: Vec<TypedResult>,
     parameters: Vec<u32>,
     described: Vec<Column>,
     suspended: bool,
@@ -446,6 +481,22 @@ impl Connection {
         param_types: &[u32],
         result_formats: &[u16],
     ) -> Result<Vec<QueryResult>, PostgresError> {
+        let results = self.execute_with_param_formats_typed(sql, params, param_types, result_formats)?;
+        Ok(results.into_iter().map(TypedResult::into_query_result).collect())
+    }
+
+    /// Extended-protocol round trip that keeps the result columns' type OIDs.
+    ///
+    /// Same wire exchange as [`Connection::execute_with_param_formats`]; the
+    /// only difference is that `RowDescription` type OIDs survive instead of
+    /// being reduced to labels.
+    pub fn execute_with_param_formats_typed(
+        &mut self,
+        sql: &str,
+        params: &[Param<'_>],
+        param_types: &[u32],
+        result_formats: &[u16],
+    ) -> Result<Vec<TypedResult>, PostgresError> {
         self.ensure_usable()?;
         let param_formats = param_format_codes(params);
         let values: Vec<Option<&[u8]>> = params.iter().map(|param| param.value).collect();
@@ -503,7 +554,7 @@ impl Connection {
         packet.extend_from_slice(&protocol::execute_packet("", 0)?);
         packet.extend_from_slice(&protocol::sync_packet());
         match self.read_extended(&packet) {
-            Ok(outcome) => Ok(outcome.results),
+            Ok(outcome) => Ok(outcome.results.into_iter().map(TypedResult::into_query_result).collect()),
             Err(error) => {
                 self.poison(&error);
                 Err(error)
@@ -559,7 +610,10 @@ impl Connection {
                 return Err(error);
             }
         };
-        Ok(PortalReport { results: outcome.results, suspended: outcome.suspended })
+        Ok(PortalReport {
+            results: outcome.results.into_iter().map(TypedResult::into_query_result).collect(),
+            suspended: outcome.suspended,
+        })
     }
 
     /// Closes a portal on the server. Closing an unknown name still answers
@@ -774,8 +828,9 @@ impl Connection {
                 b'C' => {
                     let command = protocol::command_tag(&payload)?;
                     let (columns, rows) = current.take().unwrap_or_else(|| (details.clone(), Vec::new()));
-                    let columns: Vec<Column> = columns.iter().map(|column| Column { name: column.name.clone() }).collect();
-                    results.push(QueryResult { columns, rows, tag: command });
+                    let columns: Vec<TypedColumn> =
+                        columns.iter().map(|column| TypedColumn { name: column.name.clone(), type_oid: column.type_oid }).collect();
+                    results.push(TypedResult { columns, rows, tag: command });
                 }
                 b'I' => {
                     // An empty statement answers Describe with NoData and Execute
@@ -792,8 +847,9 @@ impl Connection {
                 }
                 b's' => {
                     let (columns, rows) = current.take().unwrap_or_else(|| (details.clone(), Vec::new()));
-                    let columns: Vec<Column> = columns.iter().map(|column| Column { name: column.name.clone() }).collect();
-                    results.push(QueryResult { columns, rows, tag: String::new() });
+                    let columns: Vec<TypedColumn> =
+                        columns.iter().map(|column| TypedColumn { name: column.name.clone(), type_oid: column.type_oid }).collect();
+                    results.push(TypedResult { columns, rows, tag: String::new() });
                     suspended = true;
                 }
                 b'E' => failure = Some(protocol::error_response(&payload)),

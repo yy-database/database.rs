@@ -693,14 +693,18 @@ impl HostSession {
         self.run_bound_query(&bound)
     }
 
-    /// Apply the managed-push schema to a SQLite session.
+    /// Apply the managed-push schema to a managed SQL session.
     pub fn managed_push(&self, schema: &str) -> Result<(), ErrorEnvelope> {
         if self.closed {
             return Err(closed());
         }
         match &self.store {
             Some(SessionStore::Sqlite(db)) => db.managed_push(schema).map_err(from_sqlite_error).map(|_| ()),
-            _ => Err(ErrorEnvelope::invalid_argument(DIAG_MANAGED_PUSH_UNSUPPORTED, "managed_push is only supported on yydb and sqlite sessions")),
+            Some(SessionStore::Postgres { db, .. }) => db.managed_push(schema).map_err(from_postgres_error).map(|_| ()),
+            _ => Err(ErrorEnvelope::invalid_argument(
+                DIAG_MANAGED_PUSH_UNSUPPORTED,
+                "managed_push is only supported on sqlite and postgres sessions",
+            )),
         }
     }
 

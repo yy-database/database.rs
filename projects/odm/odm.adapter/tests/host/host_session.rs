@@ -1,5 +1,6 @@
 //! Host session facade — profile dispatch, real SQLite execution, envelopes.
 
+use odm_adapter::adapter_postgres::PostgresSource;
 use odm_adapter::host::{
     AUTHOR_CODES, CODE_CONNECTION_FAILED, CODE_INVALID_ARGUMENT, CODE_UNIQUE_CONFLICT, DIAG_BACKEND_UNSUPPORTED, DIAG_SESSION_CLOSED,
     DIAG_TRANSACTION_ALREADY_OPEN, DIAG_TRANSACTION_NOT_OPEN, ErrorEnvelope, ExecuteOutcome, HostSession, version,
@@ -78,18 +79,25 @@ fn sqlite_transactions_commit_and_roll_back() {
 }
 
 #[test]
-fn foreign_sql_profiles_are_refused_at_open() {
-    for (profile, opened) in [
-        ("postgres", HostSession::open_postgres("postgres://127.0.0.1:5432/iris")),
-        ("mysql", HostSession::open_mysql("mysql://127.0.0.1:3306/iris")),
-    ] {
-        let error = match opened {
-            Ok(_) => panic!("{profile} must be refused instead of opening a half-dead session"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, CODE_CONNECTION_FAILED, "{profile}");
-        assert_eq!(error.diagnostic_code.as_deref(), Some(DIAG_BACKEND_UNSUPPORTED), "{profile}");
-    }
+fn mysql_is_still_refused_before_its_wire_client_lands() {
+    let error = match HostSession::open_mysql("mysql://127.0.0.1:3306/iris") {
+        Ok(_) => panic!("mysql must be refused instead of opening a half-dead session"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, CODE_CONNECTION_FAILED);
+    assert_eq!(error.diagnostic_code.as_deref(), Some(DIAG_BACKEND_UNSUPPORTED));
+}
+
+#[test]
+fn postgres_open_failure_is_a_wire_failure_not_a_backend_gap() {
+    let error = match HostSession::open_postgres("postgres://127.0.0.1:1/iris") {
+        Ok(_) => panic!("an unreachable port must not open a session"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, CODE_CONNECTION_FAILED);
+    // The backend is supported now; a refused TCP connect is diagnosed on the
+    // wire layer instead of being blamed on a missing backend.
+    assert_ne!(error.diagnostic_code.as_deref(), Some(DIAG_BACKEND_UNSUPPORTED));
 }
 
 #[test]
@@ -140,4 +148,44 @@ fn unsupported_dsn_is_rejected_with_the_author_code() {
 fn outcome_json_keeps_the_envelope_shape() {
     let unit: ExecuteOutcome = ExecuteOutcome::unit();
     assert_eq!(unit.to_json(), r#"{"error":null,"ok":true,"rows":[]}"#);
+}
+
+#[test]
+fn live_postgres_session_runs_managed_push_and_plan_crud() {
+    let Some(url) = std::env::var("IRIS_TEST_POSTGRES_URL").ok().filter(|value| !value.is_empty())
+    else {
+        eprintln!("skip: set IRIS_TEST_POSTGRES_URL for the host PostgreSQL round trip");
+        return;
+    };
+
+    // Isolation uses the same wire client the session under test speaks.
+    let cleanup = PostgresSource::connect(&url).expect("postgres cleanup source");
+    cleanup
+        .with_connection(|client| {
+            client.execute("DROP TABLE IF EXISTS \"User\"").unwrap();
+            Ok(())
+        })
+        .expect("drop leftover table");
+    drop(cleanup);
+
+    let mut session = HostSession::open_postgres(&url).expect("postgres session");
+    session.managed_push(USER_SCHEMA).expect("managed push");
+
+    let inserted = session.execute(r#"User::insert({ user_id: "u8", user_name: "Ada", active: true })"#, None);
+    assert!(inserted.ok, "{:?}", inserted.error.as_ref().map(ErrorEnvelope::to_json));
+
+    let rows = session.query("User.filter(x => x.active).collect()", None);
+    assert!(rows.ok, "{:?}", rows.error.as_ref().map(ErrorEnvelope::to_json));
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0]["user_name"], "Ada");
+
+    let patched = session.execute(r#"User.filter(x => x.user_id == "u8").patch({ user_name: "Bobby" })"#, None);
+    assert!(patched.ok, "{:?}", patched.error.as_ref().map(ErrorEnvelope::to_json));
+    assert_eq!(session.query(r#"User.filter(x => x.user_id == "u8").collect()"#, None).rows[0]["user_name"], "Bobby");
+
+    let deleted = session.execute(r#"User.filter(x => x.user_id == "u8").delete()"#, None);
+    assert!(deleted.ok, "{:?}", deleted.error.as_ref().map(ErrorEnvelope::to_json));
+    assert_eq!(session.query("User.collect()", None).rows.len(), 0);
+
+    session.close();
 }

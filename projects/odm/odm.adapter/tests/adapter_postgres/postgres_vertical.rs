@@ -139,8 +139,37 @@ fn live_managed_push_crud_txn_drift_and_pool() {
     assert_eq!(rows[0].get("user_name"), Some(&Value::Str("alice".into())));
     assert!(matches!(rows[0].get("active"), Some(Value::Bool(true)) | Some(Value::Int(1))));
 
-    // Live `update` and `delete` helpers only exist on `AuthorityTxn`, which has
-    // no public constructor yet, so this run covers insert plus plan reads.
+    let patch = Planner::new(PostgresSource::capabilities())
+        .plan_source(
+            r#"
+            User.filter(x => x.user_id == "u2")
+                .patch({ user_name: "bobby" })
+            "#,
+        )
+        .unwrap();
+    let patched = db.execute_plan(&patch).unwrap();
+    assert_eq!(patched.len(), 1, "UPDATE ... RETURNING must surface the changed row");
+    assert_eq!(patched[0].get("user_name"), Some(&Value::Str("bobby".into())));
+
+    let delete = Planner::new(PostgresSource::capabilities())
+        .plan_source(
+            r#"
+            User.filter(x => x.user_id == "u1")
+                .delete()
+            "#,
+        )
+        .unwrap();
+    assert!(db.execute_plan(&delete).unwrap().is_empty());
+
+    let remaining = Planner::new(PostgresSource::capabilities()).plan_source("User.collect()").unwrap();
+    let rows = db.execute_plan(&remaining).unwrap();
+    assert_eq!(rows.len(), 1, "u1 must be gone");
+    assert_eq!(rows[0].get("user_id"), Some(&Value::Str("u2".into())));
+    assert_eq!(rows[0].get("user_name"), Some(&Value::Str("bobby".into())));
+    assert_eq!(rows[0].get("active"), Some(&Value::Bool(false)));
+
+    // Live `update` and `delete` plans are covered above through the public
+    // `execute_plan` surface.
 
     let again = db.plan_managed_push(USER_SCHEMA).unwrap();
     assert!(again.changes.is_empty());
