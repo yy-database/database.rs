@@ -21,7 +21,8 @@ use super::sql::{
     DropColumnConflict, Expr, ForeignKey, FrameBound, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal, NamedWindow,
     OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp,
     WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column, rewrite_create_index_table,
-    rewrite_create_table_column, rewrite_create_table_drop_column, rewrite_create_table_name, statement_references,
+    rewrite_create_table_column, rewrite_create_table_drop_column, rewrite_create_table_name, rewrite_view_column,
+    rewrite_view_table, statement_references,
     strip_schema_qualifiers,
 };
 
@@ -192,6 +193,16 @@ struct ViewDef {
     columns: Option<Vec<String>>,
     /// Parsed query the view re-evaluates on every read.
     query: Statement,
+}
+
+/// One `CREATE TEMP VIEW` in the temp schema, kept beside the temp tables so
+/// the connection owns it and `sqlite_temp_master` reports it.
+struct TempView {
+    def: ViewDef,
+    /// `sqlite_temp_master.sql` text, the statement without `TEMP`.
+    sql: String,
+    /// `sqlite_temp_master.rowid`, a monotonic insertion counter.
+    master_rowid: i64,
 }
 
 /// One trigger in the engine catalog.
@@ -433,6 +444,50 @@ fn frame_cells(cells: &[Cell], width: usize, rowid: i64) -> Vec<Cell> {
     out
 }
 
+/// Output names of one view: the declared list when present, otherwise the
+/// names the query produced. SQLite rejects a declared list whose width does
+/// not match the query, and suffixes repeated names with `:1`, `:2`, ...
+fn view_output_names(view: &ViewDef, actual: &[String]) -> Result<Vec<String>, SqlError> {
+    let names = match &view.columns {
+        Some(declared) => {
+            if declared.len() != actual.len() {
+                return Err(SqlError::new(
+                    "view-arity",
+                    format!("expected {} columns for '{}' but got {}", declared.len(), view.name, actual.len()),
+                )
+                .in_statement("select"));
+            }
+            declared.clone()
+        }
+        None => actual.to_vec(),
+    };
+    Ok(unique_output_names(&names))
+}
+
+/// Makes one result set's column names unique the way SQLite does for views,
+/// derived tables and CTEs: a repeated name gets `:1`, `:2`, ... appended.
+fn unique_output_names(names: &[String]) -> Vec<String> {
+    let mut used = BTreeSet::new();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let key = name.to_ascii_lowercase();
+        if used.insert(key) {
+            out.push(name.clone());
+            continue;
+        }
+        let mut suffix = 1usize;
+        loop {
+            let candidate = format!("{name}:{suffix}");
+            if used.insert(candidate.to_ascii_lowercase()) {
+                out.push(candidate);
+                break;
+            }
+            suffix += 1;
+        }
+    }
+    out
+}
+
 /// A `FROM`-shape over one view's output, so view DML can resolve its filter
 /// and assignments with the regular expression path.
 fn view_relation<'a>(label: &str, names: &[String], trigger: Option<&'a TriggerFrame>) -> Relation<'a> {
@@ -647,6 +702,9 @@ pub struct Engine {
     /// Views keyed by lowercase name. A view shares the object namespace with
     /// tables and indexes and re-evaluates its query on every read.
     views: BTreeMap<String, ViewDef>,
+    /// `CREATE TEMP VIEW` definitions keyed by lowercase name. They shadow an
+    /// equally named main view and disappear with the connection.
+    temp_views: BTreeMap<String, TempView>,
     /// Triggers keyed by lowercase name, shared with the other object names.
     triggers: BTreeMap<String, TriggerDef>,
     /// Creation counter handed to each new trigger, so firing order follows
@@ -731,6 +789,7 @@ impl Engine {
             table_lookup: BTreeMap::new(),
             indexes: BTreeMap::new(),
             views: BTreeMap::new(),
+            temp_views: BTreeMap::new(),
             triggers: BTreeMap::new(),
             trigger_sequence: 0,
             trigger_frames: Vec::new(),
@@ -1148,7 +1207,7 @@ impl Engine {
                 Ok((master_labels(), rows, true))
             }
             SystemTable::TempMaster => {
-                let mut rows = Vec::with_capacity(self.temp_tables.len() + self.triggers.len());
+                let mut rows = Vec::with_capacity(self.temp_tables.len() + self.temp_views.len() + self.triggers.len());
                 for table in &self.temp_tables {
                     rows.push(vec![
                         Cell::Text("table".to_string()),
@@ -1157,6 +1216,16 @@ impl Engine {
                         Cell::Integer(i64::from(table.rootpage)),
                         Cell::Text(table.sql.clone()),
                         Cell::Integer(table.master_rowid),
+                    ]);
+                }
+                for view in self.temp_views.values() {
+                    rows.push(vec![
+                        Cell::Text("view".to_string()),
+                        Cell::Text(view.def.name.clone()),
+                        Cell::Text(view.def.name.clone()),
+                        Cell::Integer(0),
+                        Cell::Text(view.sql.clone()),
+                        Cell::Integer(view.master_rowid),
                     ]);
                 }
                 for trigger in self.triggers.values().filter(|trigger| trigger.temp) {
@@ -1432,10 +1501,15 @@ impl Engine {
     fn view_output(&self, view: &ViewDef) -> Result<(Vec<String>, Vec<Vec<Cell>>), SqlError> {
         let budget = Budget::new();
         let result = self.select_statement(&view.query, &[], &budget, None)?;
-        let names = match &view.columns {
-            Some(columns) => columns.clone(),
-            None => result.columns.clone(),
-        };
+        let names = view_output_names(view, &result.columns)?;
+        Ok((names, result.rows))
+    }
+
+    /// Materializes one view exactly like a `FROM` reference does: the stored
+    /// query runs again, then its output names are declared or inferred.
+    fn expand_view(&self, view: &ViewDef, budget: &Budget) -> Result<(Vec<String>, Vec<Vec<Cell>>), SqlError> {
+        let result = self.select_statement(&view.query, &[], budget, None)?;
+        let names = view_output_names(view, &result.columns)?;
         Ok((names, result.rows))
     }
 
@@ -1903,7 +1977,7 @@ impl Engine {
                         if if_not_exists {
                             return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
                         }
-                        return Err(SqlError::new("table-exists", format!("table `{name}` already exists")).in_statement("create-table"));
+                        return Err(SqlError::new("table-exists", format!("table {name} already exists")).in_statement("create-table"));
                     }
                     let mut def = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict)?;
                     def.temp = true;
@@ -1926,16 +2000,16 @@ impl Engine {
                     return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 1 });
                 }
                 if self.indexes.contains_key(&key) {
-                    return Err(SqlError::new("index-exists", format!("there is already an index named `{name}`")).in_statement("create-table"));
+                    return Err(SqlError::new("index-exists", format!("there is already an index named {name}")).in_statement("create-table"));
                 }
                 if self.views.contains_key(&key) {
-                    return Err(SqlError::new("view-exists", format!("there is already a view named `{name}`")).in_statement("create-table"));
+                    return Err(SqlError::new("view-exists", format!("there is already a view named {name}")).in_statement("create-table"));
                 }
                 if self.table_lookup.contains_key(&key) {
                     if if_not_exists {
                         return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
                     }
-                    return Err(SqlError::new("table-exists", format!("table `{name}` already exists")).in_statement("create-table"));
+                    return Err(SqlError::new("table-exists", format!("table {name} already exists")).in_statement("create-table"));
                 }
                 let def = Self::catalog_table(
                     name.clone(),
@@ -1955,17 +2029,46 @@ impl Engine {
                 self.tables.push(def);
                 Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::CreateView { schema: _, name, if_not_exists, columns, query, sql } => {
+            Statement::CreateView { schema, name, if_not_exists, columns, query, temp, sql } => {
                 let key = name.to_ascii_lowercase();
                 check_reserved_object_name(&name, "create-view")?;
-                if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name))
-                    || self.indexes.contains_key(&key)
-                    || self.views.contains_key(&key)
-                {
+                // `CREATE TEMP VIEW` and `CREATE VIEW temp.v` both target the
+                // connection-owned schema, whose objects shadow main ones.
+                let temp_target = temp || self.scope == TableScope::Temp
+                    || schema.as_deref().is_some_and(|qualifier| qualifier.eq_ignore_ascii_case("temp"));
+                if temp_target {
+                    if self.temp_lookup.contains_key(&key) || self.temp_views.contains_key(&key) {
+                        if if_not_exists {
+                            return Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                        }
+                        return Err(SqlError::new("table-exists", format!("table {name} already exists")).in_statement("create-view"));
+                    }
+                    // `sqlite_temp_master` stores the statement without `TEMP`
+                    // and without a `temp.` qualifier.
+                    let stored = schema.as_deref().map(|qualifier| strip_schema_qualifiers(&sql, qualifier)).unwrap_or(sql);
+                    let master_rowid = self.temp_next_rowid;
+                    self.temp_next_rowid += 1;
+                    self.temp_views.insert(
+                        key,
+                        TempView { def: ViewDef { name, columns, query: *query }, sql: stored, master_rowid },
+                    );
+                    self.temp_created = true;
+                    return Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 1 });
+                }
+                if self.indexes.contains_key(&key) {
+                    return Err(SqlError::new("index-exists", format!("there is already an index named {name}")).in_statement("create-view"));
+                }
+                if self.views.contains_key(&key) {
                     if if_not_exists {
                         return Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 0 });
                     }
-                    return Err(SqlError::new("table-exists", format!("table `{name}` already exists")).in_statement("create-view"));
+                    return Err(SqlError::new("view-exists", format!("view {name} already exists")).in_statement("create-view"));
+                }
+                if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name)) {
+                    if if_not_exists {
+                        return Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                    }
+                    return Err(SqlError::new("table-exists", format!("table {name} already exists")).in_statement("create-view"));
                 }
                 self.writer
                     .create_view(&name, &sql)
@@ -1973,13 +2076,34 @@ impl Engine {
                 self.views.insert(key, ViewDef { name, columns, query: *query });
                 Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::DropView { schema: _, name, if_exists } => {
+            Statement::DropView { schema, name, if_exists } => {
                 let key = name.to_ascii_lowercase();
-                if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name)) {
-                    return Err(SqlError::new("wrong-object", format!("use DROP TABLE to delete table `{name}`")).in_statement("drop-view"));
+                let temp_target = self.scope == TableScope::Temp
+                    || schema.as_deref().is_some_and(|qualifier| qualifier.eq_ignore_ascii_case("temp"));
+                // Unqualified `DROP VIEW` searches temp before main, so a temp
+                // view disappears while its main namesake survives.
+                if schema.is_none() || temp_target {
+                    if self.temp_views.remove(&key).is_some() {
+                        self.triggers.retain(|_, trigger| !(trigger.temp && trigger.table == key));
+                        return Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 1 });
+                    }
+                    if temp_target {
+                        if if_exists {
+                            return Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                        }
+                        return Err(SqlError::new("unknown-view", format!("no such view: {name}")).in_statement("drop-view"));
+                    }
                 }
+                if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name)) {
+                    return Err(SqlError::new("wrong-object", format!("use DROP TABLE to delete table {name}")).in_statement("drop-view"));
+                }
+                // An index is not a view, so SQLite reports it as missing
+                // rather than as the wrong object kind.
                 if self.indexes.contains_key(&key) {
-                    return Err(SqlError::new("wrong-object", format!("use DROP INDEX to delete index `{name}`")).in_statement("drop-view"));
+                    if if_exists {
+                        return Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                    }
+                    return Err(SqlError::new("unknown-view", format!("no such view: {name}")).in_statement("drop-view"));
                 }
                 if self.views.remove(&key).is_none() {
                     if if_exists {
@@ -2308,7 +2432,7 @@ impl Engine {
                     return Err(SqlError::new("readonly-system-table", format!("table {table} may not be indexed")).in_statement("create-index"));
                 }
                 if self.views.contains_key(&table_key) {
-                    return Err(SqlError::new("readonly-view", format!("views may not be indexed: {table}")).in_statement("create-index"));
+                    return Err(SqlError::new("readonly-view", "views may not be indexed").in_statement("create-index"));
                 }
                 check_reserved_object_name(&name, "create-index")?;
                 let position = *self
@@ -2640,6 +2764,9 @@ impl Engine {
                 // The temp schema is searched before main, so `DROP TABLE`
                 // removes the temp object when both schemas share the name.
                 let temp_position = if self.scope == TableScope::Main { None } else { self.temp_lookup.get(&key).copied() };
+                if temp_position.is_none() && self.temp_views.contains_key(&key) {
+                    return Err(SqlError::new("wrong-object", format!("use DROP VIEW to delete view {name}")).in_statement("drop-table"));
+                }
                 if let Some(position) = temp_position {
                     let dropped = self.temp_tables.remove(position);
                     // The freed page goes back to the temp allocator, so the
@@ -2654,7 +2781,7 @@ impl Engine {
                 let present = objects.iter().any(|object| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case(&name));
                 if !present {
                     if objects.iter().any(|object| object.kind == SchemaObjectKind::View && object.name.eq_ignore_ascii_case(&name)) {
-                        return Err(SqlError::new("wrong-object", format!("use DROP VIEW to delete view `{name}`")).in_statement("drop-table"));
+                        return Err(SqlError::new("wrong-object", format!("use DROP VIEW to delete view {name}")).in_statement("drop-table"));
                     }
                     if if_exists {
                         return Ok(ExecResult { statement: "drop-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
@@ -2781,18 +2908,22 @@ impl Engine {
             AlterAction::RenameTable { new_name } => {
                 check_reserved_object_name(&new_name, "alter-table")?;
                 let new_key = new_name.to_ascii_lowercase();
-                if self.table_lookup.contains_key(&new_key) || self.indexes.contains_key(&new_key) {
+                if self.table_lookup.contains_key(&new_key)
+                    || self.indexes.contains_key(&new_key)
+                    || self.views.contains_key(&new_key)
+                {
                     return Err(SqlError::new(
                         "table-exists",
                         format!("there is already another table or index with this name: {new_name}"),
                     )
                     .in_statement("alter-table"));
                 }
+                let old_name = self.tables[position].name.clone();
                 let new_sql = rewrite_create_table_name(&stored, &new_name)
                     .ok_or_else(|| SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"))?;
                 let mut pending = Vec::new();
                 for object in &objects {
-                    if object.kind != SchemaObjectKind::Index || !object.table_name.eq_ignore_ascii_case(&self.tables[position].name) {
+                    if object.kind != SchemaObjectKind::Index || !object.table_name.eq_ignore_ascii_case(&old_name) {
                         continue;
                     }
                     if let Some(text) = &object.sql {
@@ -2801,12 +2932,38 @@ impl Engine {
                         pending.push((object.name.clone(), rewritten));
                     }
                 }
+                // Every view that names the old table follows the rename, and
+                // SQLite rewrites its stored text so a later reopen resolves.
+                let mut pending_views = Vec::new();
+                for object in &objects {
+                    if object.kind != SchemaObjectKind::View {
+                        continue;
+                    }
+                    let Some(view) = self.views.get(&object.name.to_ascii_lowercase()) else { continue };
+                    let Some(text) = &object.sql else { continue };
+                    if !statement_references(&view.query, &old_name) {
+                        continue;
+                    }
+                    if let Some(rewritten) = rewrite_view_table(text, &old_name, &new_name) {
+                        pending_views.push((view.name.clone(), rewritten));
+                    }
+                }
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
-                if let Err(error) = self.writer.rename_table_schema(&self.tables[position].name, &new_name, &new_sql, &pending) {
+                if let Err(error) = self.writer.rename_table_schema(&old_name, &new_name, &new_sql, &pending) {
                     let _ = self.writer.rollback();
                     return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
                 }
                 self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                if !pending_views.is_empty() {
+                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                    for (name, text) in &pending_views {
+                        if let Err(error) = self.writer.rewrite_view_sql(name, text) {
+                            let _ = self.writer.rollback();
+                            return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                        }
+                    }
+                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                }
                 self.tables[position].name = new_name;
                 self.reindex_tables();
                 for index in self.indexes.values_mut() {
@@ -2817,6 +2974,13 @@ impl Engine {
                 for trigger in self.triggers.values_mut() {
                     if trigger.table == key {
                         trigger.table = new_key.clone();
+                    }
+                }
+                for (name, text) in pending_views {
+                    if let Some(Statement::CreateView { query, .. }) = parse(&text).ok().and_then(|statements| statements.into_iter().next()) {
+                        if let Some(view) = self.views.get_mut(&name.to_ascii_lowercase()) {
+                            view.query = *query;
+                        }
                     }
                 }
                 Ok(ExecResult { statement: "alter-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
@@ -2835,7 +2999,8 @@ impl Engine {
                     return Ok(ExecResult { statement: "alter-table", columns: Vec::new(), rows: Vec::new(), affected: 1 });
                 }
                 let name = def.name.clone();
-                let new_sql = rewrite_create_table_column(&stored, &def.columns[column].name, &new)
+                let old_column = old;
+                let new_sql = rewrite_create_table_column(&stored, &old_column, &new)
                     .ok_or_else(|| SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"))?;
                 let mut pending = Vec::new();
                 for object in &objects {
@@ -2843,9 +3008,25 @@ impl Engine {
                         continue;
                     }
                     if let Some(text) = &object.sql {
-                        let rewritten = rewrite_create_index_column(text, &def.columns[column].name, &new)
+                        let rewritten = rewrite_create_index_column(text, &old_column, &new)
                             .ok_or_else(|| SqlError::new("storage", "sqlite stored index text unrecognized").in_statement("alter-table"))?;
                         pending.push((object.name.clone(), rewritten));
+                    }
+                }
+                // Views keep the renamed column reference spelled correctly in
+                // their stored text, exactly like SQLite rewrites them.
+                let mut pending_views = Vec::new();
+                for object in &objects {
+                    if object.kind != SchemaObjectKind::View {
+                        continue;
+                    }
+                    let Some(view) = self.views.get(&object.name.to_ascii_lowercase()) else { continue };
+                    let Some(text) = &object.sql else { continue };
+                    if !statement_mentions_column(&view.query, &old_column, None) {
+                        continue;
+                    }
+                    if let Some(rewritten) = rewrite_view_column(text, &old_column, &new) {
+                        pending_views.push((view.name.clone(), rewritten));
                     }
                 }
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
@@ -2854,6 +3035,23 @@ impl Engine {
                     return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
                 }
                 self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                if !pending_views.is_empty() {
+                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                    for (view, text) in &pending_views {
+                        if let Err(error) = self.writer.rewrite_view_sql(view, text) {
+                            let _ = self.writer.rollback();
+                            return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                        }
+                    }
+                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                }
+                for (view, text) in pending_views {
+                    if let Some(Statement::CreateView { query, .. }) = parse(&text).ok().and_then(|statements| statements.into_iter().next()) {
+                        if let Some(view) = self.views.get_mut(&view.to_ascii_lowercase()) {
+                            view.query = *query;
+                        }
+                    }
+                }
                 self.tables[position].columns[column].name = new;
                 Ok(ExecResult { statement: "alter-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
@@ -3613,7 +3811,12 @@ impl Engine {
                     .iter()
                     .map(|expr| resolve_expr(expr, &relation, &outer_shapes, named, &mut windows, &mut specs, true, true))
                     .collect::<Result<Vec<_>, _>>()?;
-                (Some(nodes), exprs.iter().map(Expr::label).collect())
+                (Some(nodes), exprs.iter().map(|expr| match expr {
+                    // A bare column is named after the schema's own spelling,
+                    // so `SELECT A FROM t` reports `a`.
+                    Expr::Column(reference) => relation.resolved_column_name(reference).unwrap_or_else(|| expr.label()),
+                    _ => expr.label(),
+                }).collect())
             }
             SelectItems::CountAll => (None, vec!["count(*)".to_string()]),
             SelectItems::Star => (None, relation.star_columns()),
@@ -4560,7 +4763,8 @@ impl Engine {
                             return Err(error);
                         }
                     }
-                    Materialized { columns: entry.columns.clone().unwrap_or(result.columns), rows: result.rows }
+                    let columns = entry.columns.clone().unwrap_or(result.columns);
+                    Materialized { columns: unique_output_names(&columns), rows: result.rows }
                 }
             };
             env.tables.insert(entry.name.to_ascii_lowercase(), result);
@@ -4786,7 +4990,8 @@ impl Engine {
     ) -> Result<(SourceColumns<'b>, Vec<Vec<Cell>>), SqlError> {
         if let Some(query) = &table.query {
             let result = self.select_statement(query, &[], budget, ctes)?;
-            return Ok((SourceColumns::Materialized { names: result.columns, rowid: false }, result.rows));
+            let names = unique_output_names(&result.columns);
+            return Ok((SourceColumns::Materialized { names, rowid: false }, result.rows));
         }
         let scope = match table.schema.as_deref() {
             None => Some(TableScope::Default),
@@ -4830,27 +5035,21 @@ impl Engine {
             return Ok((SourceColumns::Materialized { names: columns, rowid }, rows));
         }
         let key = table.name.to_ascii_lowercase();
+        if scope != TableScope::Main {
+            if let Some(view) = self.temp_views.get(&key) {
+                let _depth = ViewDepthGuard::enter()?;
+                let (names, rows) = self.expand_view(&view.def, budget)?;
+                return Ok((SourceColumns::Materialized { names, rowid: false }, rows));
+            }
+        }
         if scope != TableScope::Temp {
             if let Some(view) = self.views.get(&key) {
                 // A view re-runs its stored query against the current contents
                 // of every base table, exactly like SQLite. Views are not
                 // correlated, so they see no outer row or CTE from this query.
                 let _depth = ViewDepthGuard::enter()?;
-                let result = self.select_statement(&view.query, &[], budget, None)?;
-                let names = match &view.columns {
-                    Some(declared) => {
-                        if declared.len() != result.columns.len() {
-                            return Err(SqlError::new(
-                                "view-arity",
-                                format!("view {} has {} columns but {} declared", view.name, result.columns.len(), declared.len()),
-                            )
-                            .in_statement("select"));
-                        }
-                        declared.clone()
-                    }
-                    None => result.columns.clone(),
-                };
-                return Ok((SourceColumns::Materialized { names, rowid: false }, result.rows));
+                let (names, rows) = self.expand_view(view, budget)?;
+                return Ok((SourceColumns::Materialized { names, rowid: false }, rows));
             }
         }
         if scope != TableScope::Main {
@@ -4917,23 +5116,15 @@ impl Engine {
             return Ok((SourceColumns::Materialized { names: columns, rowid }, rows));
         }
         let key = table.name.to_ascii_lowercase();
+        if let Some(view) = engine.temp_views.get(&key) {
+            let _depth = ViewDepthGuard::enter()?;
+            let (names, rows) = engine.expand_view(&view.def, budget)?;
+            return Ok((SourceColumns::Materialized { names, rowid: false }, rows));
+        }
         if let Some(view) = engine.views.get(&key) {
             let _depth = ViewDepthGuard::enter()?;
-            let result = engine.select_statement(&view.query, &[], budget, None)?;
-            let names = match &view.columns {
-                Some(declared) => {
-                    if declared.len() != result.columns.len() {
-                        return Err(SqlError::new(
-                            "view-arity",
-                            format!("view {} has {} columns but {} declared", view.name, result.columns.len(), declared.len()),
-                        )
-                        .in_statement("select"));
-                    }
-                    declared.clone()
-                }
-                None => result.columns.clone(),
-            };
-            return Ok((SourceColumns::Materialized { names, rowid: false }, result.rows));
+            let (names, rows) = engine.expand_view(view, budget)?;
+            return Ok((SourceColumns::Materialized { names, rowid: false }, rows));
         }
         if let Some(position) = engine.table_lookup.get(&key).copied() {
             let def = &engine.tables[position];
@@ -5430,6 +5621,24 @@ impl<'a> Relation<'a> {
                 )
                 .in_statement("select"))
             }
+        }
+    }
+
+    /// Name of one resolved reference as the schema spells it, used for
+    /// result-column labels. `None` for rowid aliases, `USING` slots and
+    /// trigger frames, where the written name is reported instead.
+    fn resolved_column_name(&self, reference: &ColumnRef) -> Option<String> {
+        let (source, index) = self.resolve(reference).ok()?;
+        if source >= self.sources.len() {
+            return None;
+        }
+        let offset = self.sources[source].offset;
+        let local = index.checked_sub(offset)?;
+        if local < self.sources[source].visible_width() {
+            Some(self.sources[source].columns.name_at(local).to_string())
+        }
+        else {
+            None
         }
     }
 
