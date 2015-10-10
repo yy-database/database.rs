@@ -18,8 +18,8 @@ use super::error::SqlError;
 use super::json_string;
 use super::sql::{
     AggregateFunction, AlterAction, Assignment, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm,
-    DropColumnConflict, Expr, ForeignKey, FrameBound, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal, NamedWindow,
-    OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp,
+    DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal,
+    NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp,
     WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column, rewrite_create_index_table,
     rewrite_create_table_column, rewrite_create_table_drop_column, rewrite_create_table_name, rewrite_view_column,
     rewrite_view_table, statement_references,
@@ -136,6 +136,10 @@ struct ForeignKeyDef {
     parent_display: String,
     /// Parent column names as written; empty means the parent primary key.
     parent_columns: Vec<String>,
+    /// `ON DELETE` action, spelled for `PRAGMA foreign_key_list`.
+    on_delete: String,
+    /// `ON UPDATE` action, spelled for `PRAGMA foreign_key_list`.
+    on_update: String,
 }
 
 impl TableDef {
@@ -176,12 +180,16 @@ struct CheckDef {
 
 /// One index in the engine catalog, keyed by its lowercase name.
 struct IndexDef {
+    /// Index name as written, used by `PRAGMA index_list`.
+    name: String,
     /// Lowercase name of the indexed table.
     table: String,
     /// Indexed column positions, in key order.
     columns: Vec<usize>,
     /// The index enforces uniqueness.
     unique: bool,
+    /// Creation counter, so `PRAGMA index_list` reports newest first.
+    order: u64,
 }
 
 /// One view in the engine catalog, keyed by its lowercase name.
@@ -699,6 +707,9 @@ pub struct Engine {
     /// Lowercase table name to its position in [`Engine::tables`].
     table_lookup: BTreeMap<String, usize>,
     indexes: BTreeMap<String, IndexDef>,
+    /// Creation counter handed to each new explicit index, so `PRAGMA
+    /// index_list` lists the newest first like SQLite.
+    index_sequence: u64,
     /// Views keyed by lowercase name. A view shares the object namespace with
     /// tables and indexes and re-evaluates its query on every read.
     views: BTreeMap<String, ViewDef>,
@@ -788,6 +799,7 @@ impl Engine {
             tables: Vec::new(),
             table_lookup: BTreeMap::new(),
             indexes: BTreeMap::new(),
+            index_sequence: 0,
             views: BTreeMap::new(),
             temp_views: BTreeMap::new(),
             triggers: BTreeMap::new(),
@@ -993,7 +1005,12 @@ impl Engine {
                     if positions.len() != columns.len() {
                         continue;
                     }
-                    self.indexes.insert(name.to_ascii_lowercase(), IndexDef { table: table.to_ascii_lowercase(), columns: positions, unique });
+                    let order = self.index_sequence;
+                    self.index_sequence += 1;
+                    self.indexes.insert(
+                        name.to_ascii_lowercase(),
+                        IndexDef { name: name.clone(), table: table.to_ascii_lowercase(), columns: positions, unique, order },
+                    );
                 }
                 Some(Statement::CreateView { name, columns, query, .. }) => {
                     let key = name.to_ascii_lowercase();
@@ -2471,7 +2488,9 @@ impl Engine {
                 self.writer
                     .create_index_with_sql(&name, &table, &names, unique, Some(&sql))
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-index"))?;
-                self.indexes.insert(key, IndexDef { table: table_key, columns: positions, unique });
+                let order = self.index_sequence;
+                self.index_sequence += 1;
+                self.indexes.insert(key, IndexDef { name: name.clone(), table: table_key, columns: positions, unique, order });
                 Ok(ExecResult { statement: "create-index", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             Statement::Update { schema: _, table, alias, assignments, filter, returning } => {
@@ -2702,7 +2721,7 @@ impl Engine {
                     affected: plan.removed.len(),
                 })
             }
-            Statement::Pragma { schema: _, name, value } => {
+            Statement::Pragma { schema, name, value } => {
                 if name.eq_ignore_ascii_case("database_list") {
                     let mut rows = vec![vec![Cell::Integer(0), Cell::Text("main".to_string()), Cell::Text(String::new())]];
                     if self.temp_created {
@@ -2722,6 +2741,43 @@ impl Engine {
                         affected: 0,
                     });
                 }
+                let argument = value.unwrap_or_default();
+                match name.to_ascii_lowercase().as_str() {
+                    "table_info" => return pragma_table_info(self, schema.as_deref(), &argument, false),
+                    "table_xinfo" => return pragma_table_info(self, schema.as_deref(), &argument, true),
+                    "index_list" => return Ok(pragma_index_list(self, &argument)),
+                    "index_info" => return Ok(pragma_index_info(self, &argument)),
+                    "foreign_key_list" => return Ok(pragma_foreign_key_list(self, &argument)),
+                    "user_version" => {
+                        return Ok(match argument.is_empty() {
+                            false => {
+                                self.writer.set_user_version(argument.trim().parse::<i64>().unwrap_or(0));
+                                ExecResult { statement: "pragma", columns: Vec::new(), rows: Vec::new(), affected: 0 }
+                            }
+                            true => ExecResult {
+                                statement: "pragma",
+                                columns: vec!["user_version".to_string()],
+                                rows: vec![vec![Cell::Integer(self.writer.user_version())]],
+                                affected: 0,
+                            },
+                        });
+                    }
+                    "application_id" => {
+                        return Ok(match argument.is_empty() {
+                            false => {
+                                self.writer.set_application_id(argument.trim().parse::<i64>().unwrap_or(0));
+                                ExecResult { statement: "pragma", columns: Vec::new(), rows: Vec::new(), affected: 0 }
+                            }
+                            true => ExecResult {
+                                statement: "pragma",
+                                columns: vec!["application_id".to_string()],
+                                rows: vec![vec![Cell::Integer(self.writer.application_id())]],
+                                affected: 0,
+                            },
+                        });
+                    }
+                    _ => {}
+                }
                 let boolean = |text: &str| -> bool {
                     match text.to_ascii_lowercase().as_str() {
                         "on" | "true" | "yes" => true,
@@ -2733,27 +2789,29 @@ impl Engine {
                 if !name.eq_ignore_ascii_case("foreign_keys") && !recursive {
                     return Err(SqlError::new(
                         "unsupported-pragma",
-                        format!("unsupported pragma `{name}`; this engine supports `foreign_keys` and `recursive_triggers`"),
+                        format!(
+                            "unsupported pragma `{name}`; this engine supports `foreign_keys`, `recursive_triggers`, `table_info`, `table_xinfo`, `index_list`, `index_info`, `foreign_key_list`, `database_list`, `user_version` and `application_id`"
+                        ),
                     )
                     .in_clause("PRAGMA")
                     .in_statement("pragma"));
                 }
                 let flag = if recursive { &mut self.recursive_triggers } else { &mut self.foreign_keys };
-                match value {
-                    None => Ok(ExecResult {
+                if argument.is_empty() {
+                    Ok(ExecResult {
                         statement: "pragma",
                         columns: vec![name.clone()],
                         rows: vec![vec![Cell::Integer(i64::from(*flag))]],
                         affected: 0,
-                    }),
-                    Some(text) => {
-                        // SQLite reads the value as a boolean: `on` / `true`
-                        // / `yes` and any positive integer enable it, `off` /
-                        // `false` / `no` / zero and non-numeric text disable
-                        // it.
-                        *flag = boolean(&text);
-                        Ok(ExecResult { statement: "pragma", columns: Vec::new(), rows: Vec::new(), affected: 0 })
-                    }
+                    })
+                }
+                else {
+                    // SQLite reads the value as a boolean: `on` / `true`
+                    // / `yes` and any positive integer enable it, `off` /
+                    // `false` / `no` / zero and non-numeric text disable
+                    // it.
+                    *flag = boolean(&argument);
+                    Ok(ExecResult { statement: "pragma", columns: Vec::new(), rows: Vec::new(), affected: 0 })
                 }
             }
             Statement::DropTable { schema: _, name, if_exists } => {
@@ -8188,9 +8246,254 @@ fn resolve_foreign_keys(columns: &[ColumnSpec], keys: &[ForeignKey]) -> Result<V
             parent: key.parent.to_ascii_lowercase(),
             parent_display: key.parent.clone(),
             parent_columns: key.parent_columns.clone(),
+            on_delete: foreign_key_action_text(key.on_delete),
+            on_update: foreign_key_action_text(key.on_update),
         });
     }
     Ok(resolved)
+}
+
+/// Spells one referential action the way `PRAGMA foreign_key_list` reports it.
+fn foreign_key_action_text(action: ForeignKeyAction) -> String {
+    match action {
+        ForeignKeyAction::NoAction => "NO ACTION",
+        ForeignKeyAction::Restrict => "RESTRICT",
+        ForeignKeyAction::SetNull => "SET NULL",
+        ForeignKeyAction::SetDefault => "SET DEFAULT",
+        ForeignKeyAction::Cascade => "CASCADE",
+    }
+    .to_string()
+}
+
+/// Finds the table one `PRAGMA` refers to. An unqualified name searches the
+/// temp schema first, then `main`, matching SQLite's connection search order.
+fn pragma_table_def<'a>(engine: &'a Engine, schema: Option<&str>, name: &str) -> Option<&'a TableDef> {
+    let key = name.to_ascii_lowercase();
+    let wants_temp = schema.map_or(true, |slot| slot.eq_ignore_ascii_case("temp"));
+    let wants_main = schema.map_or(true, |slot| slot.eq_ignore_ascii_case("main"));
+    if wants_temp {
+        if let Some(position) = engine.temp_lookup.get(&key) {
+            return Some(&engine.temp_tables[*position].def);
+        }
+    }
+    if wants_main {
+        if let Some(position) = engine.table_lookup.get(&key) {
+            return Some(&engine.tables[*position]);
+        }
+    }
+    None
+}
+
+/// Finds the view one `PRAGMA` refers to, preferring the temp schema.
+fn pragma_view_def<'a>(engine: &'a Engine, schema: Option<&str>, name: &str) -> Option<&'a ViewDef> {
+    let key = name.to_ascii_lowercase();
+    let wants_temp = schema.map_or(true, |slot| slot.eq_ignore_ascii_case("temp"));
+    let wants_main = schema.map_or(true, |slot| slot.eq_ignore_ascii_case("main"));
+    if wants_temp {
+        if let Some(view) = engine.temp_views.get(&key) {
+            return Some(&view.def);
+        }
+    }
+    if wants_main {
+        if let Some(view) = engine.views.get(&key) {
+            return Some(view);
+        }
+    }
+    None
+}
+
+/// The declared type text `PRAGMA table_info` reports: SQLite normalises the
+/// four storage-class keywords to upper case and echoes everything else as it
+/// was written.
+fn pragma_declared_type(declared: &str) -> String {
+    let text = declared.trim();
+    match text.to_ascii_lowercase().as_str() {
+        "integer" | "text" | "real" | "blob" => text.to_ascii_uppercase(),
+        _ => text.to_string(),
+    }
+}
+
+/// Automatic indexes one table owns, in the writer's numbering order. Each
+/// entry is (suffix number, keyed column positions, `PRAGMA` origin).
+fn autoindex_definitions(def: &TableDef) -> Vec<(usize, Vec<usize>, &'static str)> {
+    let mut number = 0usize;
+    let mut definitions = Vec::new();
+    for (position, column) in def.columns.iter().enumerate() {
+        if (column.primary_key || column.unique) && def.rowid_alias != Some(position) {
+            number += 1;
+            definitions.push((number, vec![position], if column.primary_key { "pk" } else { "u" }));
+        }
+    }
+    if !def.primary_key.is_empty() && def.rowid_alias.is_none() {
+        number += 1;
+        definitions.push((number, def.primary_key.clone(), "pk"));
+    }
+    definitions
+}
+
+/// `PRAGMA table_info(t)` / `PRAGMA table_xinfo(t)`.
+fn pragma_table_info(engine: &Engine, schema: Option<&str>, table: &str, extended: bool) -> Result<ExecResult, SqlError> {
+    let mut columns = vec![
+        "cid".to_string(),
+        "name".to_string(),
+        "type".to_string(),
+        "notnull".to_string(),
+        "dflt_value".to_string(),
+        "pk".to_string(),
+    ];
+    if extended {
+        columns.push("hidden".to_string());
+    }
+    let mut rows = Vec::new();
+    if let Some(def) = pragma_table_def(engine, schema, table) {
+        let key_positions = def.primary_key_positions().unwrap_or_default();
+        for (position, column) in def.columns.iter().enumerate() {
+            let pk = key_positions.iter().position(|candidate| *candidate == position).map(|slot| slot as i64 + 1).unwrap_or(0);
+            let mut row = vec![
+                Cell::Integer(position as i64),
+                Cell::Text(column.name.clone()),
+                Cell::Text(pragma_declared_type(&column.declared_type)),
+                Cell::Integer(i64::from(column.not_null)),
+                column.default_text.clone().map(Cell::Text).unwrap_or(Cell::Null),
+                Cell::Integer(pk),
+            ];
+            if extended {
+                row.push(Cell::Integer(0));
+            }
+            rows.push(row);
+        }
+    }
+    else if let Some(view) = pragma_view_def(engine, schema, table) {
+        // SQLite infers a view column type from a plain column reference; this
+        // engine reports the output names with an empty type.
+        let (names, _) = engine.view_output(view)?;
+        for (position, name) in names.iter().enumerate() {
+            let mut row = vec![
+                Cell::Integer(position as i64),
+                Cell::Text(name.clone()),
+                Cell::Text(String::new()),
+                Cell::Integer(0),
+                Cell::Null,
+                Cell::Integer(0),
+            ];
+            if extended {
+                row.push(Cell::Integer(0));
+            }
+            rows.push(row);
+        }
+    }
+    Ok(ExecResult { statement: "pragma", columns, rows, affected: 0 })
+}
+
+/// `PRAGMA index_list(t)`: explicit indexes newest first, then the automatic
+/// constraint indexes in reverse numbering order.
+fn pragma_index_list(engine: &Engine, table: &str) -> ExecResult {
+    let key = table.to_ascii_lowercase();
+    let mut explicit: Vec<&IndexDef> = engine.indexes.values().filter(|index| index.table == key).collect();
+    explicit.sort_by(|left, right| right.order.cmp(&left.order));
+    let mut rows = Vec::new();
+    for index in explicit {
+        rows.push(vec![
+            Cell::Integer(rows.len() as i64),
+            Cell::Text(index.name.clone()),
+            Cell::Integer(i64::from(index.unique)),
+            Cell::Text("c".to_string()),
+            Cell::Integer(0),
+        ]);
+    }
+    if let Some(def) = pragma_table_def(engine, None, table) {
+        for (number, _, origin) in autoindex_definitions(def).into_iter().rev() {
+            rows.push(vec![
+                Cell::Integer(rows.len() as i64),
+                Cell::Text(format!("sqlite_autoindex_{}_{}", def.name, number)),
+                Cell::Integer(1),
+                Cell::Text(origin.to_string()),
+                Cell::Integer(0),
+            ]);
+        }
+    }
+    ExecResult {
+        statement: "pragma",
+        columns: vec!["seq".to_string(), "name".to_string(), "unique".to_string(), "origin".to_string(), "partial".to_string()],
+        rows,
+        affected: 0,
+    }
+}
+
+/// `PRAGMA index_info(i)`: `seqno`, `cid` and the column name of every key
+/// column, in key order.
+fn pragma_index_info(engine: &Engine, index: &str) -> ExecResult {
+    let mut rows = Vec::new();
+    if let Some(definition) = engine.indexes.get(&index.to_ascii_lowercase()) {
+        if let Some(def) = pragma_table_def(engine, None, &definition.table) {
+            for (seqno, position) in definition.columns.iter().enumerate() {
+                rows.push(vec![
+                    Cell::Integer(seqno as i64),
+                    Cell::Integer(*position as i64),
+                    Cell::Text(def.columns[*position].name.clone()),
+                ]);
+            }
+        }
+    }
+    else {
+        for def in engine.tables.iter().chain(engine.temp_tables.iter().map(|temp| &temp.def)) {
+            for (number, positions, _) in autoindex_definitions(def) {
+                if !format!("sqlite_autoindex_{}_{}", def.name, number).eq_ignore_ascii_case(index) {
+                    continue;
+                }
+                for (seqno, position) in positions.iter().enumerate() {
+                    rows.push(vec![
+                        Cell::Integer(seqno as i64),
+                        Cell::Integer(*position as i64),
+                        Cell::Text(def.columns[*position].name.clone()),
+                    ]);
+                }
+            }
+        }
+    }
+    ExecResult {
+        statement: "pragma",
+        columns: vec!["seqno".to_string(), "cid".to_string(), "name".to_string()],
+        rows,
+        affected: 0,
+    }
+}
+
+/// `PRAGMA foreign_key_list(t)`: SQLite prepends each new key, so the list is
+/// newest first.
+fn pragma_foreign_key_list(engine: &Engine, table: &str) -> ExecResult {
+    let mut rows = Vec::new();
+    if let Some(def) = pragma_table_def(engine, None, table) {
+        for (id, key) in def.foreign_keys.iter().rev().enumerate() {
+            for (seq, position) in key.columns.iter().enumerate() {
+                rows.push(vec![
+                    Cell::Integer(id as i64),
+                    Cell::Integer(seq as i64),
+                    Cell::Text(key.parent_display.clone()),
+                    Cell::Text(def.columns[*position].name.clone()),
+                    key.parent_columns.get(seq).map(|name| Cell::Text(name.clone())).unwrap_or(Cell::Null),
+                    Cell::Text(key.on_update.clone()),
+                    Cell::Text(key.on_delete.clone()),
+                    Cell::Text("NONE".to_string()),
+                ]);
+            }
+        }
+    }
+    ExecResult {
+        statement: "pragma",
+        columns: vec![
+            "id".to_string(),
+            "seq".to_string(),
+            "table".to_string(),
+            "from".to_string(),
+            "to".to_string(),
+            "on_update".to_string(),
+            "on_delete".to_string(),
+            "match".to_string(),
+        ],
+        rows,
+        affected: 0,
+    }
 }
 
 /// Whether one parsed expression mentions `column`; `qualifiers` restricts the

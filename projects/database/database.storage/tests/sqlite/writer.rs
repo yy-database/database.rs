@@ -14,6 +14,7 @@ fn column(name: &str, declared: &str) -> ColumnSpec {
         declared_type: declared.to_string(),
         not_null: false,
         default_value: None,
+        default_text: None,
         primary_key: false,
         unique: false,
         autoincrement: false,

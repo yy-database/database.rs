@@ -37,6 +37,9 @@ pub struct ColumnSpec {
     pub not_null: bool,
     /// Applied when the insert omits the column.
     pub default_value: Option<WriteValue>,
+    /// `DEFAULT` clause exactly as written, without the outer quotes of a
+    /// parenthesised expression; `PRAGMA table_info` echoes this text.
+    pub default_text: Option<String>,
     /// Single-column PRIMARY KEY.
     pub primary_key: bool,
     /// Single-column UNIQUE constraint.
@@ -1196,6 +1199,26 @@ impl SqliteWriter {
         self.rewrite_master_row(rowid, &name, &name, Some(sql))?;
         self.bump_cookie();
         Ok(())
+    }
+
+    /// Reads the `user_version` field at byte 60 of the database header.
+    pub fn user_version(&self) -> i64 {
+        i64::from(i32::from_be_bytes(self.pages[60..64].try_into().expect("header user version")))
+    }
+
+    /// Writes the `user_version` field at byte 60 of the database header.
+    pub fn set_user_version(&mut self, value: i64) {
+        self.pages[60..64].copy_from_slice(&(value as i32).to_be_bytes());
+    }
+
+    /// Reads the `application_id` field at byte 68 of the database header.
+    pub fn application_id(&self) -> i64 {
+        i64::from(i32::from_be_bytes(self.pages[68..72].try_into().expect("header application id")))
+    }
+
+    /// Writes the `application_id` field at byte 68 of the database header.
+    pub fn set_application_id(&mut self, value: i64) {
+        self.pages[68..72].copy_from_slice(&(value as i32).to_be_bytes());
     }
 
     /// Renames a table in the catalog: the table row, its `sql` text, the
@@ -3047,6 +3070,7 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
     let mut unique = false;
     let mut autoincrement = false;
     let mut default_value = None;
+    let mut default_text = None;
     while index < tokens.len() {
         let upper = tokens[index].to_ascii_uppercase();
         match upper.as_str() {
@@ -3074,6 +3098,7 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
             "DEFAULT" => {
                 let (value, consumed) = parse_literal(&tokens[index + 1..])?;
                 default_value = Some(value);
+                default_text = Some(tokens[index + 1..index + 1 + consumed].join(" "));
                 index += 1 + consumed;
             }
             "NULL" => {
@@ -3155,7 +3180,7 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
             _ => return Err(Error::Unsupported("sqlite column constraint unrecognized")),
         }
     }
-    Ok(ColumnSpec { name, declared_type, not_null, default_value, primary_key, unique, autoincrement })
+    Ok(ColumnSpec { name, declared_type, not_null, default_value, default_text, primary_key, unique, autoincrement })
 }
 
 fn require_keyword(tokens: &[String], index: usize, keyword: &str) -> Result<()> {
