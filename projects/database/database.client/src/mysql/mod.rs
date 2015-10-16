@@ -111,11 +111,7 @@ fn parse_mysql_url(url: &str) -> Result<(ClientConfig, SocketAddr)> {
     };
     let (host, port) = split_host_port(hostport)?;
     let database = database.map(decode).filter(|database| !database.is_empty());
-    let address = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(Error::Io)?
-        .next()
-        .ok_or(Error::Corrupt("mysql URL host did not resolve"))?;
+    let address = (host.as_str(), port).to_socket_addrs().map_err(Error::Io)?.next().ok_or(Error::Corrupt("mysql URL host did not resolve"))?;
     let user = if user.is_empty() { "root".to_owned() } else { user };
     let mut config = ClientConfig::new(host, port, user);
     if let Some(password) = password {

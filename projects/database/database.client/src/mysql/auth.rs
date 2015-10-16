@@ -74,13 +74,11 @@ pub(crate) fn rsa_encrypt(password: &str, nonce: &[u8], public_key_pem: &[u8]) -
     }
     let pem = std::str::from_utf8(public_key_pem)
         .map_err(|_| Error::Protocol { message: "caching_sha2_password public key is not valid UTF-8".into() })?;
-    let key = RsaPublicKey::from_public_key_pem(pem).map_err(|error| Error::Protocol {
-        message: format!("caching_sha2_password public key cannot be parsed: {error}"),
-    })?;
+    let key = RsaPublicKey::from_public_key_pem(pem)
+        .map_err(|error| Error::Protocol { message: format!("caching_sha2_password public key cannot be parsed: {error}") })?;
     let mut rng = rsa::rand_core::OsRng;
-    key.encrypt(&mut rng, Oaep::new::<sha1_rsa::Sha1>(), &plaintext).map_err(|error| Error::Protocol {
-        message: format!("caching_sha2_password RSA encryption failed: {error}"),
-    })
+    key.encrypt(&mut rng, Oaep::new::<sha1_rsa::Sha1>(), &plaintext)
+        .map_err(|error| Error::Protocol { message: format!("caching_sha2_password RSA encryption failed: {error}") })
 }
 
 #[cfg(test)]

@@ -17,7 +17,8 @@ fn cells(result: &QueryResult) -> Vec<&[Cell]> {
 
 #[test]
 fn live_mysql_caching_sha2_query_roundtrip() {
-    let Some(url) = url("MYSQL_TEST_URL") else {
+    let Some(url) = url("MYSQL_TEST_URL")
+    else {
         eprintln!("MYSQL_TEST_URL is not set, skipping the live MySQL smoke");
         return;
     };
@@ -25,12 +26,8 @@ fn live_mysql_caching_sha2_query_roundtrip() {
     session.ping().expect("ping");
 
     session.execute("DROP TABLE IF EXISTS smoke").expect("drop");
-    session
-        .execute("CREATE TABLE smoke (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL, note VARCHAR(64) NULL)")
-        .expect("create");
-    let inserted = session
-        .execute("INSERT INTO smoke VALUES (1, '中文', 'first'), (2, 'second', NULL)")
-        .expect("insert");
+    session.execute("CREATE TABLE smoke (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL, note VARCHAR(64) NULL)").expect("create");
+    let inserted = session.execute("INSERT INTO smoke VALUES (1, '中文', 'first'), (2, 'second', NULL)").expect("insert");
     assert_eq!(inserted, 2);
 
     let result = session.query("SELECT id, name, note FROM smoke ORDER BY id").expect("select");
@@ -50,7 +47,8 @@ fn live_mysql_caching_sha2_query_roundtrip() {
     assert_eq!(selected.rows, vec![vec![Cell::Bytes(b"changed".to_vec())]]);
 
     let missing = session.query("SELECT * FROM absent_table").expect_err("missing table");
-    let Error::Protocol { message } = missing else {
+    let Error::Protocol { message } = missing
+    else {
         panic!("expected a protocol error")
     };
     assert!(message.contains("1146"), "unexpected error message: {message}");
@@ -62,7 +60,8 @@ fn live_mysql_caching_sha2_query_roundtrip() {
 
 #[test]
 fn live_mysql_native_password_query_roundtrip() {
-    let Some(url) = url("MYSQL_TEST_NATIVE_URL") else {
+    let Some(url) = url("MYSQL_TEST_NATIVE_URL")
+    else {
         eprintln!("MYSQL_TEST_NATIVE_URL is not set, skipping the native-password smoke");
         return;
     };
