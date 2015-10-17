@@ -13,7 +13,7 @@ use std::{
 use database_protocol_mysql::MAX_PACKET_PAYLOAD;
 use database_types::{Error, Result};
 
-use super::{Cell, QueryResult, auth};
+use super::{Cell, ColumnInfo, Param, QueryResult, auth, mysql_type};
 
 /// Client-side connection settings resolved from the endpoint string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +66,13 @@ const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
 const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 
+/// `COM_STMT_PREPARE`.
+const COM_STMT_PREPARE: u8 = 0x16;
+/// `COM_STMT_EXECUTE`.
+const COM_STMT_EXECUTE: u8 = 0x17;
+/// `COM_STMT_CLOSE` (no server response).
+const COM_STMT_CLOSE: u8 = 0x19;
+
 /// `utf8mb4_general_ci`.
 const UTF8MB4_GENERAL_CI: u8 = 45;
 /// Advertised maximum packet size in the handshake response.
@@ -98,7 +105,115 @@ impl Connection {
         payload.push(0x03);
         payload.extend_from_slice(sql.as_bytes());
         self.write_packet(&payload)?;
-        self.read_result()
+        self.read_result(false)
+    }
+
+    /// Run one parameterised statement: prepare, execute, close.
+    ///
+    /// The statement is prepared per call so the adapter never has to hold
+    /// server-side handles, and closing runs even when execution failed.
+    pub fn query_with_params(&mut self, sql: &str, params: &[Param<'_>]) -> Result<QueryResult> {
+        let prepared = self.prepare(sql)?;
+        if params.len() != usize::from(prepared.parameter_count) {
+            let _ = self.close_prepared(prepared.id);
+            return Err(Error::Protocol {
+                message: format!("MySQL prepared statement expects {} parameters but {} were bound", prepared.parameter_count, params.len()),
+            });
+        }
+        let result = self.execute_prepared(prepared.id, params);
+        let closed = self.close_prepared(prepared.id);
+        result.and_then(|result| closed.map(|_| result))
+    }
+
+    /// `COM_STMT_PREPARE`: consume the parameter and column definitions so the
+    /// connection is positioned for `COM_STMT_EXECUTE`.
+    fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
+        self.next_sequence = 0;
+        let mut payload = Vec::with_capacity(sql.len() + 1);
+        payload.push(COM_STMT_PREPARE);
+        payload.extend_from_slice(sql.as_bytes());
+        self.write_packet(&payload)?;
+
+        let response = self.read_packet()?;
+        match response.first().copied() {
+            Some(0xff) => return Err(server_error(&response)),
+            Some(0x00) => {}
+            _ => return Err(Error::Protocol { message: "MySQL prepare response is not an OK packet".into() }),
+        }
+        let mut offset = 1;
+        let id = read_u32(&response, &mut offset)?;
+        let column_count = read_u16(&response, &mut offset)?;
+        let parameter_count = read_u16(&response, &mut offset)?;
+
+        for _ in 0..parameter_count {
+            self.read_packet()?;
+        }
+        if parameter_count > 0 && !is_eof(&self.read_packet()?) {
+            return Err(Error::Protocol { message: "MySQL parameter definitions did not end with EOF".into() });
+        }
+        for _ in 0..column_count {
+            self.read_packet()?;
+        }
+        if column_count > 0 && !is_eof(&self.read_packet()?) {
+            return Err(Error::Protocol { message: "MySQL prepared column definitions did not end with EOF".into() });
+        }
+        Ok(PreparedStatement { id, parameter_count })
+    }
+
+    /// `COM_STMT_EXECUTE` with the parameter block bound once.
+    fn execute_prepared(&mut self, id: u32, params: &[Param<'_>]) -> Result<QueryResult> {
+        self.next_sequence = 0;
+        let mut payload = Vec::with_capacity(16 + params.len() * 8);
+        payload.push(COM_STMT_EXECUTE);
+        payload.extend_from_slice(&id.to_le_bytes());
+        payload.push(0); // no cursor
+        payload.extend_from_slice(&1u32.to_le_bytes()); // iteration count
+
+        if !params.is_empty() {
+            let bitmap_len = params.len().div_ceil(8);
+            let mut null_bitmap = vec![0u8; bitmap_len];
+            for (index, param) in params.iter().enumerate() {
+                if param.is_null() {
+                    null_bitmap[index / 8] |= 1 << (index % 8);
+                }
+            }
+            payload.extend_from_slice(&null_bitmap);
+            payload.push(1); // parameter types are bound in this packet
+            for param in params {
+                payload.push(param.type_code());
+                payload.push(0); // not unsigned
+            }
+            for param in params {
+                match param {
+                    Param::Text(None) => {}
+                    Param::Text(Some(value)) => {
+                        push_lenenc(&mut payload, value.len());
+                        payload.extend_from_slice(value.as_bytes());
+                    }
+                    Param::Binary(value) => {
+                        push_lenenc(&mut payload, value.len());
+                        payload.extend_from_slice(value);
+                    }
+                }
+            }
+        }
+
+        self.write_packet(&payload)?;
+        self.read_result(true)
+    }
+
+    /// `COM_STMT_CLOSE`; the server sends no reply.
+    fn close_prepared(&mut self, id: u32) -> Result<()> {
+        self.next_sequence = 0;
+        let mut payload = Vec::with_capacity(5);
+        payload.push(COM_STMT_CLOSE);
+        payload.extend_from_slice(&id.to_le_bytes());
+        let result = self.write_packet(&payload);
+        // A closed connection cannot be recovered into a reusable session.
+        if result.is_err() {
+            return result;
+        }
+        Ok(())
     }
 
     /// Send the startup response and drive authentication to completion.
@@ -218,8 +333,12 @@ impl Connection {
         Ok(())
     }
 
-    /// Read one command response: OK, ERR or a text result set.
-    fn read_result(&mut self) -> Result<QueryResult> {
+    /// Read one command response: OK, ERR or a result set.
+    ///
+    /// `binary` marks the `COM_STMT_EXECUTE` row encoding; the column
+    /// definitions are parsed into [`ColumnInfo`] in both protocols so callers
+    /// can restore declared types.
+    fn read_result(&mut self, binary: bool) -> Result<QueryResult> {
         let first = self.read_packet()?;
         let Some(header) = first.first().copied()
         else {
@@ -228,8 +347,8 @@ impl Connection {
         match header {
             0xff => Err(server_error(&first)),
             0x00 => {
-                let (affected_rows, _insert_id, _status, _warnings) = parse_ok(&first)?;
-                Ok(QueryResult { affected_rows, ..QueryResult::default() })
+                let (affected_rows, insert_id, _status, _warnings) = parse_ok(&first)?;
+                Ok(QueryResult { affected_rows, insert_id, ..QueryResult::default() })
             }
             0xfb => Err(Error::Unsupported("MySQL LOCAL INFILE is not supported")),
             _ => {
@@ -238,15 +357,16 @@ impl Connection {
                 if count == 0 {
                     return Err(Error::Corrupt("MySQL result set has zero columns"));
                 }
-                let mut columns = Vec::with_capacity(count);
+                let mut column_info = Vec::with_capacity(count);
                 for _ in 0..count {
                     let definition = self.read_packet()?;
-                    columns.push(column_name(&definition)?);
+                    column_info.push(parse_column(&definition)?);
                 }
                 let terminator = self.read_packet()?;
                 if !is_eof(&terminator) {
                     return Err(Error::Protocol { message: "MySQL column definitions did not end with EOF".into() });
                 }
+                let columns = column_info.iter().map(|column| column.name.clone()).collect();
                 let mut rows = Vec::new();
                 loop {
                     let packet = self.read_packet()?;
@@ -256,12 +376,18 @@ impl Connection {
                     if is_eof(&packet) {
                         break;
                     }
-                    rows.push(parse_row(&packet, count)?);
+                    rows.push(if binary { parse_binary_row(&packet, &column_info)? } else { parse_row(&packet, count)? });
                 }
-                Ok(QueryResult { columns, rows, ..QueryResult::default() })
+                Ok(QueryResult { columns, column_info, rows, ..QueryResult::default() })
             }
         }
     }
+}
+
+/// Handle returned by `COM_STMT_PREPARE`.
+struct PreparedStatement {
+    id: u32,
+    parameter_count: u16,
 }
 
 /// Parsed `Initial Handshake Packet`.
@@ -339,6 +465,11 @@ fn read_u16(payload: &[u8], offset: &mut usize) -> Result<u16> {
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
+fn read_u32(payload: &[u8], offset: &mut usize) -> Result<u32> {
+    let bytes = take(payload, offset, 4)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 fn split_switch_request(payload: &[u8]) -> Result<(String, &[u8])> {
     let end = payload.iter().position(|byte| *byte == 0).ok_or(Error::Corrupt("MySQL auth switch has no plugin name"))?;
     let name = String::from_utf8_lossy(&payload[..end]).into_owned();
@@ -396,6 +527,25 @@ fn lenenc(payload: &[u8], offset: &mut usize) -> Result<Option<u64>> {
     }
 }
 
+/// Append a length-encoded integer (values below `0xfb` fit one byte).
+fn push_lenenc(payload: &mut Vec<u8>, value: usize) {
+    if value < 0xfb {
+        payload.push(value as u8);
+    }
+    else if value <= 0xffff {
+        payload.push(0xfc);
+        payload.extend_from_slice(&(value as u16).to_le_bytes());
+    }
+    else if value <= 0x00ff_ffff {
+        payload.push(0xfd);
+        payload.extend_from_slice(&(value as u32).to_le_bytes()[..3]);
+    }
+    else {
+        payload.push(0xfe);
+        payload.extend_from_slice(&(value as u64).to_le_bytes());
+    }
+}
+
 fn lenenc_usize(payload: &[u8], offset: &mut usize) -> Result<Option<usize>> {
     let value = lenenc(payload, offset)?;
     Ok(match value {
@@ -420,22 +570,162 @@ fn is_eof(payload: &[u8]) -> bool {
     payload.first() == Some(&0xfe) && payload.len() < 9
 }
 
-fn column_name(payload: &[u8]) -> Result<String> {
+/// Parse one column definition packet
+/// (`ColumnDefinition41`) into its label and declared shape.
+fn parse_column(payload: &[u8]) -> Result<ColumnInfo> {
     let mut offset = 0;
     let mut name = String::new();
     for index in 0..6 {
-        let value = lenenc(payload, &mut offset)?.ok_or(Error::Corrupt("MySQL column definition has a NULL string"))? as usize;
+        let value = lenenc_usize(payload, &mut offset)?.ok_or(Error::Corrupt("MySQL column definition has a NULL string"))?;
         let bytes = take(payload, &mut offset, value)?;
         if index == 4 {
             name = String::from_utf8_lossy(bytes).into_owned();
         }
     }
-    let fixed_len = lenenc(payload, &mut offset)?.ok_or(Error::Corrupt("MySQL column definition lacks fixed fields"))?;
+    let fixed_len = lenenc_usize(payload, &mut offset)?.ok_or(Error::Corrupt("MySQL column definition lacks fixed fields"))?;
     if fixed_len != 12 {
         return Err(Error::Corrupt("MySQL column definition fixed fields are not 12 bytes"));
     }
-    take(payload, &mut offset, 12)?;
-    Ok(name)
+    let charset = read_u16(payload, &mut offset)?;
+    let column_length = read_u32(payload, &mut offset)?;
+    let type_code = read_u8(payload, &mut offset)?;
+    let flags = read_u16(payload, &mut offset)?;
+    let _decimals = read_u8(payload, &mut offset)?;
+    take(payload, &mut offset, 2)?;
+    Ok(ColumnInfo { name, type_code, flags, charset, column_length })
+}
+
+/// Decode one `COM_STMT_EXECUTE` binary row.
+///
+/// Layout: `0x00` marker, a null bitmap offset by two bits, then one payload
+/// per non-null column. Values are widened into [`Cell::Bytes`] text the way
+/// the text protocol would show them; raw octets stay raw for binary columns.
+fn parse_binary_row(payload: &[u8], columns: &[ColumnInfo]) -> Result<Vec<Cell>> {
+    if payload.first() != Some(&0x00) {
+        return Err(Error::Corrupt("MySQL binary row does not start with 0x00"));
+    }
+    let mut offset = 1;
+    let bitmap_len = (columns.len() + 2).div_ceil(8);
+    let bitmap = take(payload, &mut offset, bitmap_len)?.to_vec();
+    let mut row = Vec::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        let bit = index + 2;
+        if bitmap[bit / 8] & (1 << (bit % 8)) != 0 {
+            row.push(Cell::Null);
+            continue;
+        }
+        row.push(decode_binary_value(payload, &mut offset, column)?);
+    }
+    if offset != payload.len() {
+        return Err(Error::Corrupt("MySQL binary row has trailing bytes"));
+    }
+    Ok(row)
+}
+
+fn decode_binary_value(payload: &[u8], offset: &mut usize, column: &ColumnInfo) -> Result<Cell> {
+    let unsigned = column.unsigned();
+    match column.type_code {
+        mysql_type::TINY => {
+            let value = if unsigned { i64::from(read_u8(payload, offset)?) } else { i64::from(read_u8(payload, offset)? as i8) };
+            Ok(Cell::Bytes(value.to_string().into_bytes()))
+        }
+        mysql_type::SHORT | mysql_type::YEAR => {
+            let value = if unsigned { i64::from(read_u16(payload, offset)?) } else { i64::from(read_u16(payload, offset)? as i16) };
+            Ok(Cell::Bytes(value.to_string().into_bytes()))
+        }
+        mysql_type::LONG | mysql_type::INT24 => {
+            let value = if unsigned { i64::from(read_u32(payload, offset)?) } else { i64::from(read_u32(payload, offset)? as i32) };
+            Ok(Cell::Bytes(value.to_string().into_bytes()))
+        }
+        mysql_type::LONGLONG => {
+            let bytes = take(payload, offset, 8)?;
+            let mut buffer = [0u8; 8];
+            buffer.copy_from_slice(bytes);
+            let value = if unsigned { (u64::from_le_bytes(buffer)).to_string() } else { i64::from_le_bytes(buffer).to_string() };
+            Ok(Cell::Bytes(value.into_bytes()))
+        }
+        mysql_type::FLOAT => {
+            let bytes = take(payload, offset, 4)?;
+            let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            if !value.is_finite() {
+                return Err(Error::Corrupt("MySQL binary row carries a non-finite float"));
+            }
+            Ok(Cell::Bytes(value.to_string().into_bytes()))
+        }
+        mysql_type::DOUBLE => {
+            let bytes = take(payload, offset, 8)?;
+            let mut buffer = [0u8; 8];
+            buffer.copy_from_slice(bytes);
+            let value = f64::from_le_bytes(buffer);
+            if !value.is_finite() {
+                return Err(Error::Corrupt("MySQL binary row carries a non-finite double"));
+            }
+            Ok(Cell::Bytes(value.to_string().into_bytes()))
+        }
+        mysql_type::NULL => Ok(Cell::Null),
+        mysql_type::DATE | mysql_type::NEWDATE => Ok(Cell::Bytes(read_binary_date(payload, offset)?.into_bytes())),
+        mysql_type::DATETIME | mysql_type::DATETIME2 | mysql_type::TIMESTAMP | mysql_type::TIMESTAMP2 => {
+            Ok(Cell::Bytes(read_binary_datetime(payload, offset)?.into_bytes()))
+        }
+        mysql_type::TIME | mysql_type::TIME2 => Ok(Cell::Bytes(read_binary_time(payload, offset)?.into_bytes())),
+        _ => {
+            let length = lenenc_usize(payload, offset)?.ok_or(Error::Corrupt("MySQL binary value is NULL without a bitmap bit"))?;
+            Ok(Cell::Bytes(take(payload, offset, length)?.to_vec()))
+        }
+    }
+}
+
+fn read_binary_date(payload: &[u8], offset: &mut usize) -> Result<String> {
+    let length = lenenc_usize(payload, offset)?.ok_or(Error::Corrupt("MySQL binary DATE is NULL without a bitmap bit"))?;
+    if length == 0 {
+        return Ok("0000-00-00".into());
+    }
+    let year = read_u16(payload, offset)?;
+    let month = read_u8(payload, offset)?;
+    let day = read_u8(payload, offset)?;
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn read_binary_datetime(payload: &[u8], offset: &mut usize) -> Result<String> {
+    let length = lenenc_usize(payload, offset)?.ok_or(Error::Corrupt("MySQL binary DATETIME is NULL without a bitmap bit"))?;
+    if length == 0 {
+        return Ok("0000-00-00 00:00:00".into());
+    }
+    let year = read_u16(payload, offset)?;
+    let month = read_u8(payload, offset)?;
+    let day = read_u8(payload, offset)?;
+    if length == 4 {
+        return Ok(format!("{year:04}-{month:02}-{day:02}"));
+    }
+    let hour = read_u8(payload, offset)?;
+    let minute = read_u8(payload, offset)?;
+    let second = read_u8(payload, offset)?;
+    if length >= 11 {
+        Ok(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{:06}", read_u32(payload, offset)?))
+    }
+    else {
+        Ok(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"))
+    }
+}
+
+fn read_binary_time(payload: &[u8], offset: &mut usize) -> Result<String> {
+    let length = lenenc_usize(payload, offset)?.ok_or(Error::Corrupt("MySQL binary TIME is NULL without a bitmap bit"))?;
+    if length == 0 {
+        return Ok("00:00:00".into());
+    }
+    let negative = read_u8(payload, offset)? != 0;
+    let days = read_u32(payload, offset)?;
+    let hours = read_u8(payload, offset)?;
+    let minutes = read_u8(payload, offset)?;
+    let seconds = read_u8(payload, offset)?;
+    let sign = if negative { "-" } else { "" };
+    let total_hours = days * 24 + u32::from(hours);
+    if length >= 12 {
+        Ok(format!("{sign}{total_hours:03}:{minutes:02}:{seconds:02}.{:06}", read_u32(payload, offset)?))
+    }
+    else {
+        Ok(format!("{sign}{total_hours:03}:{minutes:02}:{seconds:02}"))
+    }
 }
 
 fn parse_row(payload: &[u8], columns: usize) -> Result<Vec<Cell>> {
@@ -491,6 +781,74 @@ mod tests {
     fn a_row_keeps_null_and_empty_cells_distinct() {
         let row = parse_row(&[0xfb, 0x00], 2).expect("row");
         assert_eq!(row, vec![Cell::Null, Cell::Bytes(Vec::new())]);
+    }
+
+    fn column(name: &str, type_code: u8, flags: u16, charset: u16) -> ColumnInfo {
+        ColumnInfo { name: name.into(), type_code, flags, charset, column_length: 255 }
+    }
+
+    #[test]
+    fn a_column_definition_keeps_type_flags_and_charset() {
+        let mut payload = Vec::new();
+        for value in ["def", "app", "t", "t", "id", "id"] {
+            payload.push(value.len() as u8);
+            payload.extend_from_slice(value.as_bytes());
+        }
+        payload.push(0x0c);
+        payload.extend_from_slice(&45u16.to_le_bytes());
+        payload.extend_from_slice(&11u32.to_le_bytes());
+        payload.push(mysql_type::LONG);
+        payload.extend_from_slice(&0x0021u16.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&[0u8; 2]);
+        let parsed = parse_column(&payload).expect("column");
+        assert_eq!(parsed.name, "id");
+        assert_eq!(parsed.type_code, mysql_type::LONG);
+        assert_eq!(parsed.charset, 45);
+        assert_eq!(parsed.column_length, 11);
+        assert!(parsed.unsigned());
+        assert!(!parsed.binary());
+    }
+
+    #[test]
+    fn binary_rows_decode_ints_text_and_null_bits() {
+        let columns = [
+            column("id", mysql_type::LONG, 0x0020, 63),
+            column("name", mysql_type::VAR_STRING, 0, 45),
+            column("gone", mysql_type::LONG, 0, 63),
+        ];
+        // Three columns need one bitmap byte; index 2 sets bit 2 + 2 = 4.
+        let payload = [0x00, 0x10, 0x2a, 0x00, 0x00, 0x00, 0x03, b'b', b'o', b'b'];
+        let row = parse_binary_row(&payload, &columns).expect("row");
+        assert_eq!(row, vec![Cell::Bytes(b"42".to_vec()), Cell::Bytes(b"bob".to_vec()), Cell::Null]);
+    }
+
+    #[test]
+    fn binary_rows_decode_unsigned_bigints() {
+        let columns = [column("n", mysql_type::LONGLONG, 0x0020, 63)];
+        let mut payload = vec![0x00, 0x00];
+        payload.extend_from_slice(&u64::MAX.to_le_bytes());
+        let row = parse_binary_row(&payload, &columns).expect("row");
+        assert_eq!(row, vec![Cell::Bytes(b"18446744073709551615".to_vec())]);
+    }
+
+    #[test]
+    fn binary_rows_decode_dates_and_times() {
+        let date = column("d", mysql_type::DATE, 0, 63);
+        let payload = [0x00, 0x00, 0x04, 0xe8, 0x07, 0x01, 0x02];
+        let row = parse_binary_row(&payload, std::slice::from_ref(&date)).expect("row");
+        assert_eq!(row, vec![Cell::Bytes(b"2024-01-02".to_vec())]);
+
+        let time = column("t", mysql_type::TIME, 0, 63);
+        let payload = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03];
+        let row = parse_binary_row(&payload, std::slice::from_ref(&time)).expect("row");
+        assert_eq!(row, vec![Cell::Bytes(b"001:02:03".to_vec())]);
+    }
+
+    #[test]
+    fn binary_rows_reject_a_missing_marker() {
+        let columns = [column("id", mysql_type::LONG, 0, 63)];
+        assert!(parse_binary_row(&[0x01, 0x00, 0, 0, 0, 0], &columns).is_err());
     }
 
     #[test]
