@@ -1,8 +1,8 @@
 //! Phase 4: MySQL foreign adapter — offline + optional live tests.
 //!
-//! Live tests speak the YYDS MySQL gateway wire client (`Session`), never the
-//! third-party `mysql` crate. Until handshake / COM_QUERY land, live paths skip
-//! when the client returns `Unsupported`.
+//! Live tests speak the MySQL wire client (`Session`), never the third-party
+//! `mysql` crate. They skip only when no server URL is configured or the
+//! server cannot be reached.
 
 use database_query::ir::RealizationClass;
 use odm_adapter::adapter_mysql::{BACKEND_ID, MysqlSource, adopt_plan, classify_type};
@@ -197,6 +197,34 @@ fn live_managed_push_crud_txn_drift_and_pool() {
     let rows = db.execute_plan(&plan).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("user_name"), Some(&Value::Str("alice".into())));
+
+    // Write plans: MySQL has no RETURNING, so Insert re-queries the new row and
+    // Patch reads its target rows before the update.
+    let new_id = "dddddddd-eeee-ffff-0000-111111111111";
+    let insert_plan = Planner::new(MysqlSource::capabilities())
+        .plan_source(&format!(r#"User::insert({{ user_id: "{new_id}", user_name: "carol", active: true }})"#))
+        .unwrap();
+    let rows = db.execute_plan(&insert_plan).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("user_id"), Some(&Value::Str(new_id.into())));
+    assert_eq!(rows[0].get("user_name"), Some(&Value::Str("carol".into())));
+    assert_eq!(rows[0].get("active"), Some(&Value::Bool(true)));
+
+    let patch_plan = Planner::new(MysqlSource::capabilities())
+        .plan_source(&format!(r#"User.filter(x => x.user_id == "{new_id}").patch({{ user_name: "carol2" }})"#))
+        .unwrap();
+    let rows = db.execute_plan(&patch_plan).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("user_name"), Some(&Value::Str("carol2".into())));
+
+    let read_id =
+        Planner::new(MysqlSource::capabilities()).plan_source(&format!(r#"User.filter(x => x.user_id == "{new_id}").collect()"#)).unwrap();
+    assert_eq!(db.execute_plan(&read_id).unwrap()[0].get("user_name"), Some(&Value::Str("carol2".into())));
+
+    let delete_plan =
+        Planner::new(MysqlSource::capabilities()).plan_source(&format!(r#"User.filter(x => x.user_id == "{new_id}").delete()"#)).unwrap();
+    assert!(db.execute_plan(&delete_plan).unwrap().is_empty());
+    assert!(db.execute_plan(&read_id).unwrap().is_empty());
 
     let n = db
         .update(&RowWrite {

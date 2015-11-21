@@ -8,6 +8,26 @@ use crate::{Error, Result};
 
 use super::{ADAPTER_VERSION, BACKEND_ID};
 
+/// Whether the server folds table-name case on disk.
+///
+/// `lower_case_table_names = 1` (the Windows default) stores `User` as `user`,
+/// so drift must compare table names case-insensitively to see the table the
+/// managed push created.
+pub(crate) fn names_are_folded(session: &mut Session) -> Result<bool> {
+    let result = session.query("SELECT @@lower_case_table_names").map_err(Error::Wire)?;
+    let folded =
+        result.rows.first().and_then(|row| row.first()).and_then(|cell| cell_text(Some(cell))).and_then(|text| text.trim().parse::<u8>().ok());
+    Ok(folded.map(|value| value != 0).unwrap_or(false))
+}
+
+fn table_matches(left: &str, right: &str, folded: bool) -> bool {
+    if folded { left.eq_ignore_ascii_case(right) } else { left == right }
+}
+
+pub(crate) fn find_table<'a>(catalog: &'a ObservedCatalog, name: &str, folded: bool) -> Option<&'a ObservedTable> {
+    catalog.tables.iter().find(|table| table_matches(&table.name, name, folded))
+}
+
 pub(crate) fn inspect_catalog(session: &mut Session) -> Result<ObservedCatalog> {
     let result = session
         .query(
@@ -58,10 +78,14 @@ fn cell_text(cell: Option<&Cell>) -> Option<String> {
 
 /// Build a reviewable adopt mapping; never invents VOS business names from SQL.
 pub fn adopt_plan(document: &SchemaProjection, catalog: &ObservedCatalog) -> MappingManifest {
+    adopt_plan_with_case(document, catalog, false)
+}
+
+pub(crate) fn adopt_plan_with_case(document: &SchemaProjection, catalog: &ObservedCatalog, folded: bool) -> MappingManifest {
     let mut tables = Vec::new();
     for table in document.types.iter().filter(|item| item.kind == TypeContractKind::Table) {
         let name = table_name(table);
-        let Some(observed) = catalog.table(name)
+        let Some(observed) = find_table(catalog, name, folded)
         else {
             tables.push(TableMapping {
                 vos_table: name.to_owned(),
@@ -111,18 +135,18 @@ pub fn adopt_plan(document: &SchemaProjection, catalog: &ObservedCatalog) -> Map
     MappingManifest { adapter_id: BACKEND_ID.into(), adapter_version: ADAPTER_VERSION.into(), tables }
 }
 
-pub(crate) fn drift_report(document: &SchemaProjection, catalog: &ObservedCatalog) -> DriftReport {
+pub(crate) fn drift_report(document: &SchemaProjection, catalog: &ObservedCatalog, folded: bool) -> DriftReport {
     let vos_tables: Vec<String> =
         document.types.iter().filter(|item| item.kind == TypeContractKind::Table).map(|item| table_name(item).to_owned()).collect();
     let physical: Vec<String> = catalog.tables.iter().map(|t| t.name.clone()).collect();
 
-    let missing_physical_tables = vos_tables.iter().filter(|t| !physical.iter().any(|p| p == *t)).cloned().collect();
-    let extra_physical_tables = physical.iter().filter(|p| !vos_tables.iter().any(|t| t == *p)).cloned().collect();
+    let missing_physical_tables = vos_tables.iter().filter(|t| !physical.iter().any(|p| table_matches(t, p, folded))).cloned().collect();
+    let extra_physical_tables = physical.iter().filter(|p| !vos_tables.iter().any(|t| table_matches(t, p, folded))).cloned().collect();
 
     let mut field_mismatches = Vec::new();
     for table in document.types.iter().filter(|item| item.kind == TypeContractKind::Table) {
         let name = table_name(table);
-        let Some(obs) = catalog.table(name)
+        let Some(obs) = find_table(catalog, name, folded)
         else {
             continue;
         };
