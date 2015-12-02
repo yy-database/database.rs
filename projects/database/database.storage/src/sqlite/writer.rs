@@ -110,6 +110,11 @@ struct TableMeta {
     columns: Vec<ColumnSpec>,
     rowid_alias: Option<usize>,
     without_rowid: bool,
+    /// Record layout of a WITHOUT ROWID table: position in the stored record
+    /// to declared column position. SQLite stores the primary-key columns
+    /// first and the remaining columns in declaration order, so a key declared
+    /// after other columns still leads the record.
+    without_rowid_layout: Vec<usize>,
     /// The rowid alias is declared `AUTOINCREMENT`.
     autoincrement: bool,
     primary_key_len: usize,
@@ -222,7 +227,16 @@ impl SqliteWriter {
             }
             else if row.kind == "table" && row.sql.as_deref().is_some_and(is_without_rowid) {
                 let sql = row.sql.as_deref().unwrap_or_default();
-                let width = parse_primary_key_columns(sql)?.len();
+                let table_keys = find_primary_key_columns(sql)?.unwrap_or_default();
+                let width = if table_keys.is_empty() {
+                    parse_create_table(sql)?.iter().filter(|column| column.primary_key).count()
+                }
+                else {
+                    table_keys.len()
+                };
+                if width == 0 {
+                    return Err(Error::Corrupt("sqlite WITHOUT ROWID table has no primary key"));
+                }
                 let entries = writer.read_index_entries(row.root_page)?;
                 let mut keys = std::collections::BTreeSet::new();
                 for payload in &entries {
@@ -474,6 +488,7 @@ impl SqliteWriter {
             columns: columns.to_vec(),
             rowid_alias,
             without_rowid: false,
+            without_rowid_layout: Vec::new(),
             autoincrement: columns.iter().any(|column| column.autoincrement),
             primary_key_len: 0,
             indexes: Vec::new(),
@@ -564,10 +579,24 @@ impl SqliteWriter {
         Ok(())
     }
 
-    /// Creates a WITHOUT ROWID table whose primary key leads the declared
-    /// columns. Rows are stored in the primary-key index b-tree rooted at the
-    /// schema `rootpage`, which is what external readers walk.
+    /// Creates a WITHOUT ROWID table. Rows are stored in the primary-key
+    /// index b-tree rooted at the schema `rootpage`, which is what external
+    /// readers walk. SQLite stores the key columns first in each record, so a
+    /// key declared after other columns still leads the stored record.
     pub fn create_table_without_rowid(&mut self, name: &str, columns: &[ColumnSpec], primary_key: &[String]) -> Result<()> {
+        self.create_table_without_rowid_sql(name, columns, primary_key, None)
+    }
+
+    /// Same as [`SqliteWriter::create_table_without_rowid`], but stores `sql`
+    /// verbatim as the `sqlite_master.sql` text, matching the statement as
+    /// written.
+    pub fn create_table_without_rowid_sql(
+        &mut self,
+        name: &str,
+        columns: &[ColumnSpec],
+        primary_key: &[String],
+        sql: Option<&str>,
+    ) -> Result<()> {
         if primary_key.is_empty() {
             return Err(Error::Unsupported("sqlite WITHOUT ROWID table needs a PRIMARY KEY"));
         }
@@ -575,19 +604,15 @@ impl SqliteWriter {
             return Err(Error::Unsupported("sqlite WITHOUT ROWID primary key exceeds the column list"));
         }
         for (position, key) in primary_key.iter().enumerate() {
-            if !columns[position].name.eq_ignore_ascii_case(key) {
-                return Err(Error::Unsupported("sqlite WITHOUT ROWID primary key must lead the declared columns"));
+            if !columns.iter().any(|column| column.name.eq_ignore_ascii_case(key)) {
+                return Err(Error::Unsupported("sqlite WITHOUT ROWID primary key references unknown column"));
+            }
+            if primary_key[..position].iter().any(|existing| existing.eq_ignore_ascii_case(key)) {
+                return Err(Error::Unsupported("sqlite WITHOUT ROWID primary key repeats a column"));
             }
         }
-        let mut keyed: Vec<ColumnSpec> = Vec::with_capacity(columns.len());
-        for (position, column) in columns.iter().enumerate() {
-            let mut column = column.clone();
-            if position < primary_key.len() {
-                column.not_null = true;
-                column.primary_key = false;
-                column.unique = false;
-            }
-            keyed.push(column);
+        if columns.iter().filter(|column| column.primary_key).count() > 1 {
+            return Err(Error::Unsupported("sqlite table has more than one primary key"));
         }
         if columns.iter().any(|column| column.unique) {
             return Err(Error::Unsupported("sqlite UNIQUE columns on WITHOUT ROWID tables are not supported"));
@@ -603,8 +628,9 @@ impl SqliteWriter {
 
         let root_page = self.allocate_page()?;
         self.init_leaf_page(root_page, PAGE_INDEX_LEAF);
-        let sql = render_create_table_without_rowid(name, &keyed, primary_key);
-        let master_rowid = self.insert_master_row("table", name, name, root_page, Some(&sql))?;
+        let rendered = render_create_table_without_rowid(name, columns, primary_key);
+        let sql = sql.unwrap_or(&rendered);
+        let master_rowid = self.insert_master_row("table", name, name, root_page, Some(sql))?;
         self.without_rowid_entries.insert(master_rowid, std::collections::BTreeSet::new());
         self.without_rowid_keys.insert(master_rowid, std::collections::BTreeSet::new());
         self.bump_cookie();
@@ -626,14 +652,83 @@ impl SqliteWriter {
             }
             resolved.push(value);
         }
-        let payload = encode_record(&resolved, self.encoding);
-        let key = encode_record(&resolved[..meta.primary_key_len], self.encoding);
+        if meta.primary_key_len == 0 || meta.without_rowid_layout.len() != resolved.len() {
+            return Err(Error::Corrupt("sqlite WITHOUT ROWID record layout is incomplete"));
+        }
+        let mut layout_values: Vec<WriteValue> = Vec::with_capacity(resolved.len());
+        for position in &meta.without_rowid_layout {
+            layout_values.push(resolved[*position].clone());
+        }
+        let payload = encode_record(&layout_values, self.encoding);
+        let key = encode_record(&layout_values[..meta.primary_key_len], self.encoding);
         let unique = self.without_rowid_keys.entry(meta.master_rowid).or_default().insert(key);
         if !unique {
             return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
         }
         self.without_rowid_entries.entry(meta.master_rowid).or_default().insert(payload);
         Ok(0)
+    }
+
+    /// Deletes one WITHOUT ROWID row identified by its declared column values.
+    /// Returns whether the row was present.
+    pub fn delete_without_rowid(&mut self, table: &str, values: &[WriteValue]) -> Result<bool> {
+        let meta = self.table_meta(table)?;
+        if !meta.without_rowid {
+            return Err(Error::Unsupported("sqlite table is not WITHOUT ROWID"));
+        }
+        let (key, payload) = without_rowid_key_payload(&meta, values, self.encoding)?;
+        let entries = self.without_rowid_entries.entry(meta.master_rowid).or_default();
+        let removed = if entries.remove(&payload) {
+            true
+        }
+        else {
+            // A record written before `ALTER TABLE ADD COLUMN` is short; match
+            // it by its primary-key prefix instead of its full encoding.
+            let found = entries
+                .iter()
+                .find(|entry| record_prefix(entry, meta.primary_key_len, self.encoding).is_ok_and(|prefix| prefix == key))
+                .cloned();
+            found.is_some_and(|entry| entries.remove(&entry))
+        };
+        if removed {
+            self.without_rowid_keys.entry(meta.master_rowid).or_default().remove(&key);
+        }
+        Ok(removed)
+    }
+
+    /// Replaces one WITHOUT ROWID row, identified by its declared column
+    /// values, with another full row. Returns whether the old row existed.
+    pub fn update_without_rowid(&mut self, table: &str, old_values: &[WriteValue], new_values: &[WriteValue]) -> Result<bool> {
+        let meta = self.table_meta(table)?;
+        if !meta.without_rowid {
+            return Err(Error::Unsupported("sqlite table is not WITHOUT ROWID"));
+        }
+        if new_values.len() != meta.columns.len() {
+            return Err(Error::Unsupported("sqlite update arity mismatch"));
+        }
+        let (old_key, old_payload) = without_rowid_key_payload(&meta, old_values, self.encoding)?;
+        let (new_key, new_payload) = without_rowid_key_payload(&meta, new_values, self.encoding)?;
+        let entries = self.without_rowid_entries.entry(meta.master_rowid).or_default();
+        let found = if entries.remove(&old_payload) {
+            true
+        }
+        else {
+            let matched = entries
+                .iter()
+                .find(|entry| record_prefix(entry, meta.primary_key_len, self.encoding).is_ok_and(|prefix| prefix == old_key))
+                .cloned();
+            matched.is_some_and(|entry| entries.remove(&entry))
+        };
+        if !found {
+            return Ok(false);
+        }
+        self.without_rowid_keys.entry(meta.master_rowid).or_default().remove(&old_key);
+        if self.without_rowid_keys.entry(meta.master_rowid).or_default().contains(&new_key) {
+            return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+        }
+        self.without_rowid_keys.entry(meta.master_rowid).or_default().insert(new_key);
+        entries.insert(new_payload);
+        Ok(true)
     }
 
     /// Creates an index over one or more columns of an existing table.
@@ -817,6 +912,9 @@ impl SqliteWriter {
     /// Deletes one row by rowid; returns whether a row was removed.
     pub fn delete(&mut self, table: &str, rowid: i64) -> Result<bool> {
         let meta = self.table_meta(table)?;
+        if meta.without_rowid {
+            return Err(Error::Unsupported("sqlite rowid delete on a WITHOUT ROWID table is not supported"));
+        }
         let Some(payload) = self.read_payload(meta.root_page, rowid)?
         else {
             return Ok(false);
@@ -843,6 +941,9 @@ impl SqliteWriter {
             return Ok(false);
         }
         let meta = self.table_meta(table)?;
+        if meta.without_rowid {
+            return Err(Error::Unsupported("sqlite rowid update on a WITHOUT ROWID table is not supported"));
+        }
         if values.len() != meta.columns.len() {
             return Err(Error::Unsupported("sqlite update arity mismatch"));
         }
@@ -1382,6 +1483,31 @@ impl SqliteWriter {
         else {
             columns.iter().position(is_rowid_alias)
         };
+        // An inline `column PRIMARY KEY` is the key of a WITHOUT ROWID table
+        // when no table-level clause names one.
+        let mut without_rowid_key_positions = table_key_positions.clone();
+        if without_rowid && without_rowid_key_positions.is_empty() {
+            for (position, column) in columns.iter().enumerate() {
+                if column.primary_key {
+                    without_rowid_key_positions.push(position);
+                }
+            }
+            if without_rowid_key_positions.len() > 1 {
+                return Err(Error::Corrupt("sqlite WITHOUT ROWID table declares more than one primary key"));
+            }
+        }
+        let without_rowid_layout = if without_rowid {
+            let mut layout = without_rowid_key_positions.clone();
+            for position in 0..columns.len() {
+                if !layout.contains(&position) {
+                    layout.push(position);
+                }
+            }
+            layout
+        }
+        else {
+            Vec::new()
+        };
         let mut meta = TableMeta {
             table_name: table_row.table_name.clone(),
             master_rowid: table_row.rowid,
@@ -1390,22 +1516,26 @@ impl SqliteWriter {
             columns,
             rowid_alias,
             without_rowid,
-            primary_key_len: if without_rowid { table_key_positions.len() } else { 0 },
+            without_rowid_layout,
+            primary_key_len: if without_rowid { without_rowid_key_positions.len() } else { 0 },
             indexes: Vec::new(),
         };
         // Automatic constraint indexes are numbered in declaration order:
         // each column-level PRIMARY KEY / UNIQUE first, then a table-level key.
+        // A WITHOUT ROWID table is itself the primary-key index, so none exist.
         let mut constraint_columns: Vec<Vec<usize>> = Vec::new();
-        for (index, column) in meta.columns.iter().enumerate() {
-            if Some(index) == rowid_alias {
-                continue;
+        if !without_rowid {
+            for (index, column) in meta.columns.iter().enumerate() {
+                if Some(index) == rowid_alias {
+                    continue;
+                }
+                if column.primary_key || column.unique {
+                    constraint_columns.push(vec![index]);
+                }
             }
-            if column.primary_key || column.unique {
-                constraint_columns.push(vec![index]);
+            if !table_key_names.is_empty() && rowid_alias.is_none() {
+                constraint_columns.push(table_key_positions);
             }
-        }
-        if !table_key_names.is_empty() && rowid_alias.is_none() {
-            constraint_columns.push(table_key_positions);
         }
         for row in rows.iter().filter(|row| row.kind == "index" && eq_ignore_ascii_case(&row.table_name, table)) {
             let (positions, unique) = match row.sql.as_deref() {
@@ -2503,11 +2633,11 @@ impl SqliteWriter {
         }
     }
 
-    /// Rebuilds every index b-tree from its live key set. The old pages are
-    /// returned to the freelist before the fresh tree is allocated so the
-    /// file does not grow across repeated saves.
     /// Rebuilds every WITHOUT ROWID primary-key b-tree from its live record set.
-    fn materialize_without_rowid(&mut self) -> Result<()> {
+    /// Callers that expose [`SqliteWriter::pages`] without saving use this after
+    /// row mutation, the same way [`SqliteWriter::materialize_indexes`] keeps
+    /// secondary index pages current.
+    pub fn materialize_without_rowid(&mut self) -> Result<()> {
         let rows = self.master_rows()?;
         for row in rows.iter().filter(|row| row.kind == "table" && row.sql.as_deref().is_some_and(is_without_rowid)) {
             let entries = self.without_rowid_entries.get(&row.rowid).cloned().unwrap_or_default();
@@ -2923,10 +3053,6 @@ fn render_create_table_without_rowid(name: &str, columns: &[ColumnSpec], primary
     format!("CREATE TABLE {} ({}) WITHOUT ROWID", quote_identifier(name), parts.join(", "))
 }
 
-fn parse_primary_key_columns(sql: &str) -> Result<Vec<String>> {
-    find_primary_key_columns(sql)?.ok_or(Error::Unsupported("sqlite WITHOUT ROWID table has no table-level PRIMARY KEY"))
-}
-
 /// Returns the table-level `PRIMARY KEY (...)` columns, if the schema has one.
 fn find_primary_key_columns(sql: &str) -> Result<Option<Vec<String>>> {
     let open = sql.find('(').ok_or(Error::Corrupt("sqlite CREATE TABLE has no column list"))?;
@@ -2962,6 +3088,19 @@ fn find_primary_key_columns(sql: &str) -> Result<Option<Vec<String>>> {
         return Ok(Some(columns));
     }
     Ok(None)
+}
+
+fn without_rowid_key_payload(meta: &TableMeta, values: &[WriteValue], encoding: TextEncoding) -> Result<(Vec<u8>, Vec<u8>)> {
+    if meta.primary_key_len == 0 || meta.without_rowid_layout.len() != values.len() {
+        return Err(Error::Corrupt("sqlite WITHOUT ROWID record layout is incomplete"));
+    }
+    let mut layout_values: Vec<WriteValue> = Vec::with_capacity(values.len());
+    for position in &meta.without_rowid_layout {
+        layout_values.push(values[*position].clone());
+    }
+    let key = encode_record(&layout_values[..meta.primary_key_len], encoding);
+    let payload = encode_record(&layout_values, encoding);
+    Ok((key, payload))
 }
 
 fn record_prefix(payload: &[u8], width: usize, encoding: TextEncoding) -> Result<Vec<u8>> {
