@@ -16,7 +16,7 @@ use std::{sync::Mutex, time::Duration};
 use crate::{Error, Result};
 
 pub use database_client::pgsql::Session;
-use database_query::ir::{CommitToken, IrVersion, OutboxRecord, PhysicalPlan};
+use database_query::ir::{CommitToken, IrVersion, OutboxBacklog, OutboxRecord, PhysicalPlan};
 use odm_types::{CapabilitySet, DriftReport, LogicalMigrationPlan, MappingManifest, ObservedCatalog, QueryCaps, Row, RowWrite, WriteCaps};
 
 pub use catalog::{adopt_plan, classify_type};
@@ -169,8 +169,8 @@ impl PostgresSource {
         self.with_session(outbox::current_token)
     }
 
-    /// Authority commit with outbox.
-    pub fn authority_commit<R>(&self, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<(R, CommitToken)> {
+    /// Authority commit with outbox: business writes and events share one transaction.
+    pub fn authority_commit<R>(&self, f: impl FnOnce(&mut AuthorityTxn<'_>) -> Result<R>) -> Result<(R, CommitToken)> {
         self.with_session(|session| outbox::authority_commit(session, f))
     }
 
@@ -179,9 +179,22 @@ impl PostgresSource {
         self.with_session(|session| outbox::outbox_after(session, after_seq, limit))
     }
 
-    /// Outbox backlog size.
-    pub fn outbox_backlog(&self) -> Result<u64> {
+    /// Outbox backlog above the lowest consumer watermark.
+    ///
+    /// Without any ack row, `pending` is the cumulative count and
+    /// [`OutboxBacklog::min_acked_seq`] is `None`.
+    pub fn outbox_backlog(&self) -> Result<OutboxBacklog> {
         self.with_session(outbox::outbox_backlog)
+    }
+
+    /// Record a consumer watermark. Watermarks only move forward.
+    pub fn outbox_ack(&self, consumer: &str, acked_seq: u64) -> Result<u64> {
+        self.with_session(|session| outbox::outbox_ack(session, consumer, acked_seq))
+    }
+
+    /// Delete outbox history below `before_seq`, capped at the lowest ack watermark.
+    pub fn prune_outbox(&self, before_seq: u64) -> Result<u64> {
+        self.with_session(|session| outbox::prune(session, before_seq))
     }
 }
 
