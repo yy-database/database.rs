@@ -127,6 +127,9 @@ struct IndexMeta {
     root_page: u32,
     columns: Vec<usize>,
     unique: bool,
+    /// The key values are computed by the caller (expression and partial
+    /// indexes), so this writer never derives entries from column positions.
+    managed: bool,
 }
 
 struct Snapshot {
@@ -742,6 +745,11 @@ impl SqliteWriter {
         if name.is_empty() || columns.is_empty() {
             return Err(Error::Unsupported("sqlite index needs a name and columns"));
         }
+        if let Some(sql) = sql {
+            if index_sql_is_managed(sql)? {
+                return Err(Error::Unsupported("sqlite expression and partial indexes need caller-computed keys"));
+            }
+        }
         for object in self.master_rows()? {
             if eq_ignore_ascii_case(&object.name, name) {
                 return Err(Error::Unsupported("sqlite schema object already exists"));
@@ -788,7 +796,7 @@ impl SqliteWriter {
             let sql = sql.unwrap_or(&rendered);
             self.insert_master_row("index", name, &table_name_of(meta), root_page, Some(sql))?
         };
-        let mut index = IndexMeta { master_rowid, root_page, columns, unique };
+        let mut index = IndexMeta { master_rowid, root_page, columns, unique, managed: false };
 
         // Backfill existing rows into the live key set, then materialize the
         // fresh root. Splits may regrow the root; the master row must follow.
@@ -809,6 +817,70 @@ impl SqliteWriter {
         }
         self.index_entries.insert(master_rowid, entries);
         meta.indexes.push(index);
+        Ok(())
+    }
+
+    /// Creates an index whose key values the caller derives from row content
+    /// (expression and partial indexes). `entries` holds one `(key values,
+    /// rowid)` pair per indexed row and must already be filtered by the index
+    /// predicate.
+    pub fn create_managed_index(&mut self, name: &str, table: &str, unique: bool, sql: &str, entries: &[(Vec<WriteValue>, i64)]) -> Result<()> {
+        let meta = self.table_meta(table)?;
+        if meta.without_rowid {
+            return Err(Error::Unsupported("sqlite indexes on WITHOUT ROWID tables are not supported"));
+        }
+        for object in self.master_rows()? {
+            if eq_ignore_ascii_case(&object.name, name) {
+                return Err(Error::Unsupported("sqlite schema object already exists"));
+            }
+        }
+        let root_page = self.allocate_page()?;
+        self.init_leaf_page(root_page, PAGE_INDEX_LEAF);
+        let master_rowid = self.insert_master_row("index", name, table, root_page, Some(sql))?;
+        if unique {
+            let mut signatures = std::collections::BTreeSet::new();
+            for (values, _) in entries {
+                if !signatures.insert(encode_record(values, self.encoding)) {
+                    return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+                }
+            }
+        }
+        let keys: std::collections::BTreeSet<Vec<u8>> =
+            entries.iter().map(|(values, rowid)| managed_index_key(values, *rowid, self.encoding)).collect();
+        let mut index = IndexMeta { master_rowid, root_page, columns: Vec::new(), unique, managed: true };
+        for key in &keys {
+            index.root_page = self.index_insert(index.root_page, key)?;
+        }
+        if index.root_page != root_page {
+            self.set_master_root(master_rowid, index.root_page)?;
+        }
+        self.index_entries.insert(master_rowid, keys);
+        Ok(())
+    }
+
+    /// Replaces the key set of a managed index. The caller materializes the
+    /// b-tree afterwards, like any other index mutation.
+    pub fn replace_managed_index_entries(&mut self, index_name: &str, entries: &[(Vec<WriteValue>, i64)]) -> Result<()> {
+        let row = self
+            .master_rows()?
+            .into_iter()
+            .find(|row| row.kind == "index" && eq_ignore_ascii_case(&row.name, index_name))
+            .ok_or(Error::Unsupported("sqlite index does not exist"))?;
+        let sql = row.sql.as_deref().ok_or(Error::Unsupported("sqlite automatic indexes are not managed"))?;
+        if !index_sql_is_managed(sql)? {
+            return Err(Error::Unsupported("sqlite index is not managed"));
+        }
+        if sql.to_ascii_uppercase().starts_with("CREATE UNIQUE INDEX") {
+            let mut signatures = std::collections::BTreeSet::new();
+            for (values, _) in entries {
+                if !signatures.insert(encode_record(values, self.encoding)) {
+                    return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+                }
+            }
+        }
+        let keys: std::collections::BTreeSet<Vec<u8>> =
+            entries.iter().map(|(values, rowid)| managed_index_key(values, *rowid, self.encoding)).collect();
+        self.index_entries.insert(row.rowid, keys);
         Ok(())
     }
 
@@ -880,6 +952,9 @@ impl SqliteWriter {
             resolved[index] = WriteValue::Null;
         }
         for index_meta in &meta.indexes {
+            if index_meta.managed {
+                continue;
+            }
             if index_meta.unique {
                 let key = encode_index_key(&meta, index_meta, rowid, &resolved, self.encoding)?;
                 if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), None)? {
@@ -898,6 +973,9 @@ impl SqliteWriter {
             meta.root_page = root;
         }
         for index_meta in &meta.indexes {
+            if index_meta.managed {
+                continue;
+            }
             let key = encode_index_key(&meta, index_meta, rowid, &resolved, self.encoding)?;
             self.index_entries.entry(index_meta.master_rowid).or_default().insert(key);
         }
@@ -922,6 +1000,9 @@ impl SqliteWriter {
         let values = decode_record(&payload, self.encoding, Default::default()).map_err(|_| Error::Corrupt("sqlite record decode failed"))?;
         let owned = expand_alias(&meta, rowid, &values);
         for index_meta in &meta.indexes {
+            if index_meta.managed {
+                continue;
+            }
             let key = encode_index_key(&meta, index_meta, rowid, &owned, self.encoding)?;
             if let Some(entries) = self.index_entries.get_mut(&index_meta.master_rowid) {
                 entries.remove(&key);
@@ -977,6 +1058,9 @@ impl SqliteWriter {
             return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
         }
         for index_meta in &meta.indexes {
+            if index_meta.managed {
+                continue;
+            }
             if index_meta.unique {
                 let key = encode_index_key(&meta, index_meta, next_rowid, &owned, self.encoding)?;
                 if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), Some(rowid))? {
@@ -999,6 +1083,9 @@ impl SqliteWriter {
         }
         let meta = self.table_meta(table)?;
         for index_meta in &meta.indexes {
+            if index_meta.managed {
+                continue;
+            }
             let key = encode_index_key(&meta, index_meta, next_rowid, &owned, self.encoding)?;
             self.index_entries.entry(index_meta.master_rowid).or_default().insert(key);
         }
@@ -1538,19 +1625,25 @@ impl SqliteWriter {
             }
         }
         for row in rows.iter().filter(|row| row.kind == "index" && eq_ignore_ascii_case(&row.table_name, table)) {
-            let (positions, unique) = match row.sql.as_deref() {
+            let (positions, unique, managed) = match row.sql.as_deref() {
                 Some(sql) => {
-                    let (column_names, unique) = parse_create_index(sql)?;
-                    let mut positions = Vec::with_capacity(column_names.len());
-                    for name in column_names {
-                        let position = meta
-                            .columns
-                            .iter()
-                            .position(|column| eq_ignore_ascii_case(&column.name, &name))
-                            .ok_or(Error::Corrupt("sqlite index references unknown column"))?;
-                        positions.push(position);
+                    let unique = sql.to_ascii_uppercase().starts_with("CREATE UNIQUE INDEX");
+                    if index_sql_is_managed(sql)? {
+                        (Vec::new(), unique, true)
                     }
-                    (positions, unique)
+                    else {
+                        let (column_names, unique) = parse_create_index(sql)?;
+                        let mut positions = Vec::with_capacity(column_names.len());
+                        for name in column_names {
+                            let position = meta
+                                .columns
+                                .iter()
+                                .position(|column| eq_ignore_ascii_case(&column.name, &name))
+                                .ok_or(Error::Corrupt("sqlite index references unknown column"))?;
+                            positions.push(position);
+                        }
+                        (positions, unique, false)
+                    }
                 }
                 None => {
                     // Automatic constraint indexes store no CREATE text; the
@@ -1563,10 +1656,10 @@ impl SqliteWriter {
                         .ok_or(Error::Corrupt("sqlite autoindex name unrecognized"))?;
                     let positions =
                         constraint_columns.get(number - 1).cloned().ok_or(Error::Corrupt("sqlite autoindex number out of range"))?;
-                    (positions, true)
+                    (positions, true, false)
                 }
             };
-            meta.indexes.push(IndexMeta { master_rowid: row.rowid, root_page: row.root_page, columns: positions, unique });
+            meta.indexes.push(IndexMeta { master_rowid: row.rowid, root_page: row.root_page, columns: positions, unique, managed });
         }
         Ok(meta)
     }
@@ -3480,6 +3573,106 @@ fn split_top_level(body: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
+}
+
+/// Encodes one managed index key: the caller's key values followed by the
+/// rowid, which is what makes each entry unique in the b-tree.
+fn managed_index_key(values: &[WriteValue], rowid: i64, encoding: TextEncoding) -> Vec<u8> {
+    let mut key = values.to_vec();
+    key.push(WriteValue::Integer(rowid));
+    encode_record(&key, encoding)
+}
+
+/// Splits an index key list on top-level commas, keeping commas inside
+/// parentheses or quotes part of their term.
+fn split_index_fragments(text: &str) -> Vec<&str> {
+    let mut fragments = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (index, character) in text.char_indices() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' | '`' => quote = Some(character),
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                fragments.push(&text[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    fragments.push(&text[start..]);
+    fragments
+}
+
+/// Returns whether an index key is a bare identifier, optionally quoted.
+fn is_plain_index_identifier(text: &str) -> bool {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    if let Some(open) = bytes.first().copied() {
+        let close = match open {
+            b'"' => Some(b'"'),
+            b'\'' => Some(b'\''),
+            b'`' => Some(b'`'),
+            b'[' => Some(b']'),
+            _ => None,
+        };
+        if let Some(close) = close {
+            return bytes.len() >= 2 && bytes.last().copied() == Some(close);
+        }
+    }
+    let mut characters = text.chars();
+    let Some(first) = characters.next()
+    else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    characters.all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '$')
+}
+
+/// Returns whether a stored `CREATE INDEX` text needs caller-computed keys:
+/// an expression key, a `COLLATE` term or a trailing `WHERE` predicate.
+fn index_sql_is_managed(sql: &str) -> Result<bool> {
+    let upper = sql.to_ascii_uppercase();
+    let Some(on) = upper.find(" ON ")
+    else {
+        return Err(Error::Unsupported("sqlite CREATE INDEX text unrecognized"));
+    };
+    let rest = &sql[on + 4..];
+    let Some(open) = rest.find('(')
+    else {
+        return Err(Error::Unsupported("sqlite CREATE INDEX text lacks columns"));
+    };
+    let Some(close) = rest.rfind(')')
+    else {
+        return Err(Error::Unsupported("sqlite CREATE INDEX text lacks closing paren"));
+    };
+    if rest[close + 1..].split_whitespace().any(|word| word.eq_ignore_ascii_case("where")) {
+        return Ok(true);
+    }
+    for fragment in split_index_fragments(&rest[open + 1..close]) {
+        let fragment = fragment.trim();
+        let core = match fragment.rsplit_once(char::is_whitespace) {
+            Some((head, tail)) if tail.eq_ignore_ascii_case("asc") || tail.eq_ignore_ascii_case("desc") => head.trim_end(),
+            _ => fragment,
+        };
+        if core.split_whitespace().any(|word| word.eq_ignore_ascii_case("collate")) || !is_plain_index_identifier(core) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn parse_create_index(sql: &str) -> Result<(Vec<String>, bool)> {

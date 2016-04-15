@@ -73,7 +73,10 @@ use super::error::SqlError;
 /// the schema qualifier removed, so a database attached under another name
 /// later still reloads.
 pub fn strip_schema_qualifiers(sql: &str, schema: &str) -> String {
-    let Ok((tokens, offsets)) = tokenize(sql) else { return sql.to_string() };
+    let Ok((tokens, offsets)) = tokenize(sql)
+    else {
+        return sql.to_string();
+    };
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let matches_schema = match token {
@@ -527,10 +530,14 @@ pub enum CompareOp {
 /// Only ascending keys exist: `ASC` is accepted because it is the default,
 /// while `DESC` is rejected with `unsupported-clause` instead of silently
 /// building an ascending index.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IndexColumn {
-    /// Column name as written.
+    /// Column name as written; empty for an expression key.
     pub name: String,
+    /// Expression key such as `lower(name)`; `None` for a bare column.
+    pub expr: Option<Expr>,
+    /// `COLLATE <name>` on this key, if written.
+    pub collate: Option<String>,
 }
 
 /// One `ORDER BY` key: an expression or a constant ordinal.
@@ -929,12 +936,9 @@ impl Expr {
             Self::IsNull { value, negated } => {
                 format!("{} IS {}NULL", value.label(), if *negated { "NOT " } else { "" })
             }
-            Self::IsTruth { value, truth, negated } => format!(
-                "{} IS {}{}",
-                value.label(),
-                if *negated { "NOT " } else { "" },
-                if *truth { "TRUE" } else { "FALSE" }
-            ),
+            Self::IsTruth { value, truth, negated } => {
+                format!("{} IS {}{}", value.label(), if *negated { "NOT " } else { "" }, if *truth { "TRUE" } else { "FALSE" })
+            }
             Self::Not(inner) => format!("NOT {}", inner.label()),
             Self::And(left, right) => format!("{} AND {}", left.label(), right.label()),
             Self::Or(left, right) => format!("{} OR {}", left.label(), right.label()),
@@ -1083,11 +1087,8 @@ fn window_spec_label(spec: &WindowSpec) -> String {
         parts.push(format!("PARTITION BY {}", list.join(",")));
     }
     if !spec.order.is_empty() {
-        let list: Vec<String> = spec
-            .order
-            .iter()
-            .map(|key| format!("{}{}", key.expr.label(), if key.descending { " DESC" } else { "" }))
-            .collect();
+        let list: Vec<String> =
+            spec.order.iter().map(|key| format!("{}{}", key.expr.label(), if key.descending { " DESC" } else { "" })).collect();
         parts.push(format!("ORDER BY {}", list.join(",")));
     }
     if let Some(frame) = &spec.frame {
@@ -1105,12 +1106,7 @@ fn frame_label(frame: &Frame) -> String {
         FrameUnits::Range => "RANGE",
     };
     if frame.between {
-        format!(
-            "{} BETWEEN {} AND {}",
-            units,
-            frame_bound_label(&frame.start),
-            frame_bound_label(&frame.end)
-        )
+        format!("{} BETWEEN {} AND {}", units, frame_bound_label(&frame.start), frame_bound_label(&frame.end))
     }
     else {
         format!("{} {}", units, frame_bound_label(&frame.start))
@@ -1328,6 +1324,8 @@ pub enum Statement {
         unique: bool,
         /// Key columns in declaration order.
         columns: Vec<IndexColumn>,
+        /// Optional `WHERE` predicate of a partial index.
+        predicate: Option<Expr>,
         /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
         sql: String,
     },
@@ -1746,12 +1744,7 @@ pub fn quote_identifier(name: &str) -> String {
     let simple = !name.is_empty()
         && !name.as_bytes()[0].is_ascii_digit()
         && name.chars().all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_');
-    if simple {
-        name.to_string()
-    }
-    else {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    }
+    if simple { name.to_string() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
 }
 
 /// End offset (exclusive) of one token inside `source`. Only identifiers
@@ -1780,12 +1773,7 @@ fn token_end(source: &str, token: &Token, start: usize) -> usize {
         Token::Text(_) => quoted_end(bytes, start, b'\''),
         Token::Blob(_) => {
             let at = start + 1;
-            if bytes.get(at) == Some(&b'\'') {
-                quoted_end(bytes, at, b'\'')
-            }
-            else {
-                at
-            }
+            if bytes.get(at) == Some(&b'\'') { quoted_end(bytes, at, b'\'') } else { at }
         }
         Token::Operator(operator) => start + operator.len(),
         _ => start + 1,
@@ -1952,13 +1940,16 @@ pub enum DropColumnConflict {
 /// reported instead of rewritten. A column-level constraint belongs to the
 /// column definition and disappears with it, which is why it is not checked.
 pub fn rewrite_create_table_drop_column(sql: &str, column: &str) -> Result<Option<String>, DropColumnConflict> {
-    let Ok((tokens, offsets)) = tokenize(sql) else {
+    let Ok((tokens, offsets)) = tokenize(sql)
+    else {
         return Ok(None);
     };
-    let Some(table) = create_object_name(&tokens, "table") else {
+    let Some(table) = create_object_name(&tokens, "table")
+    else {
         return Ok(None);
     };
-    let Some(open) = (table + 1..tokens.len()).find(|index| matches!(tokens[*index], Token::LParen)) else {
+    let Some(open) = (table + 1..tokens.len()).find(|index| matches!(tokens[*index], Token::LParen))
+    else {
         return Ok(None);
     };
     // Split the column list into top-level segments, remembering the commas on
@@ -1987,7 +1978,8 @@ pub fn rewrite_create_table_drop_column(sql: &str, column: &str) -> Result<Optio
             _ => {}
         }
     }
-    let Some(_close) = close else {
+    let Some(_close) = close
+    else {
         return Ok(None);
     };
     let mut target = None;
@@ -2006,9 +1998,7 @@ pub fn rewrite_create_table_drop_column(sql: &str, column: &str) -> Result<Optio
                 if rest
                     .iter()
                     .enumerate()
-                    .any(|(offset, token)| {
-                        identifier_eq(token, column) && !matches!(tokens.get(effective + 2 + offset), Some(Token::LParen))
-                    })
+                    .any(|(offset, token)| identifier_eq(token, column) && !matches!(tokens.get(effective + 2 + offset), Some(Token::LParen)))
                 {
                     return Err(DropColumnConflict::TableCheck);
                 }
@@ -2034,7 +2024,8 @@ pub fn rewrite_create_table_drop_column(sql: &str, column: &str) -> Result<Optio
             }
         }
     }
-    let Some((start, end, before, after)) = target else {
+    let Some((start, end, before, after)) = target
+    else {
         return Ok(None);
     };
     let last = end.saturating_sub(1);
@@ -2086,9 +2077,7 @@ fn view_query_start(tokens: &[Token]) -> Option<usize> {
 fn table_name_token(tokens: &[Token], at: usize) -> Option<usize> {
     match tokens.get(at) {
         Some(Token::Word(_)) | Some(Token::Quoted(_)) => {
-            if matches!(tokens.get(at + 1), Some(Token::Dot))
-                && matches!(tokens.get(at + 2), Some(Token::Word(_)) | Some(Token::Quoted(_)))
-            {
+            if matches!(tokens.get(at + 1), Some(Token::Dot)) && matches!(tokens.get(at + 2), Some(Token::Word(_)) | Some(Token::Quoted(_))) {
                 Some(at + 2)
             }
             else {
@@ -2244,9 +2233,8 @@ fn read_number(source: &str, at: usize) -> Result<(Token, usize), SqlError> {
         while index < bytes.len() && bytes[index].is_ascii_hexdigit() {
             index += 1;
         }
-        let value = i64::from_str_radix(&source[digits_start..index], 16).map_err(|_| {
-            SqlError::syntax("hexadecimal integer literal is out of the signed 64-bit range", Some(start))
-        })?;
+        let value = i64::from_str_radix(&source[digits_start..index], 16)
+            .map_err(|_| SqlError::syntax("hexadecimal integer literal is out of the signed 64-bit range", Some(start)))?;
         return Ok((Token::Int(value), index));
     }
     while index < bytes.len() && bytes[index].is_ascii_digit() {
@@ -2274,18 +2262,16 @@ fn read_number(source: &str, at: usize) -> Result<(Token, usize), SqlError> {
     }
     let text = &source[start..index];
     if real {
-        let value = text
-            .parse::<f64>()
-            .map_err(|_| SqlError::syntax(format!("real literal `{text}` is not a finite f64"), Some(start)))?;
+        let value = text.parse::<f64>().map_err(|_| SqlError::syntax(format!("real literal `{text}` is not a finite f64"), Some(start)))?;
         if !value.is_finite() {
             return Err(SqlError::syntax(format!("real literal `{text}` is not a finite f64"), Some(start)));
         }
         Ok((Token::Real(value), index))
     }
     else {
-        let value = text.parse::<i64>().map_err(|_| {
-            SqlError::syntax(format!("integer literal `{text}` is out of the signed 64-bit range"), Some(start))
-        })?;
+        let value = text
+            .parse::<i64>()
+            .map_err(|_| SqlError::syntax(format!("integer literal `{text}` is out of the signed 64-bit range"), Some(start)))?;
         Ok((Token::Int(value), index))
     }
 }
@@ -2297,8 +2283,8 @@ fn decode_hex(text: &str, at: usize) -> Result<Vec<u8>, SqlError> {
     let mut bytes = Vec::with_capacity(text.len() / 2);
     let mut index = 0;
     while index < text.len() {
-        let byte = u8::from_str_radix(&text[index..index + 2], 16)
-            .map_err(|_| SqlError::syntax("blob literal contains a non-hex digit", Some(at)))?;
+        let byte =
+            u8::from_str_radix(&text[index..index + 2], 16).map_err(|_| SqlError::syntax("blob literal contains a non-hex digit", Some(at)))?;
         bytes.push(byte);
         index += 2;
     }
@@ -2394,7 +2380,6 @@ impl<'a> Parser<'a> {
             }
             Some(token) => Err(self.error("syntax", format!("expected {} but found {}", describe_expected(expected), token.describe()))),
             None => Err(self.error("syntax", format!("expected {} but the statement ended", describe_expected(expected)))),
-
         }
     }
 
@@ -2440,7 +2425,6 @@ impl<'a> Parser<'a> {
         self.expect_char(&Token::RParen)?;
         Ok(names)
     }
-
 
     /// Reads a comparison operator, combining the two-token forms.
     ///
@@ -2549,12 +2533,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_word("like") {
             let pattern = self.bitwise_expr()?;
-            let escape = if self.eat_word("escape") {
-                Some(Box::new(self.bitwise_expr()?))
-            }
-            else {
-                None
-            };
+            let escape = if self.eat_word("escape") { Some(Box::new(self.bitwise_expr()?)) } else { None };
             return Ok(Expr::Like { value: Box::new(left), pattern: Box::new(pattern), negated: negated_like, escape });
         }
         Ok(left)
@@ -2583,9 +2562,7 @@ impl<'a> Parser<'a> {
                     self.at += 1;
                     break;
                 }
-                Some(token) => {
-                    return Err(self.error("syntax", format!("expected `,` or `)` in the `IN` list but found {}", token.describe())))
-                }
+                Some(token) => return Err(self.error("syntax", format!("expected `,` or `)` in the `IN` list but found {}", token.describe()))),
                 None => return Err(self.error("syntax", "`IN` value list is not closed")),
             }
         }
@@ -2720,9 +2697,7 @@ impl<'a> Parser<'a> {
             }
         }
         match self.peek() {
-            Some(Token::Int(_)) | Some(Token::Real(_)) | Some(Token::Text(_)) | Some(Token::Blob(_)) => {
-                Ok(Expr::Literal(self.literal()?))
-            }
+            Some(Token::Int(_)) | Some(Token::Real(_)) | Some(Token::Text(_)) | Some(Token::Blob(_)) => Ok(Expr::Literal(self.literal()?)),
             Some(Token::Word(_)) | Some(Token::Quoted(_)) => Ok(Expr::Column(self.column_ref()?)),
             Some(token) => Err(self.error("syntax", format!("expected an expression but found {}", token.describe()))),
             None => Err(self.error("syntax", "expected an expression but the statement ended")),
@@ -2790,10 +2765,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     Some(token) => {
-                        return Err(self.error(
-                            "syntax",
-                            format!("expected `,` or `)` in the argument list but found {}", token.describe()),
-                        ))
+                        return Err(self.error("syntax", format!("expected `,` or `)` in the argument list but found {}", token.describe())));
                     }
                     None => return Err(self.error("syntax", "function argument list is not closed")),
                 }
@@ -2809,10 +2781,7 @@ impl<'a> Parser<'a> {
             // Only `group_concat` takes the optional separator argument.
             let wanted = if function == AggregateFunction::GroupConcat { 1..=2 } else { 1..=1 };
             if !wanted.contains(&args.len()) {
-                return Err(self.error(
-                    "wrong-arguments",
-                    format!("wrong number of arguments to function {}()", function.name()),
-                ));
+                return Err(self.error("wrong-arguments", format!("wrong number of arguments to function {}()", function.name())));
             }
             let mut args = args.into_iter();
             let argument = args.next().expect("argument count checked");
@@ -2821,10 +2790,7 @@ impl<'a> Parser<'a> {
         }
         match ScalarFunction::from_name(&name) {
             Some(function) if function.accepts(args.len()) => Ok(Expr::Function { name: function, args }),
-            Some(function) => Err(self.error(
-                "wrong-arguments",
-                format!("wrong number of arguments to function {}()", function.name()),
-            )),
+            Some(function) => Err(self.error("wrong-arguments", format!("wrong number of arguments to function {}()", function.name()))),
             None if is_aggregate_name(&name) => {
                 let mut error = self.error(
                     "unsupported-clause",
@@ -2847,12 +2813,7 @@ impl<'a> Parser<'a> {
             spec
         }
         else {
-            let base = if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Quoted(_))) {
-                Some(self.name()?)
-            }
-            else {
-                None
-            };
+            let base = if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Quoted(_))) { Some(self.name()?) } else { None };
             WindowSpec { base, partition: Vec::new(), order: Vec::new(), frame: None }
         };
         let function = self.window_function(name, args, count_star)?;
@@ -2872,10 +2833,7 @@ impl<'a> Parser<'a> {
         };
         if let Some(function) = simple {
             if !args.is_empty() {
-                return Err(self.error(
-                    "wrong-arguments",
-                    format!("wrong number of arguments to function {}()", lower),
-                ));
+                return Err(self.error("wrong-arguments", format!("wrong number of arguments to function {}()", lower)));
             }
             return Ok(function);
         }
@@ -2900,12 +2858,7 @@ impl<'a> Parser<'a> {
             "first_value" | "last_value" if arguments == 1 => {
                 let mut args = args.into_iter();
                 let value = Box::new(args.next().expect("arity checked"));
-                return Ok(if lower == "first_value" {
-                    WindowFunction::FirstValue(value)
-                }
-                else {
-                    WindowFunction::LastValue(value)
-                });
+                return Ok(if lower == "first_value" { WindowFunction::FirstValue(value) } else { WindowFunction::LastValue(value) });
             }
             "nth_value" if arguments == 2 => {
                 let mut args = args.into_iter();
@@ -2917,18 +2870,11 @@ impl<'a> Parser<'a> {
         }
         if let Some(function) = AggregateFunction::from_name(name) {
             if count_star {
-                return Ok(WindowFunction::Aggregate {
-                    function: AggregateFunction::CountStar,
-                    argument: None,
-                    separator: None,
-                });
+                return Ok(WindowFunction::Aggregate { function: AggregateFunction::CountStar, argument: None, separator: None });
             }
             let wanted = if function == AggregateFunction::GroupConcat { 1..=2 } else { 1..=1 };
             if !wanted.contains(&arguments) {
-                return Err(self.error(
-                    "wrong-arguments",
-                    format!("wrong number of arguments to function {}()", function.name()),
-                ));
+                return Err(self.error("wrong-arguments", format!("wrong number of arguments to function {}()", function.name())));
             }
             let mut args = args.into_iter();
             let argument = Some(Box::new(args.next().expect("arity checked")));
@@ -2936,10 +2882,7 @@ impl<'a> Parser<'a> {
             return Ok(WindowFunction::Aggregate { function, argument, separator });
         }
         if matches!(lower.as_str(), "ntile" | "lag" | "lead" | "first_value" | "last_value" | "nth_value") {
-            return Err(self.error(
-                "wrong-arguments",
-                format!("wrong number of arguments to function {lower}()"),
-            ));
+            return Err(self.error("wrong-arguments", format!("wrong number of arguments to function {lower}()")));
         }
         Err(self.error("unknown-function", format!("no such window function: {name}")))
     }
@@ -2983,17 +2926,11 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let frame = if self.peek_keyword("rows") || self.peek_keyword("range") || self.peek_keyword("groups") {
-            Some(self.frame()?)
-        }
-        else {
-            None
-        };
+        let frame =
+            if self.peek_keyword("rows") || self.peek_keyword("range") || self.peek_keyword("groups") { Some(self.frame()?) } else { None };
         if self.peek_keyword("exclude") {
-            let mut error = self.error(
-                "unsupported-clause",
-                "window frame `EXCLUDE` is not supported; frames always include every row between their edges",
-            );
+            let mut error = self
+                .error("unsupported-clause", "window frame `EXCLUDE` is not supported; frames always include every row between their edges");
             error.clause = Some("EXCLUDE".to_string());
             return Err(error);
         }
@@ -3022,12 +2959,7 @@ impl<'a> Parser<'a> {
         }
         else {
             let start = self.frame_bound()?;
-            Ok(Frame {
-                units,
-                between: false,
-                start,
-                end: FrameBound { edge: FrameEdge::CurrentRow, offset: None },
-            })
+            Ok(Frame { units, between: false, start, end: FrameBound { edge: FrameEdge::CurrentRow, offset: None } })
         }
     }
 
@@ -3107,12 +3039,7 @@ impl<'a> Parser<'a> {
     /// Reads one `FROM` entry: a table name or `( select )`, then an optional
     /// `AS` / bare alias.
     fn table_ref(&mut self) -> Result<TableRef, SqlError> {
-        let query = if self.peek() == Some(&Token::LParen) {
-            Some(Box::new(self.parenthesized_query()?))
-        }
-        else {
-            None
-        };
+        let query = if self.peek() == Some(&Token::LParen) { Some(Box::new(self.parenthesized_query()?)) } else { None };
         let (schema, name) = if query.is_some() { (None, String::new()) } else { self.qualified_name()? };
         let alias = if self.eat_word("as") {
             Some(self.name()?)
@@ -3153,10 +3080,9 @@ impl<'a> Parser<'a> {
                             break;
                         }
                         Some(token) => {
-                            return Err(self.error(
-                                "syntax",
-                                format!("expected `,` or `)` in the `WITH` column list but found {}", token.describe()),
-                            ))
+                            return Err(
+                                self.error("syntax", format!("expected `,` or `)` in the `WITH` column list but found {}", token.describe()))
+                            );
                         }
                         None => return Err(self.error("syntax", "`WITH` column list is not closed")),
                     }
@@ -3447,10 +3373,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     Some(token) => {
-                        return Err(self.error(
-                            "syntax",
-                            format!("expected `,` or `)` in the view column list but found {}", token.describe()),
-                        ))
+                        return Err(self.error("syntax", format!("expected `,` or `)` in the view column list but found {}", token.describe())));
                     }
                     None => return Err(self.error("syntax", "view column list is not closed")),
                 }
@@ -3533,12 +3456,7 @@ impl<'a> Parser<'a> {
             self.expect_word("each")?;
             self.expect_word("row")?;
         }
-        let when = if self.eat_word("when") {
-            Some(self.or_expr()?)
-        }
-        else {
-            None
-        };
+        let when = if self.eat_word("when") { Some(self.or_expr()?) } else { None };
         self.expect_word("begin")?;
         let mut body = Vec::new();
         loop {
@@ -3560,12 +3478,7 @@ impl<'a> Parser<'a> {
         let name_start = self.offsets.get(name_token).copied().unwrap_or(0);
         let raw_name = self.source[name_start..gap_end].trim_end();
         let name_end = name_start + raw_name.len();
-        let stored_name = if schema.is_some() {
-            name.clone()
-        }
-        else {
-            raw_name.to_string()
-        };
+        let stored_name = if schema.is_some() { name.clone() } else { raw_name.to_string() };
         let sql = format!("CREATE TRIGGER {stored_name}{}", self.source[name_end..end].trim_end());
         Ok(Statement::CreateTrigger { schema, name, if_not_exists, timing, event, table_schema, table, when, body, sql })
     }
@@ -3594,7 +3507,9 @@ impl<'a> Parser<'a> {
             let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
             let mut error = self.error(
                 "unsupported-clause",
-                format!("unsupported `DROP` object {found}; this engine accepts `DROP TABLE`, `DROP INDEX`, `DROP VIEW` and `DROP TRIGGER` only"),
+                format!(
+                    "unsupported `DROP` object {found}; this engine accepts `DROP TABLE`, `DROP INDEX`, `DROP VIEW` and `DROP TRIGGER` only"
+                ),
             );
             error.clause = Some("DROP".to_string());
             return Err(error);
@@ -3687,10 +3602,8 @@ impl<'a> Parser<'a> {
     /// qualifier is named instead of being half-understood.
     fn reject_qualified(&mut self, name: &str) -> Result<(), SqlError> {
         if self.peek() == Some(&Token::Dot) {
-            let mut error = self.error(
-                "unsupported-clause",
-                format!("schema-qualified object names are not supported (`{name}.` was written)"),
-            );
+            let mut error =
+                self.error("unsupported-clause", format!("schema-qualified object names are not supported (`{name}.` was written)"));
             error.clause = Some("schema".to_string());
             return Err(error);
         }
@@ -3747,7 +3660,9 @@ impl<'a> Parser<'a> {
                             break;
                         }
                         Some(token) => {
-                            return Err(self.error("syntax", format!("expected `,` or `)` in the primary key list but found {}", token.describe())));
+                            return Err(
+                                self.error("syntax", format!("expected `,` or `)` in the primary key list but found {}", token.describe()))
+                            );
                         }
                         None => return Err(self.error("syntax", "primary key column list is not closed")),
                     }
@@ -3790,7 +3705,9 @@ impl<'a> Parser<'a> {
                     self.at += 1;
                     break;
                 }
-                Some(token) => return Err(self.error("syntax", format!("expected `,` or `)` after a column definition but found {}", token.describe()))),
+                Some(token) => {
+                    return Err(self.error("syntax", format!("expected `,` or `)` after a column definition but found {}", token.describe())));
+                }
                 None => return Err(self.error("syntax", "create table column list is not closed")),
             }
         }
@@ -3882,17 +3799,27 @@ impl<'a> Parser<'a> {
         self.expect_char(&Token::LParen)?;
         let mut columns = Vec::new();
         loop {
-            let name = self.name()?;
+            // A bare column name is followed by `,`, `)`, `ASC`, `DESC` or
+            // `COLLATE`; anything else starts an expression key.
+            let next = self.tokens.get(self.at + 1);
+            let plain_column = matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Quoted(_)))
+                && (matches!(next, Some(Token::Comma) | Some(Token::RParen))
+                    || matches!(next, Some(Token::Word(word)) if word.eq_ignore_ascii_case("asc")
+                        || word.eq_ignore_ascii_case("desc")
+                        || word.eq_ignore_ascii_case("collate")));
+            let (name, expr) = if plain_column { (self.name()?, None) } else { (String::new(), Some(self.or_expr()?)) };
             if matches!(self.peek_word(), Some(word) if word.eq_ignore_ascii_case("desc")) {
+                let key = if name.is_empty() { "expression".to_string() } else { format!("`{name}`") };
                 let mut error = self.error(
                     "unsupported-clause",
-                    format!("`DESC` index key `{name}` is not supported; this engine builds ascending key order only"),
+                    format!("`DESC` index key {key} is not supported; this engine builds ascending key order only"),
                 );
                 error.clause = Some("DESC".to_string());
                 return Err(error);
             }
             self.eat_word("asc");
-            columns.push(IndexColumn { name });
+            let collate = if self.eat_word("collate") { Some(self.name()?) } else { None };
+            columns.push(IndexColumn { name, expr, collate });
             match self.peek() {
                 Some(Token::Comma) => {
                     self.at += 1;
@@ -3901,20 +3828,26 @@ impl<'a> Parser<'a> {
                     self.at += 1;
                     break;
                 }
-                Some(token) => return Err(self.error("syntax", format!("expected `,` or `)` in the index column list but found {}", token.describe()))),
+                Some(token) => {
+                    return Err(self.error("syntax", format!("expected `,` or `)` in the index column list but found {}", token.describe())));
+                }
                 None => return Err(self.error("syntax", "create index column list is not closed")),
             }
         }
+        let predicate = if self.eat_word("where") { Some(self.or_expr()?) } else { None };
         match self.peek() {
             None | Some(Token::Semi) => {
                 let prefix = if unique { "CREATE UNIQUE INDEX" } else { "CREATE INDEX" };
                 let sql = self.canonical_create_sql(prefix, name_token, name_gap_end);
-                Ok(Statement::CreateIndex { schema, name, table, if_not_exists, unique, columns, sql })
+                Ok(Statement::CreateIndex { schema, name, table, if_not_exists, unique, columns, predicate, sql })
             }
             Some(token) => {
                 let mut error = self.error(
                     "unsupported-clause",
-                    format!("unsupported `CREATE INDEX` clause starting at {}; this engine builds plain ascending indexes only", token.describe()),
+                    format!(
+                        "unsupported `CREATE INDEX` clause starting at {}; this engine builds plain ascending indexes only",
+                        token.describe()
+                    ),
                 );
                 error.clause = Some(match token {
                     Token::Word(word) => word.to_ascii_uppercase(),
@@ -3985,10 +3918,7 @@ impl<'a> Parser<'a> {
                     foreign_keys.push(self.references_clause(vec![spec.name.clone()])?);
                 }
                 else {
-                    let mut error = self.error(
-                        "unsupported-column-constraint",
-                        format!("unsupported column constraint in `{}`", spec.name),
-                    );
+                    let mut error = self.error("unsupported-column-constraint", format!("unsupported column constraint in `{}`", spec.name));
                     error.clause = Some(self.constraint_name());
                     return Err(error);
                 }
@@ -4031,13 +3961,8 @@ impl<'a> Parser<'a> {
         let parent = self.name()?;
         self.reject_qualified(&parent)?;
         let parent_columns = if self.peek() == Some(&Token::LParen) { self.column_list()? } else { Vec::new() };
-        let mut key = ForeignKey {
-            columns,
-            parent,
-            parent_columns,
-            on_delete: ForeignKeyAction::NoAction,
-            on_update: ForeignKeyAction::NoAction,
-        };
+        let mut key =
+            ForeignKey { columns, parent, parent_columns, on_delete: ForeignKeyAction::NoAction, on_update: ForeignKeyAction::NoAction };
         loop {
             if self.eat_word("on") {
                 if self.eat_word("delete") {
@@ -4148,7 +4073,17 @@ impl<'a> Parser<'a> {
             let lower = word.to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "primary" | "not" | "null" | "unique" | "default" | "constraint" | "check" | "references" | "collate" | "generated" | "autoincrement"
+                "primary"
+                    | "not"
+                    | "null"
+                    | "unique"
+                    | "default"
+                    | "constraint"
+                    | "check"
+                    | "references"
+                    | "collate"
+                    | "generated"
+                    | "autoincrement"
             ) {
                 break;
             }
@@ -4169,12 +4104,7 @@ impl<'a> Parser<'a> {
                     Token::Real(value) if negative => format!("-{value}"),
                     Token::Int(value) => value.to_string(),
                     Token::Real(value) => format!("{value}"),
-                    other => {
-                        return Err(self.error(
-                            "syntax",
-                            format!("expected a numeric type parameter but found {}", other.describe()),
-                        ))
-                    }
+                    other => return Err(self.error("syntax", format!("expected a numeric type parameter but found {}", other.describe()))),
                 };
                 parameters.push(parameter);
                 match self.peek() {
@@ -4186,10 +4116,9 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     Some(token) => {
-                        return Err(self.error(
-                            "syntax",
-                            format!("expected `,` or `)` in the type parameter list but found {}", token.describe()),
-                        ))
+                        return Err(
+                            self.error("syntax", format!("expected `,` or `)` in the type parameter list but found {}", token.describe()))
+                        );
                     }
                     None => return Err(self.error("syntax", "column type parameter list is not closed")),
                 }
@@ -4230,7 +4159,7 @@ impl<'a> Parser<'a> {
                         let index = self.next_parameter;
                         self.next_parameter += 1;
                         (index, "?".to_string())
-                    },
+                    }
                 };
                 // `?NNN` fixes that slot, so later bare `?` placeholders
                 // continue after the highest index seen so far.
@@ -4251,7 +4180,7 @@ impl<'a> Parser<'a> {
                         self.next_parameter += 1;
                         self.parameter_names.insert(name, index);
                         index
-                    },
+                    }
                 };
                 Ok(Some((index, text)))
             }
@@ -4327,7 +4256,9 @@ impl<'a> Parser<'a> {
                         self.at += 1;
                         break;
                     }
-                    Some(token) => return Err(self.error("syntax", format!("expected `,` or `)` in the column list but found {}", token.describe()))),
+                    Some(token) => {
+                        return Err(self.error("syntax", format!("expected `,` or `)` in the column list but found {}", token.describe())));
+                    }
                     None => return Err(self.error("syntax", "insert column list is not closed")),
                 }
             }
@@ -4359,7 +4290,9 @@ impl<'a> Parser<'a> {
                         self.at += 1;
                         break;
                     }
-                    Some(token) => return Err(self.error("syntax", format!("expected `,` or `)` in a VALUES tuple but found {}", token.describe()))),
+                    Some(token) => {
+                        return Err(self.error("syntax", format!("expected `,` or `)` in a VALUES tuple but found {}", token.describe())));
+                    }
                     None => return Err(self.error("syntax", "insert VALUES tuple is not closed")),
                 }
             }
@@ -4381,7 +4314,10 @@ impl<'a> Parser<'a> {
             Some(token) => {
                 let mut error = self.error(
                     "unsupported-clause",
-                    format!("unsupported clause after `{kind}` starting at {}; `ORDER BY`, `LIMIT` and `OFFSET` are not accepted here", token.describe()),
+                    format!(
+                        "unsupported clause after `{kind}` starting at {}; `ORDER BY`, `LIMIT` and `OFFSET` are not accepted here",
+                        token.describe()
+                    ),
                 );
                 error.clause = Some(match token {
                     Token::Word(word) => word.to_ascii_uppercase(),
@@ -4397,10 +4333,8 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(&Token::Star) {
             self.at += 1;
             if self.peek() == Some(&Token::Comma) {
-                let mut error = self.error(
-                    "unsupported-clause",
-                    "`RETURNING *, ...` mixes `*` with further items; list the columns explicitly instead",
-                );
+                let mut error =
+                    self.error("unsupported-clause", "`RETURNING *, ...` mixes `*` with further items; list the columns explicitly instead");
                 error.clause = Some("RETURNING".to_string());
                 return Err(error);
             }
@@ -4439,10 +4373,8 @@ impl<'a> Parser<'a> {
         let mut assignments = Vec::new();
         loop {
             if self.peek() == Some(&Token::LParen) {
-                let mut error = self.error(
-                    "unsupported-clause",
-                    "row-value `SET (a, b) = (...)` assignments are not supported; assign one column per item",
-                );
+                let mut error = self
+                    .error("unsupported-clause", "row-value `SET (a, b) = (...)` assignments are not supported; assign one column per item");
                 error.clause = Some("SET".to_string());
                 return Err(error);
             }
@@ -4493,7 +4425,10 @@ impl<'a> Parser<'a> {
         let mut compounds = Vec::new();
         loop {
             let position = self.offset();
-            let Some(op) = self.compound_operator() else { break };
+            let Some(op) = self.compound_operator()
+            else {
+                break;
+            };
             self.expect_word("select")?;
             compounds.push(CompoundTerm { op, core: self.select_core()?, position });
         }
@@ -4529,19 +4464,11 @@ impl<'a> Parser<'a> {
             None
         };
         match self.peek() {
-            None | Some(Token::Semi) | Some(Token::RParen) => Ok(Statement::Select {
-                with: Vec::new(),
-                recursive: false,
-                first,
-                compounds,
-                order,
-                limit,
-            }),
+            None | Some(Token::Semi) | Some(Token::RParen) => {
+                Ok(Statement::Select { with: Vec::new(), recursive: false, first, compounds, order, limit })
+            }
             Some(Token::Word(word)) if is_compound_keyword(word) => {
-                let mut error = self.error(
-                    "syntax",
-                    format!("`ORDER BY` clause should come after {} not before", word.to_ascii_uppercase()),
-                );
+                let mut error = self.error("syntax", format!("`ORDER BY` clause should come after {} not before", word.to_ascii_uppercase()));
                 error.clause = Some(word.to_ascii_uppercase());
                 Err(error)
             }
@@ -4624,7 +4551,9 @@ impl<'a> Parser<'a> {
                     Some(Token::Comma) => {
                         self.at += 1;
                     }
-                    Some(token) => return Err(self.error("syntax", format!("expected `,` or `FROM` in the projection but found {}", token.describe()))),
+                    Some(token) => {
+                        return Err(self.error("syntax", format!("expected `,` or `FROM` in the projection but found {}", token.describe())));
+                    }
                     None => return Err(self.error("syntax", "select projection is incomplete")),
                 }
             }
@@ -4768,8 +4697,7 @@ impl<'a> Parser<'a> {
             }
             let label = table.label().to_ascii_lowercase();
             if labels.contains(&label) {
-                let mut error =
-                    self.error("duplicate-alias", format!("table alias `{}` is used more than once in `FROM`", table.label()));
+                let mut error = self.error("duplicate-alias", format!("table alias `{}` is used more than once in `FROM`", table.label()));
                 error.position = Some(starts[index]);
                 return Err(error);
             }
@@ -4838,7 +4766,8 @@ impl<'a> Parser<'a> {
 /// skipped; derived tables and expression subqueries are followed because
 /// they still run in the same name scope.
 pub(crate) fn statement_references(statement: &Statement, name: &str) -> bool {
-    let Statement::Select { first, compounds, order, .. } = statement else {
+    let Statement::Select { first, compounds, order, .. } = statement
+    else {
         return false;
     };
     core_references(first, name)
@@ -4877,14 +4806,10 @@ fn expr_references(expr: &Expr, name: &str) -> bool {
         Expr::And(left, right) | Expr::Or(left, right) => expr_references(left, name) || expr_references(right, name),
         Expr::Case { operand, branches, otherwise } => {
             operand.as_ref().is_some_and(|expr| expr_references(expr, name))
-                || branches.iter().any(|(condition, result)| {
-                    expr_references(condition, name) || expr_references(result, name)
-                })
+                || branches.iter().any(|(condition, result)| expr_references(condition, name) || expr_references(result, name))
                 || otherwise.as_ref().is_some_and(|expr| expr_references(expr, name))
         }
-        Expr::In { value, list, .. } => {
-            expr_references(value, name) || list.iter().any(|item| expr_references(item, name))
-        }
+        Expr::In { value, list, .. } => expr_references(value, name) || list.iter().any(|item| expr_references(item, name)),
         Expr::Function { args, .. } => args.iter().any(|arg| expr_references(arg, name)),
         Expr::Subquery(statement) | Expr::Exists(statement) => statement_references(statement, name),
         Expr::InSubquery { value, query, .. } => expr_references(value, name) || statement_references(query, name),
@@ -4892,7 +4817,9 @@ fn expr_references(expr: &Expr, name: &str) -> bool {
         Expr::Alias { value, .. } => expr_references(value, name),
         Expr::Cast { value, .. } => expr_references(value, name),
         Expr::Like { value, pattern, escape, .. } => {
-            expr_references(value, name) || expr_references(pattern, name) || escape.as_ref().is_some_and(|escape| expr_references(escape, name))
+            expr_references(value, name)
+                || expr_references(pattern, name)
+                || escape.as_ref().is_some_and(|escape| expr_references(escape, name))
         }
         Expr::Window { function, spec } => window_references(function, spec, name),
     }
@@ -4985,10 +4912,7 @@ fn is_clause_keyword(word: &str) -> bool {
 /// Aggregate names that are reported as unsupported rather than "no such
 /// function", because SQLite does know them but this engine does not aggregate.
 fn is_aggregate_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "count" | "avg" | "sum" | "total" | "min" | "max"
-    )
+    matches!(name.to_ascii_lowercase().as_str(), "count" | "avg" | "sum" | "total" | "min" | "max")
 }
 
 #[cfg(test)]

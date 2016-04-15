@@ -5,25 +5,28 @@
 //! image read by `SqliteWriter::open`, and [`Engine::save`] flushes the current
 //! image back to a file.
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 use crate::{
     ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue, decode_library_version,
     decode_record,
 };
 
-use super::error::SqlError;
-use super::json_string;
-use super::sql::{
-    AggregateFunction, AlterAction, Assignment, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm,
-    DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal,
-    NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp,
-    WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column, rewrite_create_index_table,
-    rewrite_create_table_column, rewrite_create_table_drop_column, rewrite_create_table_name, rewrite_view_column,
-    rewrite_view_table, statement_references,
-    strip_schema_qualifiers,
+use super::{
+    error::SqlError,
+    json_string,
+    sql::{
+        AggregateFunction, AlterAction, Assignment, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp,
+        CompoundTerm, DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge, FrameUnits, IndexColumn, InsertValue,
+        JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, TransactionAction,
+        TriggerEvent, TriggerTiming, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column,
+        rewrite_create_index_table, rewrite_create_table_column, rewrite_create_table_drop_column, rewrite_create_table_name,
+        rewrite_view_column, rewrite_view_table, statement_references, strip_schema_qualifiers,
+    },
 };
 
 /// One cell surfaced to the host.
@@ -155,19 +158,9 @@ impl TableDef {
         if !self.primary_key.is_empty() {
             return Some(self.primary_key.clone());
         }
-        let declared: Vec<usize> = self
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.primary_key)
-            .map(|(position, _)| position)
-            .collect();
-        if declared.is_empty() {
-            None
-        }
-        else {
-            Some(declared)
-        }
+        let declared: Vec<usize> =
+            self.columns.iter().enumerate().filter(|(_, column)| column.primary_key).map(|(position, _)| position).collect();
+        if declared.is_empty() { None } else { Some(declared) }
     }
 
     /// Record layout of a WITHOUT ROWID table: stored record position to
@@ -215,17 +208,26 @@ struct CheckDef {
 }
 
 /// One index in the engine catalog, keyed by its lowercase name.
+#[derive(Clone)]
 struct IndexDef {
     /// Index name as written, used by `PRAGMA index_list`.
     name: String,
     /// Lowercase name of the indexed table.
     table: String,
-    /// Indexed column positions, in key order.
+    /// Indexed column positions, in key order. Empty for a managed index
+    /// whose keys are expression results or filtered by a predicate.
     columns: Vec<usize>,
     /// The index enforces uniqueness.
     unique: bool,
     /// Creation counter, so `PRAGMA index_list` reports newest first.
     order: u64,
+    /// The keys are computed by the engine (expression, `COLLATE` or partial
+    /// index), not derived from column positions.
+    managed: bool,
+    /// Key terms resolved against the table, evaluated per row.
+    terms: Vec<ResolvedExpr>,
+    /// Partial-index predicate resolved against the table.
+    predicate: Option<ResolvedExpr>,
 }
 
 /// One view in the engine catalog, keyed by its lowercase name.
@@ -307,7 +309,6 @@ const MAX_TRIGGER_DEPTH: usize = 100;
 /// expression. They never collide with a `FROM` source position.
 const TRIGGER_SOURCE_NEW: usize = usize::MAX;
 const TRIGGER_SOURCE_OLD: usize = usize::MAX - 1;
-
 
 /// One database attached with `ATTACH DATABASE`.
 struct AttachedDb {
@@ -553,26 +554,12 @@ fn view_relation<'a>(label: &str, names: &[String], trigger: Option<&'a TriggerF
 }
 
 /// Evaluates an optional view-DML predicate against one output row.
-fn row_matches(
-    predicate: &Option<ResolvedExpr>,
-    row: &[Cell],
-    engine: &Engine,
-    shape: &ScopeShape,
-    budget: &Budget,
-) -> Result<bool, SqlError> {
-    let Some(predicate) = predicate else {
+fn row_matches(predicate: &Option<ResolvedExpr>, row: &[Cell], engine: &Engine, shape: &ScopeShape, budget: &Budget) -> Result<bool, SqlError> {
+    let Some(predicate) = predicate
+    else {
         return Ok(true);
     };
-    let ctx = EvalContext {
-        engine,
-        outer: &[],
-        current: shape,
-        aggregates: &[],
-        windows: &[],
-        window_row: 0,
-        budget,
-        ctes: None,
-    };
+    let ctx = EvalContext { engine, outer: &[], current: shape, aggregates: &[], windows: &[], window_row: 0, budget, ctes: None };
     Ok(truthiness(&predicate.eval(row, &ctx)?) == Some(true))
 }
 
@@ -581,8 +568,7 @@ fn trigger_event_matches(defined: &TriggerEvent, incoming: &TriggerEvent) -> boo
     match (defined, incoming) {
         (TriggerEvent::Insert, TriggerEvent::Insert) | (TriggerEvent::Delete, TriggerEvent::Delete) => true,
         (TriggerEvent::Update(defined), TriggerEvent::Update(assigned)) => {
-            defined.is_empty()
-                || defined.iter().any(|column| assigned.iter().any(|assigned| assigned.eq_ignore_ascii_case(column)))
+            defined.is_empty() || defined.iter().any(|column| assigned.iter().any(|assigned| assigned.eq_ignore_ascii_case(column)))
         }
         _ => false,
     }
@@ -657,8 +643,7 @@ impl<'a> TargetShape<'a> {
     fn resolve(&self, expr: &Expr, statement: &'static str) -> Result<ResolvedExpr, SqlError> {
         let mut windows = Vec::new();
         let mut aggregates = Vec::new();
-        resolve_expr(expr, &self.relation, &[], &[], &mut windows, &mut aggregates, false, false)
-            .map_err(|error| error.in_statement(statement))
+        resolve_expr(expr, &self.relation, &[], &[], &mut windows, &mut aggregates, false, false).map_err(|error| error.in_statement(statement))
     }
 
     fn resolve_optional(&self, expr: Option<&Expr>, statement: &'static str) -> Result<Option<ResolvedExpr>, SqlError> {
@@ -675,9 +660,9 @@ impl<'a> TargetShape<'a> {
                 columns: items.iter().map(|item| item.label()).collect(),
                 items: items.iter().map(|item| self.resolve(item, statement)).collect::<Result<Vec<_>, _>>()?,
             }),
-            SelectItems::CountAll => Err(SqlError::new("unsupported-clause", "`RETURNING count(*)` is not supported")
-                .in_clause("RETURNING")
-                .in_statement(statement)),
+            SelectItems::CountAll => {
+                Err(SqlError::new("unsupported-clause", "`RETURNING count(*)` is not supported").in_clause("RETURNING").in_statement(statement))
+            }
         }
     }
 }
@@ -871,8 +856,7 @@ impl Engine {
         match action {
             TransactionAction::Begin => {
                 if self.transaction.is_some() {
-                    return Err(SqlError::new("transaction-active", "cannot start a transaction within a transaction")
-                        .in_statement("begin"));
+                    return Err(SqlError::new("transaction-active", "cannot start a transaction within a transaction").in_statement("begin"));
                 }
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("begin"))?;
                 for attached in &mut self.attached {
@@ -882,27 +866,19 @@ impl Engine {
             }
             TransactionAction::Commit => {
                 if self.transaction.take().is_none() {
-                    return Err(SqlError::new("transaction-missing", "cannot commit - no transaction is active")
-                        .in_statement("commit"));
+                    return Err(SqlError::new("transaction-missing", "cannot commit - no transaction is active").in_statement("commit"));
                 }
                 self.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
                 for attached in &mut self.attached {
-                    attached
-                        .engine
-                        .writer
-                        .commit_all()
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
+                    attached.engine.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
                 }
                 self.persist_attached_databases()?;
             }
             TransactionAction::Rollback => {
                 if self.transaction.take().is_none() {
-                    return Err(SqlError::new("transaction-missing", "cannot rollback - no transaction is active")
-                        .in_statement("rollback"));
+                    return Err(SqlError::new("transaction-missing", "cannot rollback - no transaction is active").in_statement("rollback"));
                 }
-                self.writer
-                    .rollback_all()
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback"))?;
+                self.writer.rollback_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback"))?;
                 self.reload_catalog()?;
                 for index in 0..self.attached.len() {
                     self.attached[index]
@@ -927,9 +903,7 @@ impl Engine {
                     }
                     self.transaction = Some(TransactionState { from_begin: false, savepoints: Vec::new() });
                 }
-                self.writer
-                    .savepoint(&name)
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                self.writer.savepoint(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
                 for attached in &mut self.attached {
                     attached
                         .engine
@@ -941,9 +915,7 @@ impl Engine {
             }
             TransactionAction::Release(name) => {
                 let index = self.savepoint_position(&name, "release")?;
-                self.writer
-                    .release(&name)
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
+                self.writer.release(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
                 for attached in &mut self.attached {
                     attached
                         .engine
@@ -966,9 +938,7 @@ impl Engine {
             }
             TransactionAction::RollbackTo(name) => {
                 let index = self.savepoint_position(&name, "rollback-to")?;
-                self.writer
-                    .rollback_to(&name)
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback-to"))?;
+                self.writer.rollback_to(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback-to"))?;
                 self.reload_catalog()?;
                 for index in 0..self.attached.len() {
                     self.attached[index]
@@ -989,11 +959,7 @@ impl Engine {
     fn savepoint_position(&self, name: &str, statement: &'static str) -> Result<usize, SqlError> {
         let missing = || SqlError::new("savepoint-missing", format!("no such savepoint: {name}")).in_statement(statement);
         let state = self.transaction.as_ref().ok_or_else(missing)?;
-        state
-            .savepoints
-            .iter()
-            .rposition(|saved| saved.eq_ignore_ascii_case(name))
-            .ok_or_else(missing)
+        state.savepoints.iter().rposition(|saved| saved.eq_ignore_ascii_case(name)).ok_or_else(missing)
     }
 
     /// Rebuilds the in-memory catalog after storage rolled back, so schema
@@ -1012,7 +978,10 @@ impl Engine {
     fn load_catalog(&mut self) -> Result<(), SqlError> {
         let objects = self.writer.schema_objects(TableLimits::default()).map_err(storage_error)?;
         for object in objects {
-            let Some(sql) = object.sql.as_deref() else { continue };
+            let Some(sql) = object.sql.as_deref()
+            else {
+                continue;
+            };
             let mut statements = parse(sql)?.into_iter();
             match statements.next() {
                 Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, without_rowid, .. }) => {
@@ -1024,28 +993,74 @@ impl Engine {
                         self.tables.push(def);
                     }
                 }
-                Some(Statement::CreateIndex { name, table, unique, columns, .. }) => {
-                    let positions = match self.tables.iter().find(|def| def.name.eq_ignore_ascii_case(&table)) {
-                        Some(def) => {
-                            let mut positions = Vec::with_capacity(columns.len());
-                            for column in &columns {
-                                match def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)) {
-                                    Some(position) => positions.push(position),
-                                    None => break,
-                                }
-                            }
-                            positions
-                        }
-                        None => continue,
-                    };
-                    if positions.len() != columns.len() {
+                Some(Statement::CreateIndex { name, table, unique, columns, predicate, .. }) => {
+                    let Some(def) = self.tables.iter().find(|def| def.name.eq_ignore_ascii_case(&table))
+                    else {
                         continue;
+                    };
+                    let managed = predicate.is_some() || columns.iter().any(|column| column.expr.is_some() || column.collate.is_some());
+                    let (positions, terms, predicate) = if managed {
+                        let shape = TargetShape::new(def, &table, None);
+                        let mut terms = Vec::with_capacity(columns.len());
+                        let mut failed = false;
+                        for column in &columns {
+                            let resolved = match &column.expr {
+                                Some(expr) => match shape.resolve(expr, "create-index") {
+                                    Ok(resolved) => resolved,
+                                    Err(_) => {
+                                        failed = true;
+                                        break;
+                                    }
+                                },
+                                None => match def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)) {
+                                    Some(position) => ResolvedExpr::Column { source: 0, index: position },
+                                    None => {
+                                        failed = true;
+                                        break;
+                                    }
+                                },
+                            };
+                            terms.push(resolved);
+                        }
+                        if failed {
+                            continue;
+                        }
+                        let predicate = match &predicate {
+                            Some(predicate) => match shape.resolve(predicate, "create-index") {
+                                Ok(resolved) => Some(resolved),
+                                Err(_) => continue,
+                            },
+                            None => None,
+                        };
+                        (Vec::new(), terms, predicate)
                     }
+                    else {
+                        let mut positions = Vec::with_capacity(columns.len());
+                        for column in &columns {
+                            match def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)) {
+                                Some(position) => positions.push(position),
+                                None => break,
+                            }
+                        }
+                        if positions.len() != columns.len() {
+                            continue;
+                        }
+                        (positions, Vec::new(), None)
+                    };
                     let order = self.index_sequence;
                     self.index_sequence += 1;
                     self.indexes.insert(
                         name.to_ascii_lowercase(),
-                        IndexDef { name: name.clone(), table: table.to_ascii_lowercase(), columns: positions, unique, order },
+                        IndexDef {
+                            name: name.clone(),
+                            table: table.to_ascii_lowercase(),
+                            columns: positions,
+                            unique,
+                            order,
+                            managed,
+                            terms,
+                            predicate,
+                        },
                     );
                 }
                 Some(Statement::CreateView { name, columns, query, .. }) => {
@@ -1109,32 +1124,25 @@ impl Engine {
         }
         let mut key_positions = Vec::with_capacity(primary_key.len());
         for column in &primary_key {
-            let position = columns
-                .iter()
-                .position(|existing| existing.name.eq_ignore_ascii_case(column))
-                .ok_or_else(|| {
-                    SqlError::new("unknown-column", format!("unknown column `{column}` in table `{name}`")).in_statement("create-table")
-                })?;
+            let position = columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(column)).ok_or_else(|| {
+                SqlError::new("unknown-column", format!("unknown column `{column}` in table `{name}`")).in_statement("create-table")
+            })?;
             key_positions.push(position);
         }
         if without_rowid {
             // A WITHOUT ROWID table needs a primary key: either the table-level
             // clause or exactly one inline `PRIMARY KEY`. The key columns are
             // implicitly NOT NULL and are stored first in every record.
-            let inline: Vec<usize> = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, column)| column.primary_key)
-                .map(|(position, _)| position)
-                .collect();
+            let inline: Vec<usize> =
+                columns.iter().enumerate().filter(|(_, column)| column.primary_key).map(|(position, _)| position).collect();
             if !primary_key.is_empty() && !inline.is_empty() {
-                return Err(SqlError::new("SQLITE_ERROR", format!("table {name} has more than one primary key"))
-                    .in_statement("create-table"));
+                return Err(SqlError::new("SQLITE_ERROR", format!("table {name} has more than one primary key")).in_statement("create-table"));
             }
             if key_positions.is_empty() {
                 if inline.len() > 1 {
-                    return Err(SqlError::new("SQLITE_ERROR", format!("table {name} has more than one primary key"))
-                        .in_statement("create-table"));
+                    return Err(
+                        SqlError::new("SQLITE_ERROR", format!("table {name} has more than one primary key")).in_statement("create-table")
+                    );
                 }
                 key_positions = inline;
             }
@@ -1178,7 +1186,6 @@ impl Engine {
             temp: false,
         })
     }
-
 
     /// Executes exactly one statement.
     pub fn execute_one(&mut self, statement: &str) -> Result<ExecResult, SqlError> {
@@ -1269,9 +1276,7 @@ impl Engine {
     /// b-tree, so `type`, `sql`, `rootpage`, `rowid` and ordering are the
     /// on-disk values rather than a second copy that could drift.
     fn system_rows(&self, system: SystemTable, name: &str) -> Result<(Vec<String>, Vec<Vec<Cell>>, bool), SqlError> {
-        let master_labels = || {
-            vec!["type".to_string(), "name".to_string(), "tbl_name".to_string(), "rootpage".to_string(), "sql".to_string()]
-        };
+        let master_labels = || vec!["type".to_string(), "name".to_string(), "tbl_name".to_string(), "rootpage".to_string(), "sql".to_string()];
         match system {
             SystemTable::Master => {
                 let objects = self.writer.schema_objects_with_rowids(TableLimits::default()).map_err(storage_error)?;
@@ -1369,7 +1374,8 @@ impl Engine {
             Statement::Delete { schema, table, .. } => Some((schema.as_deref(), table.clone())),
             _ => None,
         };
-        let Some((schema, table)) = fired else {
+        let Some((schema, table)) = fired
+        else {
             return self.run_statement(statement);
         };
         if !self.target_is_local(schema, &table) {
@@ -1418,9 +1424,7 @@ impl Engine {
         match schema {
             Some(qualifier) => {
                 let lower = qualifier.to_ascii_lowercase();
-                lower == "main"
-                    || lower == "temp"
-                    || self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+                lower == "main" || lower == "temp" || self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
             }
             None => {
                 self.temp_lookup.contains_key(&key)
@@ -1450,9 +1454,7 @@ impl Engine {
         let mut matched: Vec<(String, TriggerDef)> = self
             .triggers
             .iter()
-            .filter(|(_, trigger)| {
-                trigger.table == table && trigger.timing == timing && trigger_event_matches(&trigger.event, event)
-            })
+            .filter(|(_, trigger)| trigger.table == table && trigger.timing == timing && trigger_event_matches(&trigger.event, event))
             .map(|(key, trigger)| (key.clone(), trigger.clone()))
             .collect();
         matched.sort_by(|left, right| right.1.order.cmp(&left.1.order));
@@ -1487,8 +1489,7 @@ impl Engine {
 
     /// Evaluates one trigger `WHEN` predicate against the current frame.
     fn trigger_when_holds(&self, when: &Expr) -> Result<bool, SqlError> {
-        let relation =
-            Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: self.trigger_frames.last() };
+        let relation = Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: self.trigger_frames.last() };
         let shape = relation.shape();
         let mut aggregates = Vec::new();
         let mut windows = Vec::new();
@@ -1510,8 +1511,7 @@ impl Engine {
     /// Evaluates one `VALUES` expression of a trigger body against the active
     /// `NEW` / `OLD` frame.
     fn eval_trigger_expression(&self, expression: &Expr, statement: &'static str) -> Result<Cell, SqlError> {
-        let relation =
-            Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: self.trigger_frames.last() };
+        let relation = Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: self.trigger_frames.last() };
         let shape = relation.shape();
         let mut aggregates = Vec::new();
         let mut windows = Vec::new();
@@ -1636,12 +1636,9 @@ impl Engine {
                 let mut cells = vec![Cell::Null; names.len()];
                 if let Some(list) = columns {
                     for (slot, name) in list.iter().enumerate() {
-                        let position = names
-                            .iter()
-                            .position(|column| column.eq_ignore_ascii_case(name))
-                            .ok_or_else(|| {
-                                SqlError::new("unknown-column", format!("table {table} has no column named {name}")).in_statement("insert")
-                            })?;
+                        let position = names.iter().position(|column| column.eq_ignore_ascii_case(name)).ok_or_else(|| {
+                            SqlError::new("unknown-column", format!("table {table} has no column named {name}")).in_statement("insert")
+                        })?;
                         if let Some(value) = values.get(slot) {
                             cells[position] = self.insert_value_cell(value, "insert")?;
                         }
@@ -1692,8 +1689,9 @@ impl Engine {
         let event = TriggerEvent::Update(assigned);
         self.view_trigger_gate(table, key, TriggerTiming::InsteadOf, &event)?;
         if returning.is_some() {
-            return Err(SqlError::new("unsupported-clause", "RETURNING on an INSTEAD OF view update is not supported yet")
-                .in_statement("update"));
+            return Err(
+                SqlError::new("unsupported-clause", "RETURNING on an INSTEAD OF view update is not supported yet").in_statement("update")
+            );
         }
         let view = self.views.get(key).expect("view resolved").clone();
         let (names, rows) = self.view_output(&view)?;
@@ -1707,20 +1705,14 @@ impl Engine {
             let mut aggregates = Vec::new();
             let mut windows = Vec::new();
             let predicate = match filter {
-                Some(filter) => {
-                    Some(resolve_expr(filter, &relation, &[], &[], &mut windows, &mut aggregates, false, false)?)
-                }
+                Some(filter) => Some(resolve_expr(filter, &relation, &[], &[], &mut windows, &mut aggregates, false, false)?),
                 None => None,
             };
             let mut targets = Vec::with_capacity(assignments.len());
             for assignment in assignments {
-                let index = names
-                    .iter()
-                    .position(|column| column.eq_ignore_ascii_case(&assignment.column))
-                    .ok_or_else(|| {
-                        SqlError::new("unknown-column", format!("table {table} has no column named {}", assignment.column))
-                            .in_statement("update")
-                    })?;
+                let index = names.iter().position(|column| column.eq_ignore_ascii_case(&assignment.column)).ok_or_else(|| {
+                    SqlError::new("unknown-column", format!("table {table} has no column named {}", assignment.column)).in_statement("update")
+                })?;
                 let expression = resolve_expr(&assignment.value, &relation, &[], &[], &mut windows, &mut aggregates, false, false)?;
                 targets.push((index, expression));
             }
@@ -1796,8 +1788,9 @@ impl Engine {
         let event = TriggerEvent::Delete;
         self.view_trigger_gate(table, key, TriggerTiming::InsteadOf, &event)?;
         if returning.is_some() {
-            return Err(SqlError::new("unsupported-clause", "RETURNING on an INSTEAD OF view delete is not supported yet")
-                .in_statement("delete"));
+            return Err(
+                SqlError::new("unsupported-clause", "RETURNING on an INSTEAD OF view delete is not supported yet").in_statement("delete")
+            );
         }
         let view = self.views.get(key).expect("view resolved").clone();
         let (names, rows) = self.view_output(&view)?;
@@ -1809,9 +1802,7 @@ impl Engine {
             let mut aggregates = Vec::new();
             let mut windows = Vec::new();
             let predicate = match filter {
-                Some(filter) => {
-                    Some(resolve_expr(filter, &relation, &[], &[], &mut windows, &mut aggregates, false, false)?)
-                }
+                Some(filter) => Some(resolve_expr(filter, &relation, &[], &[], &mut windows, &mut aggregates, false, false)?),
                 None => None,
             };
             Ok((predicate, shape))
@@ -1850,10 +1841,9 @@ impl Engine {
         Ok(ExecResult { statement: "delete", columns: Vec::new(), rows: Vec::new(), affected: 0 })
     }
 
-
-
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
-        let Some(schema) = leading_schema(&statement).map(str::to_owned) else {
+        let Some(schema) = leading_schema(&statement).map(str::to_owned)
+        else {
             if let Some(index) = self.attached_target(&statement) {
                 return self.run_attached(index, statement);
             }
@@ -1939,10 +1929,7 @@ impl Engine {
             return Ok(());
         }
         if let Some(path) = self.attached[index].file.clone() {
-            self.attached[index]
-                .engine
-                .save(&path)
-                .map_err(|error| SqlError::new("storage", error.to_string()))?;
+            self.attached[index].engine.save(&path).map_err(|error| SqlError::new("storage", error.to_string()))?;
         }
         self.attached[index].dirty = false;
         Ok(())
@@ -2007,9 +1994,7 @@ impl Engine {
                 // until the first change.
                 if let Some(parent) = requested.parent() {
                     if !parent.as_os_str().is_empty() && !parent.exists() {
-                        return Err(
-                            SqlError::new("unable-to-open", format!("unable to open database: {file}")).in_statement("attach")
-                        );
+                        return Err(SqlError::new("unable-to-open", format!("unable to open database: {file}")).in_statement("attach"));
                     }
                 }
                 std::fs::OpenOptions::new()
@@ -2037,7 +2022,8 @@ impl Engine {
         if key == "main" || key == "temp" {
             return Err(SqlError::new("cannot-detach", format!("cannot detach database {name}")).in_statement("detach"));
         }
-        let Some(index) = self.attached_lookup.get(&key).copied() else {
+        let Some(index) = self.attached_lookup.get(&key).copied()
+        else {
             return Err(SqlError::new("unknown-database", format!("no such database: {name}")).in_statement("detach"));
         };
         self.persist_attached(index)?;
@@ -2054,7 +2040,19 @@ impl Engine {
             Statement::Transaction { action } => self.transaction(action),
             Statement::Attach { file, name } => self.attach_database(&file, &name),
             Statement::Detach { name } => self.detach_database(&name),
-            Statement::CreateTable { schema: _, name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, without_rowid, temp, sql } => {
+            Statement::CreateTable {
+                schema: _,
+                name,
+                if_not_exists,
+                columns,
+                primary_key,
+                checks,
+                foreign_keys,
+                strict,
+                without_rowid,
+                temp,
+                sql,
+            } => {
                 let key = name.to_ascii_lowercase();
                 // A WITHOUT ROWID table's writer call needs the key columns
                 // whether they were declared inline or as a table constraint.
@@ -2138,8 +2136,8 @@ impl Engine {
                 check_reserved_object_name(&name, "create-view")?;
                 // `CREATE TEMP VIEW` and `CREATE VIEW temp.v` both target the
                 // connection-owned schema, whose objects shadow main ones.
-                let temp_target = temp || self.scope == TableScope::Temp
-                    || schema.as_deref().is_some_and(|qualifier| qualifier.eq_ignore_ascii_case("temp"));
+                let temp_target =
+                    temp || self.scope == TableScope::Temp || schema.as_deref().is_some_and(|qualifier| qualifier.eq_ignore_ascii_case("temp"));
                 if temp_target {
                     if self.temp_lookup.contains_key(&key) || self.temp_views.contains_key(&key) {
                         if if_not_exists {
@@ -2152,10 +2150,7 @@ impl Engine {
                     let stored = schema.as_deref().map(|qualifier| strip_schema_qualifiers(&sql, qualifier)).unwrap_or(sql);
                     let master_rowid = self.temp_next_rowid;
                     self.temp_next_rowid += 1;
-                    self.temp_views.insert(
-                        key,
-                        TempView { def: ViewDef { name, columns, query: *query }, sql: stored, master_rowid },
-                    );
+                    self.temp_views.insert(key, TempView { def: ViewDef { name, columns, query: *query }, sql: stored, master_rowid });
                     self.temp_created = true;
                     return Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 1 });
                 }
@@ -2182,8 +2177,8 @@ impl Engine {
             }
             Statement::DropView { schema, name, if_exists } => {
                 let key = name.to_ascii_lowercase();
-                let temp_target = self.scope == TableScope::Temp
-                    || schema.as_deref().is_some_and(|qualifier| qualifier.eq_ignore_ascii_case("temp"));
+                let temp_target =
+                    self.scope == TableScope::Temp || schema.as_deref().is_some_and(|qualifier| qualifier.eq_ignore_ascii_case("temp"));
                 // Unqualified `DROP VIEW` searches temp before main, so a temp
                 // view disappears while its main namesake survives.
                 if schema.is_none() || temp_target {
@@ -2215,9 +2210,7 @@ impl Engine {
                     }
                     return Err(SqlError::new("unknown-view", format!("no such view: {name}")).in_statement("drop-view"));
                 }
-                self.writer
-                    .drop_view(&name)
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-view"))?;
+                self.writer.drop_view(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-view"))?;
                 self.triggers.retain(|_, trigger| trigger.table != key);
                 Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
@@ -2233,19 +2226,13 @@ impl Engine {
                 let table_key = table.to_ascii_lowercase();
                 let temp_target = if self.scope == TableScope::Main { None } else { self.temp_lookup.get(&table_key).copied() };
                 let main_target = if temp_target.is_some() { None } else { self.table_lookup.get(&table_key).copied() };
-                let view_target = if temp_target.is_some() || main_target.is_some() {
-                    false
-                }
-                else {
-                    self.views.contains_key(&table_key)
-                };
+                let view_target = if temp_target.is_some() || main_target.is_some() { false } else { self.views.contains_key(&table_key) };
                 if temp_target.is_none() && main_target.is_none() && !view_target {
                     let qualifier = match self.scope {
                         TableScope::Temp => "temp",
                         _ => "main",
                     };
-                    return Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{table}"))
-                        .in_statement("create-trigger"));
+                    return Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{table}")).in_statement("create-trigger"));
                 }
                 let timing_text = match timing {
                     TriggerTiming::Before => "BEFORE",
@@ -2275,15 +2262,13 @@ impl Engine {
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-trigger"))?;
                     0
                 };
-                self.triggers.insert(
-                    key,
-                    TriggerDef { name, table: table_key, timing, event, when, body, order, temp, sql, master_rowid },
-                );
+                self.triggers.insert(key, TriggerDef { name, table: table_key, timing, event, when, body, order, temp, sql, master_rowid });
                 Ok(ExecResult { statement: "create-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             Statement::DropTrigger { schema: _, name, if_exists } => {
                 let key = name.to_ascii_lowercase();
-                let Some(trigger) = self.triggers.remove(&key) else {
+                let Some(trigger) = self.triggers.remove(&key)
+                else {
                     if if_exists {
                         return Ok(ExecResult { statement: "drop-trigger", columns: Vec::new(), rows: Vec::new(), affected: 0 });
                     }
@@ -2498,6 +2483,10 @@ impl Engine {
                     return Err(error);
                 }
                 if temp_position.is_none() {
+                    if let Err(error) = self.refresh_managed_indexes(&key, def, "insert") {
+                        let _ = self.writer.rollback();
+                        return Err(error);
+                    }
                     self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
                 }
                 // Explicit indexes and the automatic ones built for column-level
@@ -2512,9 +2501,7 @@ impl Engine {
                         .enumerate()
                         .any(|(position, column)| (column.primary_key || column.unique) && Some(position) != aliased);
                 if temp_position.is_none() && (constraint_indexed || self.indexes.values().any(|index| index.table == key)) {
-                    self.writer
-                        .materialize_indexes()
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                    self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
                 }
                 if temp_position.is_none() && def.without_rowid {
                     self.writer
@@ -2522,12 +2509,7 @@ impl Engine {
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
                 }
                 if let Some(plan) = &returning {
-                    return Ok(ExecResult {
-                        statement: "insert",
-                        columns: plan.columns.clone(),
-                        rows: returned,
-                        affected: slots_by_row.len(),
-                    });
+                    return Ok(ExecResult { statement: "insert", columns: plan.columns.clone(), rows: returned, affected: slots_by_row.len() });
                 }
                 if default_values {
                     // `DEFAULT VALUES` reports neither columns nor rows, like
@@ -2541,10 +2523,12 @@ impl Engine {
                 let rows = rowids.into_iter().map(|rowid| vec![Cell::Integer(rowid)]).collect();
                 Ok(ExecResult { statement: "insert", columns: vec!["rowid".to_string()], rows, affected: slots_by_row.len() })
             }
-            Statement::CreateIndex { schema: _, name, table, if_not_exists, unique, columns, sql } => {
+            Statement::CreateIndex { schema: _, name, table, if_not_exists, unique, columns, predicate, sql } => {
                 let table_key = table.to_ascii_lowercase();
                 if is_schema_table(&table) {
-                    return Err(SqlError::new("readonly-system-table", format!("table {table} may not be indexed")).in_statement("create-index"));
+                    return Err(
+                        SqlError::new("readonly-system-table", format!("table {table} may not be indexed")).in_statement("create-index")
+                    );
                 }
                 if self.views.contains_key(&table_key) {
                     return Err(SqlError::new("readonly-view", "views may not be indexed").in_statement("create-index"));
@@ -2554,7 +2538,8 @@ impl Engine {
                     .table_lookup
                     .get(&table_key)
                     .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("create-index"))?;
-                let def = &self.tables[position];
+                let def_storage = self.tables[position].clone();
+                let def = &def_storage;
                 let key = name.to_ascii_lowercase();
                 if self.table_lookup.contains_key(&key) {
                     return Err(SqlError::new("table-exists", format!("there is already a table named `{name}`")).in_statement("create-index"));
@@ -2566,16 +2551,63 @@ impl Engine {
                     return Err(SqlError::new("index-exists", format!("index `{name}` already exists")).in_statement("create-index"));
                 }
                 if self.views.contains_key(&key) {
-                    return Err(SqlError::new("index-exists", format!("there is already an object named `{name}`")).in_statement("create-index"));
+                    return Err(
+                        SqlError::new("index-exists", format!("there is already an object named `{name}`")).in_statement("create-index")
+                    );
+                }
+                // `COLLATE` index keys change the b-tree comparison order, which
+                // this writer does not implement yet.
+                if let Some(column) = columns.iter().find(|column| column.collate.is_some()) {
+                    let mut error = SqlError::new(
+                        "unsupported-clause",
+                        format!("`COLLATE` index key `{}` is not supported; this engine compares keys with binary order", column.name),
+                    );
+                    error.clause = Some("COLLATE".to_string());
+                    return Err(error.in_statement("create-index"));
+                }
+                // Expression keys, `COLLATE` terms and a `WHERE` predicate make
+                // the key values row-dependent, so the engine computes them and
+                // hands the exact entries to the writer.
+                let managed = predicate.is_some() || columns.iter().any(|column| column.expr.is_some());
+                if managed {
+                    let shape = TargetShape::new(def, &table, None);
+                    let mut terms = Vec::with_capacity(columns.len());
+                    for column in &columns {
+                        let resolved = match &column.expr {
+                            Some(expr) => shape.resolve(expr, "create-index")?,
+                            None => {
+                                let position =
+                                    def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)).ok_or_else(
+                                        || {
+                                            SqlError::new("unknown-column", format!("unknown column `{}` in table `{table}`", column.name))
+                                                .in_statement("create-index")
+                                        },
+                                    )?;
+                                ResolvedExpr::Column { source: 0, index: position }
+                            }
+                        };
+                        terms.push(resolved);
+                    }
+                    let predicate = shape.resolve_optional(predicate.as_ref(), "create-index")?;
+                    let rows = self.live_rows(def, "create-index")?;
+                    let entries = self.managed_index_entries(def, &terms, predicate.as_ref(), &rows)?;
+                    self.writer
+                        .create_managed_index(&name, &table, unique, &sql, &entries)
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-index"))?;
+                    let order = self.index_sequence;
+                    self.index_sequence += 1;
+                    self.indexes.insert(
+                        key,
+                        IndexDef { name: name.clone(), table: table_key, columns: Vec::new(), unique, order, managed: true, terms, predicate },
+                    );
+                    return Ok(ExecResult { statement: "create-index", columns: Vec::new(), rows: Vec::new(), affected: 1 });
                 }
                 let mut positions = Vec::with_capacity(columns.len());
                 for column in &columns {
-                    let position = def
-                        .columns
-                        .iter()
-                        .position(|existing| existing.name.eq_ignore_ascii_case(&column.name))
-                        .ok_or_else(|| {
-                            SqlError::new("unknown-column", format!("unknown column `{}` in table `{table}`", column.name)).in_statement("create-index")
+                    let position =
+                        def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)).ok_or_else(|| {
+                            SqlError::new("unknown-column", format!("unknown column `{}` in table `{table}`", column.name))
+                                .in_statement("create-index")
                         })?;
                     positions.push(position);
                 }
@@ -2588,7 +2620,19 @@ impl Engine {
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-index"))?;
                 let order = self.index_sequence;
                 self.index_sequence += 1;
-                self.indexes.insert(key, IndexDef { name: name.clone(), table: table_key, columns: positions, unique, order });
+                self.indexes.insert(
+                    key,
+                    IndexDef {
+                        name: name.clone(),
+                        table: table_key,
+                        columns: positions,
+                        unique,
+                        order,
+                        managed: false,
+                        terms: Vec::new(),
+                        predicate: None,
+                    },
+                );
                 Ok(ExecResult { statement: "create-index", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             Statement::Update { schema: _, table, alias, assignments, filter, returning } => {
@@ -2615,12 +2659,10 @@ impl Engine {
                 let shape = TargetShape::new(def, alias.as_deref().unwrap_or(&table), self.trigger_frames.last());
                 let mut targets: Vec<(usize, ResolvedExpr)> = Vec::with_capacity(assignments.len());
                 for assignment in &assignments {
-                    let index = def
-                        .columns
-                        .iter()
-                        .position(|column| column.name.eq_ignore_ascii_case(&assignment.column))
-                        .ok_or_else(|| {
-                            SqlError::new("unknown-column", format!("unknown column `{}` in table `{table}`", assignment.column)).in_statement("update")
+                    let index =
+                        def.columns.iter().position(|column| column.name.eq_ignore_ascii_case(&assignment.column)).ok_or_else(|| {
+                            SqlError::new("unknown-column", format!("unknown column `{}` in table `{table}`", assignment.column))
+                                .in_statement("update")
                         })?;
                     targets.push((index, shape.resolve(&assignment.value, "update")?));
                 }
@@ -2717,12 +2759,14 @@ impl Engine {
                     }
                 }
                 if temp_position.is_none() {
+                    if let Err(error) = self.refresh_managed_indexes(&key, def, "update") {
+                        let _ = self.writer.rollback();
+                        return Err(error);
+                    }
                     self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
                 }
                 if temp_position.is_none() && needs_index {
-                    self.writer
-                        .materialize_indexes()
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
+                    self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
                 }
                 if temp_position.is_none() && def.without_rowid {
                     self.writer
@@ -2827,12 +2871,14 @@ impl Engine {
                     }
                 }
                 if temp_position.is_none() {
+                    if let Err(error) = self.refresh_managed_indexes(&key, def, "delete") {
+                        let _ = self.writer.rollback();
+                        return Err(error);
+                    }
                     self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
                 }
                 if temp_position.is_none() && needs_index {
-                    self.writer
-                        .materialize_indexes()
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
+                    self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
                 }
                 if temp_position.is_none() && def.without_rowid {
                     self.writer
@@ -2969,7 +3015,9 @@ impl Engine {
                     if if_exists {
                         return Ok(ExecResult { statement: "drop-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
                     }
-                    return Err(SqlError::new("unknown-table", format!("no such table: {}", self.scoped_name(&name))).in_statement("drop-table"));
+                    return Err(
+                        SqlError::new("unknown-table", format!("no such table: {}", self.scoped_name(&name))).in_statement("drop-table")
+                    );
                 }
                 if name.eq_ignore_ascii_case("sqlite_sequence") {
                     return Err(SqlError::new("readonly-system-table", format!("table {name} may not be dropped")).in_statement("drop-table"));
@@ -3091,15 +3139,9 @@ impl Engine {
             AlterAction::RenameTable { new_name } => {
                 check_reserved_object_name(&new_name, "alter-table")?;
                 let new_key = new_name.to_ascii_lowercase();
-                if self.table_lookup.contains_key(&new_key)
-                    || self.indexes.contains_key(&new_key)
-                    || self.views.contains_key(&new_key)
-                {
-                    return Err(SqlError::new(
-                        "table-exists",
-                        format!("there is already another table or index with this name: {new_name}"),
-                    )
-                    .in_statement("alter-table"));
+                if self.table_lookup.contains_key(&new_key) || self.indexes.contains_key(&new_key) || self.views.contains_key(&new_key) {
+                    return Err(SqlError::new("table-exists", format!("there is already another table or index with this name: {new_name}"))
+                        .in_statement("alter-table"));
                 }
                 let old_name = self.tables[position].name.clone();
                 let new_sql = rewrite_create_table_name(&stored, &new_name)
@@ -3122,8 +3164,14 @@ impl Engine {
                     if object.kind != SchemaObjectKind::View {
                         continue;
                     }
-                    let Some(view) = self.views.get(&object.name.to_ascii_lowercase()) else { continue };
-                    let Some(text) = &object.sql else { continue };
+                    let Some(view) = self.views.get(&object.name.to_ascii_lowercase())
+                    else {
+                        continue;
+                    };
+                    let Some(text) = &object.sql
+                    else {
+                        continue;
+                    };
                     if !statement_references(&view.query, &old_name) {
                         continue;
                     }
@@ -3203,8 +3251,14 @@ impl Engine {
                     if object.kind != SchemaObjectKind::View {
                         continue;
                     }
-                    let Some(view) = self.views.get(&object.name.to_ascii_lowercase()) else { continue };
-                    let Some(text) = &object.sql else { continue };
+                    let Some(view) = self.views.get(&object.name.to_ascii_lowercase())
+                    else {
+                        continue;
+                    };
+                    let Some(text) = &object.sql
+                    else {
+                        continue;
+                    };
                     if !statement_mentions_column(&view.query, &old_column, None) {
                         continue;
                     }
@@ -3241,8 +3295,9 @@ impl Engine {
             AlterAction::AddColumn { column, checks, foreign_keys, sql } => {
                 let def = &self.tables[position];
                 if def.columns.iter().any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) {
-                    return Err(SqlError::new("duplicate-column", format!("duplicate column name: {}", column.name))
-                        .in_statement("alter-table"));
+                    return Err(
+                        SqlError::new("duplicate-column", format!("duplicate column name: {}", column.name)).in_statement("alter-table")
+                    );
                 }
                 if column.primary_key {
                     return Err(SqlError::new("invalid-alter", "Cannot add a PRIMARY KEY column").in_statement("alter-table"));
@@ -3262,8 +3317,9 @@ impl Engine {
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?
                     .is_empty();
                 if column.not_null && matches!(column.default_value, None | Some(crate::WriteValue::Null)) && has_rows {
-                    return Err(SqlError::new("invalid-alter", "Cannot add a NOT NULL column with default value NULL")
-                        .in_statement("alter-table"));
+                    return Err(
+                        SqlError::new("invalid-alter", "Cannot add a NOT NULL column with default value NULL").in_statement("alter-table")
+                    );
                 }
                 let mut columns = def.columns.clone();
                 columns.push(column.clone());
@@ -3295,7 +3351,9 @@ impl Engine {
                     || def.primary_key.contains(&column_position)
                     || def.columns[column_position].primary_key;
                 if primary {
-                    return Err(SqlError::new("invalid-alter", format!("cannot drop PRIMARY KEY column: \"{column}\"")).in_statement("alter-table"));
+                    return Err(
+                        SqlError::new("invalid-alter", format!("cannot drop PRIMARY KEY column: \"{column}\"")).in_statement("alter-table")
+                    );
                 }
                 if def.columns[column_position].unique {
                     return Err(SqlError::new("invalid-alter", format!("cannot drop UNIQUE column: \"{column}\"")).in_statement("alter-table"));
@@ -3304,16 +3362,9 @@ impl Engine {
                     return Err(SqlError::new("invalid-alter", format!("cannot drop column \"{column}\": no other columns exist"))
                         .in_statement("alter-table"));
                 }
-                if let Some((name, _)) = self
-                    .indexes
-                    .iter()
-                    .find(|(_, index)| index.table == key && index.columns.contains(&column_position))
-                {
-                    return Err(SqlError::new(
-                        "invalid-alter",
-                        format!("error in index {name} after drop column: no such column: {column}"),
-                    )
-                    .in_statement("alter-table"));
+                if let Some((name, _)) = self.indexes.iter().find(|(_, index)| index.table == key && index.columns.contains(&column_position)) {
+                    return Err(SqlError::new("invalid-alter", format!("error in index {name} after drop column: no such column: {column}"))
+                        .in_statement("alter-table"));
                 }
                 let new_sql = match rewrite_create_table_drop_column(&stored, &def.columns[column_position].name) {
                     Ok(Some(text)) => text,
@@ -3335,39 +3386,22 @@ impl Engine {
                         .in_statement("alter-table"));
                     }
                 };
-                if let Some((name, _)) = self
-                    .views
-                    .iter()
-                    .find(|(_, view)| statement_mentions_column(&view.query, &column, None))
-                {
-                    return Err(SqlError::new(
-                        "invalid-alter",
-                        format!("error in view {name} after drop column: no such column: {column}"),
-                    )
-                    .in_statement("alter-table"));
+                if let Some((name, _)) = self.views.iter().find(|(_, view)| statement_mentions_column(&view.query, &column, None)) {
+                    return Err(SqlError::new("invalid-alter", format!("error in view {name} after drop column: no such column: {column}"))
+                        .in_statement("alter-table"));
                 }
-                if let Some((name, _)) = self
-                    .triggers
-                    .iter()
-                    .find(|(_, trigger)| {
-                        trigger.table == key
-                            && trigger.body.iter().any(|statement| {
-                                statement_mentions_column(statement, &column, Some(&["new", "old"]))
-                            })
-                    })
-                {
-                    return Err(SqlError::new(
-                        "invalid-alter",
-                        format!("error in trigger {name} after drop column: no such column: {column}"),
-                    )
-                    .in_statement("alter-table"));
+                if let Some((name, _)) = self.triggers.iter().find(|(_, trigger)| {
+                    trigger.table == key
+                        && trigger.body.iter().any(|statement| statement_mentions_column(statement, &column, Some(&["new", "old"])))
+                }) {
+                    return Err(SqlError::new("invalid-alter", format!("error in trigger {name} after drop column: no such column: {column}"))
+                        .in_statement("alter-table"));
                 }
                 // The catalog is re-derived from the rewritten DDL so checks,
                 // foreign keys and the rowid alias all follow the new column
                 // positions instead of being patched by hand.
-                let mut statements = parse(&new_sql).map_err(|_| {
-                    SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table")
-                })?;
+                let mut statements = parse(&new_sql)
+                    .map_err(|_| SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"))?;
                 let Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, without_rowid, .. }) =
                     statements.drain(..).next()
                 else {
@@ -3408,19 +3442,17 @@ impl Engine {
     fn ensure_unique_keys(&self, table: &str, def: &TableDef, columns: &[IndexColumn]) -> Result<(), SqlError> {
         let mut positions = Vec::with_capacity(columns.len());
         for column in columns {
-            let position = def
-                .columns
-                .iter()
-                .position(|existing| existing.name.eq_ignore_ascii_case(&column.name))
-                .ok_or_else(|| {
-                    SqlError::new("unknown-column", format!("unknown column `{}` in table `{table}`", column.name)).in_statement("create-index")
-                })?;
+            let position = def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)).ok_or_else(|| {
+                SqlError::new("unknown-column", format!("unknown column `{}` in table `{table}`", column.name)).in_statement("create-index")
+            })?;
             positions.push(position);
         }
         let mut rows = Vec::new();
-        for row in self.writer.table_rows(table, TableLimits::default()).map_err(|error| {
-            SqlError::new("storage", error.to_string()).in_statement("create-index")
-        })? {
+        for row in self
+            .writer
+            .table_rows(table, TableLimits::default())
+            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-index"))?
+        {
             rows.push(decode_row(&row.payload, def, row.rowid)?);
         }
         for right in 1..rows.len() {
@@ -3430,11 +3462,8 @@ impl Engine {
                     !matches!(first, Cell::Null) && !matches!(second, Cell::Null) && compare_cells(first, second) == Ordering::Equal
                 });
                 if collides {
-                    let names = positions
-                        .iter()
-                        .map(|position| format!("{table}.{}", def.columns[*position].name))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let names =
+                        positions.iter().map(|position| format!("{table}.{}", def.columns[*position].name)).collect::<Vec<_>>().join(", ");
                     return Err(SqlError::new("unique-constraint", format!("UNIQUE constraint failed: {names}")).in_statement("create-index"));
                 }
             }
@@ -3496,6 +3525,63 @@ impl Engine {
         Ok(rows)
     }
 
+    /// Computes the `(key values, rowid)` entries of one managed index by
+    /// evaluating its terms and predicate against every live row.
+    fn managed_index_entries(
+        &self,
+        def: &TableDef,
+        terms: &[ResolvedExpr],
+        predicate: Option<&ResolvedExpr>,
+        rows: &[(i64, Vec<Cell>)],
+    ) -> Result<Vec<(Vec<crate::WriteValue>, i64)>, SqlError> {
+        let shape = TargetShape::new(def, &def.name, None);
+        let budget = Budget::new();
+        let aggregates: Vec<Cell> = Vec::new();
+        let windows: Vec<Vec<Cell>> = Vec::new();
+        let mut entries = Vec::with_capacity(rows.len());
+        for (rowid, cells) in rows {
+            let context = EvalContext {
+                engine: self,
+                outer: &[],
+                current: &shape.scope,
+                aggregates: &aggregates,
+                windows: &windows,
+                window_row: 0,
+                budget: &budget,
+                ctes: None,
+            };
+            if let Some(predicate) = predicate {
+                if truthiness(&predicate.eval(cells, &context)?) != Some(true) {
+                    continue;
+                }
+            }
+            let mut key = Vec::with_capacity(terms.len());
+            for term in terms {
+                key.push(cell_write_value(&term.eval(cells, &context)?));
+            }
+            entries.push((key, *rowid));
+        }
+        Ok(entries)
+    }
+
+    /// Rebuilds the key sets of every managed index on `table` from the live
+    /// rows. Called inside the statement's transaction, before it commits.
+    fn refresh_managed_indexes(&mut self, table: &str, def: &TableDef, statement: &'static str) -> Result<(), SqlError> {
+        let managed: Vec<IndexDef> =
+            self.indexes.values().filter(|index| index.table.eq_ignore_ascii_case(table) && index.managed).cloned().collect();
+        if managed.is_empty() {
+            return Ok(());
+        }
+        let rows = self.live_rows(def, statement)?;
+        for index in managed {
+            let entries = self.managed_index_entries(def, &index.terms, index.predicate.as_ref(), &rows)?;
+            self.writer
+                .replace_managed_index_entries(&index.name, &entries)
+                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement(statement))?;
+        }
+        Ok(())
+    }
+
     /// Resolves one foreign key against the live catalog: the parent table
     /// position and the parent key column positions.
     ///
@@ -3509,9 +3595,7 @@ impl Engine {
             .ok_or_else(|| SqlError::new("SQLITE_ERROR", format!("no such table: main.{}", key.parent_display)).in_statement(statement))?;
         let parent = &self.tables[parent_position];
         let positions = if key.parent_columns.is_empty() {
-            parent
-                .primary_key_positions()
-                .ok_or_else(|| foreign_key_mismatch(child, key, statement))?
+            parent.primary_key_positions().ok_or_else(|| foreign_key_mismatch(child, key, statement))?
         }
         else {
             let mut positions = Vec::with_capacity(key.parent_columns.len());
@@ -3542,13 +3626,8 @@ impl Engine {
         if !parent.primary_key.is_empty() && same_positions(&parent.primary_key, positions) {
             return true;
         }
-        let declared: Vec<usize> = parent
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.primary_key)
-            .map(|(position, _)| position)
-            .collect();
+        let declared: Vec<usize> =
+            parent.columns.iter().enumerate().filter(|(_, column)| column.primary_key).map(|(position, _)| position).collect();
         if !declared.is_empty() && same_positions(&declared, positions) {
             return true;
         }
@@ -3559,9 +3638,7 @@ impl Engine {
             return true;
         }
         let parent_key = parent.name.to_ascii_lowercase();
-        self.indexes
-            .values()
-            .any(|index| index.table == parent_key && index.unique && same_positions(&index.columns, positions))
+        self.indexes.values().any(|index| index.table == parent_key && index.unique && same_positions(&index.columns, positions))
     }
 
     /// Every foreign key in the catalog that references `parent`, as
@@ -3746,7 +3823,9 @@ impl Engine {
             }
         }
         for index in self.indexes.values() {
-            if !def.temp && index.table == table_key && index.unique {
+            // Managed indexes are expression or partial, so their uniqueness is
+            // enforced while their keys are rebuilt from the live rows.
+            if !def.temp && !index.managed && index.table == table_key && index.unique {
                 keys.push(UniqueKey::Columns(index.columns.clone(), label(&index.columns)));
             }
         }
@@ -3789,16 +3868,8 @@ impl Engine {
         for (rowid, cells) in &live {
             let mut eval_cells = cells.clone();
             eval_cells.push(Cell::Integer(*rowid));
-            let ctx = EvalContext {
-                engine: self,
-                outer: &[],
-                current: shape,
-                aggregates: &[],
-                windows: &[],
-                window_row: 0,
-                budget,
-                ctes: None,
-            };
+            let ctx =
+                EvalContext { engine: self, outer: &[], current: shape, aggregates: &[], windows: &[], window_row: 0, budget, ctes: None };
             if let Some(predicate) = predicate {
                 if truthiness(&predicate.eval(&eval_cells, &ctx)?) != Some(true) {
                     continue;
@@ -3831,11 +3902,8 @@ impl Engine {
                 }
                 else {
                     if matches!(cell, Cell::Null) && column.not_null {
-                        return Err(SqlError::new(
-                            "constraint-failed",
-                            format!("NOT NULL constraint failed: {}.{}", def.name, column.name),
-                        )
-                        .in_statement("update"));
+                        return Err(SqlError::new("constraint-failed", format!("NOT NULL constraint failed: {}.{}", def.name, column.name))
+                            .in_statement("update"));
                     }
                     next[*index] = cell;
                 }
@@ -3867,9 +3935,7 @@ impl Engine {
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(index, _)| {
-                    if assigned[index] { UpdateValue::Set(cell_write_value(&next[index])) } else { UpdateValue::Keep }
-                })
+                .map(|(index, _)| if assigned[index] { UpdateValue::Set(cell_write_value(&next[index])) } else { UpdateValue::Keep })
                 .collect();
             writes.push((*rowid, values));
             affected += 1;
@@ -3893,16 +3959,8 @@ impl Engine {
         for (rowid, cells) in &live {
             let mut eval_cells = cells.clone();
             eval_cells.push(Cell::Integer(*rowid));
-            let ctx = EvalContext {
-                engine: self,
-                outer: &[],
-                current: shape,
-                aggregates: &[],
-                windows: &[],
-                window_row: 0,
-                budget,
-                ctes: None,
-            };
+            let ctx =
+                EvalContext { engine: self, outer: &[], current: shape, aggregates: &[], windows: &[], window_row: 0, budget, ctes: None };
             if let Some(predicate) = predicate {
                 if truthiness(&predicate.eval(&eval_cells, &ctx)?) != Some(true) {
                     continue;
@@ -3974,16 +4032,8 @@ impl Engine {
                 Some(on) => {
                     let mut scratch_aggregates = Vec::new();
                     let mut scratch_windows = Vec::new();
-                    let resolved = resolve_expr(
-                        on,
-                        &relation,
-                        &outer_shapes,
-                        &[],
-                        &mut scratch_windows,
-                        &mut scratch_aggregates,
-                        false,
-                        false,
-                    )?;
+                    let resolved =
+                        resolve_expr(on, &relation, &outer_shapes, &[], &mut scratch_windows, &mut scratch_aggregates, false, false)?;
                     let mut refs = Vec::new();
                     resolved.collect_sources(&mut refs);
                     if refs.iter().any(|source| *source > index) {
@@ -4007,12 +4057,18 @@ impl Engine {
                     .iter()
                     .map(|expr| resolve_expr(expr, &relation, &outer_shapes, named, &mut windows, &mut specs, true, true))
                     .collect::<Result<Vec<_>, _>>()?;
-                (Some(nodes), exprs.iter().map(|expr| match expr {
-                    // A bare column is named after the schema's own spelling,
-                    // so `SELECT A FROM t` reports `a`.
-                    Expr::Column(reference) => relation.resolved_column_name(reference).unwrap_or_else(|| expr.label()),
-                    _ => expr.label(),
-                }).collect())
+                (
+                    Some(nodes),
+                    exprs
+                        .iter()
+                        .map(|expr| match expr {
+                            // A bare column is named after the schema's own spelling,
+                            // so `SELECT A FROM t` reports `a`.
+                            Expr::Column(reference) => relation.resolved_column_name(reference).unwrap_or_else(|| expr.label()),
+                            _ => expr.label(),
+                        })
+                        .collect(),
+                )
             }
             SelectItems::CountAll => (None, vec!["count(*)".to_string()]),
             SelectItems::Star => (None, relation.star_columns()),
@@ -4091,16 +4147,7 @@ impl Engine {
                     }
                 }
                 Ok((
-                    SortKey::Expression(resolve_expr(
-                        &entry.expr,
-                        &relation,
-                        &outer_shapes,
-                        named,
-                        &mut windows,
-                        &mut specs,
-                        true,
-                        true,
-                    )?),
+                    SortKey::Expression(resolve_expr(&entry.expr, &relation, &outer_shapes, named, &mut windows, &mut specs, true, true)?),
                     entry.descending,
                 ))
             })
@@ -4146,16 +4193,8 @@ impl Engine {
             usize::MAX
         };
         let empty_aggregates: Vec<Cell> = Vec::new();
-        let ctx = EvalContext {
-            engine: self,
-            outer,
-            current: &shape,
-            aggregates: &empty_aggregates,
-            windows: &[],
-            window_row: 0,
-            budget,
-            ctes,
-        };
+        let ctx =
+            EvalContext { engine: self, outer, current: &shape, aggregates: &empty_aggregates, windows: &[], window_row: 0, budget, ctes };
         let mut conjuncts = Vec::new();
         if let Some(predicate) = predicate {
             split_conjuncts(predicate, &mut conjuncts);
@@ -4176,16 +4215,8 @@ impl Engine {
             for group_rows in groups {
                 let aggregates = specs.iter().map(|spec| compute_aggregate(spec, &group_rows, &ctx)).collect::<Result<Vec<_>, _>>()?;
                 let representative = group_rows.first().cloned().unwrap_or_else(|| vec![Cell::Null; shape.columns.len()]);
-                let group_ctx = EvalContext {
-                    engine: self,
-                    outer,
-                    current: &shape,
-                    aggregates: &aggregates,
-                    windows: &[],
-                    window_row: 0,
-                    budget,
-                    ctes,
-                };
+                let group_ctx =
+                    EvalContext { engine: self, outer, current: &shape, aggregates: &aggregates, windows: &[], window_row: 0, budget, ctes };
                 if let Some(having) = &having_expr {
                     if truthiness(&having.eval(&representative, &group_ctx)?) != Some(true) {
                         continue;
@@ -4379,23 +4410,17 @@ impl Engine {
         budget: &Budget,
         ctes: Option<&CteEnv>,
     ) -> Result<Option<(usize, Option<usize>)>, SqlError> {
-        let Some(limit) = limit else { return Ok(None) };
+        let Some(limit) = limit
+        else {
+            return Ok(None);
+        };
         let relation = Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: None };
         let shape = relation.shape();
         let outer_shapes: Vec<ScopeShape> = outer.iter().map(Scope::shape).collect();
         let mut aggregates = Vec::new();
         let mut windows = Vec::new();
         let empty: Vec<Cell> = Vec::new();
-        let ctx = EvalContext {
-            engine: self,
-            outer,
-            current: &shape,
-            aggregates: &empty,
-            windows: &[],
-            window_row: 0,
-            budget,
-            ctes,
-        };
+        let ctx = EvalContext { engine: self, outer, current: &shape, aggregates: &empty, windows: &[], window_row: 0, budget, ctes };
         let mut offset = 0usize;
         if let Some(expr) = &limit.offset {
             let resolved = resolve_expr(expr, &relation, &outer_shapes, &[], &mut windows, &mut aggregates, false, false)?;
@@ -4432,10 +4457,7 @@ impl Engine {
             if right.columns.len() != width {
                 let mut error = SqlError::new(
                     "arity-mismatch",
-                    format!(
-                        "SELECTs to the left and right of {} do not have the same number of result columns",
-                        term.op.text()
-                    ),
+                    format!("SELECTs to the left and right of {} do not have the same number of result columns", term.op.text()),
                 )
                 .in_statement("select");
                 error.clause = Some(term.op.clause().to_string());
@@ -4494,16 +4516,8 @@ impl Engine {
             let mut window_partitions: Vec<Vec<Cell>> = Vec::with_capacity(inputs.len());
             let mut window_orders: Vec<Vec<Cell>> = Vec::with_capacity(inputs.len());
             for row in inputs {
-                let ctx = EvalContext {
-                    engine: self,
-                    outer,
-                    current: shape,
-                    aggregates: &row.aggregates,
-                    windows: &[],
-                    window_row: 0,
-                    budget,
-                    ctes,
-                };
+                let ctx =
+                    EvalContext { engine: self, outer, current: shape, aggregates: &row.aggregates, windows: &[], window_row: 0, budget, ctes };
                 let mut partition = Vec::with_capacity(window.partition.len());
                 for expr in &window.partition {
                     partition.push(expr.eval(&row.values, &ctx)?);
@@ -4531,7 +4545,15 @@ impl Engine {
             let window = &windows[index];
             let window_partitions = &partitions[index];
             let window_orders = &orders[index];
-            order.sort_by(|left, right| compare_window_rows(&window_partitions[*left], &window_orders[*left], &window_partitions[*right], &window_orders[*right], &window.order));
+            order.sort_by(|left, right| {
+                compare_window_rows(
+                    &window_partitions[*left],
+                    &window_orders[*left],
+                    &window_partitions[*right],
+                    &window_orders[*right],
+                    &window.order,
+                )
+            });
             let mut column = vec![Cell::Null; inputs.len()];
             let mut start = 0;
             while start < order.len() {
@@ -4601,11 +4623,7 @@ impl Engine {
             }
             ResolvedWindowFunction::PercentRank => {
                 for slot in 0..len {
-                    column[indices[slot]] = if len == 1 {
-                        Cell::Real(0.0)
-                    } else {
-                        Cell::Real(peer_start[slot] as f64 / (len - 1) as f64)
-                    };
+                    column[indices[slot]] = if len == 1 { Cell::Real(0.0) } else { Cell::Real(peer_start[slot] as f64 / (len - 1) as f64) };
                 }
             }
             ResolvedWindowFunction::CumeDist => {
@@ -4639,16 +4657,76 @@ impl Engine {
                 self.evaluate_offset_function(value, offset, default, false, indices, inputs, column, shape, outer, budget, ctes)?;
             }
             ResolvedWindowFunction::FirstValue(value) => {
-                self.evaluate_frame_value(ValuePick::First, value, None, window, indices, orders, inputs, column, &peer_start, &peer_end, shape, outer, budget, ctes)?;
+                self.evaluate_frame_value(
+                    ValuePick::First,
+                    value,
+                    None,
+                    window,
+                    indices,
+                    orders,
+                    inputs,
+                    column,
+                    &peer_start,
+                    &peer_end,
+                    shape,
+                    outer,
+                    budget,
+                    ctes,
+                )?;
             }
             ResolvedWindowFunction::LastValue(value) => {
-                self.evaluate_frame_value(ValuePick::Last, value, None, window, indices, orders, inputs, column, &peer_start, &peer_end, shape, outer, budget, ctes)?;
+                self.evaluate_frame_value(
+                    ValuePick::Last,
+                    value,
+                    None,
+                    window,
+                    indices,
+                    orders,
+                    inputs,
+                    column,
+                    &peer_start,
+                    &peer_end,
+                    shape,
+                    outer,
+                    budget,
+                    ctes,
+                )?;
             }
             ResolvedWindowFunction::NthValue { value, position } => {
-                self.evaluate_frame_value(ValuePick::Nth, value, Some(position), window, indices, orders, inputs, column, &peer_start, &peer_end, shape, outer, budget, ctes)?;
+                self.evaluate_frame_value(
+                    ValuePick::Nth,
+                    value,
+                    Some(position),
+                    window,
+                    indices,
+                    orders,
+                    inputs,
+                    column,
+                    &peer_start,
+                    &peer_end,
+                    shape,
+                    outer,
+                    budget,
+                    ctes,
+                )?;
             }
             ResolvedWindowFunction::Aggregate { function, argument, separator } => {
-                self.evaluate_frame_aggregate(*function, argument.as_ref(), separator.as_ref(), window, indices, orders, inputs, column, &peer_start, &peer_end, shape, outer, budget, ctes)?;
+                self.evaluate_frame_aggregate(
+                    *function,
+                    argument.as_ref(),
+                    separator.as_ref(),
+                    window,
+                    indices,
+                    orders,
+                    inputs,
+                    column,
+                    &peer_start,
+                    &peer_end,
+                    shape,
+                    outer,
+                    budget,
+                    ctes,
+                )?;
             }
         }
         Ok(())
@@ -4664,16 +4742,7 @@ impl Engine {
         budget: &'a Budget,
         ctes: Option<&'a CteEnv>,
     ) -> EvalContext<'a> {
-        EvalContext {
-            engine: self,
-            outer,
-            current: shape,
-            aggregates: &inputs[index].aggregates,
-            windows: &[],
-            window_row: 0,
-            budget,
-            ctes,
-        }
+        EvalContext { engine: self, outer, current: shape, aggregates: &inputs[index].aggregates, windows: &[], window_row: 0, budget, ctes }
     }
 
     /// `lag`/`lead`: the value of a row `offset` positions away.
@@ -4822,7 +4891,8 @@ impl Engine {
         peer_end: &[usize],
         _ctx: &EvalContext,
     ) -> Result<(i64, i64), SqlError> {
-        let Some(frame) = &window.frame else {
+        let Some(frame) = &window.frame
+        else {
             // No ORDER BY means the whole partition; otherwise the default is
             // `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`, whose CURRENT ROW
             // edge is the last peer, not the current position.
@@ -4865,13 +4935,15 @@ impl Engine {
         let offset_start = range_offset(&frame.start, "starting")?;
         let offset_end = range_offset(&frame.end, "ending")?;
         if (offset_start.is_some() || offset_end.is_some()) && window.order.len() != 1 {
-            let mut error = SqlError::new("invalid-frame", "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression").in_statement("select");
+            let mut error =
+                SqlError::new("invalid-frame", "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression").in_statement("select");
             error.clause = Some("RANGE".to_string());
             return Err(error);
         }
         // A non-numeric current value can only match its own peers; unbounded
         // edges still reach the edges of the partition.
-        let Some(current) = coerced else {
+        let Some(current) = coerced
+        else {
             let start = match frame.start.edge {
                 FrameEdge::UnboundedPreceding => 0,
                 FrameEdge::UnboundedFollowing => len as i64,
@@ -4899,7 +4971,10 @@ impl Engine {
         let mut first = None;
         let mut last = None;
         for position in 0..len {
-            let Some(value) = orders[indices[position]].first().and_then(numeric) else { continue };
+            let Some(value) = orders[indices[position]].first().and_then(numeric)
+            else {
+                continue;
+            };
             let value = number_f64(value);
             if value >= low && value <= high {
                 first.get_or_insert(position);
@@ -4940,10 +5015,7 @@ impl Engine {
         let pushdown = self.recursive_limit(first, compounds, &order, limit.as_ref(), outer, budget, parent)?;
         let mut env = CteEnv { parent, tables: BTreeMap::new() };
         for entry in with {
-            let bound = pushdown
-                .as_ref()
-                .filter(|(name, _)| name.eq_ignore_ascii_case(&entry.name))
-                .map(|(_, bound)| *bound);
+            let bound = pushdown.as_ref().filter(|(name, _)| name.eq_ignore_ascii_case(&entry.name)).map(|(_, bound)| *bound);
             let result = match self.recursive_start(entry)? {
                 Some(start) => self.materialize_recursive(entry, start, &env, budget, bound)?,
                 None => {
@@ -4976,14 +5048,16 @@ impl Engine {
     /// recursive term and must also read the name. Mixed operators and a
     /// seed that reads its own CTE are reported as `circular reference`.
     fn recursive_start(&self, entry: &CommonTable) -> Result<Option<usize>, SqlError> {
-        let Statement::Select { first, compounds, .. } = entry.query.as_ref() else {
+        let Statement::Select { first, compounds, .. } = entry.query.as_ref()
+        else {
             return Ok(None);
         };
         let name = entry.name.as_str();
         if core_references(first, name) {
             return Err(circular_reference(name));
         }
-        let Some(start) = compounds.iter().position(|term| core_references(&term.core, name)) else {
+        let Some(start) = compounds.iter().position(|term| core_references(&term.core, name))
+        else {
             if statement_references(&entry.query, name) {
                 return Err(circular_reference(name));
             }
@@ -5013,7 +5087,8 @@ impl Engine {
         budget: &Budget,
         bound: Option<usize>,
     ) -> Result<Materialized, SqlError> {
-        let Statement::Select { with: inner_with, first, compounds, order, limit, .. } = entry.query.as_ref() else {
+        let Statement::Select { with: inner_with, first, compounds, order, limit, .. } = entry.query.as_ref()
+        else {
             return Err(SqlError::new("unsupported-statement", "a `WITH` body must be a `SELECT`").in_statement("select"));
         };
         // Terms before the first self-reference are the initial select; they
@@ -5167,7 +5242,8 @@ impl Engine {
         if source.query.is_some() || source.join.is_some() || source.using.is_some() || source.natural || source.name.is_empty() {
             return Ok(None);
         }
-        let Some((offset, Some(count))) = self.eval_limit(limit, outer, budget, parent)? else {
+        let Some((offset, Some(count))) = self.eval_limit(limit, outer, budget, parent)?
+        else {
             return Ok(None);
         };
         Ok(Some((source.name.to_ascii_lowercase(), offset.saturating_add(count))))
@@ -5207,23 +5283,20 @@ impl Engine {
                 }
             }
         };
-        let Some(scope) = scope else {
+        let Some(scope) = scope
+        else {
             let qualifier = table.schema.as_deref().unwrap_or_default();
             let index = match self.attached_lookup.get(&qualifier.to_ascii_lowercase()).copied() {
                 Some(index) => index,
                 None => {
-                    return Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{}", table.name))
-                        .in_statement("select"));
+                    return Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{}", table.name)).in_statement("select"));
                 }
             };
             return self.attached_source(index, qualifier, table, budget);
         };
         if table.schema.is_none() {
             if let Some(materialized) = ctes.and_then(|env| env.lookup(&table.name)) {
-                return Ok((
-                    SourceColumns::Materialized { names: materialized.columns.clone(), rowid: false },
-                    materialized.rows.clone(),
-                ));
+                return Ok((SourceColumns::Materialized { names: materialized.columns.clone(), rowid: false }, materialized.rows.clone()));
             }
         }
         if let Some(system) = system_for_scope(scope, &table.name) {
@@ -5271,8 +5344,7 @@ impl Engine {
                     .writer
                     .without_rowid_rows(&def.name, TableLimits::default())
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
-                let decoded =
-                    stored.iter().map(|payload| def.decode_without_rowid(payload)).collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
+                let decoded = stored.iter().map(|payload| def.decode_without_rowid(payload)).collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
                 return Ok((SourceColumns::Table(def), decoded));
             }
             let stored = self
@@ -5350,22 +5422,13 @@ impl Engine {
         Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{}", table.name)).in_statement("select"))
     }
 
-    fn select_statement(
-        &self,
-        statement: &Statement,
-        outer: &[Scope],
-        budget: &Budget,
-        ctes: Option<&CteEnv>,
-    ) -> Result<ExecResult, SqlError> {
+    fn select_statement(&self, statement: &Statement, outer: &[Scope], budget: &Budget, ctes: Option<&CteEnv>) -> Result<ExecResult, SqlError> {
         match statement {
             Statement::Select { with, recursive, first, compounds, order, limit } => {
                 self.run_select(with, *recursive, first, compounds, order.clone(), limit.clone(), outer, budget, ctes)
             }
-            other => Err(SqlError::new(
-                "unsupported-statement",
-                format!("a subquery must be a `SELECT` but found `{}`", other.name()),
-            )
-            .in_statement("select")),
+            other => Err(SqlError::new("unsupported-statement", format!("a subquery must be a `SELECT` but found `{}`", other.name()))
+                .in_statement("select")),
         }
     }
 }
@@ -5405,16 +5468,15 @@ fn compound_order_keys(order: &[OrderKey], columns: &[String]) -> Result<Vec<(us
                             format!("ORDER BY term `{}` does not match any column in the result set", reference.name),
                         )
                         .in_statement("select")),
-                        _ => Err(SqlError::new(
-                            "ambiguous-column",
-                            format!("ORDER BY term `{}` is ambiguous in the result set", reference.name),
-                        )
-                        .in_statement("select")),
+                        _ => {
+                            Err(SqlError::new("ambiguous-column", format!("ORDER BY term `{}` is ambiguous in the result set", reference.name))
+                                .in_statement("select"))
+                        }
                     };
                 }
             }
-            let mut error =
-                SqlError::new("unsupported-clause", "a compound `SELECT` can only order by an output column name or ordinal").in_statement("select");
+            let mut error = SqlError::new("unsupported-clause", "a compound `SELECT` can only order by an output column name or ordinal")
+                .in_statement("select");
             error.clause = Some("ORDER BY".to_string());
             Err(error)
         })
@@ -5465,9 +5527,7 @@ struct CteEnv<'a> {
 
 impl<'a> CteEnv<'a> {
     fn lookup(&self, name: &str) -> Option<&Materialized> {
-        self.tables
-            .get(&name.to_ascii_lowercase())
-            .or_else(|| self.parent.and_then(|parent| parent.lookup(name)))
+        self.tables.get(&name.to_ascii_lowercase()).or_else(|| self.parent.and_then(|parent| parent.lookup(name)))
     }
 }
 
@@ -5488,9 +5548,7 @@ struct Scope {
 
 impl Scope {
     fn shape(&self) -> ScopeShape {
-        ScopeShape {
-            columns: self.columns.iter().map(|column| (column.label.clone(), column.name.clone())).collect(),
-        }
+        ScopeShape { columns: self.columns.iter().map(|column| (column.label.clone(), column.name.clone())).collect() }
     }
 }
 
@@ -5717,9 +5775,9 @@ impl<'a> Source<'a> {
     /// Resolves an unqualified reference, skipping columns a coalesced `USING`
     /// slot owns.
     fn unqualified_index(&self, name: &str) -> Option<usize> {
-        if let Some(local) = (0..self.visible_width()).find(|local| {
-            !self.unqualified_hidden[*local] && self.columns.name_at(*local).eq_ignore_ascii_case(name)
-        }) {
+        if let Some(local) =
+            (0..self.visible_width()).find(|local| !self.unqualified_hidden[*local] && self.columns.name_at(*local).eq_ignore_ascii_case(name))
+        {
             return Some(self.offset + local);
         }
         if self.columns.hidden_rowid() && is_rowid_alias(name) {
@@ -5794,11 +5852,8 @@ impl<'a> Relation<'a> {
             })?;
             let source = &self.sources[at];
             let index = source.index(&reference.name).ok_or_else(|| {
-                SqlError::new(
-                    "unknown-column",
-                    format!("unknown column `{}` in table `{}`", reference.display(), source.label),
-                )
-                .in_statement("select")
+                SqlError::new("unknown-column", format!("unknown column `{}` in table `{}`", reference.display(), source.label))
+                    .in_statement("select")
             })?;
             return Ok((at, index));
         }
@@ -5840,12 +5895,7 @@ impl<'a> Relation<'a> {
         }
         let offset = self.sources[source].offset;
         let local = index.checked_sub(offset)?;
-        if local < self.sources[source].visible_width() {
-            Some(self.sources[source].columns.name_at(local).to_string())
-        }
-        else {
-            None
-        }
+        if local < self.sources[source].visible_width() { Some(self.sources[source].columns.name_at(local).to_string()) } else { None }
     }
 
     /// Resolves an `new.col` / `old.col` reference against the active trigger
@@ -5894,11 +5944,8 @@ impl<'a> Relation<'a> {
                 let right_local = (0..self.sources[index].visible_width())
                     .find(|local| self.sources[index].columns.name_at(*local).eq_ignore_ascii_case(&name))
                     .ok_or_else(|| {
-                        SqlError::new(
-                            "unknown-column",
-                            format!("cannot join using column {name} - column not present in both tables"),
-                        )
-                        .in_statement("select")
+                        SqlError::new("unknown-column", format!("cannot join using column {name} - column not present in both tables"))
+                            .in_statement("select")
                     })?;
                 let left = match self.using_operand(&name, index) {
                     Some(operand) => operand,
@@ -5907,7 +5954,7 @@ impl<'a> Relation<'a> {
                             "unknown-column",
                             format!("cannot join using column {name} - column not present in both tables"),
                         )
-                        .in_statement("select"))
+                        .in_statement("select"));
                     }
                 };
                 let (left_index, label, owner, source, matched) = match left {
@@ -5916,8 +5963,7 @@ impl<'a> Relation<'a> {
                         let (label, owner, source, matched) = (slot.label.clone(), slot.owner, slot.source, slot.name.clone());
                         self.using_slots[position].nameable = false;
                         if let Some((owner_source, owner_local)) = owner {
-                            self.sources[owner_source].star_override[owner_local] =
-                                Some(self.base_width() + self.using_slots.len());
+                            self.sources[owner_source].star_override[owner_local] = Some(self.base_width() + self.using_slots.len());
                         }
                         (self.base_width() + position, label, owner, source, matched)
                     }
@@ -6184,12 +6230,7 @@ impl ResolvedExpr {
                 .unwrap_or(Cell::Null),
             Self::OuterColumn { depth, index } => ctx.outer[*depth].columns[*index].value.clone(),
             Self::AggregateRef(index) => ctx.aggregates[*index].clone(),
-            Self::Window(index) => ctx
-                .windows
-                .get(*index)
-                .and_then(|column| column.get(ctx.window_row))
-                .cloned()
-                .unwrap_or(Cell::Null),
+            Self::Window(index) => ctx.windows.get(*index).and_then(|column| column.get(ctx.window_row)).cloned().unwrap_or(Cell::Null),
             Self::Unary { op, value } => {
                 let value = value.eval(values, ctx)?;
                 match op {
@@ -6271,7 +6312,9 @@ impl ResolvedExpr {
                         match text.as_deref().map(|text| text.chars().collect::<Vec<_>>()) {
                             Some(chars) if chars.len() == 1 => Some(chars[0]),
                             Some(_) => {
-                                return Err(SqlError::new("invalid-escape", "ESCAPE expression must be a single character").in_statement("select"));
+                                return Err(
+                                    SqlError::new("invalid-escape", "ESCAPE expression must be a single character").in_statement("select")
+                                );
                             }
                             None => None,
                         }
@@ -6279,7 +6322,8 @@ impl ResolvedExpr {
                     None => None,
                 };
                 // `LIKE` with a NULL value, pattern or escape yields NULL.
-                let (Some(value), Some(pattern)) = (text_form(&value), text_form(&pattern)) else {
+                let (Some(value), Some(pattern)) = (text_form(&value), text_form(&pattern))
+                else {
                     return Ok(Cell::Null);
                 };
                 let characters: Vec<char> = value.chars().collect();
@@ -6382,11 +6426,15 @@ impl ResolvedExpr {
             Self::Function { args, .. } => args.iter().any(ResolvedExpr::contains_subquery),
             Self::Cast { value, .. } => value.contains_subquery(),
             Self::Like { value, pattern, escape, .. } => {
-                value.contains_subquery()
-                    || pattern.contains_subquery()
-                    || escape.as_ref().is_some_and(|escape| escape.contains_subquery())
+                value.contains_subquery() || pattern.contains_subquery() || escape.as_ref().is_some_and(|escape| escape.contains_subquery())
             }
-            Self::Cell(_) | Self::Parameter(_) | Self::Column { .. } | Self::OuterColumn { .. } | Self::AggregateRef(_) | Self::Window(_) | Self::TriggerColumn { .. } => false,
+            Self::Cell(_)
+            | Self::Parameter(_)
+            | Self::Column { .. }
+            | Self::OuterColumn { .. }
+            | Self::AggregateRef(_)
+            | Self::Window(_)
+            | Self::TriggerColumn { .. } => false,
         }
     }
 }
@@ -6462,16 +6510,9 @@ fn resolve_expr(
             truth: *truth,
             negated: *negated,
         },
-        Expr::Not(inner) => ResolvedExpr::Not(Box::new(resolve_expr(
-            inner,
-            relation,
-            outer,
-            named,
-            windows,
-            aggregates,
-            allow_aggregate,
-            allow_window,
-        )?)),
+        Expr::Not(inner) => {
+            ResolvedExpr::Not(Box::new(resolve_expr(inner, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?))
+        }
         Expr::And(left, right) => ResolvedExpr::And(
             Box::new(resolve_expr(left, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
             Box::new(resolve_expr(right, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
@@ -6485,7 +6526,14 @@ fn resolve_expr(
                 .as_ref()
                 .map(|inner| {
                     Ok::<_, SqlError>(Box::new(resolve_expr(
-                        inner, relation, outer, named, windows, aggregates, allow_aggregate, allow_window,
+                        inner,
+                        relation,
+                        outer,
+                        named,
+                        windows,
+                        aggregates,
+                        allow_aggregate,
+                        allow_window,
                     )?))
                 })
                 .transpose()?,
@@ -6502,7 +6550,14 @@ fn resolve_expr(
                 .as_ref()
                 .map(|inner| {
                     Ok::<_, SqlError>(Box::new(resolve_expr(
-                        inner, relation, outer, named, windows, aggregates, allow_aggregate, allow_window,
+                        inner,
+                        relation,
+                        outer,
+                        named,
+                        windows,
+                        aggregates,
+                        allow_aggregate,
+                        allow_window,
                     )?))
                 })
                 .transpose()?,
@@ -6531,9 +6586,9 @@ fn resolve_expr(
             pattern: Box::new(resolve_expr(pattern, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
             negated: *negated,
             escape: match escape {
-                Some(escape) => Some(Box::new(resolve_expr(
-                    escape, relation, outer, named, windows, aggregates, allow_aggregate, allow_window,
-                )?)),
+                Some(escape) => {
+                    Some(Box::new(resolve_expr(escape, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?))
+                }
                 None => None,
             },
         },
@@ -6553,14 +6608,10 @@ fn resolve_expr(
             }
             // An aggregate argument is evaluated per row, so it may not contain
             // another aggregate; subqueries inside it are still allowed.
-            let argument = argument
-                .as_ref()
-                .map(|arg| resolve_expr(arg, relation, outer, named, windows, aggregates, false, false))
-                .transpose()?;
-            let separator = separator
-                .as_ref()
-                .map(|sep| resolve_expr(sep, relation, outer, named, windows, aggregates, false, false))
-                .transpose()?;
+            let argument =
+                argument.as_ref().map(|arg| resolve_expr(arg, relation, outer, named, windows, aggregates, false, false)).transpose()?;
+            let separator =
+                separator.as_ref().map(|sep| resolve_expr(sep, relation, outer, named, windows, aggregates, false, false)).transpose()?;
             let index = aggregates.len();
             aggregates.push(AggregateSpec { function: *function, argument, separator });
             ResolvedExpr::AggregateRef(index)
@@ -6616,12 +6667,7 @@ fn resolve_window(
     let order = merged
         .order
         .iter()
-        .map(|key| {
-            Ok((
-                resolve_expr(&key.expr, relation, outer, named, windows, aggregates, true, false)?,
-                key.descending,
-            ))
-        })
+        .map(|key| Ok((resolve_expr(&key.expr, relation, outer, named, windows, aggregates, true, false)?, key.descending)))
         .collect::<Result<Vec<_>, SqlError>>()?;
     let frame = match merged.frame {
         Some(frame) => Some(resolve_frame(frame, relation, outer, named, windows, aggregates)?),
@@ -6652,15 +6698,11 @@ fn merge_window_spec<'a>(
     if let Some(base) = &spec.base {
         let self_reference = window_name.is_some_and(|name| name.eq_ignore_ascii_case(base));
         if !self_reference && !seen.iter().any(|name| name.eq_ignore_ascii_case(base)) {
-            let definition = named
-                .iter()
-                .rev()
-                .find(|window| window.name.eq_ignore_ascii_case(base))
-                .ok_or_else(|| {
-                    let mut error = SqlError::new("unknown-window", format!("no such window: {base}")).in_statement("select");
-                    error.clause = Some(base.to_ascii_uppercase());
-                    error
-                })?;
+            let definition = named.iter().rev().find(|window| window.name.eq_ignore_ascii_case(base)).ok_or_else(|| {
+                let mut error = SqlError::new("unknown-window", format!("no such window: {base}")).in_statement("select");
+                error.clause = Some(base.to_ascii_uppercase());
+                error
+            })?;
             seen.push(base.clone());
             let inherited = merge_window_spec(&definition.spec, named, seen, Some(base))?;
             partition = inherited.partition;
@@ -6718,7 +6760,9 @@ fn resolve_frame(
             Some(offset) => match offset.as_ref() {
                 Expr::Literal(Literal::Integer(value)) if *value >= 0 => Some(ResolvedExpr::Cell(Cell::Integer(*value))),
                 _ => {
-                    return Err(SqlError::new("invalid-frame", format!("frame {which} offset must be a non-negative integer")).in_statement("select"));
+                    return Err(
+                        SqlError::new("invalid-frame", format!("frame {which} offset must be a non-negative integer")).in_statement("select")
+                    );
                 }
             },
             None => None,
@@ -6786,11 +6830,8 @@ fn resolve_outer(reference: &ColumnRef, outer: &[ScopeShape]) -> Result<Option<R
             0 => continue,
             1 => return Ok(Some(ResolvedExpr::OuterColumn { depth, index: matches[0] })),
             _ => {
-                return Err(SqlError::new(
-                    "ambiguous-column",
-                    format!("ambiguous column `{}` in an enclosing `SELECT`", reference.display()),
-                )
-                .in_statement("select"))
+                return Err(SqlError::new("ambiguous-column", format!("ambiguous column `{}` in an enclosing `SELECT`", reference.display()))
+                    .in_statement("select"));
             }
         }
     }
@@ -6817,11 +6858,9 @@ fn run_subquery(query: &Statement, values: &[Cell], ctx: &EvalContext) -> Result
 /// as upstream SQLite enforces at prepare time.
 fn check_single_column(result: &ExecResult) -> Result<(), SqlError> {
     if result.columns.len() != 1 {
-        return Err(SqlError::new(
-            "arity-mismatch",
-            format!("sub-select returns {} columns - expected 1", result.columns.len()),
-        )
-        .in_statement("select"));
+        return Err(
+            SqlError::new("arity-mismatch", format!("sub-select returns {} columns - expected 1", result.columns.len())).in_statement("select")
+        );
     }
     Ok(())
 }
@@ -6838,7 +6877,13 @@ enum ValuePick {
 }
 
 /// Compares two input rows by partition keys, then by ORDER BY keys.
-fn compare_window_rows(left_partition: &[Cell], left_order: &[Cell], right_partition: &[Cell], right_order: &[Cell], order: &[(ResolvedExpr, bool)]) -> Ordering {
+fn compare_window_rows(
+    left_partition: &[Cell],
+    left_order: &[Cell],
+    right_partition: &[Cell],
+    right_order: &[Cell],
+    order: &[(ResolvedExpr, bool)],
+) -> Ordering {
     for (left, right) in left_partition.iter().zip(right_partition) {
         let ordering = compare_cells(left, right);
         if ordering != Ordering::Equal {
@@ -6873,11 +6918,39 @@ fn range_offset(bound: &ResolvedFrameBound, which: &str) -> Result<Option<i64>, 
 fn range_edge(edge: FrameEdge, offset: Option<i64>, current: f64, descending: bool) -> f64 {
     let offset = offset.unwrap_or(0) as f64;
     match edge {
-        FrameEdge::UnboundedPreceding => if descending { f64::INFINITY } else { f64::NEG_INFINITY },
-        FrameEdge::UnboundedFollowing => if descending { f64::NEG_INFINITY } else { f64::INFINITY },
+        FrameEdge::UnboundedPreceding => {
+            if descending {
+                f64::INFINITY
+            }
+            else {
+                f64::NEG_INFINITY
+            }
+        }
+        FrameEdge::UnboundedFollowing => {
+            if descending {
+                f64::NEG_INFINITY
+            }
+            else {
+                f64::INFINITY
+            }
+        }
         FrameEdge::CurrentRow => current,
-        FrameEdge::Preceding => if descending { current + offset } else { current - offset },
-        FrameEdge::Following => if descending { current - offset } else { current + offset },
+        FrameEdge::Preceding => {
+            if descending {
+                current + offset
+            }
+            else {
+                current - offset
+            }
+        }
+        FrameEdge::Following => {
+            if descending {
+                current - offset
+            }
+            else {
+                current + offset
+            }
+        }
     }
 }
 
@@ -6890,9 +6963,7 @@ fn rows_edge(bound: &ResolvedFrameBound, which: &str, slot: usize, len: usize) -
         FrameEdge::CurrentRow => position,
         // Frames never extend past either end of the partition.
         FrameEdge::Preceding => position.saturating_sub(range_offset(bound, which)?.unwrap_or(0)).max(0),
-        FrameEdge::Following => position
-            .saturating_add(range_offset(bound, which)?.unwrap_or(0))
-            .min(len.saturating_sub(1) as i64),
+        FrameEdge::Following => position.saturating_add(range_offset(bound, which)?.unwrap_or(0)).min(len.saturating_sub(1) as i64),
     })
 }
 
@@ -6900,7 +6971,9 @@ fn rows_edge(bound: &ResolvedFrameBound, which: &str, slot: usize, len: usize) -
 fn ntile_buckets(cell: &Cell) -> Result<usize, SqlError> {
     match numeric(cell) {
         Some(Number::Int(value)) if value > 0 => Ok(value as usize),
-        Some(Number::Real(value)) if value.is_finite() && value.fract() == 0.0 && value > 0.0 && value <= usize::MAX as f64 => Ok(value as usize),
+        Some(Number::Real(value)) if value.is_finite() && value.fract() == 0.0 && value > 0.0 && value <= usize::MAX as f64 => {
+            Ok(value as usize)
+        }
         _ => Err(SqlError::new("invalid-argument", "argument of ntile must be a positive integer").in_statement("select")),
     }
 }
@@ -6918,7 +6991,9 @@ fn nth_position(cell: &Cell) -> Result<i64, SqlError> {
 fn lag_offset(cell: &Cell) -> Option<i64> {
     match numeric(cell)? {
         Number::Int(value) => Some(value),
-        Number::Real(value) if value.is_finite() && value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 => Some(value as i64),
+        Number::Real(value) if value.is_finite() && value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 => {
+            Some(value as i64)
+        }
         Number::Real(_) => None,
     }
 }
@@ -7057,7 +7132,10 @@ fn aggregate_cells(function: AggregateFunction, values: &[Cell], separators: Opt
             let mut real = 0.0f64;
             let mut seen = false;
             for cell in values {
-                let Some(number) = numeric(cell) else { continue };
+                let Some(number) = numeric(cell)
+                else {
+                    continue;
+                };
                 seen = true;
                 match (cell, number) {
                     (Cell::Integer(_), Number::Int(value)) => match integral {
@@ -7103,7 +7181,10 @@ fn aggregate_cells(function: AggregateFunction, values: &[Cell], separators: Opt
             let mut joined = String::new();
             let mut seen = false;
             for (index, value) in values.iter().enumerate() {
-                let Some(value) = text_form(value) else { continue };
+                let Some(value) = text_form(value)
+                else {
+                    continue;
+                };
                 if seen {
                     let separator = match separators {
                         // A present but NULL separator acts like an empty one.
@@ -7171,9 +7252,9 @@ fn build_groups(
                 GroupKey::Expression(expr) => expr.eval(&row, ctx),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let bucket = groups
-            .iter_mut()
-            .find(|(existing, _)| existing.len() == key.len() && existing.iter().zip(&key).all(|(left, right)| compare_cells(left, right) == Ordering::Equal));
+        let bucket = groups.iter_mut().find(|(existing, _)| {
+            existing.len() == key.len() && existing.iter().zip(&key).all(|(left, right)| compare_cells(left, right) == Ordering::Equal)
+        });
         match bucket {
             Some((_, rows)) => {
                 budget.charge(1)?;
@@ -7337,9 +7418,7 @@ fn binding_order(relation: &Relation, conjuncts: &[ResolvedExpr]) -> Vec<usize> 
             }
             let applicable = refs
                 .iter()
-                .filter(|sources| {
-                    !sources.is_empty() && sources.iter().all(|source| *source == candidate || bound[*source])
-                })
+                .filter(|sources| !sources.is_empty() && sources.iter().all(|source| *source == candidate || bound[*source]))
                 .count();
             if best.map_or(true, |(score, _)| applicable > score) {
                 best = Some((applicable, candidate));
@@ -7745,9 +7824,7 @@ fn cast_numeric(cell: &Cell) -> Cell {
 fn numeric_text(text: &str) -> Cell {
     match text_number(text) {
         Number::Int(value) => Cell::Integer(value),
-        Number::Real(value)
-            if value.is_finite() && value.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&value) =>
-        {
+        Number::Real(value) if value.is_finite() && value.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&value) => {
             Cell::Integer(value as i64)
         }
         Number::Real(value) => Cell::Real(value),
@@ -7814,12 +7891,7 @@ fn sqlite_real_text(value: f64) -> String {
 /// `LIKE` folds case only for ASCII letters; every other character compares
 /// exactly, which is why `Ü` never matches `ü`.
 fn like_eq(left: char, right: char) -> bool {
-    if left.is_ascii() && right.is_ascii() {
-        left.eq_ignore_ascii_case(&right)
-    }
-    else {
-        left == right
-    }
+    if left.is_ascii() && right.is_ascii() { left.eq_ignore_ascii_case(&right) } else { left == right }
 }
 
 /// Matches one `LIKE` pattern against a value, one character at a time.
@@ -7828,7 +7900,8 @@ fn like_eq(left: char, right: char) -> bool {
 /// character, and the `ESCAPE` character turns the next pattern character into
 /// a literal.
 fn like_match(value: &[char], pattern: &[char], escape: Option<char>) -> bool {
-    let Some((first, rest)) = pattern.split_first() else {
+    let Some((first, rest)) = pattern.split_first()
+    else {
         return value.is_empty();
     };
     if escape != Some(*first) && *first == '%' {
@@ -7844,7 +7917,8 @@ fn like_match(value: &[char], pattern: &[char], escape: Option<char>) -> bool {
     else {
         (*first, rest)
     };
-    let Some((candidate, tail)) = value.split_first() else {
+    let Some((candidate, tail)) = value.split_first()
+    else {
         return false;
     };
     if escape != Some(*first) && *first == '_' {
@@ -7883,7 +7957,8 @@ fn negate_cell(cell: &Cell) -> Cell {
 /// Arithmetic with SQLite rules: `NULL` propagates, integer operators truncate
 /// and fall back to a real on overflow, and division by zero yields `NULL`.
 fn arithmetic(op: BinaryOp, left: &Cell, right: &Cell) -> Cell {
-    let (Some(left), Some(right)) = (numeric(left), numeric(right)) else {
+    let (Some(left), Some(right)) = (numeric(left), numeric(right))
+    else {
         return Cell::Null;
     };
     match op {
@@ -7931,7 +8006,7 @@ fn arithmetic(op: BinaryOp, left: &Cell, right: &Cell) -> Cell {
                 let remainder = left.checked_rem(right).unwrap_or(0);
                 if real { Cell::Real(remainder as f64) } else { Cell::Integer(remainder) }
             }
-        },
+        }
         // `||` never reaches arithmetic: it is evaluated by its own branch.
         BinaryOp::Concat => Cell::Null,
         BinaryOp::ShiftLeft => Cell::Integer(shift(number_i64(left), number_i64(right), true)),
@@ -7962,20 +8037,10 @@ fn shift(value: i64, count: i64, left: bool) -> i64 {
     let magnitude = count.unsigned_abs();
     let leftward = left != (count < 0);
     if leftward {
-        if magnitude >= 64 {
-            0
-        }
-        else {
-            ((value as u64) << magnitude) as i64
-        }
+        if magnitude >= 64 { 0 } else { ((value as u64) << magnitude) as i64 }
     }
     else if magnitude >= 64 {
-        if value < 0 {
-            -1
-        }
-        else {
-            0
-        }
+        if value < 0 { -1 } else { 0 }
     }
     else {
         value >> magnitude
@@ -8010,9 +8075,7 @@ fn eval_function(name: ScalarFunction, args: &[Cell]) -> Cell {
             },
             Some(Number::Real(value)) => Cell::Real(value.abs()),
         },
-        ScalarFunction::Coalesce => {
-            args.iter().find(|cell| !matches!(cell, Cell::Null)).cloned().unwrap_or(Cell::Null)
-        }
+        ScalarFunction::Coalesce => args.iter().find(|cell| !matches!(cell, Cell::Null)).cloned().unwrap_or(Cell::Null),
         ScalarFunction::Length => match &args[0] {
             Cell::Null => Cell::Null,
             Cell::Blob(bytes) => Cell::Integer(bytes.len() as i64),
@@ -8100,8 +8163,10 @@ fn quote_real(value: f64) -> String {
 /// `random()` returns any 64-bit integer, so a counter-driven xorshift is
 /// enough: tests only check the type and range.
 fn next_random() -> i64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
     static STATE: AtomicU64 = AtomicU64::new(0);
     let mut state = STATE.load(Ordering::Relaxed);
     if state == 0 {
@@ -8193,7 +8258,15 @@ fn substr_cell(args: &[Cell]) -> Cell {
 /// from the right, and a negative length runs backwards from the start point.
 fn substr_bounds(length: usize, start: i64, count: Option<i64>) -> (usize, usize) {
     let length = length as i64;
-    let begin = if start > 0 { start - 1 } else if start == 0 { -1 } else { length + start };
+    let begin = if start > 0 {
+        start - 1
+    }
+    else if start == 0 {
+        -1
+    }
+    else {
+        length + start
+    };
     let (begin, end) = match count {
         None => (begin, length),
         Some(count) if count >= 0 => (begin, begin + count),
@@ -8238,17 +8311,10 @@ fn round_digits(value: f64, digits: i64) -> f64 {
     // it away from zero.
     let wide = format!("{:.*}", digits + 25, magnitude);
     let fraction = wide.split_once('.').map(|(_, fraction)| fraction).unwrap_or("");
-    let tie = fraction.len() > digits
-        && fraction.as_bytes()[digits] == b'5'
-        && fraction[digits + 1..].bytes().all(|byte| byte == b'0');
+    let tie = fraction.len() > digits && fraction.as_bytes()[digits] == b'5' && fraction[digits + 1..].bytes().all(|byte| byte == b'0');
     let text = if tie { increment_decimal(&short) } else { short };
     let rounded: f64 = text.parse().unwrap_or(magnitude);
-    if value < 0.0 {
-        -rounded
-    }
-    else {
-        rounded
-    }
+    if value < 0.0 { -rounded } else { rounded }
 }
 
 /// Increments the last decimal digit of a non-negative fixed-point string,
@@ -8268,7 +8334,7 @@ fn increment_decimal(text: &str) -> String {
             digit => {
                 characters[index] = char::from(digit as u8 + 1);
                 break;
-            },
+            }
         }
     }
     characters.into_iter().collect()
@@ -8296,7 +8362,9 @@ fn self_contained_arity(
                     SqlError::new("unknown-column", format!("unknown column `{name}` in table `{table}`")).in_statement("insert")
                 })?;
                 if seen.contains(&index) {
-                    return Err(SqlError::new("duplicate-column", format!("column `{name}` is listed twice in the insert")).in_statement("insert"));
+                    return Err(
+                        SqlError::new("duplicate-column", format!("column `{name}` is listed twice in the insert")).in_statement("insert")
+                    );
                 }
                 seen.push(index);
                 slots[index] = Some(value.clone());
@@ -8483,14 +8551,8 @@ fn autoindex_definitions(def: &TableDef) -> Vec<(usize, Vec<usize>, &'static str
 
 /// `PRAGMA table_info(t)` / `PRAGMA table_xinfo(t)`.
 fn pragma_table_info(engine: &Engine, schema: Option<&str>, table: &str, extended: bool) -> Result<ExecResult, SqlError> {
-    let mut columns = vec![
-        "cid".to_string(),
-        "name".to_string(),
-        "type".to_string(),
-        "notnull".to_string(),
-        "dflt_value".to_string(),
-        "pk".to_string(),
-    ];
+    let mut columns =
+        vec!["cid".to_string(), "name".to_string(), "type".to_string(), "notnull".to_string(), "dflt_value".to_string(), "pk".to_string()];
     if extended {
         columns.push("hidden".to_string());
     }
@@ -8577,11 +8639,7 @@ fn pragma_index_info(engine: &Engine, index: &str) -> ExecResult {
     if let Some(definition) = engine.indexes.get(&index.to_ascii_lowercase()) {
         if let Some(def) = pragma_table_def(engine, None, &definition.table) {
             for (seqno, position) in definition.columns.iter().enumerate() {
-                rows.push(vec![
-                    Cell::Integer(seqno as i64),
-                    Cell::Integer(*position as i64),
-                    Cell::Text(def.columns[*position].name.clone()),
-                ]);
+                rows.push(vec![Cell::Integer(seqno as i64), Cell::Integer(*position as i64), Cell::Text(def.columns[*position].name.clone())]);
             }
         }
     }
@@ -8601,12 +8659,7 @@ fn pragma_index_info(engine: &Engine, index: &str) -> ExecResult {
             }
         }
     }
-    ExecResult {
-        statement: "pragma",
-        columns: vec!["seqno".to_string(), "cid".to_string(), "name".to_string()],
-        rows,
-        affected: 0,
-    }
+    ExecResult { statement: "pragma", columns: vec!["seqno".to_string(), "cid".to_string(), "name".to_string()], rows, affected: 0 }
 }
 
 /// `PRAGMA foreign_key_list(t)`: SQLite prepends each new key, so the list is
@@ -8718,9 +8771,7 @@ fn window_mentions_column(spec: &WindowSpec, column: &str, qualifiers: Option<&[
 /// Whether one `SELECT` core mentions the column.
 fn core_mentions_column(core: &SelectCore, column: &str, qualifiers: Option<&[&str]>) -> bool {
     select_items_mention_column(&core.items, column, qualifiers)
-        || core.from.iter().any(|source| {
-            source.query.as_ref().is_some_and(|query| statement_mentions_column(query, column, qualifiers))
-        })
+        || core.from.iter().any(|source| source.query.as_ref().is_some_and(|query| statement_mentions_column(query, column, qualifiers)))
         || core.filter.as_ref().is_some_and(|expr| expression_mentions_column(expr, column, qualifiers))
         || core.group.iter().any(|expr| expression_mentions_column(expr, column, qualifiers))
         || core.having.as_ref().is_some_and(|expr| expression_mentions_column(expr, column, qualifiers))
@@ -8737,9 +8788,7 @@ fn statement_mentions_column(statement: &Statement, column: &str, qualifiers: Op
                 || compounds.iter().any(|term| core_mentions_column(&term.core, column, qualifiers))
                 || order.iter().any(|key| expression_mentions_column(&key.expr, column, qualifiers))
         }
-        Statement::Insert { returning, .. } => {
-            returning.as_ref().is_some_and(|items| select_items_mention_column(items, column, qualifiers))
-        }
+        Statement::Insert { returning, .. } => returning.as_ref().is_some_and(|items| select_items_mention_column(items, column, qualifiers)),
         Statement::Update { assignments, filter, returning, .. } => {
             assignments.iter().any(|assignment| expression_mentions_column(&assignment.value, column, qualifiers))
                 || filter.as_ref().is_some_and(|expr| expression_mentions_column(expr, column, qualifiers))
@@ -8755,11 +8804,8 @@ fn statement_mentions_column(statement: &Statement, column: &str, qualifiers: Op
 
 /// The error SQLite raises when a parent key is not a unique key of its table.
 fn foreign_key_mismatch(child: &TableDef, key: &ForeignKeyDef, statement: &'static str) -> SqlError {
-    SqlError::new(
-        "SQLITE_ERROR",
-        format!("foreign key mismatch - \"{}\" referencing \"{}\"", child.name, key.parent_display),
-    )
-    .in_statement(statement)
+    SqlError::new("SQLITE_ERROR", format!("foreign key mismatch - \"{}\" referencing \"{}\"", child.name, key.parent_display))
+        .in_statement(statement)
 }
 
 /// The error SQLite raises when a non-NULL child key has no parent row.
@@ -8851,11 +8897,10 @@ fn strict_value_violation(def: &TableDef, position: usize, value: &crate::WriteV
         crate::WriteValue::Blob(_) => "BLOB",
         _ => "INTEGER",
     };
-    Some(SqlError::new(
-        "constraint-datatype",
-        format!("cannot store {stored} value in {declared} column {}.{}", def.name, column.name),
+    Some(
+        SqlError::new("constraint-datatype", format!("cannot store {stored} value in {declared} column {}.{}", def.name, column.name))
+            .in_statement(statement),
     )
-    .in_statement(statement))
 }
 
 fn cell_write_value(cell: &Cell) -> crate::WriteValue {
@@ -8895,8 +8940,9 @@ fn temp_insert_row(
     let cells: Vec<Cell> = cells.into_iter().take(def.columns.len()).collect();
     for (position, column) in def.columns.iter().enumerate() {
         if column.not_null && matches!(cells[position], Cell::Null) {
-            return Err(SqlError::new("constraint-failed", format!("NOT NULL constraint failed: {}.{}", def.name, column.name))
-                .in_statement("insert"));
+            return Err(
+                SqlError::new("constraint-failed", format!("NOT NULL constraint failed: {}.{}", def.name, column.name)).in_statement("insert")
+            );
         }
     }
     let live: Vec<(i64, Vec<Cell>)> = rows.iter().map(|(rowid, cells)| (*rowid, cells.clone())).collect();
@@ -9075,9 +9121,7 @@ mod tests {
     fn engine() -> Engine {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute_one("CREATE TABLE t(a INTEGER, b INTEGER)").expect("create table");
-        engine
-            .execute_one("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (NULL, NULL), (5, 0)")
-            .expect("insert rows");
+        engine.execute_one("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (NULL, NULL), (5, 0)").expect("insert rows");
         engine
     }
 
@@ -9095,10 +9139,7 @@ mod tests {
 
     #[test]
     fn between_accepts_arithmetic_bounds() {
-        assert_eq!(
-            first_column("SELECT a FROM t WHERE a BETWEEN b - 2 AND b + 2"),
-            vec![Cell::Integer(1), Cell::Integer(2), Cell::Integer(3)]
-        );
+        assert_eq!(first_column("SELECT a FROM t WHERE a BETWEEN b - 2 AND b + 2"), vec![Cell::Integer(1), Cell::Integer(2), Cell::Integer(3)]);
     }
 
     #[test]
@@ -9163,10 +9204,7 @@ mod tests {
         assert_eq!(engine.execute_one("SELECT CAST(NULL AS INTEGER)").expect("null integer").rows, vec![vec![Cell::Null]]);
         assert_eq!(engine.execute_one("SELECT CAST(1 AS TEXT)").expect("integer text").rows, vec![vec![Cell::Text("1".to_string())]]);
         // A blob cast takes the UTF-8 bytes of the text form.
-        assert_eq!(
-            engine.execute_one("SELECT CAST(123 AS BLOB)").expect("integer blob").rows,
-            vec![vec![Cell::Blob(b"123".to_vec())]]
-        );
+        assert_eq!(engine.execute_one("SELECT CAST(123 AS BLOB)").expect("integer blob").rows, vec![vec![Cell::Blob(b"123".to_vec())]]);
         // Numeric keeps an integral value as an integer.
         assert_eq!(engine.execute_one("SELECT CAST('1e3' AS NUMERIC)").expect("numeric text").rows, vec![vec![Cell::Integer(1000)]]);
         let unsupported = engine.execute_one("SELECT CAST(1 AS FANCYTYPE)").expect_err("unknown target type");
@@ -9176,10 +9214,7 @@ mod tests {
     #[test]
     fn parenthesized_disjunction_keeps_both_branches() {
         assert_eq!(first_column("SELECT a FROM t WHERE (a = 1) OR (a > 3)"), vec![Cell::Integer(1), Cell::Integer(5)]);
-        assert_eq!(
-            first_column("SELECT a FROM t WHERE (a = 1 OR a = 2) AND b IS NOT NULL"),
-            vec![Cell::Integer(1), Cell::Integer(2)]
-        );
+        assert_eq!(first_column("SELECT a FROM t WHERE (a = 1 OR a = 2) AND b IS NOT NULL"), vec![Cell::Integer(1), Cell::Integer(2)]);
     }
 
     #[test]
@@ -9199,22 +9234,14 @@ mod tests {
             .execute_with_parameters("SELECT a FROM t LIMIT ? OFFSET ?", &[Cell::Integer(2), Cell::Integer(1)])
             .expect("positional limit");
         assert_eq!(bound[0].rows, vec![vec![Cell::Integer(2)], vec![Cell::Integer(3)]]);
-        let named = engine
-            .execute_with_parameters("SELECT a FROM t LIMIT :n", &[Cell::Integer(2)])
-            .expect("named limit");
+        let named = engine.execute_with_parameters("SELECT a FROM t LIMIT :n", &[Cell::Integer(2)]).expect("named limit");
         assert_eq!(named[0].rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]);
         // Negative values clamp like SQLite: no upper bound, no skipped rows.
-        let unlimited = engine
-            .execute_with_parameters("SELECT a FROM t LIMIT ?", &[Cell::Integer(-1)])
-            .expect("negative limit");
+        let unlimited = engine.execute_with_parameters("SELECT a FROM t LIMIT ?", &[Cell::Integer(-1)]).expect("negative limit");
         assert_eq!(unlimited[0].rows.len(), 5);
-        let offset = engine
-            .execute_with_parameters("SELECT a FROM t LIMIT 2 OFFSET ?", &[Cell::Integer(-1)])
-            .expect("negative offset");
+        let offset = engine.execute_with_parameters("SELECT a FROM t LIMIT 2 OFFSET ?", &[Cell::Integer(-1)]).expect("negative offset");
         assert_eq!(offset[0].rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]);
-        let oversized = engine
-            .execute_with_parameters("SELECT a FROM t LIMIT ?", &[Cell::Integer(999)])
-            .expect("oversized limit");
+        let oversized = engine.execute_with_parameters("SELECT a FROM t LIMIT ?", &[Cell::Integer(999)]).expect("oversized limit");
         assert_eq!(oversized[0].rows.len(), 5);
         // An unbound placeholder is NULL, which SQLite rejects as a limit.
         assert_eq!(engine.execute_one("SELECT a FROM t LIMIT ?").expect_err("unbound").code, "datatype-mismatch");
@@ -9229,11 +9256,7 @@ mod tests {
             .expect("frame");
         assert_eq!(
             results.rows,
-            vec![
-                vec![Cell::Integer(1), Cell::Integer(1)],
-                vec![Cell::Integer(2), Cell::Integer(1)],
-                vec![Cell::Integer(3), Cell::Integer(2)],
-            ]
+            vec![vec![Cell::Integer(1), Cell::Integer(1)], vec![Cell::Integer(2), Cell::Integer(1)], vec![Cell::Integer(3), Cell::Integer(2)],]
         );
     }
 
@@ -9264,10 +9287,7 @@ mod tests {
     fn select_without_from_projects_literals() {
         let mut engine = Engine::new(None).expect("blank engine");
         assert_eq!(engine.execute_one("SELECT 1").expect("constant select").rows, vec![vec![Cell::Integer(1)]]);
-        assert_eq!(
-            engine.execute_one("SELECT 1, 2 + 3").expect("two constants").rows,
-            vec![vec![Cell::Integer(1), Cell::Integer(5)]]
-        );
+        assert_eq!(engine.execute_one("SELECT 1, 2 + 3").expect("two constants").rows, vec![vec![Cell::Integer(1), Cell::Integer(5)]]);
         let aliased = engine.execute_one("SELECT 1 AS a").expect("aliased constant");
         assert_eq!(aliased.columns, vec!["a".to_string()]);
         // `LIMIT` applies to a constant projection too; a negative limit means
@@ -9293,10 +9313,7 @@ mod tests {
     #[test]
     fn compound_without_from_matches_sqlite() {
         let mut engine = Engine::new(None).expect("blank engine");
-        assert_eq!(
-            engine.execute_one("SELECT 1 UNION SELECT 2").expect("union").rows,
-            vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]
-        );
+        assert_eq!(engine.execute_one("SELECT 1 UNION SELECT 2").expect("union").rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]);
         assert_eq!(engine.execute_one("SELECT 1 UNION ALL SELECT 1").expect("union all").rows.len(), 2);
         assert_eq!(engine.execute_one("SELECT 1 INTERSECT SELECT 1").expect("intersect").rows, vec![vec![Cell::Integer(1)]]);
         assert_eq!(engine.execute_one("SELECT 1 EXCEPT SELECT 2").expect("except").rows, vec![vec![Cell::Integer(1)]]);
@@ -9401,10 +9418,7 @@ mod tests {
         // A column without a declared default still becomes NULL.
         engine.execute_one("CREATE TABLE plain(a, b)").expect("plain");
         engine.execute_one("INSERT INTO plain DEFAULT VALUES").expect("plain default values");
-        assert_eq!(
-            engine.execute_one("SELECT a, b FROM plain").expect("plain row").rows,
-            vec![vec![Cell::Null, Cell::Null]]
-        );
+        assert_eq!(engine.execute_one("SELECT a, b FROM plain").expect("plain row").rows, vec![vec![Cell::Null, Cell::Null]]);
         // An INTEGER primary key is the rowid alias, so the default row gets rowid 1.
         engine.execute_one("CREATE TABLE dvpk(a INTEGER PRIMARY KEY, b DEFAULT 3)").expect("alias defaults");
         engine.execute_one("INSERT INTO dvpk DEFAULT VALUES").expect("alias default values");
@@ -9483,12 +9497,7 @@ mod tests {
         assert_eq!(engine.execute_one("SELECT count(*) FROM t").expect("count").rows, vec![vec![Cell::Integer(4)]]);
         assert_eq!(
             engine.execute_one("SELECT id FROM t ORDER BY id").expect("rowids").rows,
-            vec![
-                vec![Cell::Integer(1)],
-                vec![Cell::Integer(2)],
-                vec![Cell::Integer(3)],
-                vec![Cell::Integer(99)]
-            ]
+            vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(99)]]
         );
 
         // The rolled-back rowid 100 is reused before the statement rolls back
@@ -9604,8 +9613,14 @@ mod tests {
         assert_eq!(engine.execute_one("SELECT CAST('2abc' AS NUMERIC)").expect("text numeric").rows, vec![vec![Cell::Integer(2)]]);
         assert_eq!(engine.execute_one("SELECT CAST(x'312e35' AS NUMERIC)").expect("blob numeric").rows, vec![vec![Cell::Real(1.5)]]);
         // A real becomes text through the same `%!.15g` rendering as `||`.
-        assert_eq!(engine.execute_one("SELECT CAST(0.30000000000000004 AS TEXT)").expect("real text").rows, vec![vec![Cell::Text("0.3".to_string())]]);
-        assert_eq!(engine.execute_one("SELECT CAST(1e300 AS TEXT)").expect("huge real text").rows, vec![vec![Cell::Text("1.0e+300".to_string())]]);
+        assert_eq!(
+            engine.execute_one("SELECT CAST(0.30000000000000004 AS TEXT)").expect("real text").rows,
+            vec![vec![Cell::Text("0.3".to_string())]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT CAST(1e300 AS TEXT)").expect("huge real text").rows,
+            vec![vec![Cell::Text("1.0e+300".to_string())]]
+        );
         // `IS TRUE` runs the same numeric prefix.
         assert_eq!(engine.execute_one("SELECT '2abc' IS TRUE").expect("text truth").rows, vec![vec![Cell::Integer(1)]]);
         assert_eq!(engine.execute_one("SELECT '0abc' IS TRUE").expect("zero truth").rows, vec![vec![Cell::Integer(0)]]);
@@ -9624,9 +9639,18 @@ mod tests {
         assert_eq!(engine.execute_one("SELECT sum(a) FROM t").expect("t sum").rows, vec![vec![Cell::Integer(11)]]);
         assert_eq!(engine.execute_one("SELECT sum(a) FROM t WHERE a > 100").expect("empty sum").rows, vec![vec![Cell::Null]]);
         // `total()` is the real-valued sibling of `sum()` and never returns NULL.
-        assert_eq!(engine.execute_one("SELECT total(x), typeof(total(x)) FROM v").expect("total").rows, vec![vec![Cell::Real(13.0), Cell::Text("real".to_string())]]);
-        assert_eq!(engine.execute_one("SELECT total(x), sum(x) FROM v WHERE 0").expect("empty total").rows, vec![vec![Cell::Real(0.0), Cell::Null]]);
-        assert_eq!(engine.execute_one("SELECT total(NULL), total(1), total(' 12abc')").expect("total literals").rows, vec![vec![Cell::Real(0.0), Cell::Real(1.0), Cell::Real(12.0)]]);
+        assert_eq!(
+            engine.execute_one("SELECT total(x), typeof(total(x)) FROM v").expect("total").rows,
+            vec![vec![Cell::Real(13.0), Cell::Text("real".to_string())]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT total(x), sum(x) FROM v WHERE 0").expect("empty total").rows,
+            vec![vec![Cell::Real(0.0), Cell::Null]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT total(NULL), total(1), total(' 12abc')").expect("total literals").rows,
+            vec![vec![Cell::Real(0.0), Cell::Real(1.0), Cell::Real(12.0)]]
+        );
     }
 
     #[test]
@@ -9660,7 +9684,10 @@ mod tests {
         assert_eq!(value(&mut engine, "SELECT quote(1.0 / 3.0)"), Cell::Text("3.333333333333333148e-01".to_string()));
         // `random()` and `randomblob()` only guarantee their shape.
         assert_eq!(value(&mut engine, "SELECT typeof(random())"), Cell::Text("integer".to_string()));
-        assert_eq!(engine.execute_one("SELECT length(randomblob(4)), typeof(randomblob(4))").expect("randomblob").rows, vec![vec![Cell::Integer(4), Cell::Text("blob".to_string())]]);
+        assert_eq!(
+            engine.execute_one("SELECT length(randomblob(4)), typeof(randomblob(4))").expect("randomblob").rows,
+            vec![vec![Cell::Integer(4), Cell::Text("blob".to_string())]]
+        );
         assert_eq!(value(&mut engine, "SELECT length(randomblob(NULL))"), Cell::Integer(1));
     }
 
@@ -9746,7 +9773,10 @@ mod tests {
         engine.execute_one("CREATE TABLE b(z TEXT PRIMARY KEY, w TEXT UNIQUE)").expect("create b");
 
         let result = engine.execute_one("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master").expect("select master");
-        assert_eq!(result.columns, vec!["type".to_string(), "name".to_string(), "tbl_name".to_string(), "rootpage".to_string(), "sql".to_string()]);
+        assert_eq!(
+            result.columns,
+            vec!["type".to_string(), "name".to_string(), "tbl_name".to_string(), "rootpage".to_string(), "sql".to_string()]
+        );
         let rows = result.rows;
         assert_eq!(rows.len(), 5);
         // Row order is creation order, which is rootpage order here as in
@@ -9775,13 +9805,16 @@ mod tests {
         // `sqlite_master` is an ordinary rowid table: `rowid` resolves and
         // `SELECT *` still projects only the five stored columns.
         let rowids = engine.execute_one("SELECT rowid, name FROM sqlite_master ORDER BY rowid").expect("master rowids");
-        assert_eq!(rowids.rows, vec![
-            vec![Cell::Integer(1), text("a")],
-            vec![Cell::Integer(2), text("ia")],
-            vec![Cell::Integer(3), text("b")],
-            vec![Cell::Integer(4), text("sqlite_autoindex_b_1")],
-            vec![Cell::Integer(5), text("sqlite_autoindex_b_2")],
-        ]);
+        assert_eq!(
+            rowids.rows,
+            vec![
+                vec![Cell::Integer(1), text("a")],
+                vec![Cell::Integer(2), text("ia")],
+                vec![Cell::Integer(3), text("b")],
+                vec![Cell::Integer(4), text("sqlite_autoindex_b_1")],
+                vec![Cell::Integer(5), text("sqlite_autoindex_b_2")],
+            ]
+        );
         let star = engine.execute_one("SELECT * FROM sqlite_master").expect("star");
         assert_eq!(star.columns.len(), 5);
         assert_eq!(star.rows[0].len(), 5);
@@ -9819,14 +9852,20 @@ mod tests {
         // `sqlite_sequence` is created by CREATE TABLE, immediately after the
         // table and before any later object.
         let master = engine.execute_one("SELECT type, name, rootpage FROM sqlite_master").expect("select master");
-        assert_eq!(master.rows, vec![vec![text("table"), text("c"), Cell::Integer(2)], vec![text("table"), text("sqlite_sequence"), Cell::Integer(3)]]);
+        assert_eq!(
+            master.rows,
+            vec![vec![text("table"), text("c"), Cell::Integer(2)], vec![text("table"), text("sqlite_sequence"), Cell::Integer(3)]]
+        );
         let empty = engine.execute_one("SELECT * FROM sqlite_sequence").expect("empty sequence");
         assert_eq!(empty.columns, vec!["name".to_string(), "seq".to_string()]);
         assert_eq!(empty.rows, Vec::<Vec<Cell>>::new());
 
         engine.execute_one("INSERT INTO c(v) VALUES ('a'), ('b')").expect("auto insert");
         assert_eq!(engine.execute_one("SELECT id FROM c").expect("select ids").rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]);
-        assert_eq!(engine.execute_one("SELECT name, seq FROM sqlite_sequence").expect("sequence").rows, vec![vec![text("c"), Cell::Integer(2)]]);
+        assert_eq!(
+            engine.execute_one("SELECT name, seq FROM sqlite_sequence").expect("sequence").rows,
+            vec![vec![text("c"), Cell::Integer(2)]]
+        );
 
         // An explicit larger rowid raises the high-water mark, then automatic
         // ids continue above it; a lower explicit rowid never lowers it.
@@ -9877,10 +9916,7 @@ mod tests {
         let mut engine = joined_engine(LEFT_RIGHT);
         let merged = engine.execute_one("SELECT id, lv, rv FROM l RIGHT JOIN r USING(id)").expect("merged columns");
         assert_eq!(merged.columns, vec!["id", "lv", "rv"]);
-        assert_eq!(
-            merged.rows,
-            vec![vec![Cell::Integer(2), text("b"), text("B")], vec![Cell::Integer(3), Cell::Null, text("C")]]
-        );
+        assert_eq!(merged.rows, vec![vec![Cell::Integer(2), text("b"), text("B")], vec![Cell::Integer(3), Cell::Null, text("C")]]);
         // `*` repeats the `USING` column neither for the left nor the right side.
         let star = engine.execute_one("SELECT * FROM l RIGHT JOIN r USING(id)").expect("star");
         assert_eq!(star.columns, vec!["id", "lv", "rv"]);
@@ -9892,10 +9928,7 @@ mod tests {
         // A table-qualified reference still addresses the original column.
         let qualified = engine.execute_one("SELECT l.id, r.id FROM l RIGHT JOIN r USING(id)").expect("qualified");
         assert_eq!(qualified.columns, vec!["id", "id"]);
-        assert_eq!(
-            qualified.rows,
-            vec![vec![Cell::Integer(2), Cell::Integer(2)], vec![Cell::Null, Cell::Integer(3)]]
-        );
+        assert_eq!(qualified.rows, vec![vec![Cell::Integer(2), Cell::Integer(2)], vec![Cell::Null, Cell::Integer(3)]]);
     }
 
     #[test]
@@ -9911,10 +9944,7 @@ mod tests {
                 vec![Cell::Integer(3), Cell::Null, text("C")],
             ]
         );
-        assert_eq!(
-            engine.execute_one("SELECT count(*) FROM l FULL OUTER JOIN r USING(id)").expect("count").rows,
-            vec![vec![Cell::Integer(3)]]
-        );
+        assert_eq!(engine.execute_one("SELECT count(*) FROM l FULL OUTER JOIN r USING(id)").expect("count").rows, vec![vec![Cell::Integer(3)]]);
 
         // `FULL` keeps the multiplicity of matched pairs instead of deduplicating rows.
         let mut duplicates = joined_engine(&[
@@ -10146,11 +10176,7 @@ mod tests {
         engine.execute_one("UPDATE t SET id = id - 1").expect("shift down");
         assert_eq!(
             engine.execute_one("SELECT id, v FROM t").expect("select").rows,
-            vec![
-                vec![Cell::Integer(0), text("a")],
-                vec![Cell::Integer(1), text("b")],
-                vec![Cell::Integer(2), text("c")],
-            ]
+            vec![vec![Cell::Integer(0), text("a")], vec![Cell::Integer(1), text("b")], vec![Cell::Integer(2), text("c")],]
         );
         let before = engine.execute_one("SELECT id FROM t").expect("select").rows;
         let error = engine.execute_one("UPDATE t SET id = id + 1").expect_err("shift up collides");
@@ -10187,10 +10213,7 @@ mod tests {
         let updated = engine.execute_one("UPDATE t SET v = v + 1 WHERE id >= 2 RETURNING id, v").expect("update returning");
         assert_eq!(updated.columns, vec!["id", "v"]);
         assert_eq!(updated.affected, 2);
-        assert_eq!(
-            updated.rows,
-            vec![vec![Cell::Integer(2), Cell::Integer(21)], vec![Cell::Integer(3), Cell::Integer(31)]]
-        );
+        assert_eq!(updated.rows, vec![vec![Cell::Integer(2), Cell::Integer(21)], vec![Cell::Integer(3), Cell::Integer(31)]]);
         // `RETURNING *` expands to the declared columns only, never the rowid.
         let starred = engine.execute_one("UPDATE t SET v = v WHERE id = 1 RETURNING *").expect("star returning");
         assert_eq!(starred.columns, vec!["id", "v"]);
@@ -10226,7 +10249,10 @@ mod tests {
         engine.execute_one("CREATE TABLE c(id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT UNIQUE)").expect("create c");
         engine.execute_one("CREATE INDEX ix ON c(k)").expect("create ix");
         engine.execute_one("INSERT INTO c(k) VALUES ('x')").expect("insert");
-        assert_eq!(engine.execute_one("SELECT name, seq FROM sqlite_sequence").expect("sequence").rows, vec![vec![text("c"), Cell::Integer(1)]]);
+        assert_eq!(
+            engine.execute_one("SELECT name, seq FROM sqlite_sequence").expect("sequence").rows,
+            vec![vec![text("c"), Cell::Integer(1)]]
+        );
         assert_eq!(engine.execute_one("SELECT count(*) FROM sqlite_master").expect("count").rows, vec![vec![Cell::Integer(4)]]);
 
         let dropped = engine.execute_one("DROP TABLE c").expect("drop c");
@@ -10235,7 +10261,10 @@ mod tests {
         // The catalog row, the explicit index row and the automatic `UNIQUE`
         // row all disappear in the same statement; only `sqlite_sequence`
         // remains, plus no sequence row for `c`.
-        assert_eq!(engine.execute_one("SELECT type, name FROM sqlite_master").expect("master").rows, vec![vec![text("table"), text("sqlite_sequence")]]);
+        assert_eq!(
+            engine.execute_one("SELECT type, name FROM sqlite_master").expect("master").rows,
+            vec![vec![text("table"), text("sqlite_sequence")]]
+        );
         assert_eq!(engine.execute_one("SELECT * FROM sqlite_sequence").expect("sequence").rows, Vec::<Vec<Cell>>::new());
         assert_eq!(engine.execute_one("SELECT * FROM c").expect_err("gone").code, "unknown-table");
         assert_eq!(engine.execute_one("DROP TABLE IF EXISTS c").expect("if exists").affected, 0);
@@ -10271,13 +10300,19 @@ mod tests {
         assert_eq!(automatic.code, "autoindex-immutable");
         assert_eq!(automatic.message, "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped");
         // Even `IF EXISTS` does not soften the refusal, matching SQLite.
-        assert_eq!(engine.execute_one("DROP INDEX IF EXISTS sqlite_autoindex_t_1").expect_err("autoindex if exists").code, "autoindex-immutable");
+        assert_eq!(
+            engine.execute_one("DROP INDEX IF EXISTS sqlite_autoindex_t_1").expect_err("autoindex if exists").code,
+            "autoindex-immutable"
+        );
         assert_eq!(engine.execute_one("DROP INDEX nope").expect_err("missing").code, "unknown-index");
         assert_eq!(engine.execute_one("DROP INDEX IF EXISTS nope").expect("if exists").affected, 0);
 
         let dropped = engine.execute_one("DROP INDEX ix").expect("drop ix");
         assert_eq!(dropped.statement, "drop-index");
-        assert_eq!(engine.execute_one("SELECT name FROM sqlite_master WHERE type = 'index'").expect("indexes").rows, vec![vec![text("sqlite_autoindex_t_1")]]);
+        assert_eq!(
+            engine.execute_one("SELECT name FROM sqlite_master WHERE type = 'index'").expect("indexes").rows,
+            vec![vec![text("sqlite_autoindex_t_1")]]
+        );
         // The automatic index still enforces the `UNIQUE` constraint.
         engine.execute_one("INSERT INTO t VALUES ('a', 1)").expect("insert");
         let duplicate = engine.execute_one("INSERT INTO t VALUES ('a', 2)").expect_err("duplicate key");
@@ -10319,7 +10354,10 @@ mod tests {
         engine.execute_one("CREATE TABLE a(x INTEGER PRIMARY KEY AUTOINCREMENT)").expect("create");
         engine.execute_one("INSERT INTO a DEFAULT VALUES").expect("insert");
         engine.execute_one("ALTER TABLE a RENAME TO b").expect("rename");
-        assert_eq!(engine.execute_one("SELECT name, seq FROM sqlite_sequence").expect("sequence").rows, vec![vec![text("b"), Cell::Integer(1)]]);
+        assert_eq!(
+            engine.execute_one("SELECT name, seq FROM sqlite_sequence").expect("sequence").rows,
+            vec![vec![text("b"), Cell::Integer(1)]]
+        );
         // A new insert continues above the high-water mark.
         engine.execute_one("INSERT INTO b DEFAULT VALUES").expect("insert after rename");
         assert_eq!(engine.execute_one("SELECT max(x) FROM b").expect("max").rows, vec![vec![Cell::Integer(2)]]);
@@ -10406,10 +10444,7 @@ mod tests {
         );
         assert_eq!(
             engine.execute_one("SELECT id, a, note FROM t ORDER BY id").expect("rows").rows,
-            vec![
-                vec![Cell::Integer(1), text("x"), text("n")],
-                vec![Cell::Integer(2), text("y"), Cell::Null],
-            ]
+            vec![vec![Cell::Integer(1), text("x"), text("n")], vec![Cell::Integer(2), text("y"), Cell::Null],]
         );
         // The shortened table keeps inserting and updating in place.
         engine.execute_one("INSERT INTO t (a, note) VALUES ('z', 'm')").expect("insert");
@@ -10446,13 +10481,7 @@ mod tests {
         engine.execute("CREATE TEMP TABLE t (a INTEGER PRIMARY KEY, b TEXT)").expect("create temp");
         assert_eq!(
             engine.execute_one("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_temp_master").expect("temp master").rows,
-            vec![vec![
-                text("table"),
-                text("t"),
-                text("t"),
-                Cell::Integer(2),
-                text("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"),
-            ]]
+            vec![vec![text("table"), text("t"), text("t"), Cell::Integer(2), text("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"),]]
         );
         assert!(engine.execute_one("SELECT name FROM sqlite_master").expect("master").rows.is_empty());
         // Both schemas may own the name, and the temp table answers first.
@@ -10494,10 +10523,7 @@ mod tests {
         // The temp slot is reserved but only listed once the temp schema exists.
         assert_eq!(
             engine.execute_one("PRAGMA database_list").expect("database list").rows,
-            vec![
-                vec![Cell::Integer(0), text("main"), text("")],
-                vec![Cell::Integer(2), text("aux"), text("")],
-            ]
+            vec![vec![Cell::Integer(0), text("main"), text("")], vec![Cell::Integer(2), text("aux"), text("")],]
         );
         engine.execute("CREATE TEMP TABLE tt (v INTEGER)").expect("temp");
         engine.execute("CREATE TABLE local (v INTEGER)").expect("main");
@@ -10511,9 +10537,7 @@ mod tests {
         );
         // A schema-qualified source joins a main table in the same statement.
         assert_eq!(
-            engine.execute_one("SELECT r.v, l.v FROM aux.remote AS r JOIN local AS l ON r.rowid = l.rowid")
-                .expect("cross-database join")
-                .rows,
+            engine.execute_one("SELECT r.v, l.v FROM aux.remote AS r JOIN local AS l ON r.rowid = l.rowid").expect("cross-database join").rows,
             vec![vec![Cell::Integer(2), Cell::Integer(1)]]
         );
         // An unqualified name falls through temp and main to the attached
@@ -10666,7 +10690,9 @@ mod tests {
         let missing = engine.execute_one("INSERT INTO child VALUES (1, NULL)").expect_err("missing parent");
         assert_eq!(missing.code, "SQLITE_ERROR");
         assert_eq!(missing.message, "no such table: main.parent");
-        let invalid = engine.execute_one("CREATE TABLE bad (id INTEGER PRIMARY KEY, FOREIGN KEY (ghost) REFERENCES parent(id))").expect_err("bad child column");
+        let invalid = engine
+            .execute_one("CREATE TABLE bad (id INTEGER PRIMARY KEY, FOREIGN KEY (ghost) REFERENCES parent(id))")
+            .expect_err("bad child column");
         assert_eq!(invalid.code, "SQLITE_ERROR");
         assert_eq!(invalid.message, "unknown column \"ghost\" in foreign key definition");
         engine.execute_one("CREATE TABLE parent (id INTEGER)").expect("parent without a key");
@@ -10679,13 +10705,17 @@ mod tests {
     fn composite_foreign_keys_use_the_parent_primary_key() {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute_one("CREATE TABLE parent (a INTEGER, b INTEGER, PRIMARY KEY (a, b))").expect("composite parent");
-        engine.execute_one("CREATE TABLE child (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES parent)").expect("composite child");
+        engine
+            .execute_one("CREATE TABLE child (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES parent)")
+            .expect("composite child");
         engine.execute_one("INSERT INTO parent VALUES (1, 2)").expect("parent row");
         engine.execute_one("INSERT INTO child VALUES (1, 1, 2)").expect("matching composite");
         let orphan = engine.execute_one("INSERT INTO child VALUES (2, 1, 3)").expect_err("composite orphan");
         assert_eq!(orphan.code, "SQLITE_CONSTRAINT_FOREIGNKEY");
         engine.execute_one("INSERT INTO child VALUES (3, 1, NULL)").expect("partial null passes");
-        let partial = engine.execute_one("CREATE TABLE single (id INTEGER PRIMARY KEY, x INTEGER, FOREIGN KEY (x) REFERENCES parent(a))").expect("create single");
+        let partial = engine
+            .execute_one("CREATE TABLE single (id INTEGER PRIMARY KEY, x INTEGER, FOREIGN KEY (x) REFERENCES parent(a))")
+            .expect("create single");
         assert_eq!(partial.statement, "create-table");
         let mismatch = engine.execute_one("INSERT INTO single VALUES (1, 1)").expect_err("single column against a composite key");
         assert_eq!(mismatch.code, "SQLITE_ERROR");
@@ -10720,7 +10750,9 @@ mod tests {
             .expect_err("deferred");
         assert_eq!(deferred.code, "unsupported-deferred-foreign-key");
         // Immediate deferral spellings keep working.
-        engine.execute_one("CREATE TABLE c4 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) NOT DEFERRABLE)").expect("not deferrable");
+        engine
+            .execute_one("CREATE TABLE c4 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) NOT DEFERRABLE)")
+            .expect("not deferrable");
         engine.execute_one("ALTER TABLE c4 ADD COLUMN other INTEGER REFERENCES parent(id)").expect("add column with a foreign key");
     }
 
@@ -10730,16 +10762,17 @@ mod tests {
         let walked = engine
             .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5) SELECT x FROM c")
             .expect("recursive walk");
-        assert_eq!(walked.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(4)], vec![Cell::Integer(5)]]);
+        assert_eq!(
+            walked.rows,
+            vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(4)], vec![Cell::Integer(5)]]
+        );
         // The keyword is not required when the body reads itself.
         let bare = engine
             .execute_one("WITH c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3) SELECT x FROM c")
             .expect("recursive without the keyword");
         assert_eq!(bare.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)]]);
         // `UNION` removes duplicates and therefore terminates a self-cycle.
-        let cycle = engine
-            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT x FROM c) SELECT x FROM c")
-            .expect("distinct cycle");
+        let cycle = engine.execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT x FROM c) SELECT x FROM c").expect("distinct cycle");
         assert_eq!(cycle.rows, vec![vec![Cell::Integer(1)]]);
         let factorial = engine
             .execute_one("WITH RECURSIVE c(n, f) AS (SELECT 1, 1 UNION ALL SELECT n+1, f*(n+1) FROM c WHERE n < 5) SELECT n, f FROM c")
@@ -10759,14 +10792,25 @@ mod tests {
     #[test]
     fn recursive_ctes_keep_duplicates_for_union_all() {
         let mut engine = Engine::new(None).expect("blank engine");
-        let duplicated = engine
-            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x FROM c LIMIT 3) SELECT x FROM c")
-            .expect("duplicates");
+        let duplicated =
+            engine.execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x FROM c LIMIT 3) SELECT x FROM c").expect("duplicates");
         assert_eq!(duplicated.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(1)], vec![Cell::Integer(1)]]);
         let seeded = engine
-            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3) SELECT x FROM c ORDER BY x")
+            .execute_one(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3) SELECT x FROM c ORDER BY x",
+            )
             .expect("seed duplicates");
-        assert_eq!(seeded.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(3)]]);
+        assert_eq!(
+            seeded.rows,
+            vec![
+                vec![Cell::Integer(1)],
+                vec![Cell::Integer(1)],
+                vec![Cell::Integer(2)],
+                vec![Cell::Integer(2)],
+                vec![Cell::Integer(3)],
+                vec![Cell::Integer(3)]
+            ]
+        );
     }
 
     #[test]
@@ -10775,7 +10819,10 @@ mod tests {
         let limited = engine
             .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT x FROM c LIMIT 5")
             .expect("bounded recursion");
-        assert_eq!(limited.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(4)], vec![Cell::Integer(5)]]);
+        assert_eq!(
+            limited.rows,
+            vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(4)], vec![Cell::Integer(5)]]
+        );
         let offset = engine
             .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT x FROM c LIMIT 2 OFFSET 3")
             .expect("bounded recursion with offset");
@@ -10804,7 +10851,10 @@ mod tests {
         let chained = engine
             .execute_one("WITH a(k) AS (SELECT 2), b(x) AS (SELECT 1 UNION ALL SELECT x+k FROM b, a WHERE x < 9) SELECT x FROM b ORDER BY x")
             .expect("earlier entry");
-        assert_eq!(chained.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(3)], vec![Cell::Integer(5)], vec![Cell::Integer(7)], vec![Cell::Integer(9)]]);
+        assert_eq!(
+            chained.rows,
+            vec![vec![Cell::Integer(1)], vec![Cell::Integer(3)], vec![Cell::Integer(5)], vec![Cell::Integer(7)], vec![Cell::Integer(9)]]
+        );
     }
 
     #[test]
@@ -10822,9 +10872,7 @@ mod tests {
     #[test]
     fn transactions_restore_rows_and_schema() {
         let mut engine = Engine::new(None).expect("blank engine");
-        engine
-            .execute("CREATE TABLE t(a INTEGER); BEGIN; INSERT INTO t VALUES (1); CREATE TABLE gone(b INTEGER); ROLLBACK")
-            .expect("script");
+        engine.execute("CREATE TABLE t(a INTEGER); BEGIN; INSERT INTO t VALUES (1); CREATE TABLE gone(b INTEGER); ROLLBACK").expect("script");
         assert_eq!(engine.execute_one("SELECT count(*) FROM t").expect("read").rows, vec![vec![Cell::Integer(0)]]);
         assert!(engine.execute_one("SELECT b FROM gone").is_err());
 
@@ -10832,10 +10880,7 @@ mod tests {
             .execute("BEGIN; INSERT INTO t VALUES (2); SAVEPOINT s; INSERT INTO t VALUES (3); ROLLBACK TO s; RELEASE s; COMMIT")
             .expect("script");
         assert_eq!(engine.execute_one("SELECT a FROM t").expect("read").rows, vec![vec![Cell::Integer(2)]]);
-        assert_eq!(
-            engine.execute_one("COMMIT").expect_err("no transaction").message,
-            "cannot commit - no transaction is active"
-        );
+        assert_eq!(engine.execute_one("COMMIT").expect_err("no transaction").message, "cannot commit - no transaction is active");
     }
 
     #[test]
@@ -10852,10 +10897,7 @@ mod tests {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute("CREATE TABLE s(a INTEGER, b TEXT, c BLOB) STRICT").expect("strict table");
         engine.execute("INSERT INTO s VALUES ('12', 5, X'00')").expect("affinity keeps strict rows valid");
-        assert_eq!(
-            engine.execute_one("SELECT a, b FROM s").expect("read").rows,
-            vec![vec![Cell::Integer(12), Cell::Text("5".to_string())]]
-        );
+        assert_eq!(engine.execute_one("SELECT a, b FROM s").expect("read").rows, vec![vec![Cell::Integer(12), Cell::Text("5".to_string())]]);
         let real = engine.execute_one("INSERT INTO s(a) VALUES (1.5)").expect_err("real into integer");
         assert_eq!(real.code, "constraint-datatype");
         assert_eq!(real.message, "cannot store REAL value in INTEGER column s.a");
@@ -10914,12 +10956,8 @@ mod tests {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT)").expect("t");
         engine.execute("CREATE TABLE log(v)").expect("log");
-        engine
-            .execute("CREATE TRIGGER bi BEFORE INSERT ON t BEGIN INSERT INTO log VALUES (new.a); END")
-            .expect("before insert");
-        engine
-            .execute("CREATE TRIGGER ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.rowid); END")
-            .expect("after insert");
+        engine.execute("CREATE TRIGGER bi BEFORE INSERT ON t BEGIN INSERT INTO log VALUES (new.a); END").expect("before insert");
+        engine.execute("CREATE TRIGGER ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.rowid); END").expect("after insert");
         engine.execute("INSERT INTO t VALUES (5, 'seven', 'x')").expect("insert");
         assert_eq!(
             engine.execute_one("SELECT v FROM log").expect("log rows").rows,
@@ -10933,14 +10971,9 @@ mod tests {
             engine.execute_one("SELECT v FROM log WHERE rowid > 2").expect("update log").rows,
             vec![vec![Cell::Text("seven".to_string())], vec![Cell::Text("nine".to_string())]]
         );
-        engine
-            .execute("CREATE TRIGGER bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES (old.id); END")
-            .expect("before delete");
+        engine.execute("CREATE TRIGGER bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES (old.id); END").expect("before delete");
         engine.execute("DELETE FROM t WHERE id = 5").expect("delete");
-        assert_eq!(
-            engine.execute_one("SELECT v FROM log WHERE rowid = 5").expect("delete log").rows,
-            vec![vec![Cell::Integer(5)]]
-        );
+        assert_eq!(engine.execute_one("SELECT v FROM log WHERE rowid = 5").expect("delete log").rows, vec![vec![Cell::Integer(5)]]);
     }
 
     #[test]
@@ -10948,14 +10981,10 @@ mod tests {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)").expect("t");
         engine.execute("CREATE TABLE log(v)").expect("log");
-        engine
-            .execute("CREATE TRIGGER w AFTER INSERT ON t WHEN new.a > 5 BEGIN INSERT INTO log VALUES (new.a); END")
-            .expect("when trigger");
+        engine.execute("CREATE TRIGGER w AFTER INSERT ON t WHEN new.a > 5 BEGIN INSERT INTO log VALUES (new.a); END").expect("when trigger");
         engine.execute("INSERT INTO t VALUES (1, 10), (2, 3)").expect("insert");
         assert_eq!(engine.execute_one("SELECT v FROM log").expect("log").rows, vec![vec![Cell::Integer(10)]]);
-        engine
-            .execute("CREATE TRIGGER wu AFTER UPDATE ON t WHEN old.a = 10 BEGIN INSERT INTO log VALUES (new.a); END")
-            .expect("when update");
+        engine.execute("CREATE TRIGGER wu AFTER UPDATE ON t WHEN old.a = 10 BEGIN INSERT INTO log VALUES (new.a); END").expect("when update");
         engine.execute("UPDATE t SET a = 11 WHERE id = 1").expect("update");
         assert_eq!(
             engine.execute_one("SELECT v FROM log ORDER BY rowid").expect("log rows").rows,
@@ -11003,9 +11032,7 @@ mod tests {
         engine.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a)").expect("t");
         engine.execute("CREATE TABLE log(v)").expect("log");
         for value in 1..=3 {
-            engine
-                .execute(&format!("CREATE TRIGGER o{value} AFTER INSERT ON t BEGIN INSERT INTO log VALUES ({value}); END"))
-                .expect("trigger");
+            engine.execute(&format!("CREATE TRIGGER o{value} AFTER INSERT ON t BEGIN INSERT INTO log VALUES ({value}); END")).expect("trigger");
         }
         engine.execute("INSERT INTO t VALUES (1, 1)").expect("insert");
         assert_eq!(
@@ -11019,30 +11046,21 @@ mod tests {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, a)").expect("u");
         engine.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, a)").expect("b");
-        engine
-            .execute("CREATE TRIGGER ta AFTER INSERT ON u BEGIN INSERT INTO b VALUES (new.id, new.a); END")
-            .expect("ta");
-        engine
-            .execute("CREATE TRIGGER tb AFTER INSERT ON b BEGIN INSERT INTO u VALUES (new.id + 100, 1); END")
-            .expect("tb");
+        engine.execute("CREATE TRIGGER ta AFTER INSERT ON u BEGIN INSERT INTO b VALUES (new.id, new.a); END").expect("ta");
+        engine.execute("CREATE TRIGGER tb AFTER INSERT ON b BEGIN INSERT INTO u VALUES (new.id + 100, 1); END").expect("tb");
         engine.execute("INSERT INTO u VALUES (1, 1)").expect("insert");
         assert_eq!(
             engine.execute_one("SELECT id FROM u ORDER BY id").expect("u rows").rows,
             vec![vec![Cell::Integer(1)], vec![Cell::Integer(101)]]
         );
-        assert_eq!(
-            engine.execute_one("SELECT id FROM b ORDER BY id").expect("b rows").rows,
-            vec![vec![Cell::Integer(1)]]
-        );
+        assert_eq!(engine.execute_one("SELECT id FROM b ORDER BY id").expect("b rows").rows, vec![vec![Cell::Integer(1)]]);
     }
 
     #[test]
     fn recursive_triggers_pragma_allows_loops_until_the_depth_limit() {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute("CREATE TABLE s(id INTEGER PRIMARY KEY, a)").expect("s");
-        engine
-            .execute("CREATE TRIGGER loop AFTER INSERT ON s BEGIN INSERT INTO s VALUES (new.id + 1000, new.a); END")
-            .expect("loop");
+        engine.execute("CREATE TRIGGER loop AFTER INSERT ON s BEGIN INSERT INTO s VALUES (new.id + 1000, new.a); END").expect("loop");
         engine.execute("INSERT INTO s VALUES (1, 1)").expect("recursive off");
         // The trigger fires once for the user row; its own insert does not
         // re-enter the trigger while `recursive_triggers` is off.
@@ -11076,10 +11094,7 @@ mod tests {
             .expect("instead insert");
         let inserted = engine.execute("INSERT INTO v VALUES (7, 8)").expect("view insert").pop().expect("result");
         assert_eq!(inserted.affected, 0);
-        assert_eq!(
-            engine.execute_one("SELECT id, a FROM base").expect("base rows").rows,
-            vec![vec![Cell::Integer(7), Cell::Integer(8)]]
-        );
+        assert_eq!(engine.execute_one("SELECT id, a FROM base").expect("base rows").rows, vec![vec![Cell::Integer(7), Cell::Integer(8)]]);
         engine
             .execute("CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN UPDATE base SET a = new.a WHERE id = old.id; END")
             .expect("instead update");
@@ -11089,9 +11104,7 @@ mod tests {
             engine.execute_one("SELECT id, a FROM base").expect("base after update").rows,
             vec![vec![Cell::Integer(7), Cell::Integer(20)]]
         );
-        engine
-            .execute("CREATE TRIGGER vd INSTEAD OF DELETE ON v BEGIN DELETE FROM base WHERE id = old.id; END")
-            .expect("instead delete");
+        engine.execute("CREATE TRIGGER vd INSTEAD OF DELETE ON v BEGIN DELETE FROM base WHERE id = old.id; END").expect("instead delete");
         let deleted = engine.execute("DELETE FROM v WHERE id = 7").expect("view delete").pop().expect("result");
         assert_eq!(deleted.affected, 0);
         assert_eq!(engine.execute_one("SELECT count(*) FROM base").expect("base after delete").rows, vec![vec![Cell::Integer(0)]]);
@@ -11102,9 +11115,7 @@ mod tests {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a)").expect("t");
         engine.execute("CREATE TABLE log(v)").expect("log");
-        engine
-            .execute("CREATE TRIGGER bad AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.zzz); END")
-            .expect("trigger");
+        engine.execute("CREATE TRIGGER bad AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.zzz); END").expect("trigger");
         let failed = engine.execute_one("INSERT INTO t VALUES (1, 1), (2, 2)").expect_err("missing column");
         assert_eq!(failed.code, "unknown-column");
         assert_eq!(failed.message, "no such column: new.zzz");
@@ -11120,9 +11131,7 @@ mod tests {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute("CREATE TABLE m(id INTEGER PRIMARY KEY, a)").expect("m");
         engine.execute("CREATE TEMP TABLE tt(id INTEGER PRIMARY KEY, a)").expect("temp table");
-        engine
-            .execute("CREATE TRIGGER temp.xt AFTER INSERT ON tt BEGIN INSERT INTO m VALUES (new.id, new.a); END")
-            .expect("temp trigger");
+        engine.execute("CREATE TRIGGER temp.xt AFTER INSERT ON tt BEGIN INSERT INTO m VALUES (new.id, new.a); END").expect("temp trigger");
         assert_eq!(
             engine.execute_one("SELECT type, name FROM sqlite_temp_master").expect("temp master").rows,
             vec![
@@ -11135,10 +11144,7 @@ mod tests {
             vec![vec![Cell::Integer(0)]]
         );
         engine.execute("INSERT INTO tt VALUES (1, 2)").expect("temp insert");
-        assert_eq!(
-            engine.execute_one("SELECT id, a FROM m").expect("m rows").rows,
-            vec![vec![Cell::Integer(1), Cell::Integer(2)]]
-        );
+        assert_eq!(engine.execute_one("SELECT id, a FROM m").expect("m rows").rows, vec![vec![Cell::Integer(1), Cell::Integer(2)]]);
         engine.execute("DROP TABLE tt").expect("drop temp");
         assert_eq!(
             engine.execute_one("SELECT count(*) FROM sqlite_temp_master WHERE type = 'trigger'").expect("temp triggers").rows,
@@ -11151,16 +11157,11 @@ mod tests {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a, b)").expect("t");
         engine.execute("CREATE TABLE log(v)").expect("log");
-        engine
-            .execute("CREATE TRIGGER uo AFTER UPDATE OF a ON t BEGIN INSERT INTO log VALUES (new.a); END")
-            .expect("update of");
+        engine.execute("CREATE TRIGGER uo AFTER UPDATE OF a ON t BEGIN INSERT INTO log VALUES (new.a); END").expect("update of");
         engine.execute("INSERT INTO t VALUES (1, 'start', 'start')").expect("seed");
         engine.execute("UPDATE t SET b = 'x'").expect("update b");
         assert_eq!(engine.execute_one("SELECT count(*) FROM log").expect("log after b").rows, vec![vec![Cell::Integer(0)]]);
         engine.execute("UPDATE t SET a = 'y'").expect("update a");
-        assert_eq!(
-            engine.execute_one("SELECT v FROM log").expect("log after a").rows,
-            vec![vec![Cell::Text("y".to_string())]]
-        );
+        assert_eq!(engine.execute_one("SELECT v FROM log").expect("log after a").rows, vec![vec![Cell::Text("y".to_string())]]);
     }
 }
