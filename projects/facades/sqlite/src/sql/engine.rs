@@ -21,7 +21,8 @@ use super::{
     json_string,
     sql::{
         AggregateFunction, AlterAction, Assignment, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp,
-        CompoundTerm, DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge, FrameUnits, IndexColumn, InsertValue,
+        CompoundTerm, ConflictAction, ConflictClause, DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge,
+        FrameUnits, IndexColumn, InsertValue,
         JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableConstraint, TableRef,
         TransactionAction,
         TriggerEvent, TriggerTiming, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column,
@@ -323,6 +324,8 @@ const MAX_TRIGGER_DEPTH: usize = 100;
 /// expression. They never collide with a `FROM` source position.
 const TRIGGER_SOURCE_NEW: usize = usize::MAX;
 const TRIGGER_SOURCE_OLD: usize = usize::MAX - 1;
+/// Pseudo source of `excluded.<column>` inside `ON CONFLICT DO UPDATE`.
+const EXCLUDED_SOURCE: usize = usize::MAX - 2;
 
 /// One database attached with `ATTACH DATABASE`.
 struct AttachedDb {
@@ -564,6 +567,7 @@ fn view_relation<'a>(label: &str, names: &[String], trigger: Option<&'a TriggerF
         using: vec![Vec::new()],
         using_slots: Vec::new(),
         trigger,
+        excluded: false,
     }
 }
 
@@ -588,7 +592,9 @@ fn trigger_event_matches(defined: &TriggerEvent, incoming: &TriggerEvent) -> boo
     }
 }
 
-/// One uniqueness rule an `UPDATE` re-checks against the live table.
+/// One uniqueness rule an `UPDATE` or an `ON CONFLICT` target re-checks
+/// against the live table.
+#[derive(Clone)]
 enum UniqueKey {
     /// The hidden rowid, reported under `t.rowid` or `t.<alias>`.
     Rowid(String),
@@ -627,6 +633,42 @@ struct DeletePlan {
     removed: Vec<i64>,
     /// `RETURNING` rows, evaluated against the row as it was.
     returning: Vec<Vec<Cell>>,
+}
+
+/// The conflict target and rewrite of one `INSERT ... ON CONFLICT` clause.
+struct UpsertPlan {
+    /// Uniqueness rules the clause reacts to.
+    keys: Vec<UniqueKey>,
+    /// `DO NOTHING` or `DO UPDATE`.
+    action: UpsertAction,
+    /// `DO UPDATE SET` targets with their resolved right-hand sides.
+    assignments: Vec<(usize, ResolvedExpr)>,
+    /// Optional `DO UPDATE ... WHERE` predicate over the stored and supplied
+    /// rows.
+    filter: Option<ResolvedExpr>,
+}
+
+/// What an `ON CONFLICT` clause does with a conflicting row.
+enum UpsertAction {
+    /// `DO NOTHING`: the supplied row is discarded.
+    Nothing,
+    /// `DO UPDATE`: the conflicting stored row is rewritten.
+    Update,
+}
+
+/// Result of applying one supplied row of an upsert.
+enum UpsertOutcome {
+    /// `DO NOTHING` skipped the row.
+    Skipped,
+    /// The row was written with this rowid.
+    Inserted(i64),
+    /// The conflicting row was rewritten.
+    Updated {
+        /// Rowid of the rewritten row.
+        rowid: i64,
+        /// `RETURNING` rows evaluated against the new values.
+        rows: Vec<Vec<Cell>>,
+    },
 }
 
 /// A resolved `RETURNING` projection.
@@ -796,6 +838,9 @@ pub struct Engine {
     /// Values bound to `?` / `:name` placeholders for the statement currently
     /// executing, in declaration order.
     parameters: Vec<Cell>,
+    /// Supplied row of the `ON CONFLICT DO UPDATE` clause being evaluated.
+    /// `excluded.<column>` reads this row instead of the table's stored row.
+    upsert_excluded: Vec<Cell>,
     /// `PRAGMA foreign_keys`, enabled at session start like better-sqlite3.
     foreign_keys: bool,
     /// `PRAGMA recursive_triggers`, off at session start like SQLite.
@@ -853,6 +898,7 @@ impl Engine {
             scope: TableScope::Default,
             active_triggers: Vec::new(),
             parameters: Vec::new(),
+            upsert_excluded: Vec::new(),
             foreign_keys: true,
             recursive_triggers: false,
             last_insert_rowid: 0,
@@ -1535,7 +1581,8 @@ impl Engine {
 
     /// Evaluates one trigger `WHEN` predicate against the current frame.
     fn trigger_when_holds(&self, when: &Expr) -> Result<bool, SqlError> {
-        let relation = Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: self.trigger_frames.last() };
+        let relation =
+            Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: self.trigger_frames.last(), excluded: false };
         let shape = relation.shape();
         let mut aggregates = Vec::new();
         let mut windows = Vec::new();
@@ -1557,7 +1604,8 @@ impl Engine {
     /// Evaluates one `VALUES` expression of a trigger body against the active
     /// `NEW` / `OLD` frame.
     fn eval_trigger_expression(&self, expression: &Expr, statement: &'static str) -> Result<Cell, SqlError> {
-        let relation = Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: self.trigger_frames.last() };
+        let relation =
+            Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: self.trigger_frames.last(), excluded: false };
         let shape = relation.shape();
         let mut aggregates = Vec::new();
         let mut windows = Vec::new();
@@ -2330,7 +2378,7 @@ impl Engine {
                 }
                 Ok(ExecResult { statement: "drop-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::Insert { schema: _, table, columns, rows, default_values, returning } => {
+            Statement::Insert { schema: _, table, columns, rows, default_values, conflict, returning } => {
                 let key = table.to_ascii_lowercase();
                 check_readonly_table(&table, "insert")?;
                 if self.views.contains_key(&key) {
@@ -2359,6 +2407,11 @@ impl Engine {
                     Some(items) => Some(returning_shape.plan(def, items, "insert")?),
                     None => None,
                 };
+                let upsert = match &conflict {
+                    Some(clause) => Some(self.prepare_upsert(def, &key, &table, clause)?),
+                    None => None,
+                };
+                let mut upsert_live = if upsert.is_some() { self.live_rows(def, "insert")? } else { Vec::new() };
                 let mut slots_by_row = Vec::with_capacity(rows.len().max(1));
                 if default_values {
                     // `DEFAULT VALUES` leaves every slot unset so the writer fills
@@ -2403,6 +2456,7 @@ impl Engine {
                 let trigger_columns = trigger_frame_columns(def);
                 let mut rowids = Vec::with_capacity(slots_by_row.len());
                 let mut last_written: Option<i64> = None;
+                let mut affected = 0usize;
                 let mut returned: Vec<Vec<Cell>> = Vec::new();
                 let mut failure = None;
                 for slots in &slots_by_row {
@@ -2428,23 +2482,57 @@ impl Engine {
                             old: None,
                         });
                     }
-                    let rowid = if let Some(position) = temp_position {
-                        let table = &mut self.temp_tables[position];
-                        match temp_insert_row(def, &mut table.rows, slots, &temp_keys) {
-                            Ok(rowid) => rowid,
+                    let outcome = match &upsert {
+                        Some(plan) => match self.apply_upsert(
+                            def,
+                            &key,
+                            &table,
+                            plan,
+                            slots,
+                            temp_position,
+                            &mut upsert_live,
+                            returning.as_ref(),
+                            &returning_shape.scope,
+                            &check_budget,
+                        ) {
+                            Ok(outcome) => outcome,
                             Err(error) => {
                                 failure = Some(error);
                                 break;
                             }
-                        }
-                    }
-                    else {
-                        match self.writer.insert(&table, slots) {
-                            Ok(rowid) => rowid,
-                            Err(error) => {
-                                failure = Some(SqlError::new("storage", error.to_string()).in_statement("insert"));
-                                break;
+                        },
+                        None => {
+                            let inserted = if let Some(position) = temp_position {
+                                let table = &mut self.temp_tables[position];
+                                temp_insert_row(def, &mut table.rows, slots, &temp_keys)
                             }
+                            else {
+                                self.writer.insert(&table, slots).map_err(|error| {
+                                    SqlError::new("storage", error.to_string()).in_statement("insert")
+                                })
+                            };
+                            match inserted {
+                                Ok(rowid) => UpsertOutcome::Inserted(rowid),
+                                Err(error) => {
+                                    failure = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                    };
+                    let rowid = match outcome {
+                        UpsertOutcome::Skipped => continue,
+                        UpsertOutcome::Inserted(rowid) => {
+                            affected += 1;
+                            rowid
+                        }
+                        UpsertOutcome::Updated { rowid, rows } => {
+                            // `plan_update` already validated the rewritten row
+                            // and evaluated `RETURNING` against it.
+                            affected += 1;
+                            last_written = Some(rowid);
+                            returned.extend(rows);
+                            continue;
                         }
                     };
                     let cells = check_row(def, slots, rowid);
@@ -2551,19 +2639,19 @@ impl Engine {
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
                 }
                 if let Some(plan) = &returning {
-                    return Ok(ExecResult { statement: "insert", columns: plan.columns.clone(), rows: returned, affected: slots_by_row.len() });
+                    return Ok(ExecResult { statement: "insert", columns: plan.columns.clone(), rows: returned, affected });
                 }
                 if default_values {
                     // `DEFAULT VALUES` reports neither columns nor rows, like
                     // SQLite; the stored row is written the same way.
-                    return Ok(ExecResult { statement: "insert", columns: Vec::new(), rows: Vec::new(), affected: slots_by_row.len() });
+                    return Ok(ExecResult { statement: "insert", columns: Vec::new(), rows: Vec::new(), affected });
                 }
                 if def.without_rowid {
                     // A WITHOUT ROWID insert has no rowid to report.
-                    return Ok(ExecResult { statement: "insert", columns: Vec::new(), rows: Vec::new(), affected: slots_by_row.len() });
+                    return Ok(ExecResult { statement: "insert", columns: Vec::new(), rows: Vec::new(), affected });
                 }
                 let rows = rowids.into_iter().map(|rowid| vec![Cell::Integer(rowid)]).collect();
-                Ok(ExecResult { statement: "insert", columns: vec!["rowid".to_string()], rows, affected: slots_by_row.len() })
+                Ok(ExecResult { statement: "insert", columns: vec!["rowid".to_string()], rows, affected })
             }
             Statement::CreateIndex { schema: _, name, table, if_not_exists, unique, columns, predicate, sql } => {
                 let table_key = table.to_ascii_lowercase();
@@ -3540,7 +3628,16 @@ impl Engine {
             using: vec![Vec::new()],
             using_slots: Vec::new(),
             trigger,
+            excluded: false,
         }
+    }
+
+    /// Relation used by `ON CONFLICT DO UPDATE`: `excluded.<column>` binds
+    /// against the supplied row while bare columns keep the stored row.
+    fn upsert_relation<'a>(def: &'a TableDef, label: &str) -> Relation<'a> {
+        let mut relation = Self::target_relation(def, label, None);
+        relation.excluded = true;
+        relation
     }
 
     /// Reads every row of `def`, decoded and sorted by rowid.
@@ -3575,6 +3672,226 @@ impl Engine {
         }
         rows.sort_by_key(|(rowid, _)| *rowid);
         Ok(rows)
+    }
+
+    /// Resolves one `ON CONFLICT` clause against the insert target: the
+    /// uniqueness rules its target names, plus the `DO UPDATE` assignments
+    /// evaluated against the stored row and the supplied (`excluded`) row.
+    fn prepare_upsert(&self, def: &TableDef, table_key: &str, label: &str, clause: &ConflictClause) -> Result<UpsertPlan, SqlError> {
+        if clause.predicate.is_some() {
+            // A target `WHERE` narrows the match to a partial index. Those
+            // indexes keep their keys in engine-managed sets, so the target
+            // cannot be matched by column positions alone.
+            return Err(SqlError::new(
+                "unsupported-clause",
+                "`ON CONFLICT` target `WHERE` on a partial index is not supported",
+            )
+            .in_clause("WHERE")
+            .in_statement("insert"));
+        }
+        let keys = match &clause.target {
+            None => {
+                let mut keys = self.unique_keys(def, table_key);
+                if def.without_rowid {
+                    keys.retain(|key| !matches!(key, UniqueKey::Rowid(_)));
+                }
+                keys
+            }
+            Some(columns) => {
+                let mut positions = Vec::with_capacity(columns.len());
+                for column in columns {
+                    let position = def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(column)).ok_or_else(|| {
+                        SqlError::new("unknown-column", format!("no such column: {column}")).in_statement("insert")
+                    })?;
+                    positions.push(position);
+                }
+                let keys = self.upsert_target_keys(def, table_key, &positions);
+                if keys.is_empty() {
+                    return Err(SqlError::new(
+                        "conflict-target",
+                        "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+                    )
+                    .in_statement("insert"));
+                }
+                keys
+            }
+        };
+        let (action, assignments, filter) = match &clause.action {
+            ConflictAction::Nothing => (UpsertAction::Nothing, Vec::new(), None),
+            ConflictAction::Update { assignments, predicate } => {
+                let relation = Self::upsert_relation(def, label);
+                let mut targets = Vec::with_capacity(assignments.len());
+                for assignment in assignments {
+                    let index = def
+                        .columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(&assignment.column))
+                        .ok_or_else(|| {
+                            SqlError::new("unknown-column", format!("no such column: {}", assignment.column)).in_statement("insert")
+                        })?;
+                    targets.push((index, Self::resolve_upsert_expr(&relation, &assignment.value)?));
+                }
+                let filter = match predicate {
+                    Some(expression) => Some(Self::resolve_upsert_expr(&relation, expression)?),
+                    None => None,
+                };
+                (UpsertAction::Update, targets, filter)
+            }
+        };
+        Ok(UpsertPlan { keys, action, assignments, filter })
+    }
+
+    /// Resolves one expression of a `DO UPDATE` clause against the upsert
+    /// relation, which exposes both the stored row and `excluded.<column>`.
+    fn resolve_upsert_expr(relation: &Relation, expression: &Expr) -> Result<ResolvedExpr, SqlError> {
+        let mut windows = Vec::new();
+        let mut aggregates = Vec::new();
+        resolve_expr(expression, relation, &[], &[], &mut windows, &mut aggregates, false, false).map_err(|error| error.in_statement("insert"))
+    }
+
+    /// The uniqueness rules one `ON CONFLICT (columns)` target matches.
+    fn upsert_target_keys(&self, def: &TableDef, table_key: &str, positions: &[usize]) -> Vec<UniqueKey> {
+        self.unique_keys(def, table_key)
+            .into_iter()
+            .filter(|key| match key {
+                UniqueKey::Rowid(_) => !def.without_rowid && positions.len() == 1 && def.rowid_alias == Some(positions[0]),
+                UniqueKey::Columns(existing, _) => same_positions(existing, positions),
+            })
+            .collect()
+    }
+
+    /// Applies one supplied row of an upsert: insert it, skip it, or rewrite the
+    /// stored row it conflicts with. `live` is the statement's own view of the
+    /// table so a later supplied row sees rows written earlier in the same
+    /// statement, exactly like SQLite.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_upsert(
+        &mut self,
+        def: &TableDef,
+        table_key: &str,
+        table: &str,
+        plan: &UpsertPlan,
+        slots: &[Option<crate::WriteValue>],
+        temp_position: Option<usize>,
+        live: &mut Vec<(i64, Vec<Cell>)>,
+        returning: Option<&ReturningPlan>,
+        shape: &ScopeShape,
+        budget: &Budget,
+    ) -> Result<UpsertOutcome, SqlError> {
+        let width = def.columns.len();
+        // The rowid the supplied row will occupy. An explicit `INTEGER PRIMARY
+        // KEY` value is used as written, otherwise SQLite's `max(rowid) + 1`.
+        let explicit_rowid = def
+            .rowid_alias
+            .and_then(|alias| slots.get(alias).and_then(|slot| slot.as_ref()))
+            .and_then(|value| match value {
+                crate::WriteValue::Integer(value) => Some(*value),
+                _ => None,
+            });
+        let candidate_rowid = match explicit_rowid {
+            Some(rowid) => rowid,
+            None => live.iter().map(|(rowid, _)| *rowid).max().unwrap_or(0) + 1,
+        };
+        let candidate = check_row(def, slots, candidate_rowid);
+        let mut conflict_rowid = None;
+        for key in &plan.keys {
+            for (rowid, cells) in live.iter() {
+                if upsert_key_conflicts(key, &candidate, candidate_rowid, *rowid, cells) {
+                    conflict_rowid = Some(*rowid);
+                    break;
+                }
+            }
+            if conflict_rowid.is_some() {
+                break;
+            }
+        }
+        let Some(rowid) = conflict_rowid
+        else {
+            let inserted = if let Some(position) = temp_position {
+                let keys = self.unique_keys(def, table_key);
+                let table_state = &mut self.temp_tables[position];
+                temp_insert_row(def, &mut table_state.rows, slots, &keys)?
+            }
+            else {
+                self.writer.insert(table, slots).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?
+            };
+            live.push((inserted, candidate[..width].to_vec()));
+            return Ok(UpsertOutcome::Inserted(inserted));
+        };
+        if matches!(plan.action, UpsertAction::Nothing) {
+            return Ok(UpsertOutcome::Skipped);
+        }
+        // `DO UPDATE` rewrites the conflicting row the query planner would have
+        // matched: the stored row plus this rowid, narrowed by the clause's own
+        // `WHERE`.
+        let mut predicate = ResolvedExpr::Compare {
+            left: Box::new(ResolvedExpr::Column { source: 0, index: width }),
+            op: CompareOp::Eq,
+            right: Box::new(ResolvedExpr::Cell(Cell::Integer(rowid))),
+        };
+        if let Some(filter) = &plan.filter {
+            predicate = ResolvedExpr::And(Box::new(predicate), Box::new(filter.clone()));
+        }
+        self.upsert_excluded = candidate[..width].to_vec();
+        let planned = self.plan_update(def, table_key, &plan.assignments, Some(&predicate), returning, shape, budget);
+        self.upsert_excluded.clear();
+        let planned = planned?;
+        if planned.writes.is_empty() {
+            // `DO UPDATE ... WHERE` was false: SQLite leaves the row alone.
+            return Ok(UpsertOutcome::Skipped);
+        }
+        for (_, values) in &planned.writes {
+            for (position, value) in values.iter().enumerate() {
+                if let crate::UpdateValue::Set(value) = value {
+                    if let Some(error) = strict_value_violation(def, position, value, "insert") {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        let old_lookup: BTreeMap<i64, Vec<Cell>> = live.iter().cloned().collect();
+        if let Some(position) = temp_position {
+            let table_state = &mut self.temp_tables[position];
+            for (write_rowid, values) in &planned.writes {
+                let cells = table_state
+                    .rows
+                    .get_mut(write_rowid)
+                    .ok_or_else(|| SqlError::new("storage", "temp row disappeared").in_statement("insert"))?;
+                for (slot, value) in values.iter().enumerate() {
+                    if let crate::UpdateValue::Set(value) = value {
+                        cells[slot] = write_value_cell(value);
+                    }
+                }
+            }
+        }
+        else {
+            for (write_rowid, values) in &planned.writes {
+                let written = if def.without_rowid {
+                    let old_cells = old_lookup.get(write_rowid).cloned().unwrap_or_default();
+                    let old_values: Vec<crate::WriteValue> = old_cells.iter().map(cell_write_value).collect();
+                    let mut new_cells = old_cells;
+                    if new_cells.len() < width {
+                        new_cells.resize(width, Cell::Null);
+                    }
+                    for (slot, value) in values.iter().enumerate() {
+                        if let crate::UpdateValue::Set(value) = value {
+                            new_cells[slot] = write_value_cell(value);
+                        }
+                    }
+                    let new_values: Vec<crate::WriteValue> = new_cells.iter().map(cell_write_value).collect();
+                    self.writer.update_without_rowid(table, &old_values, &new_values)
+                }
+                else {
+                    self.writer.update(table, *write_rowid, values)
+                };
+                if let Err(error) = written {
+                    return Err(write_failure(error, "insert", def));
+                }
+            }
+        }
+        *live = self.live_rows(def, "insert")?;
+        let rowid = planned.writes.first().map(|(rowid, _)| *rowid).unwrap_or(rowid);
+        Ok(UpsertOutcome::Updated { rowid, rows: planned.returning })
     }
 
     /// Computes the `(key values, rowid)` entries of one managed index by
@@ -3862,8 +4179,16 @@ impl Engine {
             Some(alias) => format!("{}.{}", def.name, def.columns[alias].name),
             None => format!("{}.rowid", def.name),
         };
-        let mut keys = vec![UniqueKey::Rowid(rowid_label)];
-        if def.primary_key_index && !def.primary_key.is_empty() {
+        let mut keys = Vec::new();
+        if !def.without_rowid {
+            keys.push(UniqueKey::Rowid(rowid_label));
+        }
+        // A WITHOUT ROWID table has no rowid and its primary key is the
+        // clustered key, so that key is the first uniqueness rule.
+        if def.without_rowid && !def.primary_key.is_empty() {
+            keys.push(UniqueKey::Columns(def.primary_key.clone(), label(&def.primary_key)));
+        }
+        else if def.primary_key_index && !def.primary_key.is_empty() {
             keys.push(UniqueKey::Columns(def.primary_key.clone(), label(&def.primary_key)));
         }
         for (position, column) in def.columns.iter().enumerate() {
@@ -4077,7 +4402,7 @@ impl Engine {
             sources.push(source);
             tables.push(rows);
         }
-        let mut relation = Relation { sources, using: vec![Vec::new(); from.len()], using_slots: Vec::new(), trigger: None };
+        let mut relation = Relation { sources, using: vec![Vec::new(); from.len()], using_slots: Vec::new(), trigger: None, excluded: false };
         relation.plan_joins(&from)?;
         let shape = relation.shape();
         let outer_shapes: Vec<ScopeShape> = outer.iter().map(Scope::shape).collect();
@@ -4472,7 +4797,7 @@ impl Engine {
         else {
             return Ok(None);
         };
-        let relation = Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: None };
+        let relation = Relation { sources: Vec::new(), using: Vec::new(), using_slots: Vec::new(), trigger: None, excluded: false };
         let shape = relation.shape();
         let outer_shapes: Vec<ScopeShape> = outer.iter().map(Scope::shape).collect();
         let mut aggregates = Vec::new();
@@ -5885,6 +6210,8 @@ struct Relation<'a> {
     /// `NEW` / `OLD` frame of the trigger body being resolved, if any. A
     /// `new.` or `old.` reference binds here instead of to a `FROM` source.
     trigger: Option<&'a TriggerFrame>,
+    /// `excluded.` references bind to the supplied row of an upsert.
+    excluded: bool,
 }
 
 impl<'a> Relation<'a> {
@@ -5904,6 +6231,15 @@ impl<'a> Relation<'a> {
         if let Some(qualifier) = &reference.qualifier {
             if qualifier.eq_ignore_ascii_case("new") || qualifier.eq_ignore_ascii_case("old") {
                 return self.resolve_trigger(reference, qualifier);
+            }
+            if qualifier.eq_ignore_ascii_case("excluded") && self.excluded {
+                let source = self.sources.first().ok_or_else(|| {
+                    SqlError::new("unknown-table", "no table to bind `excluded` against").in_statement("insert")
+                })?;
+                let index = source.index(&reference.name).ok_or_else(|| {
+                    SqlError::new("unknown-column", format!("no such column: excluded.{}", reference.name)).in_statement("insert")
+                })?;
+                return Ok((EXCLUDED_SOURCE, index));
             }
             let at = self.sources.iter().position(|source| source.label.eq_ignore_ascii_case(qualifier)).ok_or_else(|| {
                 SqlError::new("unknown-table", format!("unknown table `{qualifier}` in the `FROM` clause")).in_statement("select")
@@ -6151,6 +6487,11 @@ enum ResolvedExpr {
         /// Column position inside the trigger frame.
         index: usize,
     },
+    /// `excluded.col` of an `ON CONFLICT DO UPDATE` clause: the supplied row.
+    ExcludedColumn {
+        /// Column position inside the supplied row.
+        index: usize,
+    },
     /// Column borrowed from an enclosing scope: `depth` counts outward from the
     /// current core, `index` addresses that scope's flattened row.
     OuterColumn { depth: usize, index: usize },
@@ -6286,6 +6627,7 @@ impl ResolvedExpr {
                 .and_then(|cells| cells.get(*index))
                 .cloned()
                 .unwrap_or(Cell::Null),
+            Self::ExcludedColumn { index } => ctx.engine.upsert_excluded.get(*index).cloned().unwrap_or(Cell::Null),
             Self::OuterColumn { depth, index } => ctx.outer[*depth].columns[*index].value.clone(),
             Self::AggregateRef(index) => ctx.aggregates[*index].clone(),
             Self::Window(index) => ctx.windows.get(*index).and_then(|column| column.get(ctx.window_row)).cloned().unwrap_or(Cell::Null),
@@ -6413,7 +6755,7 @@ impl ResolvedExpr {
     /// Appends the source indices this expression reads.
     fn collect_sources(&self, out: &mut Vec<usize>) {
         match self {
-            Self::Cell(_) | Self::OuterColumn { .. } | Self::AggregateRef(_) | Self::TriggerColumn { .. } => {}
+            Self::Cell(_) | Self::OuterColumn { .. } | Self::AggregateRef(_) | Self::TriggerColumn { .. } | Self::ExcludedColumn { .. } => {}
             // A subquery's own scope is resolved when it runs, so it cannot be
             // attributed to a single source here; `contains_subquery` makes
             // such a conjunct wait for the complete row instead.
@@ -6492,7 +6834,8 @@ impl ResolvedExpr {
             | Self::OuterColumn { .. }
             | Self::AggregateRef(_)
             | Self::Window(_)
-            | Self::TriggerColumn { .. } => false,
+            | Self::TriggerColumn { .. }
+            | Self::ExcludedColumn { .. } => false,
         }
     }
 }
@@ -6533,6 +6876,7 @@ fn resolve_expr(
         Expr::Column(reference) => match relation.resolve(reference) {
             Ok((TRIGGER_SOURCE_NEW, index)) => ResolvedExpr::TriggerColumn { old: false, index },
             Ok((TRIGGER_SOURCE_OLD, index)) => ResolvedExpr::TriggerColumn { old: true, index },
+            Ok((EXCLUDED_SOURCE, index)) => ResolvedExpr::ExcludedColumn { index },
             Ok((source, index)) => ResolvedExpr::Column { source, index },
             Err(error) if error.code == "unknown-column" || error.code == "unknown-table" => match resolve_outer(reference, outer)? {
                 Some(found) => found,
@@ -8486,7 +8830,7 @@ fn resolve_checks(
         unqualified_hidden: vec![false; width],
         star_override: vec![None; width],
     };
-    let relation = Relation { sources: vec![source], using: vec![Vec::new()], using_slots: Vec::new(), trigger: None };
+    let relation = Relation { sources: vec![source], using: vec![Vec::new()], using_slots: Vec::new(), trigger: None, excluded: false };
     let mut resolved = Vec::with_capacity(checks.len());
     for check in checks {
         let mut aggregates = Vec::new();
@@ -9013,6 +9357,26 @@ fn temp_insert_row(
     }
     rows.insert(rowid, cells);
     Ok(rowid)
+}
+
+/// Whether one supplied upsert row collides with one stored row on `key`.
+///
+/// A `NULL` in any key column never conflicts, exactly like a unique index.
+fn upsert_key_conflicts(
+    key: &UniqueKey,
+    candidate: &[Cell],
+    candidate_rowid: i64,
+    existing_rowid: i64,
+    existing: &[Cell],
+) -> bool {
+    match key {
+        UniqueKey::Rowid(_) => candidate_rowid == existing_rowid,
+        UniqueKey::Columns(positions, _) => positions.iter().all(|position| {
+            let first = &candidate[*position];
+            let second = &existing[*position];
+            !matches!(first, Cell::Null) && !matches!(second, Cell::Null) && compare_cells(first, second) == Ordering::Equal
+        }),
+    }
 }
 
 /// Reports the first uniqueness rule the candidate row violates against the
