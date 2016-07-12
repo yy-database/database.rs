@@ -635,10 +635,26 @@ struct DeletePlan {
     returning: Vec<Vec<Cell>>,
 }
 
+/// One engine-managed unique index an `ON CONFLICT` target matched.
+#[derive(Clone)]
+struct ManagedTarget {
+    /// The partial or expression index the target selected.
+    index: IndexDef,
+    /// `t.a, t.b` fragment for uniqueness failures on the index.
+    label: String,
+}
+
 /// The conflict target and rewrite of one `INSERT ... ON CONFLICT` clause.
 struct UpsertPlan {
     /// Uniqueness rules the clause reacts to.
     keys: Vec<UniqueKey>,
+    /// Managed indexes the clause reacts to.
+    managed: Vec<ManagedTarget>,
+    /// Other uniqueness rules that still abort the statement when the supplied
+    /// row violates them.
+    others: Vec<UniqueKey>,
+    /// Managed indexes outside the target that still abort the statement.
+    other_managed: Vec<ManagedTarget>,
     /// `DO NOTHING` or `DO UPDATE`.
     action: UpsertAction,
     /// `DO UPDATE SET` targets with their resolved right-hand sides.
@@ -3678,25 +3694,22 @@ impl Engine {
     /// uniqueness rules its target names, plus the `DO UPDATE` assignments
     /// evaluated against the stored row and the supplied (`excluded`) row.
     fn prepare_upsert(&self, def: &TableDef, table_key: &str, label: &str, clause: &ConflictClause) -> Result<UpsertPlan, SqlError> {
-        if clause.predicate.is_some() {
-            // A target `WHERE` narrows the match to a partial index. Those
-            // indexes keep their keys in engine-managed sets, so the target
-            // cannot be matched by column positions alone.
-            return Err(SqlError::new(
-                "unsupported-clause",
-                "`ON CONFLICT` target `WHERE` on a partial index is not supported",
-            )
-            .in_clause("WHERE")
-            .in_statement("insert"));
-        }
-        let keys = match &clause.target {
-            None => {
-                let mut keys = self.unique_keys(def, table_key);
-                if def.without_rowid {
-                    keys.retain(|key| !matches!(key, UniqueKey::Rowid(_)));
-                }
-                keys
+        let mismatch = || {
+            SqlError::new("conflict-target", "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint").in_statement("insert")
+        };
+        // The target predicate is resolved against the insert target alone:
+        // `excluded` is not in scope there, exactly like SQLite.
+        let target_predicate = match (&clause.target, &clause.predicate) {
+            (Some(_), Some(expression)) => {
+                let relation = Self::target_relation(def, label, None);
+                Some(Self::resolve_upsert_expr(&relation, expression)?)
             }
+            (Some(_), None) => None,
+            (None, Some(_)) => return Err(mismatch()),
+            (None, None) => None,
+        };
+        let positions = match &clause.target {
+            None => None,
             Some(columns) => {
                 let mut positions = Vec::with_capacity(columns.len());
                 for column in columns {
@@ -3705,17 +3718,55 @@ impl Engine {
                     })?;
                     positions.push(position);
                 }
-                let keys = self.upsert_target_keys(def, table_key, &positions);
-                if keys.is_empty() {
-                    return Err(SqlError::new(
-                        "conflict-target",
-                        "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
-                    )
-                    .in_statement("insert"));
-                }
-                keys
+                Some(positions)
             }
         };
+        let all_keys = self.unique_keys(def, table_key);
+        let (keys, others) = match &positions {
+            None => {
+                let mut keys = all_keys;
+                if def.without_rowid {
+                    keys.retain(|key| !matches!(key, UniqueKey::Rowid(_)));
+                }
+                (keys, Vec::new())
+            }
+            Some(positions) if target_predicate.is_some() => {
+                // A target `WHERE` can only name a partial index, so no plain
+                // unique constraint or full index is the conflict resolver.
+                (Vec::new(), all_keys)
+            }
+            Some(positions) => {
+                let keys = self.upsert_target_keys(def, table_key, positions);
+                let others = all_keys
+                    .into_iter()
+                    .filter(|key| match key {
+                        UniqueKey::Rowid(_) => !(positions.len() == 1 && def.rowid_alias == Some(positions[0])),
+                        UniqueKey::Columns(existing, _) => !same_positions(existing, positions),
+                    })
+                    .collect();
+                (keys, others)
+            }
+        };
+        let all_managed = self.upsert_managed_indexes(def, table_key);
+        let (managed, other_managed) = match &positions {
+            None => (all_managed, Vec::new()),
+            Some(positions) => {
+                let mut managed = Vec::new();
+                let mut other_managed = Vec::new();
+                for target in all_managed {
+                    if managed_target_matches(&target, positions, target_predicate.as_ref()) {
+                        managed.push(target);
+                    }
+                    else {
+                        other_managed.push(target);
+                    }
+                }
+                (managed, other_managed)
+            }
+        };
+        if positions.is_some() && keys.is_empty() && managed.is_empty() {
+            return Err(mismatch());
+        }
         let (action, assignments, filter) = match &clause.action {
             ConflictAction::Nothing => (UpsertAction::Nothing, Vec::new(), None),
             ConflictAction::Update { assignments, predicate } => {
@@ -3738,7 +3789,7 @@ impl Engine {
                 (UpsertAction::Update, targets, filter)
             }
         };
-        Ok(UpsertPlan { keys, action, assignments, filter })
+        Ok(UpsertPlan { keys, managed, others, other_managed, action, assignments, filter })
     }
 
     /// Resolves one expression of a `DO UPDATE` clause against the upsert
@@ -3747,6 +3798,22 @@ impl Engine {
         let mut windows = Vec::new();
         let mut aggregates = Vec::new();
         resolve_expr(expression, relation, &[], &[], &mut windows, &mut aggregates, false, false).map_err(|error| error.in_statement("insert"))
+    }
+
+    /// Every unique engine-managed index of `table`, which includes partial and
+    /// expression indexes.
+    fn upsert_managed_indexes(&self, def: &TableDef, table_key: &str) -> Vec<ManagedTarget> {
+        if def.temp {
+            return Vec::new();
+        }
+        self.indexes
+            .values()
+            .filter(|index| index.managed && index.unique && index.table == table_key)
+            .map(|index| {
+                let label = managed_index_label(def, index);
+                ManagedTarget { index: index.clone(), label }
+            })
+            .collect()
     }
 
     /// The uniqueness rules one `ON CONFLICT (columns)` target matches.
@@ -3758,6 +3825,79 @@ impl Engine {
                 UniqueKey::Columns(existing, _) => same_positions(existing, positions),
             })
             .collect()
+    }
+
+    /// The key values one managed index produces for a row, or `None` when the
+    /// row is outside the index's partial predicate.
+    fn managed_target_key(&self, def: &TableDef, target: &ManagedTarget, cells: &[Cell]) -> Result<Option<Vec<Cell>>, SqlError> {
+        let shape = TargetShape::new(def, &def.name, None);
+        let budget = Budget::new();
+        let aggregates: Vec<Cell> = Vec::new();
+        let windows: Vec<Vec<Cell>> = Vec::new();
+        let context = EvalContext {
+            engine: self,
+            outer: &[],
+            current: &shape.scope,
+            aggregates: &aggregates,
+            windows: &windows,
+            window_row: 0,
+            budget: &budget,
+            ctes: None,
+        };
+        if let Some(predicate) = &target.index.predicate {
+            if truthiness(&predicate.eval(cells, &context)?) != Some(true) {
+                return Ok(None);
+            }
+        }
+        let mut key = Vec::with_capacity(target.index.terms.len());
+        for term in &target.index.terms {
+            key.push(term.eval(cells, &context)?);
+        }
+        Ok(Some(key))
+    }
+
+    /// The first uniqueness rule outside the conflict target the supplied row
+    /// still violates; SQLite aborts the statement instead of resolving it.
+    fn upsert_other_conflict(
+        &self,
+        def: &TableDef,
+        plan: &UpsertPlan,
+        candidate: &[Cell],
+        candidate_rowid: i64,
+        live: &[(i64, Vec<Cell>)],
+        skip: i64,
+    ) -> Result<Option<String>, SqlError> {
+        for key in &plan.others {
+            let wanted = key.values(candidate, candidate_rowid);
+            for (rowid, cells) in live {
+                if *rowid == skip {
+                    continue;
+                }
+                let other = key.values(cells, *rowid);
+                let collides = wanted.iter().zip(&other).all(|(first, second)| {
+                    !matches!(first, Cell::Null) && !matches!(second, Cell::Null) && compare_cells(first, second) == Ordering::Equal
+                });
+                if collides {
+                    return Ok(Some(key.label().to_string()));
+                }
+            }
+        }
+        for target in &plan.other_managed {
+            let Some(wanted) = self.managed_target_key(def, target, candidate)? else {
+                continue;
+            };
+            for (rowid, cells) in live {
+                if *rowid == skip {
+                    continue;
+                }
+                if let Some(other) = self.managed_target_key(def, target, cells)? {
+                    if managed_keys_conflict(&wanted, &other) {
+                        return Ok(Some(target.label.clone()));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Applies one supplied row of an upsert: insert it, skip it, or rewrite the
@@ -3805,8 +3945,31 @@ impl Engine {
                 break;
             }
         }
+        if conflict_rowid.is_none() {
+            for target in &plan.managed {
+                let Some(wanted) = self.managed_target_key(def, target, &candidate)? else {
+                    continue;
+                };
+                for (rowid, cells) in live.iter() {
+                    if let Some(other) = self.managed_target_key(def, target, cells)? {
+                        if managed_keys_conflict(&wanted, &other) {
+                            conflict_rowid = Some(*rowid);
+                            break;
+                        }
+                    }
+                }
+                if conflict_rowid.is_some() {
+                    break;
+                }
+            }
+        }
+        let unique_failed =
+            |label: String| SqlError::new("unique-constraint", format!("UNIQUE constraint failed: {label}")).in_statement("insert");
         let Some(rowid) = conflict_rowid
         else {
+            if let Some(label) = self.upsert_other_conflict(def, plan, &candidate, candidate_rowid, live, -1)? {
+                return Err(unique_failed(label));
+            }
             let inserted = if let Some(position) = temp_position {
                 let keys = self.unique_keys(def, table_key);
                 let table_state = &mut self.temp_tables[position];
@@ -3819,7 +3982,13 @@ impl Engine {
             return Ok(UpsertOutcome::Inserted(inserted));
         };
         if matches!(plan.action, UpsertAction::Nothing) {
+            if let Some(label) = self.upsert_other_conflict(def, plan, &candidate, candidate_rowid, live, -1)? {
+                return Err(unique_failed(label));
+            }
             return Ok(UpsertOutcome::Skipped);
+        }
+        if let Some(label) = self.upsert_other_conflict(def, plan, &candidate, candidate_rowid, live, rowid)? {
+            return Err(unique_failed(label));
         }
         // `DO UPDATE` rewrites the conflicting row the query planner would have
         // matched: the stored row plus this rowid, narrowed by the clause's own
@@ -6263,9 +6432,19 @@ impl<'a> Relation<'a> {
                 })?;
                 return Ok((EXCLUDED_SOURCE, index));
             }
-            let at = self.sources.iter().position(|source| source.label.eq_ignore_ascii_case(qualifier)).ok_or_else(|| {
-                SqlError::new("unknown-table", format!("unknown table `{qualifier}` in the `FROM` clause")).in_statement("select")
-            })?;
+            let at = match self.sources.iter().position(|source| source.label.eq_ignore_ascii_case(qualifier)) {
+                Some(at) => at,
+                // Outside an upsert, `excluded` is not a pseudo table: SQLite
+                // reports the qualified name as a missing column.
+                None if qualifier.eq_ignore_ascii_case("excluded") => {
+                    return Err(SqlError::new("unknown-column", format!("no such column: excluded.{}", reference.name)).in_statement("select"));
+                }
+                None => {
+                    return Err(
+                        SqlError::new("unknown-table", format!("unknown table `{qualifier}` in the `FROM` clause")).in_statement("select"),
+                    );
+                }
+            };
             let source = &self.sources[at];
             let index = source.index(&reference.name).ok_or_else(|| {
                 SqlError::new("unknown-column", format!("unknown column `{}` in table `{}`", reference.display(), source.label))
@@ -6493,7 +6672,7 @@ impl<'a> Relation<'a> {
 
 /// A projection / `WHERE` / `ORDER BY` expression with every column resolved
 /// to a merged row index.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum ResolvedExpr {
     /// Value of a bound parameter placeholder, or `NULL` when the host did not
     /// supply one for that slot.
@@ -9379,6 +9558,49 @@ fn temp_insert_row(
     }
     rows.insert(rowid, cells);
     Ok(rowid)
+}
+
+/// Declared column positions of a managed index whose terms are all plain
+/// columns, or `None` for a real expression key.
+fn managed_term_positions(index: &IndexDef) -> Option<Vec<usize>> {
+    index
+        .terms
+        .iter()
+        .map(|term| match term {
+            ResolvedExpr::Column { source: 0, index: column } => Some(*column),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether one managed index is the one an `ON CONFLICT (columns)` target names.
+fn managed_target_matches(target: &ManagedTarget, positions: &[usize], predicate: Option<&ResolvedExpr>) -> bool {
+    if target.index.predicate.as_ref() != predicate {
+        return false;
+    }
+    match managed_term_positions(&target.index) {
+        Some(terms) => !terms.is_empty() && same_positions(&terms, positions),
+        None => false,
+    }
+}
+
+/// `t.a, t.b` fragment of a managed index, matching SQLite's uniqueness text.
+fn managed_index_label(def: &TableDef, index: &IndexDef) -> String {
+    match managed_term_positions(index) {
+        Some(positions) if !positions.is_empty() => {
+            positions.iter().map(|position| format!("{}.{}", def.name, def.columns[*position].name)).collect::<Vec<_>>().join(", ")
+        }
+        _ => format!("index '{}'", index.name),
+    }
+}
+
+/// Whether two computed managed-index keys collide, with SQLite's rule that a
+/// `NULL` component never conflicts.
+fn managed_keys_conflict(first: &[Cell], second: &[Cell]) -> bool {
+    first.len() == second.len()
+        && first.iter().zip(second).all(|(left, right)| {
+            !matches!(left, Cell::Null) && !matches!(right, Cell::Null) && compare_cells(left, right) == Ordering::Equal
+        })
 }
 
 /// Whether one supplied upsert row collides with one stored row on `key`.
