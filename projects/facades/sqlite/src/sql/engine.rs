@@ -161,6 +161,10 @@ struct ForeignKeyDef {
     on_delete: String,
     /// `ON UPDATE` action, spelled for `PRAGMA foreign_key_list`.
     on_update: String,
+    /// `ON DELETE` action as parsed, applied when parent rows are removed.
+    on_delete_action: ForeignKeyAction,
+    /// `ON UPDATE` action as parsed, applied when parent keys are rewritten.
+    on_update_action: ForeignKeyAction,
 }
 
 impl TableDef {
@@ -1646,6 +1650,34 @@ impl Engine {
         self.triggers.values().any(|trigger| trigger.table == table)
     }
 
+    /// Queues one `BEFORE` update event of a row.
+    fn queue_update_before(
+        &mut self,
+        table: &str,
+        def: &TableDef,
+        columns: &[String],
+        assigned: &[String],
+        rowid: i64,
+        old: &[Cell],
+        new: &[Cell],
+    ) {
+        self.queue_update_event(table, def, columns, assigned, rowid, old, new, TriggerTiming::Before);
+    }
+
+    /// Queues one `AFTER` update event of a row.
+    fn queue_update_after(
+        &mut self,
+        table: &str,
+        def: &TableDef,
+        columns: &[String],
+        assigned: &[String],
+        rowid: i64,
+        old: &[Cell],
+        new: &[Cell],
+    ) {
+        self.queue_update_event(table, def, columns, assigned, rowid, old, new, TriggerTiming::After);
+    }
+
     /// Queues the `BEFORE` and `AFTER` events of one updated row.
     fn queue_update_events(
         &mut self,
@@ -1657,6 +1689,21 @@ impl Engine {
         old: &[Cell],
         new: &[Cell],
     ) {
+        self.queue_update_before(table, def, columns, assigned, rowid, old, new);
+        self.queue_update_after(table, def, columns, assigned, rowid, old, new);
+    }
+
+    fn queue_update_event(
+        &mut self,
+        table: &str,
+        def: &TableDef,
+        columns: &[String],
+        assigned: &[String],
+        rowid: i64,
+        old: &[Cell],
+        new: &[Cell],
+        timing: TriggerTiming,
+    ) {
         let new_rowid = def
             .rowid_alias
             .and_then(|alias| new.get(alias))
@@ -1667,31 +1714,42 @@ impl Engine {
             .unwrap_or(rowid);
         let old = frame_cells(old, def.columns.len(), rowid);
         let new = frame_cells(new, def.columns.len(), new_rowid);
-        for timing in [TriggerTiming::Before, TriggerTiming::After] {
-            self.pending_events.push(PendingTriggerEvent {
-                table: table.to_string(),
-                timing,
-                event: TriggerEvent::Update(assigned.to_vec()),
-                columns: columns.to_vec(),
-                new: Some(new.clone()),
-                old: Some(old.clone()),
-            });
-        }
+        self.pending_events.push(PendingTriggerEvent {
+            table: table.to_string(),
+            timing,
+            event: TriggerEvent::Update(assigned.to_vec()),
+            columns: columns.to_vec(),
+            new: Some(new),
+            old: Some(old),
+        });
+    }
+
+    /// Queues one `BEFORE` delete event of a row.
+    fn queue_delete_before(&mut self, table: &str, columns: &[String], rowid: i64, old: &[Cell]) {
+        self.queue_delete_event(table, columns, rowid, old, TriggerTiming::Before);
+    }
+
+    /// Queues one `AFTER` delete event of a row.
+    fn queue_delete_after(&mut self, table: &str, columns: &[String], rowid: i64, old: &[Cell]) {
+        self.queue_delete_event(table, columns, rowid, old, TriggerTiming::After);
     }
 
     /// Queues the `BEFORE` and `AFTER` events of one deleted row.
     fn queue_delete_events(&mut self, table: &str, columns: &[String], rowid: i64, old: &[Cell]) {
+        self.queue_delete_before(table, columns, rowid, old);
+        self.queue_delete_after(table, columns, rowid, old);
+    }
+
+    fn queue_delete_event(&mut self, table: &str, columns: &[String], rowid: i64, old: &[Cell], timing: TriggerTiming) {
         let old = frame_cells(old, columns.len() - 1, rowid);
-        for timing in [TriggerTiming::Before, TriggerTiming::After] {
-            self.pending_events.push(PendingTriggerEvent {
-                table: table.to_string(),
-                timing,
-                event: TriggerEvent::Delete,
-                columns: columns.to_vec(),
-                new: None,
-                old: Some(old.clone()),
-            });
-        }
+        self.pending_events.push(PendingTriggerEvent {
+            table: table.to_string(),
+            timing,
+            event: TriggerEvent::Delete,
+            columns: columns.to_vec(),
+            new: None,
+            old: Some(old),
+        });
     }
 
     /// Output columns and rows of one view, used as the source of
@@ -2821,7 +2879,7 @@ impl Engine {
                     None => None,
                 };
                 let budget = Budget::new();
-                let needs_index = self.has_indexes(def, &key);
+                let mut needs_index = self.has_indexes(def, &key);
                 let plan = self.plan_update(def, &key, &targets, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget)?;
                 // Old row values are needed to tell which referenced keys this
                 // statement rewrites, so they are read before the transaction.
@@ -2841,6 +2899,9 @@ impl Engine {
                 let trigger_columns = trigger_frame_columns(def);
                 let assigned_names: Vec<String> = assignments.iter().map(|assignment| assignment.column.clone()).collect();
                 let old_lookup: BTreeMap<i64, Vec<Cell>> = old_rows.iter().cloned().collect();
+                // The `AFTER` events wait until referential actions and checks
+                // have run, matching SQLite's `BEFORE`, cascade, `AFTER` order.
+                let mut after_events: Vec<(i64, Vec<Cell>, Vec<Cell>)> = Vec::new();
                 if let Some(position) = temp_position {
                     let mut events: Vec<(i64, Vec<Cell>, Vec<Cell>)> = Vec::new();
                     {
@@ -2879,7 +2940,8 @@ impl Engine {
                         }
                         if queue_triggers {
                             let old_cells = old_lookup.get(rowid).cloned().unwrap_or_default();
-                            self.queue_update_events(&key, def, &trigger_columns, &assigned_names, *rowid, &old_cells, &new_cells);
+                            self.queue_update_before(&key, def, &trigger_columns, &assigned_names, *rowid, &old_cells, &new_cells);
+                            after_events.push((*rowid, old_cells, new_cells.clone()));
                         }
                         let written = if def.without_rowid {
                             let old_values: Vec<crate::WriteValue> =
@@ -2896,12 +2958,47 @@ impl Engine {
                         }
                     }
                 }
+                let mut needs_without_rowid = temp_position.is_none() && def.without_rowid;
+                if temp_position.is_none() && self.foreign_keys {
+                    let changes: Vec<(Vec<Cell>, Option<Vec<Cell>>)> = plan
+                        .writes
+                        .iter()
+                        .map(|(rowid, values)| {
+                            let old = old_lookup.get(rowid).cloned().unwrap_or_default();
+                            let mut next = old.clone();
+                            if next.len() < def.columns.len() {
+                                next.resize(def.columns.len(), Cell::Null);
+                            }
+                            for (slot, value) in values.iter().enumerate() {
+                                if let crate::UpdateValue::Set(value) = value {
+                                    next[slot] = write_value_cell(value);
+                                }
+                            }
+                            (old, Some(next))
+                        })
+                        .collect();
+                    match self.apply_foreign_key_actions(def, &changes, "update", 0) {
+                        Ok((index_needed, without_needed)) => {
+                            needs_index |= index_needed;
+                            needs_without_rowid |= without_needed;
+                        }
+                        Err(error) => {
+                            let _ = self.writer.rollback();
+                            return Err(error);
+                        }
+                    }
+                }
                 if self.foreign_keys {
                     if let Err(error) = self.check_update_foreign_keys(def, &plan, &old_rows, &assigned, "update") {
                         if temp_position.is_none() {
                             let _ = self.writer.rollback();
                         }
                         return Err(error);
+                    }
+                }
+                if temp_position.is_none() {
+                    for (rowid, old_cells, new_cells) in &after_events {
+                        self.queue_update_after(&key, def, &trigger_columns, &assigned_names, *rowid, old_cells, new_cells);
                     }
                 }
                 if temp_position.is_none() {
@@ -2914,7 +3011,7 @@ impl Engine {
                 if temp_position.is_none() && needs_index {
                     self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
                 }
-                if temp_position.is_none() && def.without_rowid {
+                if needs_without_rowid {
                     self.writer
                         .materialize_without_rowid()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
@@ -2958,7 +3055,7 @@ impl Engine {
                     None => None,
                 };
                 let budget = Budget::new();
-                let needs_index = self.has_indexes(def, &key);
+                let mut needs_index = self.has_indexes(def, &key);
                 let plan = self.plan_delete(def, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget)?;
                 // The deleted rows' referenced keys are only visible before the
                 // removal, so the snapshot is taken ahead of the transaction.
@@ -2970,6 +3067,7 @@ impl Engine {
                 let queue_triggers = self.table_has_triggers(&key);
                 let trigger_columns = trigger_frame_columns(def);
                 let old_lookup: BTreeMap<i64, Vec<Cell>> = old_rows.iter().cloned().collect();
+                let mut after_events: Vec<(i64, Vec<Cell>)> = Vec::new();
                 if let Some(position) = temp_position {
                     {
                         let table = &mut self.temp_tables[position];
@@ -2989,7 +3087,8 @@ impl Engine {
                     for rowid in &plan.removed {
                         if queue_triggers {
                             let old_cells = old_lookup.get(rowid).cloned().unwrap_or_default();
-                            self.queue_delete_events(&key, &trigger_columns, *rowid, &old_cells);
+                            self.queue_delete_before(&key, &trigger_columns, *rowid, &old_cells);
+                            after_events.push((*rowid, old_cells));
                         }
                         let removed = if def.without_rowid {
                             let old_values: Vec<crate::WriteValue> =
@@ -3005,6 +3104,24 @@ impl Engine {
                         }
                     }
                 }
+                let mut needs_without_rowid = temp_position.is_none() && def.without_rowid;
+                if temp_position.is_none() && self.foreign_keys {
+                    let changes: Vec<(Vec<Cell>, Option<Vec<Cell>>)> = plan
+                        .removed
+                        .iter()
+                        .map(|rowid| (old_lookup.get(rowid).cloned().unwrap_or_default(), None))
+                        .collect();
+                    match self.apply_foreign_key_actions(def, &changes, "delete", 0) {
+                        Ok((index_needed, without_needed)) => {
+                            needs_index |= index_needed;
+                            needs_without_rowid |= without_needed;
+                        }
+                        Err(error) => {
+                            let _ = self.writer.rollback();
+                            return Err(error);
+                        }
+                    }
+                }
                 if self.foreign_keys {
                     if let Err(error) = self.check_delete_foreign_keys(def, &old_rows, &plan.removed, "delete") {
                         match (temp_position, temp_snapshot) {
@@ -3017,6 +3134,11 @@ impl Engine {
                     }
                 }
                 if temp_position.is_none() {
+                    for (rowid, old_cells) in &after_events {
+                        self.queue_delete_after(&key, &trigger_columns, *rowid, old_cells);
+                    }
+                }
+                if temp_position.is_none() {
                     if let Err(error) = self.refresh_managed_indexes(&key, def, "delete") {
                         let _ = self.writer.rollback();
                         return Err(error);
@@ -3026,7 +3148,7 @@ impl Engine {
                 if temp_position.is_none() && needs_index {
                     self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
                 }
-                if temp_position.is_none() && def.without_rowid {
+                if needs_without_rowid {
                     self.writer
                         .materialize_without_rowid()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
@@ -4059,6 +4181,7 @@ impl Engine {
                     }
                 }
                 if queue_triggers {
+                    self.queue_update_before(table_key, def, &trigger_columns, &assigned_names, *write_rowid, &old_cells, &new_cells);
                     events.push((*write_rowid, old_cells.clone(), new_cells.clone()));
                 }
                 let written = if def.without_rowid {
@@ -4074,11 +4197,46 @@ impl Engine {
                 }
             }
         }
-        for (updated_rowid, old_cells, new_cells) in events {
-            self.queue_update_events(table_key, def, &trigger_columns, &assigned_names, updated_rowid, &old_cells, &new_cells);
+        if temp_position.is_some() {
+            for (updated_rowid, old_cells, new_cells) in &events {
+                self.queue_update_events(table_key, def, &trigger_columns, &assigned_names, *updated_rowid, old_cells, new_cells);
+            }
+        }
+        if temp_position.is_none() && self.foreign_keys {
+            let changes: Vec<(Vec<Cell>, Option<Vec<Cell>>)> = planned
+                .writes
+                .iter()
+                .map(|(write_rowid, values)| {
+                    let old = old_lookup.get(write_rowid).cloned().unwrap_or_default();
+                    let mut next = old.clone();
+                    if next.len() < width {
+                        next.resize(width, Cell::Null);
+                    }
+                    for (slot, value) in values.iter().enumerate() {
+                        if let crate::UpdateValue::Set(value) = value {
+                            next[slot] = write_value_cell(value);
+                        }
+                    }
+                    (old, Some(next))
+                })
+                .collect();
+            let (index_needed, without_needed) = self.apply_foreign_key_actions(def, &changes, "insert", 0)?;
+            if index_needed {
+                self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+            }
+            if without_needed {
+                self.writer
+                    .materialize_without_rowid()
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+            }
         }
         if self.foreign_keys {
             self.check_update_foreign_keys(def, &planned, &old_rows, &assigned, "insert")?;
+        }
+        if temp_position.is_none() {
+            for (updated_rowid, old_cells, new_cells) in &events {
+                self.queue_update_after(table_key, def, &trigger_columns, &assigned_names, *updated_rowid, old_cells, new_cells);
+            }
         }
         *live = self.live_rows(def, "insert")?;
         let rowid = planned.writes.first().map(|(rowid, _)| *rowid).unwrap_or(rowid);
@@ -4357,6 +4515,180 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Applies the `ON DELETE` / `ON UPDATE` actions of every foreign key that
+    /// references `parent`, recursing into the tables those actions touch.
+    ///
+    /// `changes` carries the cells every changed parent row had before the
+    /// statement and, for a rewrite, the cells it has now; `None` means the row
+    /// was removed. `NO ACTION` and `RESTRICT` rows are left for the
+    /// end-of-statement checks. Returns whether a touched child owns
+    /// materialized indexes or a stored WITHOUT ROWID b-tree.
+    fn apply_foreign_key_actions(
+        &mut self,
+        parent: &TableDef,
+        changes: &[(Vec<Cell>, Option<Vec<Cell>>)],
+        statement: &'static str,
+        depth: usize,
+    ) -> Result<(bool, bool), SqlError> {
+        if depth > 100 {
+            return Err(SqlError::new("constraint-failed", "foreign key cascade exceeded the depth limit").in_statement(statement));
+        }
+        let deleting = changes.iter().all(|(_, next)| next.is_none());
+        let mut needs_index = false;
+        let mut needs_without_rowid = false;
+        for (child_position, key) in self.referencing_foreign_keys(&parent.name) {
+            let action = if deleting { key.on_delete_action } else { key.on_update_action };
+            if matches!(action, ForeignKeyAction::NoAction | ForeignKeyAction::Restrict) {
+                continue;
+            }
+            let child = self.tables[child_position].clone();
+            if child.temp {
+                continue;
+            }
+            let (_, parent_columns) = self.foreign_key_parent(&child, &key, statement)?;
+            let mut pairs: Vec<(Vec<Cell>, Option<Vec<Cell>>)> = Vec::new();
+            for (old, next) in changes {
+                let old_values = pick(old, &parent_columns);
+                if old_values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                    continue;
+                }
+                let new_values = next.as_ref().map(|cells| pick(cells, &parent_columns));
+                if let Some(values) = &new_values {
+                    if cells_equal(&old_values, values) {
+                        continue;
+                    }
+                }
+                pairs.push((old_values, new_values));
+            }
+            if pairs.is_empty() {
+                continue;
+            }
+            let child_rows = self.live_rows(&child, statement)?;
+            let child_key = child.name.to_ascii_lowercase();
+            let frame_columns = trigger_frame_columns(&child);
+            let fires = self.table_has_triggers(&child_key);
+            let assigned: Vec<String> = key.columns.iter().map(|position| child.columns[*position].name.clone()).collect();
+            let mut deleted: Vec<(i64, Vec<Cell>)> = Vec::new();
+            let mut updated: Vec<(i64, Vec<Cell>, Vec<Cell>)> = Vec::new();
+            for (rowid, cells) in &child_rows {
+                let values = pick(cells, &key.columns);
+                if values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                    continue;
+                }
+                let Some((_, next)) = pairs.iter().find(|(old, _)| cells_equal(old, &values)) else {
+                    continue;
+                };
+                match action {
+                    ForeignKeyAction::Cascade => match next {
+                        None => deleted.push((*rowid, cells.clone())),
+                        Some(next) => {
+                            let mut rewritten = cells.clone();
+                            for (position, value) in key.columns.iter().zip(next.iter()) {
+                                rewritten[*position] = value.clone();
+                            }
+                            updated.push((*rowid, cells.clone(), rewritten));
+                        }
+                    },
+                    ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
+                        let mut rewritten = cells.clone();
+                        for position in &key.columns {
+                            let column = &child.columns[*position];
+                            let value = match action {
+                                ForeignKeyAction::SetNull => Cell::Null,
+                                _ => {
+                                    let default = column.default_value.clone().unwrap_or(crate::WriteValue::Null);
+                                    write_value_cell(&crate::apply_write_affinity(&column.declared_type, default))
+                                }
+                            };
+                            if matches!(value, Cell::Null) && column.not_null {
+                                return Err(SqlError::new(
+                                    "constraint-failed",
+                                    format!("NOT NULL constraint failed: {}.{}", child.name, column.name),
+                                )
+                                .in_statement(statement));
+                            }
+                            rewritten[*position] = value;
+                        }
+                        updated.push((*rowid, cells.clone(), rewritten));
+                    }
+                    _ => {}
+                }
+            }
+            if deleted.is_empty() && updated.is_empty() {
+                continue;
+            }
+            let table_key = child.name.clone();
+            for (rowid, old) in &deleted {
+                if fires {
+                    self.queue_delete_before(&table_key, &frame_columns, *rowid, old);
+                }
+                let written = if child.without_rowid {
+                    let values: Vec<crate::WriteValue> = old.iter().map(cell_write_value).collect();
+                    self.writer.delete_without_rowid(&table_key, &values)
+                }
+                else {
+                    self.writer.delete(&table_key, *rowid)
+                };
+                written.map_err(|error| write_failure(error, statement, &child))?;
+                if fires {
+                    self.queue_delete_after(&table_key, &frame_columns, *rowid, old);
+                }
+            }
+            for (rowid, old, next) in &updated {
+                if fires {
+                    self.queue_update_before(&table_key, &child, &frame_columns, &assigned, *rowid, old, next);
+                }
+                let written = if child.without_rowid {
+                    let old_values: Vec<crate::WriteValue> = old.iter().map(cell_write_value).collect();
+                    let new_values: Vec<crate::WriteValue> = next.iter().map(cell_write_value).collect();
+                    self.writer.update_without_rowid(&table_key, &old_values, &new_values)
+                }
+                else {
+                    let values: Vec<UpdateValue> = next.iter().map(|cell| UpdateValue::Set(cell_write_value(cell))).collect();
+                    self.writer.update(&table_key, *rowid, &values)
+                };
+                written.map_err(|error| write_failure(error, statement, &child))?;
+                if fires {
+                    self.queue_update_after(&table_key, &child, &frame_columns, &assigned, *rowid, old, next);
+                }
+            }
+            // Rewritten child rows still have to resolve every foreign key,
+            // which catches `SET DEFAULT` values that name no parent.
+            let validated: Vec<i64> = updated
+                .iter()
+                .map(|(rowid, _, next)| {
+                    child
+                        .rowid_alias
+                        .and_then(|alias| match next.get(alias) {
+                            Some(Cell::Integer(value)) => Some(*value),
+                            _ => None,
+                        })
+                        .unwrap_or(*rowid)
+                })
+                .collect();
+            if !validated.is_empty() {
+                self.check_insert_foreign_keys(&child, &validated, statement)?;
+            }
+            self.refresh_managed_indexes(&child_key, &child, statement)?;
+            if self.has_indexes(&child, &child_key) {
+                needs_index = true;
+            }
+            if child.without_rowid {
+                needs_without_rowid = true;
+            }
+            let child_changes: Vec<(Vec<Cell>, Option<Vec<Cell>>)> = if deleting {
+                deleted.iter().map(|(_, old)| (old.clone(), None)).collect()
+            }
+            else {
+                updated.iter().map(|(_, old, next)| (old.clone(), Some(next.clone()))).collect()
+            };
+            let (index_needed, without_needed) = self.apply_foreign_key_actions(&child, &child_changes, statement, depth + 1)?;
+            needs_index |= index_needed;
+            needs_without_rowid |= without_needed;
+        }
+        Ok((needs_index, needs_without_rowid))
     }
 
     /// Every uniqueness rule an `UPDATE` has to re-check, in the order SQLite
@@ -9070,6 +9402,8 @@ fn resolve_foreign_keys(columns: &[ColumnSpec], keys: &[ForeignKey]) -> Result<V
             parent_columns: key.parent_columns.clone(),
             on_delete: foreign_key_action_text(key.on_delete),
             on_update: foreign_key_action_text(key.on_update),
+            on_delete_action: key.on_delete,
+            on_update_action: key.on_update,
         });
     }
     Ok(resolved)
@@ -11403,27 +11737,45 @@ mod tests {
     }
 
     #[test]
-    fn cascading_and_deferred_foreign_keys_are_rejected_explicitly() {
+    fn referential_actions_run_and_deferred_keys_stay_rejected() {
         let mut engine = Engine::new(None).expect("blank engine");
-        engine.execute_one("CREATE TABLE parent (id INTEGER PRIMARY KEY)").expect("create parent");
-        let cascade = engine
-            .execute_one("CREATE TABLE c1 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)")
-            .expect_err("cascade");
-        assert_eq!(cascade.code, "unsupported-foreign-key-action");
-        assert_eq!(cascade.clause.as_deref(), Some("CASCADE"));
-        let set_null = engine
-            .execute_one("CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE SET NULL)")
-            .expect_err("set null");
-        assert_eq!(set_null.code, "unsupported-foreign-key-action");
+        engine.execute_one("CREATE TABLE p (id INTEGER PRIMARY KEY)").expect("create parent");
+        engine
+            .execute_one("CREATE TABLE c1 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE)")
+            .expect("cascade");
+        engine
+            .execute_one("CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL ON UPDATE SET NULL)")
+            .expect("set null");
+        engine
+            .execute_one(
+                "CREATE TABLE c3 (id INTEGER PRIMARY KEY, pid INTEGER DEFAULT 9 REFERENCES p(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+            )
+            .expect("set default");
+        engine.execute_one("INSERT INTO p VALUES (1), (9)").expect("parents");
+        engine.execute_one("INSERT INTO c1 VALUES (2, 1)").expect("cascade child");
+        engine.execute_one("INSERT INTO c2 VALUES (3, 1)").expect("null child");
+        engine.execute_one("INSERT INTO c3 VALUES (4, 1)").expect("default child");
+        engine.execute_one("UPDATE p SET id = 5 WHERE id = 1").expect("cascade update");
+        assert_eq!(
+            engine.execute_one("SELECT id, pid FROM c1").expect("cascade rows").rows,
+            vec![vec![Cell::Integer(2), Cell::Integer(5)]]
+        );
+        assert_eq!(engine.execute_one("SELECT id, pid FROM c2").expect("null rows").rows, vec![vec![Cell::Integer(3), Cell::Null]]);
+        assert_eq!(
+            engine.execute_one("SELECT id, pid FROM c3").expect("default rows").rows,
+            vec![vec![Cell::Integer(4), Cell::Integer(9)]]
+        );
+        engine.execute_one("DELETE FROM p WHERE id = 5").expect("cascade delete");
+        assert_eq!(engine.execute_one("SELECT id FROM c1").expect("cascade delete rows").rows, Vec::<Vec<Cell>>::new());
+        assert_eq!(engine.execute_one("SELECT id, pid FROM c2").expect("null rows after delete").rows, vec![vec![Cell::Integer(3), Cell::Null]]);
+        assert_eq!(
+            engine.execute_one("SELECT id, pid FROM c3").expect("default rows after delete").rows,
+            vec![vec![Cell::Integer(4), Cell::Integer(9)]]
+        );
         let deferred = engine
-            .execute_one("CREATE TABLE c3 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+            .execute_one("CREATE TABLE c4 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
             .expect_err("deferred");
         assert_eq!(deferred.code, "unsupported-deferred-foreign-key");
-        // Immediate deferral spellings keep working.
-        engine
-            .execute_one("CREATE TABLE c4 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) NOT DEFERRABLE)")
-            .expect("not deferrable");
-        engine.execute_one("ALTER TABLE c4 ADD COLUMN other INTEGER REFERENCES parent(id)").expect("add column with a foreign key");
     }
 
     #[test]
