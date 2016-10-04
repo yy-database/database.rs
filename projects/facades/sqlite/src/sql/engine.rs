@@ -554,6 +554,151 @@ fn unique_output_names(names: &[String]) -> Vec<String> {
     out
 }
 
+/// SQLite's standard type name for one declared type: the affinity class the
+/// type text resolves to, or an empty string for the BLOB affinity.
+fn standard_affinity_name(declared: &str) -> String {
+    let upper = declared.to_ascii_uppercase();
+    let name = if upper.contains("INT") {
+        "INT"
+    }
+    else if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
+        "TEXT"
+    }
+    else if declared.is_empty() || upper.contains("BLOB") {
+        ""
+    }
+    else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+        "REAL"
+    }
+    else {
+        "NUM"
+    };
+    name.to_string()
+}
+
+/// Resolves a `column` reference of a CTAS output item to the unique source
+/// column that defines it.
+fn ctas_lookup_column<'a>(
+    reference: &ColumnRef,
+    sources: &'a [(String, Vec<(String, String)>)],
+) -> Option<&'a (String, String)> {
+    let qualifier = reference.qualifier.as_deref();
+    let mut found = None;
+    for (label, columns) in sources {
+        if let Some(qualifier) = qualifier {
+            if !label.eq_ignore_ascii_case(qualifier) {
+                continue;
+            }
+        }
+        for column in columns {
+            if column.0.eq_ignore_ascii_case(&reference.name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(column);
+            }
+        }
+    }
+    found
+}
+
+/// Output label of one CTAS item: the source column's own spelling for a bare
+/// reference, otherwise the expression's label.
+fn ctas_expression_label(expression: &Expr, sources: &[(String, Vec<(String, String)>)]) -> String {
+    if let Expr::Column(reference) = expression {
+        if let Some(column) = ctas_lookup_column(reference, sources) {
+            return column.0.clone();
+        }
+    }
+    expression.label()
+}
+
+/// Declared type of one CTAS output item: a bare column reference copies its
+/// source affinity, every other expression gets no declared type.
+fn ctas_expression_type(expression: &Expr, sources: &[(String, Vec<(String, String)>)]) -> String {
+    match expression {
+        Expr::Alias { value, .. } => ctas_expression_type(value, sources),
+        Expr::Column(reference) => {
+            ctas_lookup_column(reference, sources).map(|column| standard_affinity_name(&column.1)).unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Quotes a schema identifier when the generated `CREATE TABLE` text needs it.
+fn ctas_quote_name(name: &str) -> String {
+    let plain = !name.is_empty()
+        && name.chars().next().is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_');
+    if plain {
+        name.to_string()
+    }
+    else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+/// `sqlite_master.sql` text of a `CREATE TABLE ... AS SELECT` result, built the
+/// same way SQLite generates it. SQLite switches to a multi-line layout for
+/// long definitions; the compact form is emitted here because every reader
+/// (including this parser) accepts it.
+fn ctas_schema_sql(name: &str, columns: &[ColumnSpec]) -> String {
+    let mut sql = format!("CREATE TABLE {}(", ctas_quote_name(name));
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&ctas_quote_name(&column.name));
+        if !column.declared_type.is_empty() {
+            sql.push(' ');
+            sql.push_str(&column.declared_type);
+        }
+    }
+    sql.push(')');
+    sql
+}
+
+/// `INSERT ... SELECT` slot mapping: SQLite reports a different arity message
+/// depending on whether an explicit column list was written.
+fn select_arity(
+    def: &TableDef,
+    table: &str,
+    columns: Option<&[String]>,
+    values: &[crate::WriteValue],
+) -> Result<Vec<Option<crate::WriteValue>>, SqlError> {
+    match columns {
+        Some(names) => {
+            if values.len() != names.len() {
+                return Err(SqlError::new("arity-mismatch", format!("{} values for {} columns", values.len(), names.len()))
+                    .in_statement("insert"));
+            }
+            self_contained_arity(def, table, Some(names), values)
+        }
+        None => {
+            if values.len() != def.columns.len() {
+                return Err(SqlError::new(
+                    "arity-mismatch",
+                    format!("table {table} has {} columns but {} values were supplied", def.columns.len(), values.len()),
+                )
+                .in_statement("insert"));
+            }
+            self_contained_arity(def, table, None, values)
+        }
+    }
+}
+
+/// Converts one select result cell into an `INSERT` value when the target is a
+/// view handled by `INSTEAD OF` triggers.
+fn cell_insert_value(cell: &Cell) -> InsertValue {
+    InsertValue::Literal(match cell {
+        Cell::Null => super::Literal::Null,
+        Cell::Integer(value) => super::Literal::Integer(*value),
+        Cell::Real(value) => super::Literal::Real(*value),
+        Cell::Text(value) => super::Literal::Text(value.clone()),
+        Cell::Blob(value) => super::Literal::Blob(value.clone()),
+    })
+}
+
 /// A `FROM`-shape over one view's output, so view DML can resolve its filter
 /// and assignments with the regular expression path.
 fn view_relation<'a>(label: &str, names: &[String], trigger: Option<&'a TriggerFrame>) -> Relation<'a> {
@@ -2203,6 +2348,184 @@ impl Engine {
         Ok(ExecResult { statement: "detach", columns: Vec::new(), rows: Vec::new(), affected: 0 })
     }
 
+    /// Executes `CREATE TABLE name AS SELECT ...`.
+    ///
+    /// The declared columns are derived from the query output: a bare column
+    /// reference copies its source column's affinity as SQLite's standard
+    /// type name (`INT`, `TEXT`, `REAL`, `NUM`), and every other expression
+    /// gets no declared type. Duplicate output labels are numbered `:1`, `:2`.
+    fn create_table_as(&mut self, name: String, if_not_exists: bool, temp: bool, query: &Statement) -> Result<ExecResult, SqlError> {
+        let key = name.to_ascii_lowercase();
+        check_reserved_object_name(&name, "create-table")?;
+        let temp_target = temp || self.scope == TableScope::Temp;
+        if temp_target {
+            if self.temp_lookup.contains_key(&key) || self.temp_views.contains_key(&key) {
+                if if_not_exists {
+                    return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                }
+                return Err(SqlError::new("table-exists", format!("table {name} already exists")).in_statement("create-table"));
+            }
+        }
+        else {
+            if self.indexes.contains_key(&key) {
+                return Err(SqlError::new("index-exists", format!("there is already an index named {name}")).in_statement("create-table"));
+            }
+            if self.views.contains_key(&key) {
+                return Err(SqlError::new("view-exists", format!("there is already a view named {name}")).in_statement("create-table"));
+            }
+            if self.table_lookup.contains_key(&key) {
+                if if_not_exists {
+                    return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                }
+                return Err(SqlError::new("table-exists", format!("table {name} already exists")).in_statement("create-table"));
+            }
+        }
+        let budget = Budget::new();
+        let selected = self.select_statement(query, &[], &budget, None)?;
+        let labels = unique_output_names(&selected.columns);
+        let mut types: Vec<String> =
+            self.ctas_statement_columns(query, &BTreeMap::new())?.into_iter().map(|(_, declared)| declared).collect();
+        types.resize(labels.len(), String::new());
+        types.truncate(labels.len());
+        let columns: Vec<ColumnSpec> = labels
+            .iter()
+            .zip(types)
+            .map(|(name, declared_type)| ColumnSpec {
+                name: name.clone(),
+                declared_type,
+                not_null: false,
+                default_value: None,
+                default_text: None,
+                primary_key: false,
+                unique: false,
+                autoincrement: false,
+            })
+            .collect();
+        let sql = ctas_schema_sql(&name, &columns);
+        let mut def = Self::catalog_table(name.clone(), columns.clone(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, false)?;
+        if temp_target {
+            def.temp = true;
+            let rootpage = match self.temp_free_pages.pop_first() {
+                Some(page) => page,
+                None => {
+                    let page = self.temp_next_page;
+                    self.temp_next_page += 1;
+                    page
+                }
+            };
+            let master_rowid = self.temp_next_rowid;
+            self.temp_next_rowid += 1;
+            let mut rows = BTreeMap::new();
+            for row in &selected.rows {
+                let slots: Vec<Option<crate::WriteValue>> = row.iter().map(|cell| Some(cell_write_value(cell))).collect();
+                temp_insert_row(&def, &mut rows, &slots, &[])?;
+            }
+            let position = self.temp_tables.len();
+            self.temp_lookup.insert(key, position);
+            self.temp_tables.push(TempTable { def, sql, rootpage, master_rowid, rows });
+            self.temp_created = true;
+            return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+        }
+        self.writer
+            .create_table_with_primary_key_sql(&name, &columns, &[], Some(&sql))
+            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+        if !selected.rows.is_empty() {
+            self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+            for row in &selected.rows {
+                let slots: Vec<Option<crate::WriteValue>> = row.iter().map(|cell| Some(cell_write_value(cell))).collect();
+                if let Err(error) = self.writer.insert(&name, &slots) {
+                    let _ = self.writer.rollback();
+                    return Err(SqlError::new("storage", error.to_string()).in_statement("create-table"));
+                }
+            }
+            self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+        }
+        let position = self.tables.len();
+        self.table_lookup.insert(key, position);
+        self.tables.push(def);
+        Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 0 })
+    }
+
+    /// Output column labels and copied declared types of one query, used to
+    /// build the schema of `CREATE TABLE ... AS SELECT`.
+    fn ctas_statement_columns(
+        &self,
+        statement: &Statement,
+        inherited: &BTreeMap<String, Vec<(String, String)>>,
+    ) -> Result<Vec<(String, String)>, SqlError> {
+        let Statement::Select { with, first, .. } = statement
+        else {
+            return Ok(Vec::new());
+        };
+        let mut ctes = inherited.clone();
+        for entry in with {
+            let mut columns = self.ctas_statement_columns(&entry.query, &ctes)?;
+            if let Some(names) = &entry.columns {
+                if names.len() == columns.len() {
+                    for (column, name) in columns.iter_mut().zip(names) {
+                        column.0 = name.clone();
+                    }
+                }
+            }
+            ctes.insert(entry.name.to_ascii_lowercase(), columns);
+        }
+        let mut sources: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(first.from.len());
+        for table in &first.from {
+            let label = table.alias.clone().unwrap_or_else(|| table.name.clone());
+            sources.push((label, self.ctas_table_columns(table, &ctes)?));
+        }
+        let mut output = Vec::new();
+        match &first.items {
+            SelectItems::Named(expressions) => {
+                for expression in expressions {
+                    let label = ctas_expression_label(expression, &sources);
+                    let declared = ctas_expression_type(expression, &sources);
+                    output.push((label, declared));
+                }
+            }
+            SelectItems::CountAll => output.push(("count(*)".to_string(), String::new())),
+            SelectItems::Star => {
+                for (_, columns) in &sources {
+                    output.extend(columns.iter().cloned());
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    /// Columns one `FROM` item exposes to the output of a CTAS query.
+    fn ctas_table_columns(
+        &self,
+        table: &TableRef,
+        ctes: &BTreeMap<String, Vec<(String, String)>>,
+    ) -> Result<Vec<(String, String)>, SqlError> {
+        if let Some(query) = &table.query {
+            return self.ctas_statement_columns(query, ctes);
+        }
+        let name = table.name.to_ascii_lowercase();
+        if let Some(columns) = ctes.get(&name) {
+            return Ok(columns.clone());
+        }
+        if let Some(def) = self.tables.iter().find(|def| def.name.eq_ignore_ascii_case(&table.name)) {
+            return Ok(def.columns.iter().map(|column| (column.name.clone(), standard_affinity_name(&column.declared_type))).collect());
+        }
+        if let Some(temp) = self.temp_tables.iter().find(|temp| temp.def.name.eq_ignore_ascii_case(&table.name)) {
+            return Ok(temp.def.columns.iter().map(|column| (column.name.clone(), standard_affinity_name(&column.declared_type))).collect());
+        }
+        if let Some(view) = self.views.get(&name) {
+            let mut columns = self.ctas_statement_columns(&view.query, ctes)?;
+            if let Some(names) = &view.columns {
+                if names.len() == columns.len() {
+                    for (column, name) in columns.iter_mut().zip(names) {
+                        column.0 = name.clone();
+                    }
+                }
+            }
+            return Ok(columns);
+        }
+        Ok(Vec::new())
+    }
+
     fn run_statement_inner(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         match statement {
             Statement::Transaction { action } => self.transaction(action),
@@ -2220,8 +2543,12 @@ impl Engine {
                 strict,
                 without_rowid,
                 temp,
+                query,
                 sql,
             } => {
+                if let Some(query) = query {
+                    return self.create_table_as(name, if_not_exists, temp, &query);
+                }
                 let key = name.to_ascii_lowercase();
                 // A WITHOUT ROWID table's writer call needs the key columns
                 // whether they were declared inline or as a table constraint.
@@ -2452,11 +2779,25 @@ impl Engine {
                 }
                 Ok(ExecResult { statement: "drop-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::Insert { schema: _, table, columns, rows, default_values, conflict, returning } => {
+            Statement::Insert { schema: _, table, columns, rows, default_values, query, replace, conflict, returning } => {
                 let key = table.to_ascii_lowercase();
                 check_readonly_table(&table, "insert")?;
+                // A `SELECT` source is evaluated before any row is written, so
+                // `INSERT INTO t SELECT ... FROM t` reads the table's original
+                // contents, exactly like SQLite.
+                let selected_rows: Option<Vec<Vec<Cell>>> = match &query {
+                    Some(query) => {
+                        let budget = Budget::new();
+                        Some(self.select_statement(query, &[], &budget, None)?.rows)
+                    }
+                    None => None,
+                };
                 if self.views.contains_key(&key) {
-                    return self.run_view_insert(&table, &key, columns.as_deref(), &rows, default_values);
+                    let literal_rows: Vec<Vec<InsertValue>> = match &selected_rows {
+                        Some(rows) => rows.iter().map(|row| row.iter().map(cell_insert_value).collect()).collect(),
+                        None => rows.clone(),
+                    };
+                    return self.run_view_insert(&table, &key, columns.as_deref(), &literal_rows, default_values);
                 }
                 let temp_position = if self.scope == TableScope::Main { None } else { self.temp_lookup.get(&key).copied() };
                 let main_position = if self.scope == TableScope::Temp {
@@ -2482,7 +2823,12 @@ impl Engine {
                     None => None,
                 };
                 let upsert = match &conflict {
-                    Some(clause) => Some(self.prepare_upsert(def, &key, &table, clause)?),
+                    Some(clause) => {
+                        if replace {
+                            return Err(SqlError::new("syntax", "ON CONFLICT clause is not allowed with REPLACE").in_statement("insert"));
+                        }
+                        Some(self.prepare_upsert(def, &key, &table, clause)?)
+                    }
                     None => None,
                 };
                 let mut upsert_live = if upsert.is_some() { self.live_rows(def, "insert")? } else { Vec::new() };
@@ -2503,6 +2849,12 @@ impl Engine {
                         resolved.push(cell_write_value(&cell));
                     }
                     slots_by_row.push(self_contained_arity(def, &table, columns.as_deref(), &resolved)?);
+                }
+                if let Some(rows) = &selected_rows {
+                    for row in rows {
+                        let resolved: Vec<crate::WriteValue> = row.iter().map(cell_write_value).collect();
+                        slots_by_row.push(select_arity(def, &table, columns.as_deref(), &resolved)?);
+                    }
                 }
                 // A `STRICT` table rejects a value whose post-affinity storage
                 // class differs from the declared type, before any row is
@@ -2528,6 +2880,11 @@ impl Engine {
                 let check_budget = Budget::new();
                 let queue_triggers = self.table_has_triggers(&key);
                 let trigger_columns = trigger_frame_columns(def);
+                let recursive_triggers = self.recursive_triggers;
+                let replace_old_rows = if replace { self.live_rows(def, "insert")? } else { Vec::new() };
+                let mut replace_deleted: Vec<(i64, Vec<Cell>)> = Vec::new();
+                let mut replace_index_needed = false;
+                let mut replace_without_needed = false;
                 let mut rowids = Vec::with_capacity(slots_by_row.len());
                 let mut last_written: Option<i64> = None;
                 let mut affected = 0usize;
@@ -2537,7 +2894,7 @@ impl Engine {
                     // A `BEFORE INSERT` trigger sees the row before it is
                     // written: defaults are already applied and an unassigned
                     // rowid is `-1`, exactly like SQLite.
-                    if queue_triggers {
+                    if queue_triggers && !replace {
                         let before_rowid = def
                             .rowid_alias
                             .and_then(|alias| slots.get(alias).and_then(|slot| slot.as_ref()))
@@ -2556,7 +2913,27 @@ impl Engine {
                             old: None,
                         });
                     }
-                    let outcome = match &upsert {
+                    let outcome = if replace {
+                        match self.apply_replace(
+                            def,
+                            &key,
+                            &table,
+                            slots,
+                            temp_position,
+                            recursive_triggers,
+                            queue_triggers,
+                            &trigger_columns,
+                            &mut replace_deleted,
+                        ) {
+                            Ok(rowid) => UpsertOutcome::Inserted(rowid),
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    else {
+                        match &upsert {
                         Some(plan) => match self.apply_upsert(
                             def,
                             &key,
@@ -2592,6 +2969,7 @@ impl Engine {
                                     break;
                                 }
                             }
+                        }
                         }
                     };
                     let rowid = match outcome {
@@ -2674,6 +3052,23 @@ impl Engine {
                 // the transaction commits: a failing statement leaves no row
                 // behind, and a self-reference may point at a later row of the
                 // same statement.
+                if failure.is_none() && self.foreign_keys && temp_position.is_none() && !replace_deleted.is_empty() {
+                    let changes: Vec<(Vec<Cell>, Option<Vec<Cell>>)> =
+                        replace_deleted.iter().map(|(_, cells)| (cells.clone(), None)).collect();
+                    match self.apply_foreign_key_actions(def, &changes, "insert", 0) {
+                        Ok((index_needed, without_needed)) => {
+                            replace_index_needed |= index_needed;
+                            replace_without_needed |= without_needed;
+                        }
+                        Err(error) => failure = Some(error),
+                    }
+                    if failure.is_none() {
+                        let removed: Vec<i64> = replace_deleted.iter().map(|(rowid, _)| *rowid).collect();
+                        if let Err(error) = self.check_delete_foreign_keys(def, &replace_old_rows, &removed, "insert") {
+                            failure = Some(error);
+                        }
+                    }
+                }
                 if failure.is_none() && self.foreign_keys {
                     if let Err(error) = self.check_insert_foreign_keys(def, &rowids, "insert") {
                         failure = Some(error);
@@ -2704,10 +3099,10 @@ impl Engine {
                 // `PRIMARY KEY` / `UNIQUE` constraint live only as key sets
                 // until they are materialized into b-tree pages, so a write to
                 // an indexed table has to rebuild them before the image is read.
-                if temp_position.is_none() && self.has_indexes(def, &key) {
+                if temp_position.is_none() && (self.has_indexes(def, &key) || replace_index_needed) {
                     self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
                 }
-                if temp_position.is_none() && def.without_rowid {
+                if temp_position.is_none() && (def.without_rowid || replace_without_needed) {
                     self.writer
                         .materialize_without_rowid()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
@@ -4241,6 +4636,116 @@ impl Engine {
         *live = self.live_rows(def, "insert")?;
         let rowid = planned.writes.first().map(|(rowid, _)| *rowid).unwrap_or(rowid);
         Ok(UpsertOutcome::Updated { rowid, rows: planned.returning })
+    }
+
+    /// Applies one `REPLACE` row: delete every stored row that conflicts on a
+    /// uniqueness rule, then insert the supplied row.
+    ///
+    /// The delete is an ordinary row removal for foreign-key purposes, but a
+    /// `DELETE` trigger only fires when `recursive_triggers` is on, matching
+    /// SQLite's documented `REPLACE` behavior.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_replace(
+        &mut self,
+        def: &TableDef,
+        table_key: &str,
+        table: &str,
+        slots: &[Option<crate::WriteValue>],
+        temp_position: Option<usize>,
+        recursive_triggers: bool,
+        queue_triggers: bool,
+        trigger_columns: &[String],
+        deleted: &mut Vec<(i64, Vec<Cell>)>,
+    ) -> Result<i64, SqlError> {
+        let live = self.live_rows(def, "insert")?;
+        let explicit_rowid = def
+            .rowid_alias
+            .and_then(|alias| slots.get(alias).and_then(|slot| slot.as_ref()))
+            .and_then(|value| match value {
+                crate::WriteValue::Integer(value) => Some(*value),
+                _ => None,
+            });
+        let candidate_rowid = match explicit_rowid {
+            Some(rowid) => rowid,
+            None => live.iter().map(|(rowid, _)| *rowid).max().unwrap_or(0) + 1,
+        };
+        let candidate = check_row(def, slots, candidate_rowid);
+        let mut conflicts: BTreeSet<i64> = BTreeSet::new();
+        for unique in self.unique_keys(def, table_key) {
+            for (rowid, cells) in &live {
+                if upsert_key_conflicts(&unique, &candidate, candidate_rowid, *rowid, cells) {
+                    conflicts.insert(*rowid);
+                }
+            }
+        }
+        for target in self.upsert_managed_indexes(def, table_key) {
+            let Some(wanted) = self.managed_target_key(def, &target, &candidate)?
+            else {
+                continue;
+            };
+            for (rowid, cells) in &live {
+                if let Some(other) = self.managed_target_key(def, &target, cells)? {
+                    if managed_keys_conflict(&wanted, &other) {
+                        conflicts.insert(*rowid);
+                    }
+                }
+            }
+        }
+        for rowid in conflicts {
+            let old = live.iter().find(|(candidate, _)| *candidate == rowid).map(|(_, cells)| cells.clone()).unwrap_or_default();
+            if queue_triggers && recursive_triggers {
+                self.queue_delete_before(table_key, trigger_columns, rowid, &old);
+            }
+            if let Some(position) = temp_position {
+                self.temp_tables[position].rows.remove(&rowid);
+            }
+            else {
+                let removed = if def.without_rowid {
+                    let old_values: Vec<crate::WriteValue> = old.iter().map(cell_write_value).collect();
+                    self.writer.delete_without_rowid(table, &old_values)
+                }
+                else {
+                    self.writer.delete(table, rowid)
+                };
+                if let Err(error) = removed {
+                    return Err(write_failure(error, "insert", def));
+                }
+            }
+            deleted.push((rowid, old.clone()));
+            if queue_triggers && recursive_triggers {
+                // `AFTER DELETE` is queued as soon as the row is gone, so the
+                // replacement's delete trigger runs before its insert trigger.
+                self.queue_delete_after(table_key, trigger_columns, rowid, &old);
+            }
+        }
+        if queue_triggers {
+            // The conflict-resolution deletes have already run, so a
+            // `BEFORE INSERT` trigger observes the state after them.
+            let before_rowid = def
+                .rowid_alias
+                .and_then(|alias| slots.get(alias).and_then(|slot| slot.as_ref()))
+                .and_then(|value| match value {
+                    crate::WriteValue::Integer(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(-1);
+            self.pending_events.push(PendingTriggerEvent {
+                table: table_key.to_string(),
+                timing: TriggerTiming::Before,
+                event: TriggerEvent::Insert,
+                columns: trigger_columns.to_vec(),
+                new: Some(check_row(def, slots, before_rowid)),
+                old: None,
+            });
+        }
+        if let Some(position) = temp_position {
+            let keys = self.unique_keys(def, table_key);
+            let table_state = &mut self.temp_tables[position];
+            temp_insert_row(def, &mut table_state.rows, slots, &keys)
+        }
+        else {
+            self.writer.insert(table, slots).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))
+        }
     }
 
     /// Computes the `(key values, rowid)` entries of one managed index by
