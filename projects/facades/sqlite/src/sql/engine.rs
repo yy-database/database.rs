@@ -5532,7 +5532,7 @@ impl Engine {
             Some(expr) => Some(resolve_expr(expr, &relation, &outer_shapes, named, &mut windows, &mut specs, true, false)?),
             None => None,
         };
-        let keys: Vec<(SortKey, bool)> = order
+        let keys: Vec<(SortKey, SortDirection)> = order
             .iter()
             .map(|entry| {
                 // A bare integer is a 1-based output-column ordinal, as in SQLite.
@@ -5545,7 +5545,7 @@ impl Engine {
                         )
                         .in_statement("select"));
                     }
-                    return Ok((SortKey::Projected(position as usize - 1), entry.descending));
+                    return Ok((SortKey::Projected(position as usize - 1), SortDirection::of(entry)));
                 }
                 // An unqualified name that matches a projection alias sorts by
                 // the output column; SQLite prefers the alias over a same-named
@@ -5553,13 +5553,13 @@ impl Engine {
                 if let Expr::Column(column) = &entry.expr {
                     if column.qualifier.is_none() {
                         if let Some(position) = labels.iter().position(|label| label.eq_ignore_ascii_case(&column.name)) {
-                            return Ok((SortKey::Projected(position), entry.descending));
+                            return Ok((SortKey::Projected(position), SortDirection::of(entry)));
                         }
                     }
                 }
                 Ok((
                     SortKey::Expression(resolve_expr(&entry.expr, &relation, &outer_shapes, named, &mut windows, &mut specs, true, true)?),
-                    entry.descending,
+                    SortDirection::of(entry),
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -5881,9 +5881,9 @@ impl Engine {
             let keys = compound_order_keys(&order, &columns)?;
             rows.sort_by(|left, right| {
                 keys.iter()
-                    .find_map(|(index, descending)| {
-                        let ordering = compare_cells(&left[*index], &right[*index]);
-                        (ordering != Ordering::Equal).then(|| if *descending { ordering.reverse() } else { ordering })
+                    .find_map(|(index, direction)| {
+                        let ordering = direction.compare(&left[*index], &right[*index]);
+                        (ordering != Ordering::Equal).then_some(ordering)
                     })
                     .unwrap_or(Ordering::Equal)
             });
@@ -5911,10 +5911,10 @@ impl Engine {
         outer: &[Scope],
         budget: &Budget,
         ctes: Option<&CteEnv>,
-    ) -> Result<(Vec<Vec<Cell>>, Vec<Vec<Cell>>, Vec<bool>), SqlError> {
+    ) -> Result<(Vec<Vec<Cell>>, Vec<Vec<Cell>>, Vec<SortDirection>), SqlError> {
         let mut values: Vec<Vec<Cell>> = vec![Vec::new(); windows.len()];
         let mut keys: Vec<Vec<Cell>> = vec![Vec::new(); inputs.len()];
-        let mut descending: Vec<bool> = Vec::new();
+        let mut descending: Vec<SortDirection> = Vec::new();
         // Key expressions are evaluated once per window; the sorts then run
         // from the last window to the first. Each later window is a tie-breaker
         // of the previous one, which reproduces SQLite's sorter chain: the
@@ -5942,8 +5942,8 @@ impl Engine {
             }
             partitions.push(window_partitions);
             orders.push(window_orders);
-            descending.resize(descending.len() + window.partition.len(), false);
-            descending.extend(window.order.iter().map(|(_, descending)| *descending));
+            descending.resize(descending.len() + window.partition.len(), SortDirection::default());
+            descending.extend(window.order.iter().map(|(_, direction)| *direction));
         }
         for (index, key_row) in keys.iter_mut().enumerate() {
             for window in 0..windows.len() {
@@ -6333,7 +6333,7 @@ impl Engine {
         peer_start: &[usize],
         peer_end: &[usize],
     ) -> Result<(i64, i64), SqlError> {
-        let descending = window.order.first().is_some_and(|(_, descending)| *descending);
+        let descending = window.order.first().is_some_and(|(_, direction)| direction.descending);
         let current = if window.order.len() == 1 { orders[indices[slot]].first().cloned() } else { None };
         // RANGE offsets are numeric only: text and blob ordering keys compare by
         // collation, so SQLite narrows such a frame to the peer group instead of
@@ -6603,9 +6603,9 @@ impl Engine {
             let keys = compound_order_keys(order, &columns)?;
             rows.sort_by(|left, right| {
                 keys.iter()
-                    .find_map(|(index, descending)| {
-                        let ordering = compare_cells(&left[*index], &right[*index]);
-                        (ordering != Ordering::Equal).then(|| if *descending { ordering.reverse() } else { ordering })
+                    .find_map(|(index, direction)| {
+                        let ordering = direction.compare(&left[*index], &right[*index]);
+                        (ordering != Ordering::Equal).then_some(ordering)
                     })
                     .unwrap_or(Ordering::Equal)
             });
@@ -6849,7 +6849,7 @@ impl Engine {
 /// SQLite only lets a compound query order by an output column, either by
 /// 1-based ordinal or by its result label; source columns are out of scope
 /// once the cores have been combined.
-fn compound_order_keys(order: &[OrderKey], columns: &[String]) -> Result<Vec<(usize, bool)>, SqlError> {
+fn compound_order_keys(order: &[OrderKey], columns: &[String]) -> Result<Vec<(usize, SortDirection)>, SqlError> {
     order
         .iter()
         .map(|entry| {
@@ -6862,7 +6862,7 @@ fn compound_order_keys(order: &[OrderKey], columns: &[String]) -> Result<Vec<(us
                     )
                     .in_statement("select"));
                 }
-                return Ok((position as usize - 1, entry.descending));
+                return Ok((position as usize - 1, SortDirection::of(entry)));
             }
             if let Expr::Column(reference) = &entry.expr {
                 if reference.qualifier.is_none() {
@@ -6873,7 +6873,7 @@ fn compound_order_keys(order: &[OrderKey], columns: &[String]) -> Result<Vec<(us
                         .map(|(index, _)| index)
                         .collect::<Vec<_>>();
                     return match matching.as_slice() {
-                        [index] => Ok((*index, entry.descending)),
+                        [index] => Ok((*index, SortDirection::of(entry))),
                         [] => Err(SqlError::new(
                             "unknown-column",
                             format!("ORDER BY term `{}` does not match any column in the result set", reference.name),
@@ -7079,6 +7079,8 @@ fn row_preserving_expr(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
             row_preserving_expr(left) && row_preserving_expr(right)
         }
+        Expr::IsDistinct { left, right, .. } => row_preserving_expr(left) && row_preserving_expr(right),
+        Expr::Glob { value, pattern, .. } => row_preserving_expr(value) && row_preserving_expr(pattern),
         Expr::IsNull { value, .. } | Expr::IsTruth { value, .. } | Expr::Not(value) => row_preserving_expr(value),
         Expr::Case { operand, branches, otherwise } => {
             operand.as_ref().map_or(true, |expr| row_preserving_expr(expr))
@@ -7568,6 +7570,10 @@ enum ResolvedExpr {
     Cast { value: Box<ResolvedExpr>, target: CastType },
     /// `x [NOT] LIKE y [ESCAPE z]`.
     Like { value: Box<ResolvedExpr>, pattern: Box<ResolvedExpr>, negated: bool, escape: Option<Box<ResolvedExpr>> },
+    /// `x IS DISTINCT FROM y` or `x IS NOT DISTINCT FROM y`.
+    IsDistinct { left: Box<ResolvedExpr>, right: Box<ResolvedExpr>, negated: bool },
+    /// `x GLOB y` or `x NOT GLOB y`.
+    Glob { value: Box<ResolvedExpr>, pattern: Box<ResolvedExpr>, negated: bool },
     /// Scalar subquery `(SELECT ...)`.
     Subquery(Box<Statement>),
     /// `EXISTS (SELECT ...)`.
@@ -7595,7 +7601,7 @@ struct ResolvedWindow {
     /// `PARTITION BY` expressions.
     partition: Vec<ResolvedExpr>,
     /// `ORDER BY` keys with their direction.
-    order: Vec<(ResolvedExpr, bool)>,
+    order: Vec<(ResolvedExpr, SortDirection)>,
     /// Explicit frame, already merged with a base window's frame.
     frame: Option<ResolvedFrame>,
 }
@@ -7741,6 +7747,37 @@ impl ResolvedExpr {
                 eval_function(*name, &values)
             }
             Self::Cast { value, target } => cast_cell(&value.eval(values, ctx)?, *target),
+            Self::IsDistinct { left, right, negated } => {
+                let left = left.eval(values, ctx)?;
+                let right = right.eval(values, ctx)?;
+                // `NULL` is a value again: two `NULL`s are not distinct, while a
+                // `NULL` against anything else is. Non-NULL operands use the same
+                // storage-class ordering as `=`, so `1` and `1.0` are the same.
+                let distinct = match (&left, &right) {
+                    (Cell::Null, Cell::Null) => false,
+                    (Cell::Null, _) | (_, Cell::Null) => true,
+                    _ => compare_cells(&left, &right) != Ordering::Equal,
+                };
+                Cell::Integer(i64::from(distinct != *negated))
+            }
+            Self::Glob { value, pattern, negated } => {
+                let value = value.eval(values, ctx)?;
+                let pattern = pattern.eval(values, ctx)?;
+                // Both operands must be text: `NULL` propagates, and a blob never
+                // matches, unlike `LIKE` which unblobs its operand.
+                if matches!(value, Cell::Null) || matches!(pattern, Cell::Null) {
+                    return Ok(Cell::Null);
+                }
+                let matched = match (&value, &pattern) {
+                    (Cell::Blob(_), _) | (_, Cell::Blob(_)) => false,
+                    _ => {
+                        let value: Vec<char> = text_form(&value).unwrap_or_default().chars().collect();
+                        let pattern: Vec<char> = text_form(&pattern).unwrap_or_default().chars().collect();
+                        glob_match(&value, &pattern)
+                    }
+                };
+                Cell::Integer(i64::from(matched != *negated))
+            }
             Self::Like { value, pattern, negated, escape } => {
                 let value = value.eval(values, ctx)?;
                 let pattern = pattern.eval(values, ctx)?;
@@ -7806,6 +7843,14 @@ impl ResolvedExpr {
                 left.collect_sources(out);
                 right.collect_sources(out);
             }
+            Self::IsDistinct { left, right, .. } => {
+                left.collect_sources(out);
+                right.collect_sources(out);
+            }
+            Self::Glob { value, pattern, .. } => {
+                value.collect_sources(out);
+                pattern.collect_sources(out);
+            }
             Self::Case { operand, branches, otherwise } => {
                 if let Some(operand) = operand {
                     operand.collect_sources(out);
@@ -7855,6 +7900,8 @@ impl ResolvedExpr {
             Self::Binary { left, right, .. } | Self::Compare { left, right, .. } | Self::And(left, right) | Self::Or(left, right) => {
                 left.contains_subquery() || right.contains_subquery()
             }
+            Self::IsDistinct { left, right, .. } => left.contains_subquery() || right.contains_subquery(),
+            Self::Glob { value, pattern, .. } => value.contains_subquery() || pattern.contains_subquery(),
             Self::Case { operand, branches, otherwise } => {
                 operand.as_ref().is_some_and(|operand| operand.contains_subquery())
                     || branches.iter().any(|(condition, result)| condition.contains_subquery() || result.contains_subquery())
@@ -7884,6 +7931,48 @@ enum SortKey {
     Projected(usize),
     /// Expression over the merged source row.
     Expression(ResolvedExpr),
+}
+
+/// Direction of one resolved sort key plus its explicit `NULL` placement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SortDirection {
+    /// `DESC` was written.
+    descending: bool,
+    /// `NULLS FIRST` / `NULLS LAST`; `None` keeps the SQLite default, which is
+    /// first for `ASC` and last for `DESC`.
+    nulls_first: Option<bool>,
+}
+
+impl SortDirection {
+    /// Direction of a parsed key.
+    fn of(key: &OrderKey) -> Self {
+        Self { descending: key.descending, nulls_first: key.nulls_first }
+    }
+
+    /// Compares two cells, honouring the direction and the `NULL` placement.
+    fn compare(self, left: &Cell, right: &Cell) -> Ordering {
+        match (left, right) {
+            (Cell::Null, Cell::Null) => Ordering::Equal,
+            (Cell::Null, _) | (_, Cell::Null) => {
+                let first = self.nulls_first.unwrap_or(!self.descending);
+                if matches!(left, Cell::Null) == first {
+                    Ordering::Less
+                }
+                else {
+                    Ordering::Greater
+                }
+            }
+            _ => {
+                let ordering = compare_cells(left, right);
+                if self.descending {
+                    ordering.reverse()
+                }
+                else {
+                    ordering
+                }
+            }
+        }
+    }
 }
 
 /// One `GROUP BY` term.
@@ -8032,6 +8121,16 @@ fn resolve_expr(
                 None => None,
             },
         },
+        Expr::Glob { value, pattern, negated } => ResolvedExpr::Glob {
+            value: Box::new(resolve_expr(value, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
+            pattern: Box::new(resolve_expr(pattern, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
+            negated: *negated,
+        },
+        Expr::IsDistinct { left, right, negated } => ResolvedExpr::IsDistinct {
+            left: Box::new(resolve_expr(left, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
+            right: Box::new(resolve_expr(right, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
+            negated: *negated,
+        },
         Expr::Subquery(query) => ResolvedExpr::Subquery(query.clone()),
         Expr::Exists(query) => ResolvedExpr::Exists(query.clone()),
         Expr::InSubquery { value, query, negated } => ResolvedExpr::InSubquery {
@@ -8107,7 +8206,7 @@ fn resolve_window(
     let order = merged
         .order
         .iter()
-        .map(|key| Ok((resolve_expr(&key.expr, relation, outer, named, windows, aggregates, true, false)?, key.descending)))
+        .map(|key| Ok((resolve_expr(&key.expr, relation, outer, named, windows, aggregates, true, false)?, SortDirection::of(key))))
         .collect::<Result<Vec<_>, SqlError>>()?;
     let frame = match merged.frame {
         Some(frame) => Some(resolve_frame(frame, relation, outer, named, windows, aggregates)?),
@@ -8322,7 +8421,7 @@ fn compare_window_rows(
     left_order: &[Cell],
     right_partition: &[Cell],
     right_order: &[Cell],
-    order: &[(ResolvedExpr, bool)],
+    order: &[(ResolvedExpr, SortDirection)],
 ) -> Ordering {
     for (left, right) in left_partition.iter().zip(right_partition) {
         let ordering = compare_cells(left, right);
@@ -8330,9 +8429,8 @@ fn compare_window_rows(
             return ordering;
         }
     }
-    for (index, (_, descending)) in order.iter().enumerate() {
-        let ordering = compare_cells(&left_order[index], &right_order[index]);
-        let ordering = if *descending { ordering.reverse() } else { ordering };
+    for (index, (_, direction)) in order.iter().enumerate() {
+        let ordering = direction.compare(&left_order[index], &right_order[index]);
         if ordering != Ordering::Equal {
             return ordering;
         }
@@ -9034,10 +9132,9 @@ fn truthiness(cell: &Cell) -> Option<bool> {
     }
 }
 
-fn compare_key_rows(left: &[Cell], right: &[Cell], keys: &[(SortKey, bool)]) -> Ordering {
-    for (index, (_, descending)) in keys.iter().enumerate() {
-        let ordering = compare_cells(&left[index], &right[index]);
-        let ordering = if *descending { ordering.reverse() } else { ordering };
+fn compare_key_rows(left: &[Cell], right: &[Cell], keys: &[(SortKey, SortDirection)]) -> Ordering {
+    for (index, (_, direction)) in keys.iter().enumerate() {
+        let ordering = direction.compare(&left[index], &right[index]);
         if ordering != Ordering::Equal {
             return ordering;
         }
@@ -9046,10 +9143,9 @@ fn compare_key_rows(left: &[Cell], right: &[Cell], keys: &[(SortKey, bool)]) -> 
 }
 
 /// Compares two composite window sort keys, honouring each column's direction.
-fn compare_ordered(left: &[Cell], right: &[Cell], descending: &[bool]) -> Ordering {
-    for (index, descending) in descending.iter().enumerate() {
-        let ordering = compare_cells(&left[index], &right[index]);
-        let ordering = if *descending { ordering.reverse() } else { ordering };
+fn compare_ordered(left: &[Cell], right: &[Cell], directions: &[SortDirection]) -> Ordering {
+    for (index, direction) in directions.iter().enumerate() {
+        let ordering = direction.compare(&left[index], &right[index]);
         if ordering != Ordering::Equal {
             return ordering;
         }
@@ -9326,6 +9422,88 @@ fn sqlite_real_text(value: f64) -> String {
         text.insert(0, '-');
     }
     text
+}
+
+/// Matches one `GLOB` pattern against a value, one character at a time.
+///
+/// `*` matches any run including the empty one, `?` matches exactly one
+/// character, and `[...]` is a class: `^` negates it, `a-c` is an inclusive
+/// range, a leading `]` is a literal member, and an unclosed `[` never matches.
+/// Unlike `LIKE`, every comparison is case sensitive.
+fn glob_match(value: &[char], pattern: &[char]) -> bool {
+    let Some((first, rest)) = pattern.split_first()
+    else {
+        return value.is_empty();
+    };
+    match *first {
+        '*' => glob_match(value, rest) || value.split_first().is_some_and(|(_, tail)| glob_match(tail, pattern)),
+        '?' => value.split_first().is_some_and(|(_, tail)| glob_match(tail, rest)),
+        '[' => {
+            let Some((candidate, tail)) = value.split_first()
+            else {
+                return false;
+            };
+            match glob_class(*candidate, rest) {
+                Some(true) => glob_match(tail, &rest[glob_class_width(rest)..]),
+                _ => false,
+            }
+        }
+        literal => value.split_first().is_some_and(|(candidate, tail)| *candidate == literal && glob_match(tail, rest)),
+    }
+}
+
+/// Width of the `[...]` class that starts at `pattern[0]`, including both
+/// brackets. Zero means the class is never closed.
+fn glob_class_width(pattern: &[char]) -> usize {
+    let mut index = usize::from(pattern.first() == Some(&'^'));
+    let mut first_item = true;
+    while index < pattern.len() {
+        if pattern[index] == ']' && !first_item {
+            return index + 1;
+        }
+        first_item = false;
+        // `a-c` is a range only when a member follows the dash.
+        if index + 2 < pattern.len() && pattern[index + 1] == '-' && pattern[index + 2] != ']' {
+            index += 3;
+        }
+        else {
+            index += 1;
+        }
+    }
+    0
+}
+
+/// Matches one character against the class body that follows `[`.
+fn glob_class(candidate: char, pattern: &[char]) -> Option<bool> {
+    let width = glob_class_width(pattern);
+    if width == 0 {
+        return None;
+    }
+    let invert = pattern.first() == Some(&'^');
+    let body = &pattern[usize::from(invert)..width - 1];
+    let mut matched = false;
+    let mut index = 0;
+    let mut first_item = true;
+    while index < body.len() {
+        // A leading `]` is a member instead of the closing bracket.
+        if body[index] == ']' && !first_item {
+            break;
+        }
+        first_item = false;
+        if index + 2 < body.len() && body[index + 1] == '-' && body[index + 2] != ']' {
+            if candidate >= body[index] && candidate <= body[index + 2] {
+                matched = true;
+            }
+            index += 3;
+        }
+        else {
+            if candidate == body[index] {
+                matched = true;
+            }
+            index += 1;
+        }
+    }
+    Some(if invert { !matched } else { matched })
 }
 
 /// `LIKE` folds case only for ASCII letters; every other character compares
@@ -10164,6 +10342,12 @@ fn expression_mentions_column(expr: &Expr, column: &str, qualifiers: Option<&[&s
         Expr::Unary { value, .. } => expression_mentions_column(value, column, qualifiers),
         Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
             expression_mentions_column(left, column, qualifiers) || expression_mentions_column(right, column, qualifiers)
+        }
+        Expr::IsDistinct { left, right, .. } => {
+            expression_mentions_column(left, column, qualifiers) || expression_mentions_column(right, column, qualifiers)
+        }
+        Expr::Glob { value, pattern, .. } => {
+            expression_mentions_column(value, column, qualifiers) || expression_mentions_column(pattern, column, qualifiers)
         }
         Expr::IsNull { value, .. } | Expr::IsTruth { value, .. } | Expr::Not(value) | Expr::Alias { value, .. } | Expr::Cast { value, .. } => {
             expression_mentions_column(value, column, qualifiers)
