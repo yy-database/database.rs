@@ -22,7 +22,7 @@ use super::{
     sql::{
         AggregateFunction, AlterAction, Assignment, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp,
         CompoundTerm, ConflictAction, ConflictClause, DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge,
-        FrameUnits, IndexColumn, InsertValue,
+        FrameExclude, FrameUnits, IndexColumn, InsertValue,
         JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableConstraint, TableRef,
         TransactionAction,
         TriggerEvent, TriggerTiming, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column,
@@ -6079,6 +6079,7 @@ impl Engine {
                     column,
                     &peer_start,
                     &peer_end,
+                    &dense,
                     shape,
                     outer,
                     budget,
@@ -6097,6 +6098,7 @@ impl Engine {
                     column,
                     &peer_start,
                     &peer_end,
+                    &dense,
                     shape,
                     outer,
                     budget,
@@ -6115,17 +6117,21 @@ impl Engine {
                     column,
                     &peer_start,
                     &peer_end,
+                    &dense,
                     shape,
                     outer,
                     budget,
                     ctes,
                 )?;
             }
-            ResolvedWindowFunction::Aggregate { function, argument, separator } => {
+            ResolvedWindowFunction::Aggregate { function, argument, separator, distinct, filter, order } => {
                 self.evaluate_frame_aggregate(
                     *function,
                     argument.as_ref(),
                     separator.as_ref(),
+                    *distinct,
+                    filter.as_ref(),
+                    order,
                     window,
                     indices,
                     orders,
@@ -6133,6 +6139,7 @@ impl Engine {
                     column,
                     &peer_start,
                     &peer_end,
+                    &dense,
                     shape,
                     outer,
                     budget,
@@ -6218,6 +6225,7 @@ impl Engine {
         column: &mut [Cell],
         peer_start: &[usize],
         peer_end: &[usize],
+        group_of: &[i64],
         shape: &ScopeShape,
         outer: &[Scope],
         budget: &Budget,
@@ -6226,24 +6234,30 @@ impl Engine {
         let len = indices.len();
         for slot in 0..len {
             let ctx = self.window_context(inputs, indices[slot], shape, outer, budget, ctes);
-            let (start, end) = self.frame_bounds(window, slot, len, indices, orders, peer_start, peer_end, &ctx)?;
+            let (start, end) = self.frame_bounds(window, slot, len, indices, orders, peer_start, peer_end, group_of, &ctx)?;
+            let exclude = window.frame.as_ref().map_or(FrameExclude::NoOthers, |frame| frame.exclude);
+            // Every position still in the frame after EXCLUDE, in frame order.
+            let mut positions = (start.max(0)..=end.min(len as i64 - 1))
+                .filter(|position| !frame_row_excluded(exclude, *position as usize, slot, peer_start, peer_end))
+                .map(|position| position as usize);
             let wanted = match pick {
-                ValuePick::First => start,
-                ValuePick::Last => end,
+                ValuePick::First => positions.next(),
+                ValuePick::Last => positions.last(),
                 ValuePick::Nth => {
                     let position = position.expect("nth_value carries a position");
                     match nth_position(&position.eval(&inputs[indices[slot]].values, &ctx)?)? {
                         0 => unreachable!("nth_position rejects zero"),
-                        nth => start.saturating_add(nth - 1),
+                        nth => positions.nth(nth as usize - 1),
                     }
                 }
             };
-            if wanted < start || wanted > end || wanted < 0 || wanted as usize >= len {
+            let Some(wanted) = wanted
+            else {
                 column[indices[slot]] = Cell::Null;
                 continue;
-            }
-            let target_ctx = self.window_context(inputs, indices[wanted as usize], shape, outer, budget, ctes);
-            column[indices[slot]] = value.eval(&inputs[indices[wanted as usize]].values, &target_ctx)?;
+            };
+            let target_ctx = self.window_context(inputs, indices[wanted], shape, outer, budget, ctes);
+            column[indices[slot]] = value.eval(&inputs[indices[wanted]].values, &target_ctx)?;
         }
         Ok(())
     }
@@ -6255,6 +6269,9 @@ impl Engine {
         function: AggregateFunction,
         argument: Option<&ResolvedExpr>,
         separator: Option<&ResolvedExpr>,
+        distinct: bool,
+        filter: Option<&ResolvedExpr>,
+        order: &[(ResolvedExpr, SortDirection)],
         window: &ResolvedWindow,
         indices: &[usize],
         orders: &[Vec<Cell>],
@@ -6262,28 +6279,44 @@ impl Engine {
         column: &mut [Cell],
         peer_start: &[usize],
         peer_end: &[usize],
+        group_of: &[i64],
         shape: &ScopeShape,
         outer: &[Scope],
         budget: &Budget,
         ctes: Option<&CteEnv>,
     ) -> Result<(), SqlError> {
         let len = indices.len();
+        let exclude = window.frame.as_ref().map_or(FrameExclude::NoOthers, |frame| frame.exclude);
         for slot in 0..len {
             let ctx = self.window_context(inputs, indices[slot], shape, outer, budget, ctes);
-            let (start, end) = self.frame_bounds(window, slot, len, indices, orders, peer_start, peer_end, &ctx)?;
-            let mut values = Vec::new();
-            let mut separators = Vec::new();
+            let (start, end) = self.frame_bounds(window, slot, len, indices, orders, peer_start, peer_end, group_of, &ctx)?;
+            let mut entries: Vec<(Cell, Cell, Vec<Cell>)> = Vec::new();
             for position in start.max(0)..=end.min(len as i64 - 1) {
+                if frame_row_excluded(exclude, position as usize, slot, peer_start, peer_end) {
+                    continue;
+                }
                 let row = &inputs[indices[position as usize]];
                 let row_ctx = self.window_context(inputs, indices[position as usize], shape, outer, budget, ctes);
-                match argument {
-                    Some(argument) => values.push(argument.eval(&row.values, &row_ctx)?),
-                    None => values.push(Cell::Null),
+                if let Some(filter) = filter {
+                    if truthiness(&filter.eval(&row.values, &row_ctx)?) != Some(true) {
+                        continue;
+                    }
                 }
-                if let Some(separator) = separator {
-                    separators.push(separator.eval(&row.values, &row_ctx)?);
-                }
+                let value = match argument {
+                    Some(argument) => argument.eval(&row.values, &row_ctx)?,
+                    None => Cell::Null,
+                };
+                let separator = match separator {
+                    Some(separator) => separator.eval(&row.values, &row_ctx)?,
+                    None => Cell::Null,
+                };
+                let keys = order
+                    .iter()
+                    .map(|(expr, _)| expr.eval(&row.values, &row_ctx))
+                    .collect::<Result<Vec<_>, SqlError>>()?;
+                entries.push((value, separator, keys));
             }
+            let (values, separators) = shape_aggregate_inputs(entries, distinct, order);
             column[indices[slot]] = aggregate_cells(function, &values, if separator.is_some() { Some(&separators) } else { None });
         }
         Ok(())
@@ -6300,6 +6333,7 @@ impl Engine {
         orders: &[Vec<Cell>],
         peer_start: &[usize],
         peer_end: &[usize],
+        group_of: &[i64],
         _ctx: &EvalContext,
     ) -> Result<(i64, i64), SqlError> {
         let Some(frame) = &window.frame
@@ -6315,6 +6349,10 @@ impl Engine {
                 let end = rows_edge(&frame.end, "ending", slot, len)?;
                 Ok((start, end))
             }
+            FrameUnits::Groups => Ok((
+                groups_edge(&frame.start, "starting", slot, len, peer_start, peer_end, group_of)?,
+                groups_edge(&frame.end, "ending", slot, len, peer_start, peer_end, group_of)?,
+            )),
             FrameUnits::Range => self.range_bounds(window, frame, slot, len, indices, orders, peer_start, peer_end),
         }
     }
@@ -6379,8 +6417,12 @@ impl Engine {
         }
         let low = start_edge.min(end_edge);
         let high = start_edge.max(end_edge);
-        let mut first = None;
-        let mut last = None;
+        // An unbounded edge spans that whole side of the partition, so rows
+        // whose ORDER BY key has no numeric form are not dropped from it.
+        let start_unbounded = matches!(frame.start.edge, FrameEdge::UnboundedPreceding);
+        let end_unbounded = matches!(frame.end.edge, FrameEdge::UnboundedFollowing);
+        let mut first = start_unbounded.then_some(0);
+        let mut last = end_unbounded.then_some(len - 1);
         for position in 0..len {
             let Some(value) = orders[indices[position]].first().and_then(numeric)
             else {
@@ -6389,7 +6431,18 @@ impl Engine {
             let value = number_f64(value);
             if value >= low && value <= high {
                 first.get_or_insert(position);
-                last = Some(position);
+                if !end_unbounded {
+                    last = Some(position);
+                }
+            }
+        }
+        // NULL sorts before every numeric key in ascending order, so the
+        // leading run of rows without a numeric key stays inside a frame that
+        // begins at the partition start even when its other edge is bounded.
+        if start_unbounded && !descending && first.is_some() {
+            let nulls = (0..len).take_while(|position| orders[indices[*position]].first().and_then(numeric).is_none()).count();
+            if nulls > 0 {
+                last = Some(last.map_or(nulls - 1, |last| last.max(nulls - 1)));
             }
         }
         Ok(match (first, last) {
@@ -7013,6 +7066,12 @@ struct AggregateSpec {
     argument: Option<ResolvedExpr>,
     /// `group_concat` separator, evaluated per row like SQLite does.
     separator: Option<ResolvedExpr>,
+    /// `DISTINCT` was written before the argument.
+    distinct: bool,
+    /// `FILTER (WHERE ...)` applied before the aggregate sees a row.
+    filter: Option<ResolvedExpr>,
+    /// `ORDER BY` inside the argument list, used by `group_concat`.
+    order: Vec<(ResolvedExpr, SortDirection)>,
 }
 
 /// Two result rows are equal when every cell compares equal under the engine's
@@ -7631,7 +7690,17 @@ enum ResolvedWindowFunction {
     /// `nth_value(expr, n)`.
     NthValue { value: ResolvedExpr, position: ResolvedExpr },
     /// Aggregate over the frame.
-    Aggregate { function: AggregateFunction, argument: Option<ResolvedExpr>, separator: Option<ResolvedExpr> },
+    Aggregate {
+        function: AggregateFunction,
+        argument: Option<ResolvedExpr>,
+        separator: Option<ResolvedExpr>,
+        /// `DISTINCT` was written before the argument.
+        distinct: bool,
+        /// `FILTER (WHERE ...)` applied before the aggregate sees a row.
+        filter: Option<ResolvedExpr>,
+        /// `ORDER BY` inside the argument list, used by `group_concat`.
+        order: Vec<(ResolvedExpr, SortDirection)>,
+    },
 }
 
 /// One resolved frame edge.
@@ -7644,12 +7713,14 @@ struct ResolvedFrameBound {
 
 /// A resolved explicit frame.
 struct ResolvedFrame {
-    /// `ROWS` or `RANGE`.
+    /// `ROWS`, `RANGE` or `GROUPS`.
     units: FrameUnits,
     /// Starting edge.
     start: ResolvedFrameBound,
     /// Ending edge.
     end: ResolvedFrameBound,
+    /// Rows dropped from the computed frame.
+    exclude: FrameExclude,
 }
 
 impl ResolvedExpr {
@@ -8138,7 +8209,7 @@ fn resolve_expr(
             query: query.clone(),
             negated: *negated,
         },
-        Expr::Aggregate { function, argument, separator } => {
+        Expr::Aggregate { function, argument, separator, distinct, filter, order } => {
             if !allow_aggregate {
                 let mut error =
                     SqlError::new("misuse-of-aggregate", format!("misuse of aggregate function {}()", function.name())).in_statement("select");
@@ -8151,8 +8222,16 @@ fn resolve_expr(
                 argument.as_ref().map(|arg| resolve_expr(arg, relation, outer, named, windows, aggregates, false, false)).transpose()?;
             let separator =
                 separator.as_ref().map(|sep| resolve_expr(sep, relation, outer, named, windows, aggregates, false, false)).transpose()?;
+            let filter =
+                filter.as_ref().map(|expr| resolve_expr(expr, relation, outer, named, windows, aggregates, false, false)).transpose()?;
+            let order = order
+                .iter()
+                .map(|key| {
+                    Ok((resolve_expr(&key.expr, relation, outer, named, windows, aggregates, false, false)?, SortDirection::of(key)))
+                })
+                .collect::<Result<Vec<_>, SqlError>>()?;
             let index = aggregates.len();
-            aggregates.push(AggregateSpec { function: *function, argument, separator });
+            aggregates.push(AggregateSpec { function: *function, argument, separator, distinct: *distinct, filter, order });
             ResolvedExpr::AggregateRef(index)
         }
         Expr::Window { function, spec } => {
@@ -8310,7 +8389,7 @@ fn resolve_frame(
     };
     let start = resolve_bound(&frame.start, "starting")?;
     let end = resolve_bound(&frame.end, "ending")?;
-    Ok(ResolvedFrame { units: frame.units, start, end })
+    Ok(ResolvedFrame { units: frame.units, start, end, exclude: frame.exclude })
 }
 
 /// Resolves the arguments of a window function.
@@ -8347,11 +8426,20 @@ fn resolve_window_function(
         WindowFunction::NthValue { value, position } => {
             ResolvedWindowFunction::NthValue { value: argument(value)?, position: argument(position)? }
         }
-        WindowFunction::Aggregate { function, argument: value, separator } => ResolvedWindowFunction::Aggregate {
-            function: *function,
-            argument: value.as_ref().map(|expr| argument(expr)).transpose()?,
-            separator: separator.as_ref().map(|expr| argument(expr)).transpose()?,
-        },
+        WindowFunction::Aggregate { function, argument: value, separator, distinct, filter, order } => {
+            let mut resolved_order = Vec::with_capacity(order.len());
+            for key in order {
+                resolved_order.push((argument(&key.expr)?, SortDirection::of(key)));
+            }
+            ResolvedWindowFunction::Aggregate {
+                function: *function,
+                argument: value.as_ref().map(|expr| argument(expr)).transpose()?,
+                separator: separator.as_ref().map(|expr| argument(expr)).transpose()?,
+                distinct: *distinct,
+                filter: filter.as_ref().map(|expr| argument(expr)).transpose()?,
+                order: resolved_order,
+            }
+        }
     })
 }
 
@@ -8505,6 +8593,59 @@ fn rows_edge(bound: &ResolvedFrameBound, which: &str, slot: usize, len: usize) -
     })
 }
 
+/// Resolves one `GROUPS` frame edge to a position in the partition.
+///
+/// Peer groups are contiguous, so `group_of` (each row's dense group number)
+/// both locates the target group and tells whether it lies outside the
+/// partition.
+fn groups_edge(
+    bound: &ResolvedFrameBound,
+    which: &str,
+    slot: usize,
+    len: usize,
+    peer_start: &[usize],
+    peer_end: &[usize],
+    group_of: &[i64],
+) -> Result<i64, SqlError> {
+    let starting = which == "starting";
+    // `CURRENT ROW` names the row's whole peer group: a start edge lands on its
+    // first row and an end edge on its last.
+    if bound.edge == FrameEdge::CurrentRow {
+        return Ok(if starting { peer_start[slot] as i64 } else { peer_end[slot] as i64 });
+    }
+    let group = group_of[slot];
+    let target = match bound.edge {
+        FrameEdge::UnboundedPreceding => return Ok(if starting { 0 } else { -1 }),
+        FrameEdge::UnboundedFollowing => {
+            return Ok(if starting { len as i64 } else { len.saturating_sub(1) as i64 });
+        }
+        FrameEdge::Preceding => group.saturating_sub(range_offset(bound, which)?.unwrap_or(0)),
+        FrameEdge::Following => group.saturating_add(range_offset(bound, which)?.unwrap_or(0)),
+        FrameEdge::CurrentRow => unreachable!("handled above"),
+    };
+    if target < 0 {
+        return Ok(if starting { 0 } else { -1 });
+    }
+    // Frames never extend past either end of the partition.
+    let first = group_of.partition_point(|value| *value < target);
+    if first >= len {
+        return Ok(if starting { len as i64 } else { len as i64 - 1 });
+    }
+    Ok(if starting { peer_start[first] as i64 } else { peer_end[first] as i64 })
+}
+
+/// `EXCLUDE` decision for one frame position computed for `slot`.
+fn frame_row_excluded(exclude: FrameExclude, position: usize, slot: usize, peer_start: &[usize], peer_end: &[usize]) -> bool {
+    match exclude {
+        FrameExclude::NoOthers => false,
+        FrameExclude::CurrentRow => position == slot,
+        FrameExclude::Group => position >= peer_start[slot] && position <= peer_end[slot],
+        // `TIES` drops the peers but keeps the row being computed, even when it
+        // is the only member of its group.
+        FrameExclude::Ties => position >= peer_start[slot] && position <= peer_end[slot] && position != slot,
+    }
+}
+
 /// Bucket count of `ntile(n)`; SQLite rejects zero and negative counts.
 fn ntile_buckets(cell: &Cell) -> Result<usize, SqlError> {
     match numeric(cell) {
@@ -8623,24 +8764,61 @@ fn retain_first_distinct(rows: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
 ///
 /// Empty input follows SQLite: `count` is `0`, every other aggregate is `NULL`.
 fn compute_aggregate(spec: &AggregateSpec, rows: &[Vec<Cell>], ctx: &EvalContext) -> Result<Cell, SqlError> {
-    let mut values = Vec::with_capacity(rows.len());
+    let mut entries: Vec<(Cell, Cell, Vec<Cell>)> = Vec::with_capacity(rows.len());
     for row in rows {
-        values.push(match &spec.argument {
+        if let Some(filter) = &spec.filter {
+            if truthiness(&filter.eval(row, ctx)?) != Some(true) {
+                continue;
+            }
+        }
+        let value = match &spec.argument {
             Some(argument) => argument.eval(row, ctx)?,
             None => Cell::Null,
-        });
+        };
+        let separator = match &spec.separator {
+            Some(separator) => separator.eval(row, ctx)?,
+            None => Cell::Null,
+        };
+        let keys = spec
+            .order
+            .iter()
+            .map(|(expr, _)| expr.eval(row, ctx))
+            .collect::<Result<Vec<_>, SqlError>>()?;
+        entries.push((value, separator, keys));
     }
-    let separators = match &spec.separator {
-        Some(separator) => {
-            let mut cells = Vec::with_capacity(rows.len());
-            for row in rows {
-                cells.push(separator.eval(row, ctx)?);
-            }
-            Some(cells)
+    let (values, separators) = shape_aggregate_inputs(entries, spec.distinct, &spec.order);
+    Ok(aggregate_cells(spec.function, &values, if spec.separator.is_some() { Some(&separators) } else { None }))
+}
+
+/// Applies `DISTINCT` and the in-argument `ORDER BY` to one aggregate's input.
+///
+/// `DISTINCT` sorts the values first so equal ones sit together, drops the
+/// duplicates, then the explicit `ORDER BY` (when present) re-sorts the
+/// survivors. Without `DISTINCT` only the explicit order applies, and it is
+/// stable so equal keys keep the row order SQLite would keep.
+fn shape_aggregate_inputs(
+    mut entries: Vec<(Cell, Cell, Vec<Cell>)>,
+    distinct: bool,
+    order: &[(ResolvedExpr, SortDirection)],
+) -> (Vec<Cell>, Vec<Cell>) {
+    let directions: Vec<SortDirection> = order.iter().map(|(_, direction)| *direction).collect();
+    if distinct {
+        entries.sort_by(|left, right| compare_cells(&left.0, &right.0));
+        entries.dedup_by(|left, right| compare_cells(&left.0, &right.0) == Ordering::Equal);
+        if !order.is_empty() {
+            entries.sort_by(|left, right| compare_ordered(&left.2, &right.2, &directions));
         }
-        None => None,
-    };
-    Ok(aggregate_cells(spec.function, &values, separators.as_deref()))
+    }
+    else if !order.is_empty() {
+        entries.sort_by(|left, right| compare_ordered(&left.2, &right.2, &directions));
+    }
+    let mut values = Vec::with_capacity(entries.len());
+    let mut separators = Vec::with_capacity(entries.len());
+    for (value, separator, _) in entries {
+        values.push(value);
+        separators.push(separator);
+    }
+    (values, separators)
 }
 
 /// Aggregates already evaluated argument values.

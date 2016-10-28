@@ -555,14 +555,28 @@ pub struct OrderKey {
     pub nulls_first: Option<bool>,
 }
 
-/// Window frame unit. `GROUPS` is deliberately absent: it is rejected at
-/// parse time with `unsupported-clause` instead of being approximated.
+/// Window frame unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameUnits {
     /// `ROWS`: frame edges count physical rows.
     Rows,
     /// `RANGE`: frame edges follow the single numeric `ORDER BY` value.
     Range,
+    /// `GROUPS`: frame edges count peer groups of the `ORDER BY` keys.
+    Groups,
+}
+
+/// `EXCLUDE` clause of an explicit frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameExclude {
+    /// `EXCLUDE NO OTHERS`, the default: the frame keeps every row.
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW`: drop the row being computed.
+    CurrentRow,
+    /// `EXCLUDE GROUP`: drop the current row and all of its peers.
+    Group,
+    /// `EXCLUDE TIES`: drop the peers but keep the current row.
+    Ties,
 }
 
 /// One edge of an explicit window frame.
@@ -589,7 +603,7 @@ pub struct FrameBound {
     pub offset: Option<Box<Expr>>,
 }
 
-/// `ROWS` / `RANGE` frame between two edges.
+/// `ROWS` / `RANGE` / `GROUPS` frame between two edges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     /// Unit of the offsets.
@@ -600,6 +614,8 @@ pub struct Frame {
     pub start: FrameBound,
     /// Ending edge.
     pub end: FrameBound,
+    /// `EXCLUDE` clause; `NoOthers` when it was not written.
+    pub exclude: FrameExclude,
 }
 
 /// One window definition written after `OVER`, or in a `WINDOW` clause.
@@ -676,6 +692,12 @@ pub enum WindowFunction {
         argument: Option<Box<Expr>>,
         /// `group_concat` separator.
         separator: Option<Box<Expr>>,
+        /// `DISTINCT` was written before the argument.
+        distinct: bool,
+        /// `FILTER (WHERE ...)` applied before the aggregate sees a row.
+        filter: Option<Box<Expr>>,
+        /// `ORDER BY` inside the argument list, used by `group_concat`.
+        order: Vec<OrderKey>,
     },
 }
 
@@ -873,6 +895,12 @@ pub enum Expr {
         argument: Option<Box<Expr>>,
         /// Second argument of `group_concat(x, sep)`, evaluated per row.
         separator: Option<Box<Expr>>,
+        /// `DISTINCT` was written before the argument.
+        distinct: bool,
+        /// `FILTER (WHERE ...)` applied before the aggregate sees a row.
+        filter: Option<Box<Expr>>,
+        /// `ORDER BY` inside the argument list, used by `group_concat`.
+        order: Vec<OrderKey>,
     },
     /// `expr AS name` in a projection. The alias only changes the output
     /// label; it never changes the value.
@@ -1054,10 +1082,10 @@ impl Expr {
             Self::InSubquery { value, negated, .. } => {
                 format!("{}{} IN subquery", value.label(), if *negated { " NOT" } else { "" })
             }
-            Self::Aggregate { function, argument, separator } => {
+            Self::Aggregate { function, argument, separator, distinct, .. } => {
                 let mut label = match argument {
                     None => format!("{}(*)", function.name()),
-                    Some(argument) => format!("{}({}", function.name(), argument.label()),
+                    Some(argument) => format!("{}({}{}", function.name(), if *distinct { "DISTINCT " } else { "" }, argument.label()),
                 };
                 if let Some(separator) = separator {
                     label.push_str(&format!(", {}", separator.label()));
@@ -1114,9 +1142,12 @@ fn window_function_label(function: &WindowFunction) -> String {
             text.push(',');
             text.push_str(&position.label());
         }
-        WindowFunction::Aggregate { function, argument, separator } => {
+        WindowFunction::Aggregate { function, argument, separator, distinct, .. } => {
             text.push_str(function.name());
             text.push('(');
+            if *distinct {
+                text.push_str("DISTINCT ");
+            }
             match argument {
                 None => text.push('*'),
                 Some(argument) => text.push_str(&argument.label()),
@@ -1159,13 +1190,21 @@ fn frame_label(frame: &Frame) -> String {
     let units = match frame.units {
         FrameUnits::Rows => "ROWS",
         FrameUnits::Range => "RANGE",
+        FrameUnits::Groups => "GROUPS",
     };
-    if frame.between {
+    let mut text = if frame.between {
         format!("{} BETWEEN {} AND {}", units, frame_bound_label(&frame.start), frame_bound_label(&frame.end))
     }
     else {
         format!("{} {}", units, frame_bound_label(&frame.start))
+    };
+    match frame.exclude {
+        FrameExclude::NoOthers => {}
+        FrameExclude::CurrentRow => text.push_str(" EXCLUDE CURRENT ROW"),
+        FrameExclude::Group => text.push_str(" EXCLUDE GROUP"),
+        FrameExclude::Ties => text.push_str(" EXCLUDE TIES"),
     }
+    text
 }
 
 fn frame_bound_label(bound: &FrameBound) -> String {
@@ -2859,12 +2898,15 @@ impl<'a> Parser<'a> {
     fn function_expr(&mut self) -> Result<Expr, SqlError> {
         let name = self.name()?;
         self.expect_char(&Token::LParen)?;
+        let aggregate = AggregateFunction::from_name(&name);
         // `count(*)` has no expression argument, so it is recognized before the
         // general argument list is read.
-        let count_star = AggregateFunction::from_name(&name) == Some(AggregateFunction::Count)
+        let count_star = aggregate == Some(AggregateFunction::Count)
             && matches!(self.peek(), Some(Token::Star))
             && matches!(self.tokens.get(self.at + 1), Some(Token::RParen));
+        let mut distinct = false;
         let mut args = Vec::new();
+        let mut order = Vec::new();
         if count_star {
             self.at += 2;
         }
@@ -2872,8 +2914,19 @@ impl<'a> Parser<'a> {
             self.at += 1;
         }
         else {
+            if self.eat_word("distinct") {
+                distinct = true;
+            }
             loop {
                 args.push(self.or_expr()?);
+                // `ORDER BY` ends the argument list; only `group_concat` uses it.
+                if self.peek_keyword("order") {
+                    self.at += 1;
+                    self.expect_word("by")?;
+                    order = self.order_list()?;
+                    self.expect_char(&Token::RParen)?;
+                    break;
+                }
                 match self.peek() {
                     Some(Token::Comma) => self.at += 1,
                     Some(Token::RParen) => {
@@ -2887,22 +2940,54 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        let filter = if self.eat_word("filter") {
+            self.expect_char(&Token::LParen)?;
+            self.expect_word("where")?;
+            let filter = Box::new(self.or_expr()?);
+            self.expect_char(&Token::RParen)?;
+            Some(filter)
+        }
+        else {
+            None
+        };
         if self.peek_keyword("over") {
-            return self.window_expr(&name, args, count_star);
+            if aggregate.is_none() && (distinct || !order.is_empty() || filter.is_some()) {
+                return Err(self.error(
+                    "syntax",
+                    format!("`DISTINCT`, `ORDER BY` and `FILTER` require an aggregate function, not `{name}`"),
+                ));
+            }
+            return self.window_expr(&name, args, count_star, distinct, order, filter);
         }
         if count_star {
-            return Ok(Expr::Aggregate { function: AggregateFunction::CountStar, argument: None, separator: None });
+            return Ok(Expr::Aggregate {
+                function: AggregateFunction::CountStar,
+                argument: None,
+                separator: None,
+                distinct,
+                filter,
+                order,
+            });
         }
-        if let Some(function) = AggregateFunction::from_name(&name) {
+        if let Some(function) = aggregate {
             // Only `group_concat` takes the optional separator argument.
             let wanted = if function == AggregateFunction::GroupConcat { 1..=2 } else { 1..=1 };
             if !wanted.contains(&args.len()) {
                 return Err(self.error("wrong-arguments", format!("wrong number of arguments to function {}()", function.name())));
             }
+            if distinct && args.len() != 1 {
+                return Err(self.error("syntax", "DISTINCT aggregates must have exactly one argument"));
+            }
             let mut args = args.into_iter();
             let argument = args.next().expect("argument count checked");
             let separator = args.next().map(Box::new);
-            return Ok(Expr::Aggregate { function, argument: Some(Box::new(argument)), separator });
+            return Ok(Expr::Aggregate { function, argument: Some(Box::new(argument)), separator, distinct, filter, order });
+        }
+        if distinct || !order.is_empty() || filter.is_some() {
+            return Err(self.error(
+                "syntax",
+                format!("`{name}()` is not an aggregate and cannot carry `DISTINCT`, `ORDER BY` or `FILTER`"),
+            ));
         }
         match ScalarFunction::from_name(&name) {
             Some(function) if function.accepts(args.len()) => Ok(Expr::Function { name: function, args }),
@@ -2920,7 +3005,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Reads `OVER <spec>` after a window function call has been parsed.
-    fn window_expr(&mut self, name: &str, args: Vec<Expr>, count_star: bool) -> Result<Expr, SqlError> {
+    fn window_expr(
+        &mut self,
+        name: &str,
+        args: Vec<Expr>,
+        count_star: bool,
+        distinct: bool,
+        order: Vec<OrderKey>,
+        filter: Option<Box<Expr>>,
+    ) -> Result<Expr, SqlError> {
         self.expect_word("over")?;
         let spec = if self.peek() == Some(&Token::LParen) {
             self.at += 1;
@@ -2932,13 +3025,36 @@ impl<'a> Parser<'a> {
             let base = if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Quoted(_))) { Some(self.name()?) } else { None };
             WindowSpec { base, partition: Vec::new(), order: Vec::new(), frame: None }
         };
-        let function = self.window_function(name, args, count_star)?;
+        let function = self.window_function(name, args, count_star, distinct, order, filter)?;
         Ok(Expr::Window { function, spec })
     }
 
     /// Turns the written call into a supported window function, checking arity.
-    fn window_function(&mut self, name: &str, args: Vec<Expr>, count_star: bool) -> Result<WindowFunction, SqlError> {
+    fn window_function(
+        &mut self,
+        name: &str,
+        args: Vec<Expr>,
+        count_star: bool,
+        distinct: bool,
+        order: Vec<OrderKey>,
+        filter: Option<Box<Expr>>,
+    ) -> Result<WindowFunction, SqlError> {
         let lower = name.to_ascii_lowercase();
+        let carries_aggregate_modifiers = distinct || !order.is_empty() || filter.is_some();
+        // SQLite keeps `FILTER` for window aggregates but refuses `DISTINCT` and
+        // an in-argument `ORDER BY` once `OVER` is present.
+        if distinct {
+            return Err(self.error("syntax", "DISTINCT is not supported for window functions"));
+        }
+        if !order.is_empty() {
+            return Err(self.error("syntax", format!("ORDER BY may not be used with non-aggregate {name}()")));
+        }
+        if carries_aggregate_modifiers && AggregateFunction::from_name(name).is_none() {
+            return Err(self.error(
+                "syntax",
+                format!("`DISTINCT`, `ORDER BY` and `FILTER` require an aggregate function, not `{name}`"),
+            ));
+        }
         let simple = match lower.as_str() {
             "row_number" => Some(WindowFunction::RowNumber),
             "rank" => Some(WindowFunction::Rank),
@@ -2986,16 +3102,26 @@ impl<'a> Parser<'a> {
         }
         if let Some(function) = AggregateFunction::from_name(name) {
             if count_star {
-                return Ok(WindowFunction::Aggregate { function: AggregateFunction::CountStar, argument: None, separator: None });
+                return Ok(WindowFunction::Aggregate {
+                    function: AggregateFunction::CountStar,
+                    argument: None,
+                    separator: None,
+                    distinct,
+                    filter,
+                    order,
+                });
             }
             let wanted = if function == AggregateFunction::GroupConcat { 1..=2 } else { 1..=1 };
             if !wanted.contains(&arguments) {
                 return Err(self.error("wrong-arguments", format!("wrong number of arguments to function {}()", function.name())));
             }
+            if distinct && arguments != 1 {
+                return Err(self.error("syntax", "DISTINCT aggregates must have exactly one argument"));
+            }
             let mut args = args.into_iter();
             let argument = Some(Box::new(args.next().expect("arity checked")));
             let separator = args.next().map(Box::new);
-            return Ok(WindowFunction::Aggregate { function, argument, separator });
+            return Ok(WindowFunction::Aggregate { function, argument, separator, distinct, filter, order });
         }
         if matches!(lower.as_str(), "ntile" | "lag" | "lead" | "first_value" | "last_value" | "nth_value") {
             return Err(self.error("wrong-arguments", format!("wrong number of arguments to function {lower}()")));
@@ -3006,8 +3132,9 @@ impl<'a> Parser<'a> {
     /// Reads a window definition after its opening parenthesis has been consumed.
     ///
     /// The definition may start with a base window name, then a `PARTITION BY`
-    /// list, an `ORDER BY` list and an explicit `ROWS` / `RANGE` frame. `GROUPS`
-    /// and `EXCLUDE` are recognized only to be rejected by name.
+    /// list, an `ORDER BY` list and an explicit `ROWS` / `RANGE` / `GROUPS`
+    /// frame with its optional `EXCLUDE` clause. `EXCLUDE` is only accepted
+    /// after a frame unit, which is what SQLite's grammar requires.
     fn window_spec(&mut self) -> Result<WindowSpec, SqlError> {
         let mut base = None;
         if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Quoted(_)))
@@ -3044,39 +3171,53 @@ impl<'a> Parser<'a> {
         }
         let frame =
             if self.peek_keyword("rows") || self.peek_keyword("range") || self.peek_keyword("groups") { Some(self.frame()?) } else { None };
-        if self.peek_keyword("exclude") {
-            let mut error = self
-                .error("unsupported-clause", "window frame `EXCLUDE` is not supported; frames always include every row between their edges");
-            error.clause = Some("EXCLUDE".to_string());
-            return Err(error);
-        }
         Ok(WindowSpec { base, partition, order, frame })
     }
 
-    /// Reads `ROWS|RANGE|GROUPS <edge> [BETWEEN <edge> AND <edge>]`.
+    /// Reads `ROWS|RANGE|GROUPS <edge> [BETWEEN <edge> AND <edge>] [EXCLUDE ...]`.
     fn frame(&mut self) -> Result<Frame, SqlError> {
-        if self.eat_word("groups") {
-            let mut error = self.error("unsupported-clause", "window frame unit `GROUPS` is not supported");
-            error.clause = Some("GROUPS".to_string());
-            return Err(error);
-        }
         let units = if self.eat_word("rows") {
             FrameUnits::Rows
         }
-        else {
-            self.expect_word("range")?;
+        else if self.eat_word("range") {
             FrameUnits::Range
+        }
+        else {
+            self.expect_word("groups")?;
+            FrameUnits::Groups
         };
-        if self.eat_word("between") {
+        let (between, start, end) = if self.eat_word("between") {
             let start = self.frame_bound()?;
             self.expect_word("and")?;
             let end = self.frame_bound()?;
-            Ok(Frame { units, between: true, start, end })
+            (true, start, end)
         }
         else {
-            let start = self.frame_bound()?;
-            Ok(Frame { units, between: false, start, end: FrameBound { edge: FrameEdge::CurrentRow, offset: None } })
+            (false, self.frame_bound()?, FrameBound { edge: FrameEdge::CurrentRow, offset: None })
+        };
+        let exclude = if self.eat_word("exclude") {
+            if self.eat_word("no") {
+                self.expect_word("others")?;
+                FrameExclude::NoOthers
+            }
+            else if self.eat_word("current") {
+                self.expect_word("row")?;
+                FrameExclude::CurrentRow
+            }
+            else if self.eat_word("group") {
+                FrameExclude::Group
+            }
+            else if self.eat_word("ties") {
+                FrameExclude::Ties
+            }
+            else {
+                return Err(self.error("syntax", "expected `NO OTHERS`, `CURRENT ROW`, `GROUP` or `TIES` after `EXCLUDE`"));
+            }
         }
+        else {
+            FrameExclude::NoOthers
+        };
+        Ok(Frame { units, between, start, end, exclude })
     }
 
     /// Reads one frame edge: `UNBOUNDED PRECEDING/FOLLOWING`, `CURRENT ROW`
@@ -3125,6 +3266,16 @@ impl<'a> Parser<'a> {
             _ => false,
         };
         is_not && next
+    }
+
+    /// Reads one or more comma-separated `ORDER BY` keys.
+    fn order_list(&mut self) -> Result<Vec<OrderKey>, SqlError> {
+        let mut keys = vec![self.order_key()?];
+        while self.peek() == Some(&Token::Comma) {
+            self.at += 1;
+            keys.push(self.order_key()?);
+        }
+        Ok(keys)
     }
 
     fn order_key(&mut self) -> Result<OrderKey, SqlError> {
@@ -5103,7 +5254,11 @@ fn expr_references(expr: &Expr, name: &str) -> bool {
         Expr::Function { args, .. } => args.iter().any(|arg| expr_references(arg, name)),
         Expr::Subquery(statement) | Expr::Exists(statement) => statement_references(statement, name),
         Expr::InSubquery { value, query, .. } => expr_references(value, name) || statement_references(query, name),
-        Expr::Aggregate { argument, .. } => argument.as_ref().is_some_and(|expr| expr_references(expr, name)),
+        Expr::Aggregate { argument, filter, order, .. } => {
+            argument.as_ref().is_some_and(|expr| expr_references(expr, name))
+                || filter.as_ref().is_some_and(|expr| expr_references(expr, name))
+                || order.iter().any(|key| expr_references(&key.expr, name))
+        }
         Expr::Alias { value, .. } => expr_references(value, name),
         Expr::Cast { value, .. } => expr_references(value, name),
         Expr::Like { value, pattern, escape, .. } => {
@@ -5132,13 +5287,19 @@ fn window_references(function: &WindowFunction, spec: &WindowSpec, name: &str) -
             arguments
         }
         WindowFunction::NthValue { value, position } => vec![value.as_ref(), position.as_ref()],
-        WindowFunction::Aggregate { argument, separator, .. } => {
+        WindowFunction::Aggregate { argument, separator, filter, order, .. } => {
             let mut arguments = Vec::new();
             if let Some(argument) = argument {
                 arguments.push(argument.as_ref());
             }
             if let Some(separator) = separator {
                 arguments.push(separator.as_ref());
+            }
+            if let Some(filter) = filter {
+                arguments.push(filter.as_ref());
+            }
+            for key in order {
+                arguments.push(&key.expr);
             }
             arguments
         }
