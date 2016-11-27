@@ -9908,7 +9908,64 @@ fn eval_function(name: ScalarFunction, args: &[Cell]) -> Cell {
         ScalarFunction::Random => Cell::Integer(next_random()),
         ScalarFunction::RandomBlob => Cell::Blob(random_blob(&args[0])),
         ScalarFunction::Instr => instr_cell(args),
+        ScalarFunction::Trim => trim_cell(args, true, true),
+        ScalarFunction::Ltrim => trim_cell(args, true, false),
+        ScalarFunction::Rtrim => trim_cell(args, false, true),
+        ScalarFunction::Replace => replace_cell(args),
+        ScalarFunction::IfNull => match &args[0] {
+            Cell::Null => args[1].clone(),
+            value => value.clone(),
+        },
+        // `nullif(x, y)` 与 `x = y` 共用比较语义，比较结果未知时返回 `x`。
+        ScalarFunction::NullIf => match compare_values(&args[0], &args[1], CompareOp::Eq) {
+            Some(true) => Cell::Null,
+            _ => args[0].clone(),
+        },
     }
+}
+
+/// `trim` 家族：按字符集去除两端字符，第二个参数缺省时只去除空格。
+fn trim_cell(args: &[Cell], left: bool, right: bool) -> Cell {
+    let Some(text) = text_form(&args[0]) else {
+        return Cell::Null;
+    };
+    let set = match args.get(1) {
+        Some(cell) => match text_form(cell) {
+            Some(set) => set,
+            None => return Cell::Null,
+        },
+        None => " ".to_string(),
+    };
+    if set.is_empty() {
+        return Cell::Text(text);
+    }
+    let characters: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    let mut end = characters.len();
+    if left {
+        while start < end && set.chars().any(|candidate| candidate == characters[start]) {
+            start += 1;
+        }
+    }
+    if right {
+        while end > start && set.chars().any(|candidate| candidate == characters[end - 1]) {
+            end -= 1;
+        }
+    }
+    Cell::Text(characters[start..end].iter().collect())
+}
+
+/// `replace(x, y, z)`：空 `y` 原样返回 `x`，任一参数为 `NULL` 时返回 `NULL`。
+fn replace_cell(args: &[Cell]) -> Cell {
+    let (Some(text), Some(pattern), Some(replacement)) =
+        (text_form(&args[0]), text_form(&args[1]), text_form(&args[2]))
+    else {
+        return Cell::Null;
+    };
+    if pattern.is_empty() {
+        return Cell::Text(text);
+    }
+    Cell::Text(text.replace(&pattern, &replacement))
 }
 
 /// `instr(x, y)`: the one-based character position of the first `y` inside
