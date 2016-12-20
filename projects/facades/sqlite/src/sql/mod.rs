@@ -11,6 +11,7 @@
 //! Every statement runs over the pure-Rust format-3 writer, so the resulting
 //! image is a real `.sqlite3` file, not a simulation layer.
 
+pub(crate) mod datetime;
 pub mod engine;
 pub mod error;
 pub mod sql;

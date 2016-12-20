@@ -425,6 +425,76 @@ pub enum ScalarFunction {
     Min,
     /// 多参数 `max(a, b, ...)`，任一参数为 `NULL` 时返回 `NULL`。
     Max,
+    /// `ceil(x)` / `ceiling(x)`，整数入参原样返回，实数入参向上取整。
+    Ceil,
+    /// `floor(x)`，整数入参原样返回，实数入参向下取整。
+    Floor,
+    /// `trunc(x)`，整数入参原样返回，实数入参向零截断。
+    Trunc,
+    /// `sqrt(x)`，负数与不可解析入参返回 `NULL`。
+    Sqrt,
+    /// `pow(x, y)` / `power(x, y)`，非有限结果返回 `NULL`。
+    Pow,
+    /// `mod(x, y)`，按浮点余数求值，除数零返回 `NULL`。
+    Mod,
+    /// `exp(x)`，溢出非有限结果返回 `NULL`。
+    Exp,
+    /// `ln(x)`，非正数返回 `NULL`。
+    Ln,
+    /// `log(x)` 为十进制对数，`log(b, x)` 为以 `b` 为底。
+    Log,
+    /// `log2(x)`。
+    Log2,
+    /// `log10(x)`。
+    Log10,
+    /// `sin(x)`。
+    Sin,
+    /// `cos(x)`。
+    Cos,
+    /// `tan(x)`。
+    Tan,
+    /// `asin(x)`。
+    Asin,
+    /// `acos(x)`。
+    Acos,
+    /// `atan(x)`。
+    Atan,
+    /// `atan2(y, x)`，保留带符号零的象限。
+    Atan2,
+    /// `sinh(x)`。
+    Sinh,
+    /// `cosh(x)`。
+    Cosh,
+    /// `tanh(x)`。
+    Tanh,
+    /// `asinh(x)`。
+    Asinh,
+    /// `acosh(x)`。
+    Acosh,
+    /// `atanh(x)`。
+    Atanh,
+    /// `degrees(x)`，弧度转角度。
+    Degrees,
+    /// `radians(x)`，角度转弧度。
+    Radians,
+    /// `pi()`，圆周率常量。
+    Pi,
+    /// `sign(x)`，返回整数 `-1` / `0` / `1`。
+    Sign,
+    /// `date(...)`，返回 `YYYY-MM-DD`。
+    Date,
+    /// `time(...)`，返回 `HH:MM:SS`。
+    Time,
+    /// `datetime(...)`，返回 `YYYY-MM-DD HH:MM:SS`。
+    Datetime,
+    /// `julianday(...)`，返回儒略日实数。
+    JulianDay,
+    /// `unixepoch(...)`，返回自 `1970-01-01` 起的秒数。
+    UnixEpoch,
+    /// `strftime(format, ...)`，按 SQLite 的格式化规则渲染。
+    Strftime,
+    /// `timediff(a, b)`，按年月日时分秒分量输出两个时刻之差。
+    Timediff,
 }
 
 impl ScalarFunction {
@@ -456,6 +526,43 @@ impl ScalarFunction {
             "soundex" => Some(Self::Soundex),
             "min" => Some(Self::Min),
             "max" => Some(Self::Max),
+            // 数学函数：`ceiling` 与 `power` 是 SQLite 接受的别名。
+            "ceil" | "ceiling" => Some(Self::Ceil),
+            "floor" => Some(Self::Floor),
+            "trunc" => Some(Self::Trunc),
+            "sqrt" => Some(Self::Sqrt),
+            "pow" | "power" => Some(Self::Pow),
+            "mod" => Some(Self::Mod),
+            "exp" => Some(Self::Exp),
+            "ln" => Some(Self::Ln),
+            "log" => Some(Self::Log),
+            "log2" => Some(Self::Log2),
+            "log10" => Some(Self::Log10),
+            "sin" => Some(Self::Sin),
+            "cos" => Some(Self::Cos),
+            "tan" => Some(Self::Tan),
+            "asin" => Some(Self::Asin),
+            "acos" => Some(Self::Acos),
+            "atan" => Some(Self::Atan),
+            "atan2" => Some(Self::Atan2),
+            "sinh" => Some(Self::Sinh),
+            "cosh" => Some(Self::Cosh),
+            "tanh" => Some(Self::Tanh),
+            "asinh" => Some(Self::Asinh),
+            "acosh" => Some(Self::Acosh),
+            "atanh" => Some(Self::Atanh),
+            "degrees" => Some(Self::Degrees),
+            "radians" => Some(Self::Radians),
+            "pi" => Some(Self::Pi),
+            "sign" => Some(Self::Sign),
+            // 日期时间函数：入参数量由各函数自己决定，修饰符数量不限。
+            "date" => Some(Self::Date),
+            "time" => Some(Self::Time),
+            "datetime" => Some(Self::Datetime),
+            "julianday" => Some(Self::JulianDay),
+            "unixepoch" => Some(Self::UnixEpoch),
+            "strftime" => Some(Self::Strftime),
+            "timediff" => Some(Self::Timediff),
             _ => None,
         }
     }
@@ -488,6 +595,41 @@ impl ScalarFunction {
             Self::Soundex => "soundex",
             Self::Min => "min",
             Self::Max => "max",
+            Self::Ceil => "ceil",
+            Self::Floor => "floor",
+            Self::Trunc => "trunc",
+            Self::Sqrt => "sqrt",
+            Self::Pow => "pow",
+            Self::Mod => "mod",
+            Self::Exp => "exp",
+            Self::Ln => "ln",
+            Self::Log => "log",
+            Self::Log2 => "log2",
+            Self::Log10 => "log10",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Tan => "tan",
+            Self::Asin => "asin",
+            Self::Acos => "acos",
+            Self::Atan => "atan",
+            Self::Atan2 => "atan2",
+            Self::Sinh => "sinh",
+            Self::Cosh => "cosh",
+            Self::Tanh => "tanh",
+            Self::Asinh => "asinh",
+            Self::Acosh => "acosh",
+            Self::Atanh => "atanh",
+            Self::Degrees => "degrees",
+            Self::Radians => "radians",
+            Self::Pi => "pi",
+            Self::Sign => "sign",
+            Self::Date => "date",
+            Self::Time => "time",
+            Self::Datetime => "datetime",
+            Self::JulianDay => "julianday",
+            Self::UnixEpoch => "unixepoch",
+            Self::Strftime => "strftime",
+            Self::Timediff => "timediff",
         }
     }
 
@@ -507,6 +649,37 @@ impl ScalarFunction {
             Self::Char => true,
             Self::Unicode | Self::Soundex => count == 1,
             Self::Min | Self::Max => count >= 2,
+            Self::Ceil
+            | Self::Floor
+            | Self::Trunc
+            | Self::Sqrt
+            | Self::Exp
+            | Self::Ln
+            | Self::Log2
+            | Self::Log10
+            | Self::Sin
+            | Self::Cos
+            | Self::Tan
+            | Self::Asin
+            | Self::Acos
+            | Self::Atan
+            | Self::Sinh
+            | Self::Cosh
+            | Self::Tanh
+            | Self::Asinh
+            | Self::Acosh
+            | Self::Atanh
+            | Self::Degrees
+            | Self::Radians
+            | Self::Sign => count == 1,
+            Self::Pow | Self::Atan2 | Self::Mod => count == 2,
+            Self::Log => (1..=2).contains(&count),
+            Self::Pi => count == 0,
+            // 日期时间函数接受零个或多个修饰符；`strftime` 至少要一个格式串，
+            // `timediff` 只接受两个时刻。
+            Self::Date | Self::Time | Self::Datetime | Self::JulianDay | Self::UnixEpoch => true,
+            Self::Strftime => count >= 1,
+            Self::Timediff => count == 2,
         }
     }
 }
