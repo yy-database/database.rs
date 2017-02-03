@@ -14,6 +14,7 @@
 pub(crate) mod datetime;
 pub mod engine;
 pub mod error;
+pub(crate) mod json;
 pub mod sql;
 
 pub use engine::{Cell, Engine, ExecResult, results_json};

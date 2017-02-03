@@ -341,6 +341,10 @@ pub enum BinaryOp {
     Modulo,
     /// `||`: string concatenation, which binds tighter than `*` in SQLite.
     Concat,
+    /// `->`: 选取 JSON 值并以 JSON 文本返回。
+    Arrow,
+    /// `->>`: 选取 JSON 值并转成 SQL 值。
+    ArrowText,
     /// `<<`.
     ShiftLeft,
     /// `>>`.
@@ -361,6 +365,8 @@ impl BinaryOp {
             Self::Divide => "/",
             Self::Modulo => "%",
             Self::Concat => "||",
+            Self::Arrow => "->",
+            Self::ArrowText => "->>",
             Self::ShiftLeft => "<<",
             Self::ShiftRight => ">>",
             Self::BitAnd => "&",
@@ -495,6 +501,30 @@ pub enum ScalarFunction {
     Strftime,
     /// `timediff(a, b)`，按年月日时分秒分量输出两个时刻之差。
     Timediff,
+    /// `json_valid(x[, flags])`，严格 JSON 判定或形态位掩码判定。
+    JsonValid,
+    /// `json_type(x[, path])`。
+    JsonType,
+    /// `json_array(...)`。
+    JsonArray,
+    /// `json_object(key, value, ...)`。
+    JsonObject,
+    /// `json_quote(x)`。
+    JsonQuote,
+    /// `json_extract(x, path, ...)`。
+    JsonExtract,
+    /// `json_array_length(x[, path])`。
+    JsonArrayLength,
+    /// `json_remove(x, path, ...)`。
+    JsonRemove,
+    /// `json_set(x, path, value, ...)`。
+    JsonSet,
+    /// `json_insert(x, path, value, ...)`。
+    JsonInsert,
+    /// `json_replace(x, path, value, ...)`。
+    JsonReplace,
+    /// `json_patch(target, patch)`。
+    JsonPatch,
 }
 
 impl ScalarFunction {
@@ -563,6 +593,19 @@ impl ScalarFunction {
             "unixepoch" => Some(Self::UnixEpoch),
             "strftime" => Some(Self::Strftime),
             "timediff" => Some(Self::Timediff),
+            // JSON 标量函数：精确匹配 SQLite 的严格 JSON 解析与路径语法。
+            "json_valid" => Some(Self::JsonValid),
+            "json_type" => Some(Self::JsonType),
+            "json_array" => Some(Self::JsonArray),
+            "json_object" => Some(Self::JsonObject),
+            "json_quote" => Some(Self::JsonQuote),
+            "json_extract" => Some(Self::JsonExtract),
+            "json_array_length" => Some(Self::JsonArrayLength),
+            "json_remove" => Some(Self::JsonRemove),
+            "json_set" => Some(Self::JsonSet),
+            "json_insert" => Some(Self::JsonInsert),
+            "json_replace" => Some(Self::JsonReplace),
+            "json_patch" => Some(Self::JsonPatch),
             _ => None,
         }
     }
@@ -630,6 +673,18 @@ impl ScalarFunction {
             Self::UnixEpoch => "unixepoch",
             Self::Strftime => "strftime",
             Self::Timediff => "timediff",
+            Self::JsonValid => "json_valid",
+            Self::JsonType => "json_type",
+            Self::JsonArray => "json_array",
+            Self::JsonObject => "json_object",
+            Self::JsonQuote => "json_quote",
+            Self::JsonExtract => "json_extract",
+            Self::JsonArrayLength => "json_array_length",
+            Self::JsonRemove => "json_remove",
+            Self::JsonSet => "json_set",
+            Self::JsonInsert => "json_insert",
+            Self::JsonReplace => "json_replace",
+            Self::JsonPatch => "json_patch",
         }
     }
 
@@ -680,7 +735,36 @@ impl ScalarFunction {
             Self::Date | Self::Time | Self::Datetime | Self::JulianDay | Self::UnixEpoch => true,
             Self::Strftime => count >= 1,
             Self::Timediff => count == 2,
+            // JSON：`json_valid` 接受单参数严格判定与双参数形态位掩码形式，其余按
+            // SQLite 的参数形状。
+            Self::JsonValid => (1..=2).contains(&count),
+            Self::JsonQuote => count == 1,
+            Self::JsonType | Self::JsonArrayLength => (1..=2).contains(&count),
+            Self::JsonArray | Self::JsonObject => true,
+            Self::JsonExtract => count >= 1,
+            Self::JsonRemove => count >= 2,
+            Self::JsonSet | Self::JsonInsert | Self::JsonReplace => count >= 3 && (count - 1) % 2 == 0,
+            Self::JsonPatch => count == 2,
         }
+    }
+
+    /// Whether this scalar belongs to the JSON module.
+    pub fn is_json(self) -> bool {
+        matches!(
+            self,
+            Self::JsonValid
+                | Self::JsonType
+                | Self::JsonArray
+                | Self::JsonObject
+                | Self::JsonQuote
+                | Self::JsonExtract
+                | Self::JsonArrayLength
+                | Self::JsonRemove
+                | Self::JsonSet
+                | Self::JsonInsert
+                | Self::JsonReplace
+                | Self::JsonPatch
+        )
     }
 }
 
@@ -1992,6 +2076,17 @@ fn tokenize(source: &str) -> Result<(Vec<Token>, Vec<usize>), SqlError> {
                 tokens.push(Token::Semi);
                 at += 1;
             }
+            b'-' if bytes.get(at + 1) == Some(&b'>') => {
+                offsets.push(at);
+                if bytes.get(at + 2) == Some(&b'>') {
+                    tokens.push(Token::Operator("->>".to_string()));
+                    at += 3;
+                }
+                else {
+                    tokens.push(Token::Operator("->".to_string()));
+                    at += 2;
+                }
+            }
             b'-' => {
                 offsets.push(at);
                 tokens.push(Token::Minus);
@@ -2631,10 +2726,20 @@ fn read_number(source: &str, at: usize) -> Result<(Token, usize), SqlError> {
         Ok((Token::Real(value), index))
     }
     else {
-        let value = text
-            .parse::<i64>()
-            .map_err(|_| SqlError::syntax(format!("integer literal `{text}` is out of the signed 64-bit range"), Some(start)))?;
-        Ok((Token::Int(value), index))
+        // SQLite 把超出 64 位的十进制字面量降为 REAL，只有带上负号且恰好为
+        // 2^63 时才折叠成整数最小值，见 `unary_expr` / `literal`。
+        match text.parse::<i64>() {
+            Ok(value) => Ok((Token::Int(value), index)),
+            Err(_) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
+                let value =
+                    text.parse::<f64>().map_err(|_| SqlError::syntax(format!("real literal `{text}` is not a finite f64"), Some(start)))?;
+                if !value.is_finite() {
+                    return Err(SqlError::syntax(format!("real literal `{text}` is not a finite f64"), Some(start)));
+                }
+                Ok((Token::Real(value), index))
+            }
+            Err(_) => Err(SqlError::syntax(format!("integer literal `{text}` is out of the signed 64-bit range"), Some(start))),
+        }
     }
 }
 
@@ -2687,6 +2792,18 @@ impl<'a> Parser<'a> {
 
     fn offset(&self) -> usize {
         self.offsets.get(self.at).copied().unwrap_or(self.end)
+    }
+
+    /// 当前数字 token 的原始文本，用于识别 SQLite 对 `-9223372036854775808`
+    /// 的整数折叠特例。
+    fn numeric_token_text(&self) -> Option<&str> {
+        let start = *self.offsets.get(self.at)?;
+        let bytes = self.source.as_bytes();
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_digit() || matches!(bytes[end], b'.' | b'e' | b'E' | b'+' | b'-')) {
+            end += 1;
+        }
+        self.source.get(start..end)
     }
 
     fn error(&self, code: &'static str, message: impl Into<String>) -> SqlError {
@@ -3007,10 +3124,16 @@ impl<'a> Parser<'a> {
     /// `+` (`1 || 2 * 3` is 36) but looser than unary `-` (`-1 || 2` is -12).
     fn concat_expr(&mut self) -> Result<Expr, SqlError> {
         let mut left = self.unary_expr()?;
-        while matches!(self.peek(), Some(Token::Operator(operator)) if operator == "||") {
+        loop {
+            let op = match self.peek() {
+                Some(Token::Operator(operator)) if operator == "||" => BinaryOp::Concat,
+                Some(Token::Operator(operator)) if operator == "->" => BinaryOp::Arrow,
+                Some(Token::Operator(operator)) if operator == "->>" => BinaryOp::ArrowText,
+                _ => break,
+            };
             self.at += 1;
             let right = self.unary_expr()?;
-            left = Expr::Binary { left: Box::new(left), op: BinaryOp::Concat, right: Box::new(right) };
+            left = Expr::Binary { left: Box::new(left), op, right: Box::new(right) };
         }
         Ok(left)
     }
@@ -3018,6 +3141,12 @@ impl<'a> Parser<'a> {
     fn unary_expr(&mut self) -> Result<Expr, SqlError> {
         if matches!(self.peek(), Some(Token::Minus)) {
             self.at += 1;
+            // SQLite 把 `-9223372036854775808` 折叠成整数最小值，而不是先转成
+            // REAL 再取负。
+            if matches!(self.peek(), Some(Token::Int(_) | Token::Real(_))) && self.numeric_token_text() == Some("9223372036854775808") {
+                self.at += 1;
+                return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
+            }
             return Ok(Expr::Unary { op: UnaryOp::Negate, value: Box::new(self.unary_expr()?) });
         }
         if matches!(self.peek(), Some(Token::Operator(operator)) if operator == "+") {
@@ -3180,22 +3309,12 @@ impl<'a> Parser<'a> {
         };
         if self.peek_keyword("over") {
             if aggregate.is_none() && (distinct || !order.is_empty() || filter.is_some()) {
-                return Err(self.error(
-                    "syntax",
-                    format!("`DISTINCT`, `ORDER BY` and `FILTER` require an aggregate function, not `{name}`"),
-                ));
+                return Err(self.error("syntax", format!("`DISTINCT`, `ORDER BY` and `FILTER` require an aggregate function, not `{name}`")));
             }
             return self.window_expr(&name, args, count_star, distinct, order, filter);
         }
         if count_star {
-            return Ok(Expr::Aggregate {
-                function: AggregateFunction::CountStar,
-                argument: None,
-                separator: None,
-                distinct,
-                filter,
-                order,
-            });
+            return Ok(Expr::Aggregate { function: AggregateFunction::CountStar, argument: None, separator: None, distinct, filter, order });
         }
         // 多参数 `min` / `max` 是标量函数，单参数形式仍走聚合分支。
         let scalar_min_max = args.len() > 1 && matches!(aggregate, Some(AggregateFunction::Min | AggregateFunction::Max));
@@ -3214,10 +3333,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Aggregate { function, argument: Some(Box::new(argument)), separator, distinct, filter, order });
         }
         if distinct || !order.is_empty() || filter.is_some() {
-            return Err(self.error(
-                "syntax",
-                format!("`{name}()` is not an aggregate and cannot carry `DISTINCT`, `ORDER BY` or `FILTER`"),
-            ));
+            return Err(self.error("syntax", format!("`{name}()` is not an aggregate and cannot carry `DISTINCT`, `ORDER BY` or `FILTER`")));
         }
         match ScalarFunction::from_name(&name) {
             Some(function) if function.accepts(args.len()) => Ok(Expr::Function { name: function, args }),
@@ -3280,10 +3396,7 @@ impl<'a> Parser<'a> {
             return Err(self.error("syntax", format!("ORDER BY may not be used with non-aggregate {name}()")));
         }
         if carries_aggregate_modifiers && AggregateFunction::from_name(name).is_none() {
-            return Err(self.error(
-                "syntax",
-                format!("`DISTINCT`, `ORDER BY` and `FILTER` require an aggregate function, not `{name}`"),
-            ));
+            return Err(self.error("syntax", format!("`DISTINCT`, `ORDER BY` and `FILTER` require an aggregate function, not `{name}`")));
         }
         let simple = match lower.as_str() {
             "row_number" => Some(WindowFunction::RowNumber),
@@ -4164,10 +4277,7 @@ impl<'a> Parser<'a> {
             }
             else {
                 let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
-                let mut error = self.error(
-                    "unsupported-clause",
-                    format!("`CREATE TABLE ... AS` takes a `SELECT` query, not {found}"),
-                );
+                let mut error = self.error("unsupported-clause", format!("`CREATE TABLE ... AS` takes a `SELECT` query, not {found}"));
                 error.clause = Some("AS".to_string());
                 return Err(error);
             };
@@ -4776,6 +4886,10 @@ impl<'a> Parser<'a> {
         let negative = matches!(self.peek(), Some(Token::Minus));
         if negative {
             self.at += 1;
+            if self.numeric_token_text() == Some("9223372036854775808") {
+                self.at += 1;
+                return Ok(Literal::Integer(i64::MIN));
+            }
         }
         let token = self.take()?;
         let literal = match token {
@@ -4913,17 +5027,7 @@ impl<'a> Parser<'a> {
         }
         let conflict = self.conflict_clause()?;
         let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
-        Ok(Statement::Insert {
-            schema,
-            table,
-            columns,
-            rows,
-            default_values: false,
-            query: None,
-            replace,
-            conflict,
-            returning,
-        })
+        Ok(Statement::Insert { schema, table, columns, rows, default_values: false, query: None, replace, conflict, returning })
     }
 
     /// Parses `ON CONFLICT [(target)] [WHERE ...] DO NOTHING | DO UPDATE SET ...`.
