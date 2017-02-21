@@ -1,0 +1,28 @@
+[package]
+name = "mongo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MongoDB facade: document store, cursors, oplog and command semantics over an abstract storage backend"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["storage"]
+# `.yykv` / `.yyds` 文档存储与命令语义。只做 BSON / JSON / wire 编解码的
+# wasm 目标关闭它，避免把 `std::fs` 编进目标。
+storage = ["dep:database-types", "dep:database-storage", "dep:database-cluster"]
+
+[dependencies]
+database-protocol-mongo = { workspace = true }
+database-types = { workspace = true, optional = true }
+database-storage = { workspace = true, optional = true }
+database-cluster = { workspace = true, optional = true }
+# `preserve_order` 让命令文档保持调用方发送时的字段顺序。MongoDB 比较嵌入文档与
+# `$addToSet` 值都按字段顺序，解析期排序会把不同文档静默合并成同一个值。
+serde_json = { version = "1", features = ["preserve_order"] }
