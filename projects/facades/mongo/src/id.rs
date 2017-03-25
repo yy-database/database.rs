@@ -14,7 +14,7 @@ pub fn generate_object_id() -> [u8; 12] {
     identifier[0..4].copy_from_slice(&seconds.to_be_bytes());
     let random = hash_bytes(&entropy, u64::from(nanos));
     identifier[4..9].copy_from_slice(&random[..5]);
-    let tail = hash_bytes(&entropy, u64::from(nanos) ^ 0x9e37_79b9_7f4a_7c52);
+    let tail = hash_bytes(&entropy, u64::from(nanos) ^ 0x9e37_79b9_7f4a_7c15);
     identifier[9..12].copy_from_slice(&tail[..3]);
     identifier
 }

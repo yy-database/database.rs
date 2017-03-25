@@ -46,6 +46,7 @@ database-client = { path = "projects/database/database.client" }
 database-server = { path = "projects/database/database.server" }
 sqlite = { path = "projects/facades/sqlite" }
 mongo = { path = "projects/facades/mongo" }
+regex = "1"
 iris = { path = "projects/odm/odm" }
 odm-types = { path = "projects/odm/odm.types" }
 odm-adapter = { path = "projects/odm/odm.adapter" }

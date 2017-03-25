@@ -21,6 +21,8 @@ pub mod id;
 pub mod oplog;
 
 #[cfg(feature = "storage")]
+pub mod commands;
+#[cfg(feature = "storage")]
 pub mod import;
 #[cfg(feature = "storage")]
 pub mod storage;
