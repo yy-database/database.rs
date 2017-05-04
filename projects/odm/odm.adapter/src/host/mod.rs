@@ -8,7 +8,7 @@
 //! [`ErrorEnvelope`] (`code` + `message`); the code is never folded back into a
 //! display string, because callers assert on the code layer.
 
-use std::{collections::BTreeMap, path::Path, sync::Mutex};
+use std::{path::Path, sync::Mutex};
 
 use odm_types::{CapabilitySet, DatasourceKind, Iris, Planner, ReferenceStore, Row, expand_endpoint, load_project, resolve_path};
 use serde_json::{Value as JsonValue, json};
@@ -170,16 +170,14 @@ impl ExecuteOutcome {
         Self { ok: false, rows: Vec::new(), error: Some(error) }
     }
 
-    /// Full envelope JSON: `{"error": …, "ok": …, "rows": […]}`.
+    /// Full envelope JSON: `{"ok": …, "rows": […], "error": {…} | null}`.
     pub fn to_json(&self) -> String {
-        // A `BTreeMap` keeps the wire key order stable. `serde_json` switches its
-        // own map to insertion order when any workspace member enables
-        // `preserve_order`, which must not change this envelope.
-        let mut envelope = BTreeMap::new();
-        envelope.insert("error", self.error.as_ref().map(ErrorEnvelope::to_json).unwrap_or(JsonValue::Null));
-        envelope.insert("ok", JsonValue::Bool(self.ok));
-        envelope.insert("rows", JsonValue::Array(self.rows.clone()));
-        serde_json::to_string(&envelope).expect("envelope is plain JSON")
+        json!({
+            "ok": self.ok,
+            "rows": self.rows,
+            "error": self.error.as_ref().map(ErrorEnvelope::to_json),
+        })
+        .to_string()
     }
 
     /// Row array JSON (N-API `rowsJson`).
