@@ -2771,7 +2771,7 @@ impl Engine {
                 }
                 Ok(ExecResult { statement: "drop-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::Insert { schema: _, table, columns, rows, default_values, query, replace, conflict, returning } => {
+            Statement::Insert { schema: _, table, columns, rows, default_values, query, replace, ignore, conflict, returning } => {
                 let key = table.to_ascii_lowercase();
                 check_readonly_table(&table, "insert")?;
                 // A `SELECT` source is evaluated before any row is written, so
@@ -2850,12 +2850,22 @@ impl Engine {
                 }
                 // A `STRICT` table rejects a value whose post-affinity storage
                 // class differs from the declared type, before any row is
-                // written.
-                for slots in &slots_by_row {
-                    for (position, slot) in slots.iter().enumerate() {
-                        if let Some(value) = slot {
-                            if let Some(error) = strict_value_violation(def, position, value, "insert") {
-                                return Err(error);
+                // written. `INSERT OR IGNORE` skips the offending row instead.
+                if ignore {
+                    slots_by_row.retain(|slots| {
+                        slots.iter().enumerate().all(|(position, slot)| match slot {
+                            Some(value) => strict_value_violation(def, position, value, "insert").is_none(),
+                            None => true,
+                        })
+                    });
+                }
+                else {
+                    for slots in &slots_by_row {
+                        for (position, slot) in slots.iter().enumerate() {
+                            if let Some(value) = slot {
+                                if let Some(error) = strict_value_violation(def, position, value, "insert") {
+                                    return Err(error);
+                                }
                             }
                         }
                     }
@@ -2956,6 +2966,7 @@ impl Engine {
                                 };
                                 match inserted {
                                     Ok(rowid) => UpsertOutcome::Inserted(rowid),
+                                    Err(error) if ignore && ignoreable_insert_error(&error) => continue,
                                     Err(error) => {
                                         failure = Some(error);
                                         break;
@@ -3225,10 +3236,16 @@ impl Engine {
                 );
                 Ok(ExecResult { statement: "create-index", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            Statement::Update { schema: _, table, alias, assignments, filter, returning } => {
+            Statement::Update { schema: _, table, alias, assignments, from, filter, returning } => {
                 check_readonly_table(&table, "update")?;
                 let key = table.to_ascii_lowercase();
                 if self.views.contains_key(&key) {
+                    if !from.is_empty() {
+                        let mut error =
+                            SqlError::new("unsupported-clause", "`UPDATE ... FROM` is not supported on a view; name a base table instead");
+                        error.clause = Some("FROM".to_string());
+                        return Err(error.in_statement("update"));
+                    }
                     return self.run_view_update(&table, &key, alias.as_deref(), &assignments, filter.as_ref(), returning.as_ref());
                 }
                 let temp_position = if self.scope == TableScope::Main { None } else { self.temp_lookup.get(&key).copied() };
@@ -3246,7 +3263,53 @@ impl Engine {
                     None => self.tables[main_position.expect("main table resolved")].clone(),
                 };
                 let def = &def_storage;
-                let shape = TargetShape::new(def, alias.as_deref().unwrap_or(&table), self.trigger_frames.last());
+                let budget = Budget::new();
+                // An `UPDATE ... FROM` resolves assignments and the predicate
+                // against the target row plus every `FROM` source, so a bare
+                // column may come from either side.
+                let (shape, from_tables) = if from.is_empty() {
+                    (TargetShape::new(def, alias.as_deref().unwrap_or(&table), self.trigger_frames.last()), Vec::new())
+                }
+                else {
+                    let width = def.columns.len();
+                    let mut sources = vec![Source {
+                        label: alias.as_deref().unwrap_or(&table).to_string(),
+                        columns: SourceColumns::Table(def),
+                        offset: 0,
+                        join: None,
+                        star_hidden: vec![false; width],
+                        unqualified_hidden: vec![false; width],
+                        star_override: vec![None; width],
+                    }];
+                    let mut offset = width + usize::from(!def.without_rowid);
+                    let mut from_tables: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(from.len());
+                    for entry in &from {
+                        let (columns, rows) = self.select_source(entry, &budget, None)?;
+                        let visible = columns.width();
+                        let width = visible + usize::from(columns.hidden_rowid());
+                        sources.push(Source {
+                            label: entry.label().to_string(),
+                            columns,
+                            offset,
+                            join: None,
+                            star_hidden: vec![false; visible],
+                            unqualified_hidden: vec![false; visible],
+                            star_override: vec![None; visible],
+                        });
+                        offset += width;
+                        from_tables.push(rows);
+                    }
+                    let source_count = sources.len();
+                    let relation = Relation {
+                        sources,
+                        using: vec![Vec::new(); source_count],
+                        using_slots: Vec::new(),
+                        trigger: self.trigger_frames.last(),
+                        excluded: false,
+                    };
+                    let scope = relation.shape();
+                    (TargetShape { relation, scope }, from_tables)
+                };
                 let mut targets: Vec<(usize, ResolvedExpr)> = Vec::with_capacity(assignments.len());
                 for assignment in &assignments {
                     let index =
@@ -3264,9 +3327,50 @@ impl Engine {
                     Some(items) => Some(returning_shape.plan(def, items, "update")?),
                     None => None,
                 };
-                let budget = Budget::new();
+                // A target row joined to several `FROM` rows is updated once,
+                // using the first matching join row, like SQLite.
+                let joined = if from.is_empty() {
+                    None
+                }
+                else {
+                    let product = join_product(&from_tables);
+                    let mut joined: BTreeMap<i64, Vec<Cell>> = BTreeMap::new();
+                    if !product.is_empty() {
+                        let live = self.live_rows(def, "update")?;
+                        let ctx = EvalContext {
+                            engine: self,
+                            outer: &[],
+                            current: &shape.scope,
+                            aggregates: &[],
+                            windows: &[],
+                            window_row: 0,
+                            budget: &budget,
+                            ctes: None,
+                        };
+                        for (rowid, cells) in &live {
+                            let mut base = cells.clone();
+                            if !def.without_rowid {
+                                base.push(Cell::Integer(*rowid));
+                            }
+                            for extra in &product {
+                                let mut merged = base.clone();
+                                merged.extend(extra.iter().cloned());
+                                let keep = match &predicate {
+                                    Some(predicate) => truthiness(&predicate.eval(&merged, &ctx)?) == Some(true),
+                                    None => true,
+                                };
+                                if keep {
+                                    joined.insert(*rowid, merged);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(joined)
+                };
                 let mut needs_index = self.has_indexes(def, &key);
-                let plan = self.plan_update(def, &key, &targets, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget)?;
+                let plan =
+                    self.plan_update(def, &key, &targets, predicate.as_ref(), joined.as_ref(), returning.as_ref(), &shape.scope, &budget)?;
                 // Old row values are needed to tell which referenced keys this
                 // statement rewrites, so they are read before the transaction.
                 let old_rows = self.live_rows(def, "update")?;
@@ -4504,7 +4608,7 @@ impl Engine {
             predicate = ResolvedExpr::And(Box::new(predicate), Box::new(filter.clone()));
         }
         self.upsert_excluded = candidate[..width].to_vec();
-        let planned = self.plan_update(def, table_key, &plan.assignments, Some(&predicate), returning, shape, budget);
+        let planned = self.plan_update(def, table_key, &plan.assignments, Some(&predicate), None, returning, shape, budget);
         self.upsert_excluded.clear();
         let planned = planned?;
         if planned.writes.is_empty() {
@@ -5240,12 +5344,18 @@ impl Engine {
     /// evaluated against the pre-statement row, assignments apply left to right
     /// (last one wins), and each row is checked against the *current* table, so
     /// a rowid shift behaves exactly like SQLite's ascending-order pass.
+    ///
+    /// `joined` carries the row shape of an `UPDATE ... FROM` statement: the
+    /// target columns, its rowid, and every `FROM` source appended, for the
+    /// target rows whose join produced a match. A row outside the map is not
+    /// updated, and the predicate has already been applied to its merged row.
     fn plan_update(
         &self,
         def: &TableDef,
         table_key: &str,
         targets: &[(usize, ResolvedExpr)],
         predicate: Option<&ResolvedExpr>,
+        joined: Option<&BTreeMap<i64, Vec<Cell>>>,
         returning: Option<&ReturningPlan>,
         shape: &ScopeShape,
         budget: &Budget,
@@ -5258,13 +5368,24 @@ impl Engine {
         let mut returned = Vec::new();
         let mut affected = 0usize;
         for (rowid, cells) in &live {
-            let mut eval_cells = cells.clone();
-            eval_cells.push(Cell::Integer(*rowid));
+            let eval_cells = match joined {
+                Some(joined) => match joined.get(rowid) {
+                    Some(row) => row.clone(),
+                    None => continue,
+                },
+                None => {
+                    let mut cells = cells.clone();
+                    cells.push(Cell::Integer(*rowid));
+                    cells
+                }
+            };
             let ctx =
                 EvalContext { engine: self, outer: &[], current: shape, aggregates: &[], windows: &[], window_row: 0, budget, ctes: None };
-            if let Some(predicate) = predicate {
-                if truthiness(&predicate.eval(&eval_cells, &ctx)?) != Some(true) {
-                    continue;
+            if joined.is_none() {
+                if let Some(predicate) = predicate {
+                    if truthiness(&predicate.eval(&eval_cells, &ctx)?) != Some(true) {
+                        continue;
+                    }
                 }
             }
             let mut next = cells.clone();
@@ -9073,6 +9194,26 @@ fn coalesce_using(row: &mut [Cell], pairs: &[UsingJoin]) {
     }
 }
 
+/// Materializes the Cartesian product of the `UPDATE ... FROM` sources.
+/// Every source row already carries its hidden rowid slot, so concatenating
+/// them in `FROM` order reproduces the merged row the relation resolves
+/// against.
+fn join_product(tables: &[Vec<Vec<Cell>>]) -> Vec<Vec<Cell>> {
+    let mut product: Vec<Vec<Cell>> = vec![Vec::new()];
+    for rows in tables {
+        let mut next = Vec::with_capacity(product.len() * rows.len());
+        for prefix in &product {
+            for row in rows {
+                let mut merged = prefix.clone();
+                merged.extend(row.iter().cloned());
+                next.push(merged);
+            }
+        }
+        product = next;
+    }
+    product
+}
+
 /// Flattens `a AND b AND c` into single conjuncts, each applied as soon as its
 /// sources are bound.
 fn split_conjuncts(predicate: ResolvedExpr, out: &mut Vec<ResolvedExpr>) {
@@ -11338,6 +11479,14 @@ fn check_row(def: &TableDef, slots: &[Option<crate::WriteValue>], rowid: i64) ->
     }
     cells.push(Cell::Integer(rowid));
     cells
+}
+
+/// `INSERT OR IGNORE` 吞掉 UNIQUE / NOT NULL / CHECK 冲突，其余错误照常上报。
+fn ignoreable_insert_error(error: &SqlError) -> bool {
+    let message = error.message.as_str();
+    message.contains("UNIQUE constraint failed")
+        || message.contains("NOT NULL constraint failed")
+        || message.contains("CHECK constraint failed")
 }
 
 /// Reports one `STRICT` storage-class violation: the value is first converted
