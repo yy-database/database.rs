@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
     thread,
     time::Duration,
 };
@@ -256,8 +256,8 @@ fn find_exact_id_after_insert_returns_one_document() {
     let empty_filter = bson_document(&[]);
     let find_cmd = bson_document(&[bson_string("find", "users"), bson_string("$db", "test"), bson_doc_element("filter", &empty_filter)]);
     let reply = roundtrip(&mut client, 2, &find_cmd);
-    let ok = extract_int32(&reply, "ok");
-    assert_eq!(ok, Some(1), "find reply ok");
+    let ok = extract_double(&reply, "ok");
+    assert_eq!(ok, Some(1.0), "find reply ok");
 
     let batch_len = extract_cursor_firstbatch_len(&reply);
     assert_eq!(batch_len, Some(1), "firstBatch length");
@@ -346,13 +346,13 @@ fn different_databases_isolate_documents_of_same_collection_name() {
     let filter_by_id = bson_document(&[bson_object_id("_id", id_a)]);
     let find_a = bson_document(&[bson_string("find", "users"), bson_string("$db", "db_A"), bson_doc_element("filter", &filter_by_id)]);
     let ra = roundtrip(&mut client, 3, &find_a);
-    assert_eq!(extract_int32(&ra, "ok"), Some(1));
+    assert_eq!(extract_double(&ra, "ok"), Some(1.0));
     assert_eq!(extract_cursor_firstbatch_len(&ra), Some(1), "db_A must see Alice");
 
     // Find Alice from db_B.users by _id → should get 0 docs (isolated)
     let find_a_in_b = bson_document(&[bson_string("find", "users"), bson_string("$db", "db_B"), bson_doc_element("filter", &filter_by_id)]);
     let rab = roundtrip(&mut client, 4, &find_a_in_b);
-    assert_eq!(extract_int32(&rab, "ok"), Some(1));
+    assert_eq!(extract_double(&rab, "ok"), Some(1.0));
     assert_eq!(extract_cursor_firstbatch_len(&rab), Some(0), "db_B must NOT see db_A data");
 
     let _ = client.shutdown(Shutdown::Write);
@@ -367,7 +367,7 @@ fn empty_collection_find_returns_empty_array_without_error() {
     let empty_filter = bson_document(&[]);
     let find_cmd = bson_document(&[bson_string("find", "ghosts"), bson_string("$db", "empty_db"), bson_doc_element("filter", &empty_filter)]);
     let reply = roundtrip(&mut client, 1, &find_cmd);
-    assert_eq!(extract_int32(&reply, "ok"), Some(1), "empty collection find must succeed");
+    assert_eq!(extract_double(&reply, "ok"), Some(1.0), "empty collection find must succeed");
     assert_eq!(extract_cursor_firstbatch_len(&reply), Some(0), "must return empty firstBatch");
 
     let _ = client.shutdown(Shutdown::Write);
@@ -410,7 +410,7 @@ fn insert_without_id_auto_generates_object_id() {
     let empty_filter = bson_document(&[]);
     let find_cmd = bson_document(&[bson_string("find", "auto_col"), bson_string("$db", "test"), bson_doc_element("filter", &empty_filter)]);
     let find_reply = roundtrip(&mut client, 2, &find_cmd);
-    assert_eq!(extract_int32(&find_reply, "ok"), Some(1));
+    assert_eq!(extract_double(&find_reply, "ok"), Some(1.0));
     assert_eq!(extract_cursor_firstbatch_len(&find_reply), Some(1));
 
     let _ = client.shutdown(Shutdown::Write);
