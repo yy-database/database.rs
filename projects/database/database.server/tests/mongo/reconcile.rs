@@ -1,11 +1,11 @@
 //! 网关写读应答的逐字节基线。
 //!
 //! 38 条固定语料喂给网关，游标 id 是服务端不透明值，先归一化为 `1`，再与冻结
-//! 的字节基线比对。基线结果：35 条逐字节一致，3 条为已记录在案的能力差异。
+//! 的字节基线比对。基线结果：37 条逐字节一致，1 条为已记录在案的能力差异。
 //!
-//! 3 条差异在这里按「已知差异」断言：固定网关当前回复字节并写明原因，不写成
-//! 通过。命令语义由上游 `mongo` 门面提供，网关只做 OP_MSG 编解码与
-//! `MongoStorage` 后端注入，不在网关里补实现来追平。
+//! 这 1 条差异按「已知差异」断言：固定网关当前回复字节并写明原因，不写成通过。
+//! 命令语义由上游 `mongo` 门面提供，网关只做 OP_MSG 编解码与 `MongoStorage`
+//! 后端注入，不在网关里补实现来追平。
 
 use std::collections::HashMap;
 
@@ -142,10 +142,7 @@ fn corpus() -> Vec<Step> {
         "crud",
         "update $inc",
         doc(vec![("update", text("crud")), ("updates", array(vec![update_spec])), ("$db", text("app"))]),
-        Expected::KnownDifference {
-            reply: "2f000000106f6b0000000000026572726d7367000c000000756e737570706f727465640010636f6465003b00000000",
-            reason: "命令层未实现 `update`，网关只回通用 `59 unsupported`。",
-        },
+        Expected::Match("27000000106e0001000000106e4d6f6469666965640001000000016f6b00000000000000f03f00"),
     );
     push(
         "crud",
@@ -289,7 +286,7 @@ fn corpus() -> Vec<Step> {
         ]),
         Expected::KnownDifference {
             reply: "2f000000106f6b0000000000026572726d7367000c000000756e737570706f727465640010636f6465003b00000000",
-            reason: "命令层未实现索引，`createIndexes` 只回 `59 unsupported`，因此唯一索引与 `{a: []}` 产生的 `undefined` 键路径不会触发。",
+            reason: "网关不路由 `createIndexes`，索引管理留在门面命令层。索引构建失败消息含随机 operation id 与集合 UUID，无法冻结逐字节基线，因此这一条按已知差异保留。",
         },
     );
     push(
@@ -418,10 +415,7 @@ fn corpus() -> Vec<Step> {
             ("updates", array(vec![d(vec![("q", d(vec![])), ("u", d(vec![("a", int(1))]))])])),
             ("$db", text("app")),
         ]),
-        Expected::KnownDifference {
-            reply: "2f000000106f6b0000000000026572726d7367000c000000756e737570706f727465640010636f6465003b00000000",
-            reason: "命令层未实现 `update`，替换式更新同样落进通用 `59 unsupported`。",
-        },
+        Expected::Match("27000000106e0000000000106e4d6f6469666965640000000000016f6b00000000000000f03f00"),
     );
     push(
         "error",
@@ -599,6 +593,6 @@ fn reconcile_corpus_matches_reference_wire_bytes() {
     }
 
     assert!(drift.is_empty(), "对账基线与实跑不一致：\n{}", drift.join("\n"));
-    assert_eq!(matched, 35, "MATCH 条数漂移");
-    assert_eq!(known, 3, "MISMATCH 条数漂移");
+    assert_eq!(matched, 37, "MATCH 条数漂移");
+    assert_eq!(known, 1, "MISMATCH 条数漂移");
 }
