@@ -14,6 +14,8 @@ database-protocol-mysql = { workspace = true }
 database-protocol-pgsql = { workspace = true }
 database-protocol-redis = { workspace = true }
 database-protocol-yy = { workspace = true }
+database-formats = { workspace = true }
+database-storage = { workspace = true }
 database-types = { workspace = true }
 database-udf = { workspace = true }
 serde = { workspace = true }

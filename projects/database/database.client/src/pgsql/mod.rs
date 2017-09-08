@@ -19,12 +19,26 @@ use database_types::{Error, Result};
 /// PostgreSQL wire errors, shared with `database-protocol-pgsql`.
 pub mod error;
 
+/// `psql` argument surface: option parsing and result-line rendering.
+pub mod psql;
+
+/// Server-side data directory: catalog naming, `.yykv` shard and the
+/// `postmaster.pid` directory lock.
+pub mod postmaster;
+
+/// Client-side `.yyds` catalog plus `.yykv` shard store.
+pub mod store;
+
 /// Password authentication: MD5, cleartext and SCRAM-SHA-256.
 mod auth;
 
 /// Connection primitives: startup handshake, simple and extended query.
 #[allow(missing_docs)]
 pub mod client;
+
+pub use postmaster::{ServerChange, ServerRow, ServerStore};
+pub use psql::PsqlOptions;
+pub use store::Store;
 
 pub use client::{
     BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Param, Portal, PortalReport, Prepared, Report,
