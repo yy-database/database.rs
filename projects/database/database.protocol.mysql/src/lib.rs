@@ -5,6 +5,9 @@
 /// classic 包头能表示的最大载荷长度。
 pub const MAX_PACKET_PAYLOAD: usize = 0x00ff_ffff;
 
+/// classic 协议握手宣告的版本号。
+pub const PROTOCOL_VERSION: u8 = 10;
+
 /// 一条借用接收缓冲区二进制载荷的包。
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet<'input> {

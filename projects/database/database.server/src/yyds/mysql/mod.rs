@@ -7,6 +7,7 @@
 use database_protocol::{GatewayConfig, GatewayKind, startup_banner as protocol_startup_banner};
 
 pub mod connection;
+pub mod instance;
 pub mod service;
 pub mod wire;
 
