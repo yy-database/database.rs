@@ -172,6 +172,12 @@ impl LocalSource {
         self.conn.borrow()
     }
 
+    /// Close the connection, checkpointing its journal before the writer lock
+    /// is released by the drop that follows.
+    pub fn close(&self) {
+        self.conn.borrow().close();
+    }
+
     /// Install / verify schema (Native Pull handshake input).
     pub fn ensure_schema(&self, document: &str) -> Result<()> {
         self.conn.borrow().ensure_schema(document)?;
