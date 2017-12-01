@@ -143,6 +143,11 @@ fn write_array_header(stream: &mut dyn io::Write, length: usize) -> io::Result<(
     write!(stream, "*{length}\r\n")
 }
 
+/// 集合聚合回复头：RESP3 用 `~` 表示 set 类型，RESP2 降级为 `*` 数组。
+fn write_set_header(stream: &mut dyn io::Write, length: usize, protocol: u8) -> io::Result<()> {
+    write!(stream, "{}{length}\r\n", if protocol == 3 { '~' } else { '*' })
+}
+
 fn write_storage_error(stream: &mut dyn io::Write, message: &str) -> io::Result<()> {
     write_error(stream, message)
 }
@@ -329,6 +334,9 @@ pub(crate) fn is_set_command(command: &[u8]) -> bool {
         b"SMOVE",
         b"SRANDMEMBER",
         b"SSCAN",
+        b"SPOP",
+        b"SMISMEMBER",
+        b"SINTERCARD",
     ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
@@ -2113,9 +2121,9 @@ pub(crate) fn handle_set(
         }
         let key = request.arguments[1];
         return match load_set(stream, executor, base, key)? {
-            Loaded::Missing => write_array_header(stream, 0),
+            Loaded::Missing => write_set_header(stream, 0, protocol),
             Loaded::Found(members) => {
-                write_array_header(stream, members.len())?;
+                write_set_header(stream, members.len(), protocol)?;
                 for member in &members {
                     write_bulk(stream, member)?;
                 }
@@ -2158,7 +2166,7 @@ pub(crate) fn handle_set(
             return Ok(());
         };
         let result = apply_set_op(op, &sets);
-        write_array_header(stream, result.len())?;
+        write_set_header(stream, result.len(), protocol)?;
         for member in &result {
             write_bulk(stream, member)?;
         }
@@ -2345,6 +2353,145 @@ pub(crate) fn handle_set(
             Loaded::Rejected => return Ok(()),
         };
         return write_scan_page(stream, &members, cursor, count, pattern.as_deref());
+    }
+    if command.eq_ignore_ascii_case(b"SPOP") {
+        if request.arguments.len() < 2 || request.arguments.len() > 3 {
+            return write_arity_error(stream, "spop");
+        }
+        let count = match request.arguments.get(2) {
+            None => None,
+            Some(raw) => match parse_index(raw) {
+                Some(count) if count >= 0 => Some(count as usize),
+                Some(_) => return write_error(stream, "value is out of range, must be positive"),
+                None => return write_error(stream, "value is not an integer or out of range"),
+            },
+        };
+        let Some(count) = count
+        else {
+            let mut members = match load_set(stream, executor, base, request.arguments[1])? {
+                Loaded::Missing => return write_null(stream, protocol),
+                Loaded::Found(members) => members,
+                Loaded::Rejected => return Ok(()),
+            };
+            if members.is_empty() {
+                return write_null(stream, protocol);
+            }
+            let mut state = random_state();
+            let index = (next_random(&mut state) as usize) % members.len();
+            let member = members.remove(index);
+            if members.is_empty() {
+                if let Err(message) = remove_value(executor, &KeyKind::Set.namespace(base), request.arguments[1]) {
+                    return write_storage_error(stream, &message);
+                }
+            }
+            else {
+                let Some(bytes) = encode_set(&members)
+                else {
+                    return write_error(stream, "set exceeds the storage limit");
+                };
+                if let Err(message) =
+                    store_value(executor, &KeyKind::Set.namespace(base), request.arguments[1], bytes)
+                {
+                    return write_storage_error(stream, &message);
+                }
+            }
+            return write_bulk(stream, &member);
+        };
+        if count == 0 {
+            return write_set_header(stream, 0, protocol);
+        }
+        let members = match load_set(stream, executor, base, request.arguments[1])? {
+            Loaded::Missing => return write_set_header(stream, 0, protocol),
+            Loaded::Found(members) => members,
+            Loaded::Rejected => return Ok(()),
+        };
+        if members.is_empty() {
+            return write_set_header(stream, 0, protocol);
+        }
+        let take = count.min(members.len());
+        let mut order: Vec<usize> = (0..members.len()).collect();
+        let mut state = random_state();
+        // 部分 Fisher-Yates 洗牌，取前 take 个保证不重复。
+        for index in 0..take {
+            let swap = index + (next_random(&mut state) as usize) % (members.len() - index);
+            order.swap(index, swap);
+        }
+        write_set_header(stream, take, protocol)?;
+        for index in order.iter().take(take) {
+            write_bulk(stream, &members[*index])?;
+        }
+        if take == members.len() {
+            if let Err(message) = remove_value(executor, &KeyKind::Set.namespace(base), request.arguments[1]) {
+                return write_storage_error(stream, &message);
+            }
+            return Ok(());
+        }
+        let mut kept = vec![true; members.len()];
+        for index in order.iter().take(take) {
+            kept[*index] = false;
+        }
+        let remaining = members
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| kept[*index])
+            .map(|(_, member)| member.clone())
+            .collect::<Vec<Vec<u8>>>();
+        let Some(bytes) = encode_set(&remaining)
+        else {
+            return write_error(stream, "set exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::Set.namespace(base), request.arguments[1], bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"SMISMEMBER") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "smismember");
+        }
+        let members = match load_set(stream, executor, base, request.arguments[1])? {
+            Loaded::Missing => Vec::new(),
+            Loaded::Found(members) => members,
+            Loaded::Rejected => return Ok(()),
+        };
+        write_array_header(stream, request.arguments.len() - 2)?;
+        for member in &request.arguments[2..] {
+            let present = members.iter().any(|existing| existing.as_slice() == *member);
+            write_integer(stream, i64::from(present))?;
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"SINTERCARD") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "sintercard");
+        }
+        let numkeys = match parse_index(request.arguments[1]) {
+            Some(numkeys) if numkeys > 0 => numkeys as usize,
+            _ => return write_error(stream, "numkeys should be greater than 0"),
+        };
+        if request.arguments.len() < 2 + numkeys {
+            return write_error(stream, "Number of keys can't be greater than number of args");
+        }
+        let mut limit = 0usize;
+        if request.arguments.len() > 2 + numkeys {
+            if !request.arguments[2 + numkeys].eq_ignore_ascii_case(b"LIMIT")
+                || request.arguments.len() != 4 + numkeys
+            {
+                return write_error(stream, "syntax error");
+            }
+            match parse_index(request.arguments[3 + numkeys]) {
+                Some(value) if value >= 0 => limit = value as usize,
+                _ => return write_error(stream, "LIMIT can't be negative"),
+            }
+        }
+        let keys = request.arguments[2..2 + numkeys].to_vec();
+        let Some(sets) = load_sets(stream, executor, base, &keys)?
+        else {
+            return Ok(());
+        };
+        let found = apply_set_op(SetOp::Inter, &sets).len();
+        let result = if limit == 0 { found } else { found.min(limit) };
+        return write_integer(stream, result as i64);
     }
     // SISMEMBER
     if request.arguments.len() != 3 {

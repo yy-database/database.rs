@@ -193,6 +193,22 @@ fn expect_null_array(client: &mut TcpStream) {
     }
 }
 
+fn expect_integer_array(client: &mut TcpStream, expected: &[i64]) {
+    match read_reply(client) {
+        Reply::Array(Some(items)) => {
+            let values = items
+                .into_iter()
+                .map(|item| match item {
+                    Reply::Integer(value) => value,
+                    other => panic!("expected integer array element, got {}", describe(&other)),
+                })
+                .collect::<Vec<i64>>();
+            assert_eq!(values, expected);
+        }
+        other => panic!("expected integer array {expected:?}, got {}", describe(&other)),
+    }
+}
+
 fn expect_scan(client: &mut TcpStream) -> (String, Vec<String>) {
     match read_reply(client) {
         Reply::Array(Some(items)) => {
@@ -1338,6 +1354,107 @@ fn set_move_and_random_member() {
     expect_error(&mut client, "ERR value is not an integer or out of range");
     send(&mut client, &["SRANDMEMBER", "str"]);
     expect_error(&mut client, WRONGTYPE);
+}
+
+/// `SPOP` removes random members, `SMISMEMBER` reports per-member presence and
+/// `SINTERCARD` counts an intersection with an optional `LIMIT`.
+#[test]
+fn set_pop_mismember_and_intercard() {
+    let (mut client, _server) = memory_server("redis-set-pop-mismember-intercard");
+    send(&mut client, &["SADD", "s", "a", "b", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SADD", "t", "b", "c", "d"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+
+    send(&mut client, &["SMISMEMBER", "s", "a", "ghost", "c"]);
+    expect_integer_array(&mut client, &[1, 0, 1]);
+    send(&mut client, &["SMISMEMBER", "no-such-key", "a", "b"]);
+    expect_integer_array(&mut client, &[0, 0]);
+    send(&mut client, &["SMISMEMBER", "str", "a"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["SMISMEMBER", "s"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'smismember' command");
+
+    send(&mut client, &["SINTERCARD", "2", "s", "t"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["SINTERCARD", "2", "s", "t", "LIMIT", "1"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SINTERCARD", "2", "s", "t", "LIMIT", "0"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["SINTERCARD", "1", "s"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SINTERCARD", "2", "s", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SINTERCARD", "1", "str"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["SINTERCARD", "0", "s"]);
+    expect_error(&mut client, "ERR numkeys should be greater than 0");
+    send(&mut client, &["SINTERCARD", "two", "s"]);
+    expect_error(&mut client, "ERR numkeys should be greater than 0");
+    send(&mut client, &["SINTERCARD", "3", "s", "t"]);
+    expect_error(&mut client, "ERR Number of keys can't be greater than number of args");
+    send(&mut client, &["SINTERCARD", "2", "s", "t", "LIMIT", "-1"]);
+    expect_error(&mut client, "ERR LIMIT can't be negative");
+    send(&mut client, &["SINTERCARD", "2", "s", "t", "LIMIT", "x"]);
+    expect_error(&mut client, "ERR LIMIT can't be negative");
+    send(&mut client, &["SINTERCARD", "2", "s", "t", "COUNT", "1"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["SINTERCARD", "2", "s", "t", "LIMIT", "1", "extra"]);
+    expect_error(&mut client, "ERR syntax error");
+
+    send(&mut client, &["SADD", "p", "x", "y", "z"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["EXPIRE", "p", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SPOP", "p"]);
+    let popped = read_bulk_text(&mut client).expect("SPOP without count must reply one member");
+    assert!(["x", "y", "z"].contains(&popped.as_str()));
+    send(&mut client, &["SCARD", "p"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    let remaining_ttl = {
+        send(&mut client, &["TTL", "p"]);
+        expect_integer(&mut client)
+    };
+    assert!(remaining_ttl > 0, "SPOP must not drop the key deadline");
+
+    send(&mut client, &["SPOP", "p", "0"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["SCARD", "p"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["SPOP", "p", "5"]);
+    let drained = read_array_text(&mut client);
+    let mut sorted = drained.clone();
+    sorted.sort();
+    assert_eq!(sorted.len(), 2, "SPOP with a count above the cardinality replies every member");
+    send(&mut client, &["EXISTS", "p"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    send(&mut client, &["SPOP", "no-such-key"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["SPOP", "no-such-key", "3"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["SPOP"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'spop' command");
+    send(&mut client, &["SPOP", "s", "1", "extra"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'spop' command");
+    send(&mut client, &["SPOP", "s", "-1"]);
+    expect_error(&mut client, "ERR value is out of range, must be positive");
+    send(&mut client, &["SPOP", "s", "not-a-number"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["SPOP", "str"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["SPOP", "str", "2"]);
+    expect_error(&mut client, WRONGTYPE);
+
+    // Popping from a single-member set removes the key.
+    send(&mut client, &["SADD", "one", "only"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SPOP", "one"]);
+    assert_eq!(read_bulk_text(&mut client).as_deref(), Some("only"));
+    send(&mut client, &["EXISTS", "one"]);
+    assert_eq!(expect_integer(&mut client), 0);
 }
 
 /// `SSCAN` walks a set in pages, honours `MATCH` and ends with cursor `0`.
