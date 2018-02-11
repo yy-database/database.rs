@@ -1603,8 +1603,8 @@ fn read_rank_with_score(client: &mut TcpStream) -> Option<(i64, String)> {
                 other => panic!("unexpected rank reply {:?}", other),
             }
         }
-        // 真机的 `WITHSCORE` 缺失成员回 bulk null（RESP2 `$-1`）。
-        Reply::Bulk(None) => None,
+        // 真机的 `WITHSCORE` 缺失成员回 null array（RESP2 `*-1`）。
+        Reply::Array(None) => None,
         other => panic!("expected rank array, got {}", describe(&other)),
     }
 }
@@ -1685,6 +1685,13 @@ fn zset_lex_ranges_and_rank() {
     expect_array(&mut client, &["c", "b", "a"]);
     send(&mut client, &["ZREVRANGEBYLEX", "lex", "+", "-", "LIMIT", "1", "2"]);
     expect_array(&mut client, &["c", "b"]);
+    // 分数不一致时真机按 (score, member) 遍历后按成员边界过滤，不重排成字典序。
+    send(&mut client, &["ZADD", "mixed", "2", "a", "1", "z", "3", "m"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZRANGEBYLEX", "mixed", "-", "+"]);
+    expect_array(&mut client, &["z", "a", "m"]);
+    send(&mut client, &["ZREVRANGEBYLEX", "mixed", "+", "-"]);
+    expect_array(&mut client, &["m", "a", "z"]);
     send(&mut client, &["ZRANGEBYLEX", "lex", "-", "+", "WITHSCORES"]);
     expect_error(&mut client, "ERR syntax error, WITHSCORES not supported in combination with BYLEX");
     send(&mut client, &["ZREVRANGEBYLEX", "lex", "+", "-", "WITHSCORES"]);
@@ -3285,7 +3292,7 @@ fn zset_family_options_ranges_and_pops() {
         other => panic!("expected WITHSCORE array, got {}", describe(&other)),
     }
     send(&mut client, &["ZRANK", "r", "ghost", "WITHSCORE"]);
-    expect_bulk(&mut client, None);
+    expect_null_array(&mut client);
     send(&mut client, &["ZRANK", "r", "b", "BOGUS"]);
     expect_error(&mut client, "ERR syntax error");
 
