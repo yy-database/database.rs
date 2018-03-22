@@ -2769,6 +2769,49 @@ fn lex_at_most(member: &[u8], bound: &LexBound) -> bool {
     }
 }
 
+/// 真机在 (score, member) 顺序上做字典范围查找，再取命中的连续一段。
+///
+/// 分数一致时这就是普通的字典序；分数不一致时保留这条遍历语义，包括首元素
+/// 越过 `max` 时整段判空。
+fn lex_block(
+    entries: &[(Vec<u8>, f64)],
+    min: &LexBound,
+    max: &LexBound,
+    reverse: bool,
+) -> Option<(usize, usize)> {
+    let (first, last) = entries.first().zip(entries.last())?;
+    if !lex_at_most(&first.0, max) || !lex_at_least(&last.0, min) {
+        return None;
+    }
+    if reverse {
+        let mut end = entries.len() - 1;
+        while end > 0 && !lex_at_most(&entries[end].0, max) {
+            end -= 1;
+        }
+        if !lex_at_most(&entries[end].0, max) || !lex_at_least(&entries[end].0, min) {
+            return None;
+        }
+        let mut start = end;
+        while start > 0 && lex_at_least(&entries[start - 1].0, min) {
+            start -= 1;
+        }
+        Some((start, end))
+    }
+    else {
+        let Some(start) = entries.iter().position(|(member, _)| lex_at_least(member, min)) else {
+            return None;
+        };
+        if !lex_at_most(&entries[start].0, max) {
+            return None;
+        }
+        let mut end = start;
+        while end + 1 < entries.len() && lex_at_most(&entries[end + 1].0, max) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+}
+
 /// 把 `start` / `stop` 归一化为可切片的排名区间；空区间回 `None`。
 fn entry_rank_range(start: i64, stop: i64, length: usize) -> Option<(usize, usize)> {
     let length = length as i64;
@@ -2977,13 +3020,13 @@ fn select_range(
                 write_error(stream, "min or max not valid string range item")?;
                 return Ok(None);
             };
-            // The server walks the skiplist in (score, member) order and filters by
-            // the member bounds, so mixed scores keep their score order.
+            // 真机按 (score, member) 顺序定位首尾再整段输出，分数不一致时
+            // 保留这条遍历语义。
             sort_zset(&mut entries);
-            let mut selected: Vec<(Vec<u8>, f64)> = entries
-                .into_iter()
-                .filter(|(member, _)| lex_at_least(member, &min) && lex_at_most(member, &max))
-                .collect();
+            let mut selected: Vec<(Vec<u8>, f64)> = match lex_block(&entries, &min, &max, request.reverse) {
+                Some((start, end)) => entries[start..=end].to_vec(),
+                None => Vec::new(),
+            };
             if request.reverse {
                 selected.reverse();
             }
@@ -4467,15 +4510,14 @@ pub(crate) fn handle_zset(
             Loaded::Found(entries) => entries,
             Loaded::Rejected => return Ok(()),
         };
-        // 与真机一致：按 (score, member) 遍历后按成员边界过滤，分数不一致时
-        // 保留分数顺序而不是重排成字典序。
+        // 与真机一致：按 (score, member) 顺序定位整段，分数不一致时保留
+        // 分数顺序而不是重排成字典序。
         let mut entries = entries;
         sort_zset(&mut entries);
-        let mut members: Vec<Vec<u8>> = entries
-            .into_iter()
-            .filter(|(member, _)| lex_at_least(member, &min) && lex_at_most(member, &max))
-            .map(|(member, _)| member)
-            .collect();
+        let mut members: Vec<Vec<u8>> = match lex_block(&entries, &min, &max, reverse) {
+            Some((start, end)) => entries[start..=end].iter().map(|(member, _)| member.clone()).collect(),
+            None => Vec::new(),
+        };
         if reverse {
             members.reverse();
         }
@@ -4651,13 +4693,12 @@ pub(crate) fn handle_zset(
             });
         }
         else if let Some((low, high)) = lex_range {
-            entries.retain(|(member, _)| {
-                let hit = lex_at_least(member, &low) && lex_at_most(member, &high);
-                if hit {
-                    removed += 1;
-                }
-                !hit
-            });
+            // 真机按 (score, member) 顺序定位首尾后整段删除。
+            sort_zset(&mut entries);
+            if let Some((start, end)) = lex_block(&entries, &low, &high, false) {
+                entries.drain(start..=end);
+                removed = (end - start + 1) as i64;
+            }
         }
         else {
             sort_zset(&mut entries);
