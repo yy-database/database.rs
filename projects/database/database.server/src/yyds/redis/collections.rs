@@ -579,7 +579,7 @@ fn score_text(score: f64) -> String {
     if score == 0.0 {
         return "0".to_string();
     }
-    if score.fract() == 0.0 && score.abs() < 4_611_686_018_427_387_904.0 {
+    if score.fract() == 0.0 && score.abs() <= 4_611_686_018_427_387_904.0 {
         return (score as i64).to_string();
     }
     let negative = score < 0.0;
