@@ -238,13 +238,17 @@ fn getex_rejects_combined_options() {
         ["EX", "10", "PERSIST"].as_slice(),
         ["PERSIST", "EX", "10"].as_slice(),
         ["EX", "10", "PX", "3000"].as_slice(),
-        ["EX", "10", "EX", "20"].as_slice(),
     ] {
         let mut arguments = vec!["GETEX", "k"];
         arguments.extend_from_slice(options);
         send(&mut client, &arguments);
         expect_error(&mut client, "ERR syntax error");
     }
+    // 同一种选项重复出现时最后一次生效，真机同样接受。
+    send(&mut client, &["GETEX", "k", "EX", "10", "EX", "20"]);
+    expect_bulk(&mut client, Some("v"));
+    send(&mut client, &["GETEX", "k", "PERSIST", "PERSIST"]);
+    expect_bulk(&mut client, Some("v"));
     send(&mut client, &["PTTL", "k"]);
     assert_eq!(expect_integer(&mut client), -1);
     send(&mut client, &["GET", "k"]);
@@ -415,12 +419,14 @@ fn expire_condition_option_errors() {
         ["EXPIRE", "k", "100", "NX", "XX"].as_slice(),
         ["EXPIRE", "k", "100", "NX", "GT"].as_slice(),
         ["EXPIRE", "k", "100", "XX", "NX"].as_slice(),
-        ["EXPIRE", "k", "100", "GT", "LT"].as_slice(),
-        ["EXPIREAT", "k", "100", "LT", "GT"].as_slice(),
         ["PEXPIRE", "k", "100", "NX", "LT"].as_slice(),
     ] {
         send(&mut client, arguments);
         expect_error(&mut client, "ERR NX and XX, GT or LT options at the same time are not compatible");
+    }
+    for arguments in [["EXPIRE", "k", "100", "GT", "LT"].as_slice(), ["EXPIREAT", "k", "100", "LT", "GT"].as_slice()] {
+        send(&mut client, arguments);
+        expect_error(&mut client, "ERR GT and LT options at the same time are not compatible");
     }
     send(&mut client, &["EXPIRE", "k", "100", "BOGUS"]);
     expect_error(&mut client, "ERR Unsupported option BOGUS");

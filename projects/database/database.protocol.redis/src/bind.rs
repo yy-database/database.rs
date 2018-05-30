@@ -66,6 +66,8 @@ pub struct SetRequest {
     pub expiry: Option<SetExpiry>,
     /// 覆盖写入时是否保留原过期。
     pub keep_ttl: bool,
+    /// 是否在回复里带回旧值（`GET` 选项）。
+    pub get: bool,
 }
 
 /// 本绑定器产出的中立键值动作（不含产品品牌语义）。
@@ -104,38 +106,44 @@ pub struct BoundCommand {
 
 /// 解析完整的 `SET` 选项列表。
 ///
-/// 选项大小写不敏感、顺序任意，与 Redis 一致。重复或冲突组合
-/// （`NX XX`、`EX 1 EX 2`、`EX 1 KEEPTTL`、缺少参数的尾部选项）视为语法错误；
-/// 非正或非规范整数的过期值在写入前拒绝。
+/// 选项大小写不敏感、顺序任意，与 Redis 一致。`NX XX`、不同种过期选项同时出现、
+/// `KEEPTTL` 与过期选项同时出现、缺少参数的尾部选项视为语法错误；同一种选项重复出现
+/// 时保留最后一次。非正或非规范整数的过期值在写入前拒绝。
 pub fn bind_set(arguments: &[&[u8]]) -> Result<SetRequest, BindError> {
     if arguments.len() < 3 {
         return Err(BindError::WrongArity);
     }
     let mut condition = SetCondition::Always;
     let mut expiry = None;
+    let mut expiry_kind: Option<&[u8]> = None;
     let mut keep_ttl = false;
+    let mut get = false;
     let mut index = 3;
     while index < arguments.len() {
         let option = arguments[index];
         if option.eq_ignore_ascii_case(b"NX") {
-            if condition != SetCondition::Always {
+            if condition == SetCondition::IfPresent {
                 return Err(BindError::Syntax);
             }
             condition = SetCondition::IfAbsent;
             index += 1;
         }
         else if option.eq_ignore_ascii_case(b"XX") {
-            if condition != SetCondition::Always {
+            if condition == SetCondition::IfAbsent {
                 return Err(BindError::Syntax);
             }
             condition = SetCondition::IfPresent;
             index += 1;
         }
         else if option.eq_ignore_ascii_case(b"KEEPTTL") {
-            if keep_ttl || expiry.is_some() {
+            if expiry.is_some() {
                 return Err(BindError::Syntax);
             }
             keep_ttl = true;
+            index += 1;
+        }
+        else if option.eq_ignore_ascii_case(b"GET") {
+            get = true;
             index += 1;
         }
         else if option.eq_ignore_ascii_case(b"EX")
@@ -143,7 +151,8 @@ pub fn bind_set(arguments: &[&[u8]]) -> Result<SetRequest, BindError> {
             || option.eq_ignore_ascii_case(b"EXAT")
             || option.eq_ignore_ascii_case(b"PXAT")
         {
-            if expiry.is_some() || keep_ttl {
+            // 真机允许同一种过期选项重复出现（最后一次生效），不同种同时出现才是语法错误。
+            if keep_ttl || expiry_kind.is_some_and(|kind| !kind.eq_ignore_ascii_case(option)) {
                 return Err(BindError::Syntax);
             }
             let Some(raw) = arguments.get(index + 1)
@@ -170,14 +179,15 @@ pub fn bind_set(arguments: &[&[u8]]) -> Result<SetRequest, BindError> {
             else {
                 SetExpiry::Seconds(magnitude)
             });
+            expiry_kind = Some(option);
             index += 2;
         }
         else {
-            // `GET` / `IDLE` 等选项需要本绑定器尚未实现的语义，显式拒绝而不是静默丢弃。
+            // `IDLE` 等选项需要本绑定器尚未实现的语义，显式拒绝而不是静默丢弃。
             return Err(BindError::UnsupportedOptions);
         }
     }
-    Ok(SetRequest { key: arguments[1].to_vec(), value: arguments[2].to_vec(), condition, expiry, keep_ttl })
+    Ok(SetRequest { key: arguments[1].to_vec(), value: arguments[2].to_vec(), condition, expiry, keep_ttl, get })
 }
 
 /// Redis 拒绝非规范整数拼写（`+1`、` 1`、`01`）。

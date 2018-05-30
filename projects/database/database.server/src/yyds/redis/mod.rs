@@ -126,6 +126,29 @@ pub fn execute_zset_command(
     collections::handle_zset(stream, &request, Some(executor), namespace, protocol)
 }
 
+/// Executes one string or key family request and writes the RESP reply.
+///
+/// Command semantics, reply framing and type checks stay in the redis connection
+/// handler. The caller only supplies the logical database namespace, the connection
+/// protocol version and the key-value backend, so an embedder such as a language
+/// binding can reuse this family without reimplementing it.
+pub fn execute_string_command(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    executor: &dyn KeyValueExecutor,
+    namespace: &database_types::cluster::Namespace,
+    protocol: u8,
+) -> io::Result<()> {
+    let request = resp::Request {
+        arguments: arguments.to_vec(),
+        consumed: 0,
+    };
+    if connection::handle_string(stream, &request, Some(executor), Some(executor), None, namespace, protocol)? {
+        return Ok(());
+    }
+    connection::write_unknown_command(stream, arguments)
+}
+
 /// Banner shown when a disguise server starts.
 pub fn startup_banner(port: u16) -> String {
     protocol_startup_banner(&GatewayConfig::new(GATEWAY_KIND).with_port(port))

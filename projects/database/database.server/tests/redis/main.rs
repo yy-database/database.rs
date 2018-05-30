@@ -8,4 +8,5 @@ mod getex;
 mod object;
 mod pubsub;
 mod resp;
+mod strings;
 mod watch;
