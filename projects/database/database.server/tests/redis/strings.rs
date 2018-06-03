@@ -350,4 +350,18 @@ fn string_family_entry_matches_the_server() {
     assert_eq!(run(&[b"SET", b"k", b"v2", b"GET"]), "$1\r\nv\r\n");
     assert_eq!(run(&[b"FLUSHDB"]), "+OK\r\n");
     assert_eq!(run(&[b"GET", b"k"]), "$-1\r\n");
+
+    // An embedded binding mounts the catalog under a prefix of its own, so the
+    // database helpers must preserve it instead of rebuilding `redis:<index>`.
+    let prefixed = Namespace("redis:db0".into());
+    let run_prefixed = |arguments: &[&[u8]]| {
+        let mut output = Vec::new();
+        execute_string_command(&mut output, arguments, &executor, &prefixed, 2).unwrap();
+        String::from_utf8(output).unwrap()
+    };
+    assert_eq!(run_prefixed(&[b"SET", b"k", b"v"]), "+OK\r\n");
+    assert_eq!(run_prefixed(&[b"SET", b"k", b"v", b"BOGUS"]), "-ERR syntax error\r\n");
+    assert_eq!(run_prefixed(&[b"DBSIZE"]), ":1\r\n");
+    assert_eq!(run_prefixed(&[b"FLUSHDB"]), "+OK\r\n");
+    assert_eq!(run_prefixed(&[b"DBSIZE"]), ":0\r\n");
 }
