@@ -297,11 +297,20 @@ fn object_encoding_reports_real_values() {
         send(&mut client, &["OBJECT", "ENCODING", parts[1]]);
         expect_bulk(&mut client, Some(expected));
     }
-    let long = "a".repeat(41);
-    send(&mut client, &["SET", "long", &long]);
+    let embstr = "a".repeat(36);
+    send(&mut client, &["SET", "embstr", &embstr]);
     expect_status(&mut client, "OK");
-    send(&mut client, &["OBJECT", "ENCODING", "long"]);
+    send(&mut client, &["OBJECT", "ENCODING", "embstr"]);
+    expect_bulk(&mut client, Some("embstr"));
+    let raw = "a".repeat(37);
+    send(&mut client, &["SET", "raw", &raw]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["OBJECT", "ENCODING", "raw"]);
     expect_bulk(&mut client, Some("raw"));
+    send(&mut client, &["OBJECT", "BOGUS", "x"]);
+    expect_error(&mut client, "ERR unknown subcommand 'BOGUS'. Try OBJECT HELP.");
+    send(&mut client, &["OBJECT", "ENCODING"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'object|encoding' command");
 
     send(&mut client, &["HSET", "h", "f", "v"]);
     assert_eq!(expect_integer(&mut client), 1);

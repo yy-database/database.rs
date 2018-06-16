@@ -193,11 +193,11 @@ fn object_rejects_unknown_subcommands_and_wrong_arity() {
     expect_error(&mut client, "ERR wrong number of arguments for 'object' command");
 
     send(&mut client, &["OBJECT", "IDLETIME"]);
-    expect_error(&mut client, "ERR Unknown subcommand or wrong number of arguments for 'IDLETIME'. Try OBJECT HELP.");
+    expect_error(&mut client, "ERR wrong number of arguments for 'object|idletime' command");
 
     send(&mut client, &["OBJECT", "BOGUS", "k"]);
-    expect_error(&mut client, "ERR Unknown subcommand or wrong number of arguments for 'BOGUS'. Try OBJECT HELP.");
+    expect_error(&mut client, "ERR unknown subcommand 'BOGUS'. Try OBJECT HELP.");
 
     send(&mut client, &["OBJECT", "REFCOUNT", "k", "extra"]);
-    expect_error(&mut client, "ERR Unknown subcommand or wrong number of arguments for 'REFCOUNT'. Try OBJECT HELP.");
+    expect_error(&mut client, "ERR wrong number of arguments for 'object|refcount' command");
 }
