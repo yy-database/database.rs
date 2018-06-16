@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue, decode_library_version,
-    decode_record,
+    decode_record, read_index_table, read_table, validate_database,
 };
 
 use super::{
@@ -1187,6 +1187,124 @@ impl Engine {
         self.views.clear();
         self.triggers.clear();
         self.load_catalog()
+    }
+
+    /// `PRAGMA integrity_check`: walks the header, the schema, every table and
+    /// index b-tree, and the freelist chain over the current image. A healthy
+    /// image reports one `ok` row; a structural problem is reported as a row of
+    /// text, matching SQLite's non-failing result shape.
+    ///
+    /// The check reads pages, it does not trust the in-memory catalog or the
+    /// writer's bookkeeping, so a decoder failure surfaces here instead of
+    /// being answered with a hard-coded `ok`. Page-reachability accounting
+    /// (detecting a page shared by two b-trees) is outside this walk because
+    /// the reader API validates each tree in isolation.
+    fn pragma_integrity_check(&self, argument: &str) -> ExecResult {
+        let mut problems = Vec::new();
+        let pages = self.writer.pages();
+        let limits = TableLimits::default();
+        match validate_database(pages) {
+            Ok(_) => {
+                let objects = match self.writer.schema_objects(limits) {
+                    Ok(objects) => objects,
+                    Err(error) => {
+                        problems.push(format!("schema: {error}"));
+                        Vec::new()
+                    }
+                };
+                for object in &objects {
+                    let Some(root) = object.root_page.filter(|root| *root != 0)
+                    else {
+                        continue;
+                    };
+                    let outcome = match object.kind {
+                        SchemaObjectKind::Index => read_index_table(pages, root, limits).map(|_| ()),
+                        SchemaObjectKind::Table if self.table_is_without_rowid(&object.name) => {
+                            read_index_table(pages, root, limits).map(|_| ())
+                        }
+                        SchemaObjectKind::Table => read_table(pages, root, limits).map(|_| ()),
+                        SchemaObjectKind::View | SchemaObjectKind::Trigger => Ok(()),
+                    };
+                    if let Err(error) = outcome {
+                        let kind = match object.kind {
+                            SchemaObjectKind::Table => "table",
+                            SchemaObjectKind::Index => "index",
+                            SchemaObjectKind::View => "view",
+                            SchemaObjectKind::Trigger => "trigger",
+                        };
+                        problems.push(format!("{kind} `{}`: {error}", object.name));
+                    }
+                }
+                self.collect_freelist_problems(pages, &mut problems);
+            }
+            Err(error) => problems.push(error.to_string()),
+        }
+        let limit = argument.trim().parse::<usize>().ok().filter(|limit| *limit > 0).unwrap_or(100);
+        let rows = if problems.is_empty() {
+            vec![vec![Cell::Text("ok".to_string())]]
+        }
+        else {
+            problems.iter().take(limit).map(|problem| vec![Cell::Text(problem.clone())]).collect()
+        };
+        ExecResult { statement: "pragma", columns: vec!["integrity_check".to_string()], rows, affected: 0 }
+    }
+
+    /// Matches a schema table name against the catalog to know whether its
+    /// root is a table b-tree or a primary-key index b-tree.
+    fn table_is_without_rowid(&self, name: &str) -> bool {
+        self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(name) && def.without_rowid)
+    }
+
+    /// Replays the freelist chain and checks that the trunk pages and leaves
+    /// account for exactly the count declared in the file header.
+    fn collect_freelist_problems(&self, pages: &[u8], problems: &mut Vec<String>) {
+        let page_size = self.writer.page_size() as usize;
+        if page_size == 0 || pages.len() < page_size {
+            return;
+        }
+        let page_count = pages.len() / page_size;
+        let declared = database_formats::sqlite::read_freelist_count(pages) as usize;
+        let mut trunk = database_formats::sqlite::read_freelist_trunk(pages);
+        let mut seen = BTreeSet::new();
+        let mut total = 0usize;
+        while trunk != 0 {
+            let index = trunk as usize;
+            if index == 0 || index > page_count {
+                problems.push(format!("freelist trunk page {trunk} is out of range"));
+                return;
+            }
+            if !seen.insert(trunk) {
+                problems.push(format!("freelist trunk page {trunk} is repeated"));
+                return;
+            }
+            total += 1;
+            let start = (index - 1) * page_size;
+            let page = &pages[start..start + page_size];
+            let next = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
+            let leaves = u32::from_be_bytes([page[4], page[5], page[6], page[7]]) as usize;
+            let capacity = page_size / 4 - 2;
+            if leaves > capacity {
+                problems.push(format!("freelist trunk page {trunk} declares {leaves} leaves beyond capacity {capacity}"));
+                return;
+            }
+            for leaf_index in 0..leaves {
+                let offset = 8 + leaf_index * 4;
+                let leaf = u32::from_be_bytes([page[offset], page[offset + 1], page[offset + 2], page[offset + 3]]) as usize;
+                if leaf == 0 || leaf > page_count {
+                    problems.push(format!("freelist leaf page {leaf} on trunk {trunk} is out of range"));
+                    continue;
+                }
+                if !seen.insert(leaf as u32) {
+                    problems.push(format!("freelist leaf page {leaf} is repeated"));
+                    continue;
+                }
+                total += 1;
+            }
+            trunk = next;
+        }
+        if total != declared {
+            problems.push(format!("freelist declares {declared} pages but the chain holds {total}"));
+        }
     }
 
     /// Replays the stored `CREATE TABLE` / `CREATE INDEX` text of every
@@ -3702,6 +3820,7 @@ impl Engine {
                             },
                         });
                     }
+                    "integrity_check" => return Ok(self.pragma_integrity_check(&argument)),
                     _ => {}
                 }
                 let boolean = |text: &str| -> bool {
@@ -3716,7 +3835,7 @@ impl Engine {
                     return Err(SqlError::new(
                         "unsupported-pragma",
                         format!(
-                            "unsupported pragma `{name}`; this engine supports `foreign_keys`, `recursive_triggers`, `table_info`, `table_xinfo`, `index_list`, `index_info`, `foreign_key_list`, `database_list`, `user_version` and `application_id`"
+                            "unsupported pragma `{name}`; this engine supports `foreign_keys`, `recursive_triggers`, `table_info`, `table_xinfo`, `index_list`, `index_info`, `foreign_key_list`, `database_list`, `user_version`, `application_id` and `integrity_check`"
                         ),
                     )
                     .in_clause("PRAGMA")
@@ -11790,6 +11909,26 @@ mod tests {
         // Reading a reopened image never rewrites it.
         assert_eq!(reopened.snapshot(), image.as_slice());
         std::fs::remove_file(&path).expect("cleanup image");
+    }
+
+    /// `PRAGMA integrity_check` walks the image rather than echoing a fixed
+    /// answer, so it has to stay `ok` across tables, indexes and freed pages.
+    #[test]
+    fn integrity_check_reports_ok_for_an_image_with_a_freelist() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute_batch(&[
+                "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE)".to_string(),
+                "CREATE INDEX t_b ON t(b)".to_string(),
+                "INSERT INTO t VALUES (1, 'x'), (2, 'y')".to_string(),
+                "CREATE TABLE dropped(z TEXT)".to_string(),
+                "INSERT INTO dropped VALUES ('z')".to_string(),
+                "DROP TABLE dropped".to_string(),
+            ])
+            .expect("seed image");
+        let result = engine.execute_one("PRAGMA integrity_check").expect("check executes");
+        assert_eq!(result.columns, vec!["integrity_check".to_string()]);
+        assert_eq!(result.rows, vec![vec![Cell::Text("ok".to_string())]]);
     }
 
     /// Two-column table with one all-`NULL` row, inserted in rowid order.
