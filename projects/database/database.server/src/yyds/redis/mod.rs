@@ -153,3 +153,24 @@ pub fn execute_string_command(
 pub fn startup_banner(port: u16) -> String {
     protocol_startup_banner(&GatewayConfig::new(GATEWAY_KIND).with_port(port))
 }
+
+/// 服务器面会话：`CLIENT` / `COMMAND` / `INFO` / `CONFIG` / `ACL`。
+pub use server_face::EmbeddedServerFace;
+
+/// Executes one server-face request against an external executor and writes the RESP reply.
+///
+/// `CLIENT` / `COMMAND` / `INFO` / `CONFIG` / `ACL` semantics stay in the upstream
+/// server face. The session carries the connection-scoped fields (client name, database,
+/// protocol and config overrides), so an embedder such as a language binding keeps the
+/// same observable state across calls without reimplementing any command.
+pub fn execute_server_command(
+    session: &mut EmbeddedServerFace,
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    executor: &dyn KeyValueExecutor,
+    database: u8,
+    protocol: u8,
+) -> io::Result<()> {
+    session.set_session(database, protocol);
+    session.execute(stream, arguments, executor).map(|_| ())
+}

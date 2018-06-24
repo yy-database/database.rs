@@ -123,7 +123,7 @@ pub(crate) struct ConnectionState {
 }
 
 impl ConnectionState {
-    fn new(record: Arc<ClientRecord>) -> Self {
+    pub(crate) fn new(record: Arc<ClientRecord>) -> Self {
         Self {
             protocol: 2,
             in_multi: false,
@@ -3417,7 +3417,7 @@ fn respond(
         server_face::handle_config(stream, request, clients)?;
     }
     else if command.eq_ignore_ascii_case(b"ACL") {
-        server_face::handle_acl(stream, request)?;
+        server_face::handle_acl(stream, request, state.protocol)?;
     }
     else if command.eq_ignore_ascii_case(b"COMMAND") {
         server_face::handle_command(stream, request, state.protocol)?;

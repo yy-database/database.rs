@@ -21,9 +21,11 @@ use database_execution::cluster::{KeyValueExecutor, LocalExecutor};
 use database_server::yyds::redis::{
     blocking::BlockingRegistry,
     connection::{KeyAccessTracker, serve_cancellable_with_executor_and_tracker},
+    execute_server_command,
     pubsub::PubSubRegistry,
     resp::RequestLimits,
     server_face::ClientRegistry,
+    EmbeddedServerFace,
 };
 use database_storage::cluster_kv::MemoryShard;
 use database_types::cluster::{ShardEpoch, ShardId};
@@ -363,6 +365,35 @@ fn two_face_parity() {
         panic!("face parity disagreed on {} of {compared} command(s)", problems.len());
     }
     println!("face parity compared {compared} commands, 0 mismatches");
+}
+
+/// 语言绑定没有 socket，嵌入式入口必须自己保留 `CLIENT` / `CONFIG` 的会话状态。
+#[test]
+fn embedded_server_face_keeps_session_state() {
+    let shard = ShardId("redis-server-entry".into());
+    let executor = LocalExecutor::new(
+        ShardMap::new(ShardEpoch(1), vec![shard.clone()]).unwrap(),
+        HashMap::from([(shard, MemoryShard::new())]),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut session = EmbeddedServerFace::new();
+    let run = |session: &mut EmbeddedServerFace, protocol: u8, arguments: &[&[u8]]| {
+        let mut output = Vec::new();
+        execute_server_command(session, &mut output, arguments, &executor, 0, protocol).unwrap();
+        String::from_utf8(output).unwrap()
+    };
+    assert_eq!(run(&mut session, 2, &[b"CLIENT", b"SETNAME", b"entry"]), "+OK\r\n");
+    assert_eq!(run(&mut session, 2, &[b"CLIENT", b"GETNAME"]), "$5\r\nentry\r\n");
+    assert_eq!(run(&mut session, 2, &[b"CONFIG", b"SET", b"maxmemory", b"100mb"]), "+OK\r\n");
+    assert_eq!(
+        run(&mut session, 2, &[b"CONFIG", b"GET", b"maxmemory"]),
+        "*2\r\n$9\r\nmaxmemory\r\n$9\r\n104857600\r\n"
+    );
+    assert!(run(&mut session, 2, &[b"COMMAND", b"COUNT"]).starts_with(':'));
+    assert_eq!(run(&mut session, 2, &[b"INFO", b"bogus"]), "$0\r\n\r\n");
+    assert_eq!(run(&mut session, 2, &[b"ACL", b"GETUSER", b"nosuch"]), "$-1\r\n");
+    assert_eq!(run(&mut session, 3, &[b"ACL", b"GETUSER", b"nosuch"]), "_\r\n");
 }
 
 /// 把同一条命令同时发给两面并按顺序读回，避免一方阻塞时另一方的回复串位。

@@ -2,8 +2,8 @@
 //!
 //! 这一层覆盖 `CLIENT` / `COMMAND` / `INFO` / `CONFIG` / `ACL`。口径按真机抓帧固定：
 //! `CLIENT LIST` 是**单条** bulk、行间 `\n`，`CLIENT GETNAME` 无名称时回 null bulk，
-//! `CLIENT KILL` 单参数形回 `OK`、带过滤器形回计数。同名命令在 TypeScript 产品侧另有
-//! 一份实现，两侧各写一条断言锁住同一行为，并由两面对照门逐条比较 reply。
+//! `CLIENT KILL` 单参数形回 `OK`、带过滤器形回计数。监听器和嵌入式绑定共用这套实现，
+//! 语言侧只保留转发。
 //!
 //! 连接登记表是监听器级的：`CLIENT LIST`、`CLIENT INFO` 和 `CLIENT KILL` 都要看到
 //! 别的连接，所以每条连接的可变会话字段放在共享的 [`ClientRecord`] 里，而不是留在
@@ -72,8 +72,8 @@ pub(crate) struct ClientRecord {
     local: String,
     /// 连接建立时刻，供 `age=` 使用。
     created: Instant,
-    /// 写侧句柄，`CLIENT KILL` 通过它关闭 socket。
-    sink: Arc<ClientSink>,
+    /// 写侧句柄，`CLIENT KILL` 通过它关闭 socket；嵌入式会话没有 socket。
+    sink: Option<Arc<ClientSink>>,
     /// 可变会话字段。
     state: Mutex<ClientState>,
 }
@@ -86,7 +86,7 @@ impl std::fmt::Debug for ClientRecord {
 }
 
 impl ClientRecord {
-    fn new(id: u64, pubsub_id: u64, remote: String, local: String, sink: Arc<ClientSink>) -> Self {
+    fn new(id: u64, pubsub_id: u64, remote: String, local: String, sink: Option<Arc<ClientSink>>) -> Self {
         let now = Instant::now();
         Self {
             id,
@@ -171,7 +171,9 @@ impl ClientRecord {
 
     /// 立即关闭这条连接的 socket，唤醒它可能阻塞中的读写。
     fn kill(&self) {
-        self.sink.shutdown();
+        if let Some(sink) = &self.sink {
+            sink.shutdown();
+        }
     }
 
     fn age_seconds(&self) -> u64 {
@@ -259,7 +261,20 @@ impl ClientRegistry {
     pub(crate) fn attach(&self, sink: Arc<ClientSink>, pubsub_id: u64, remote: String, local: String) -> Arc<ClientRecord> {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
         self.connections.fetch_add(1, Ordering::AcqRel);
-        let record = Arc::new(ClientRecord::new(id, pubsub_id, remote, local, sink));
+        let record = Arc::new(ClientRecord::new(id, pubsub_id, remote, local, Some(sink)));
+        self.lock().push(Arc::clone(&record));
+        record
+    }
+
+    /// 登记一条没有 socket 的会话，供嵌入式绑定复用同一套服务器面语义。
+    ///
+    /// `CLIENT LIST` / `CLIENT INFO` 读到的身份字段与真机同形，`CLIENT KILL` 命中它时
+    /// 没有可关闭的写侧，只保留回复计数语义。
+    pub(crate) fn attach_detached(&self) -> Arc<ClientRecord> {
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        self.connections.fetch_add(1, Ordering::AcqRel);
+        let address = "127.0.0.1:0".to_string();
+        let record = Arc::new(ClientRecord::new(id, id, address.clone(), address, None));
         self.lock().push(Arc::clone(&record));
         record
     }
@@ -1243,7 +1258,7 @@ const ACL_CATEGORIES: &[&str] = &[
 ];
 
 /// `ACL WHOAMI | LIST | CAT [category] | GETUSER user`，只有 `default` 用户。
-pub(crate) fn handle_acl(stream: &mut dyn Write, request: &Request<'_>) -> io::Result<()> {
+pub(crate) fn handle_acl(stream: &mut dyn Write, request: &Request<'_>, protocol: u8) -> io::Result<()> {
     let count = request.arguments.len();
     if count < 2 {
         return write_arity(stream, "acl");
@@ -1295,7 +1310,7 @@ pub(crate) fn handle_acl(stream: &mut dyn Write, request: &Request<'_>) -> io::R
                 return write_arity(stream, "acl|getuser");
             }
             if !String::from_utf8_lossy(request.arguments[2]).eq_ignore_ascii_case("default") {
-                return write_null(stream, 2);
+                return write_null(stream, protocol);
             }
             stream.write_all(b"*12\r\n")?;
             write_bulk(stream, b"flags")?;
@@ -1315,6 +1330,75 @@ pub(crate) fn handle_acl(stream: &mut dyn Write, request: &Request<'_>) -> io::R
             stream.write_all(b"*0\r\n")
         }
         _ => write_error(stream, &format!("unknown subcommand '{}'. Try ACL HELP.", String::from_utf8_lossy(raw))),
+    }
+}
+
+/// 嵌入式服务器面会话，复用监听器同一套 `CLIENT` / `COMMAND` / `INFO` / `CONFIG` / `ACL`。
+///
+/// 监听器用真实 socket 登记连接；语言绑定没有 socket，因此这里持有一条无写侧的登记
+/// 记录，只把会话字段（名字、库号、协议、配置）跨调用保留下来。`CLIENT KILL` 命中这条
+/// 记录时没有可关闭的写侧，计数与回复形态仍与真机一致。
+pub struct EmbeddedServerFace {
+    registry: ClientRegistry,
+    pubsub: PubSubRegistry,
+    state: ConnectionState,
+}
+
+impl EmbeddedServerFace {
+    /// 创建一条独立会话，配置取真机默认值。
+    pub fn new() -> Self {
+        let registry = ClientRegistry::standalone();
+        let pubsub = PubSubRegistry::new();
+        let state = ConnectionState::new(registry.attach_detached());
+        Self { registry, pubsub, state }
+    }
+
+    /// 同步宿主会话的库号与 RESP 版本，`CLIENT LIST` 与 `COMMAND` 读取它们。
+    pub fn set_session(&mut self, database: u8, protocol: u8) {
+        self.state.protocol = protocol;
+        self.state.record.set_database(database);
+        self.state.record.set_protocol(protocol);
+    }
+
+    /// 执行一条服务器面命令；返回 `false` 表示 `CLIENT KILL` 命中了本会话。
+    pub fn execute(
+        &mut self,
+        stream: &mut dyn Write,
+        arguments: &[&[u8]],
+        executor: &dyn KeyValueExecutor,
+    ) -> io::Result<bool> {
+        let request = Request {
+            arguments: arguments.to_vec(),
+            consumed: 0,
+        };
+        let command = arguments.first().copied().unwrap_or_default();
+        self.state.record.touch(command_context(command, arguments));
+        self.registry.bump_command();
+        if command.eq_ignore_ascii_case(b"CLIENT") {
+            return handle_client(stream, &request, &self.state, &self.registry, &self.pubsub);
+        }
+        if command.eq_ignore_ascii_case(b"COMMAND") {
+            handle_command(stream, &request, self.state.protocol)?;
+        }
+        else if command.eq_ignore_ascii_case(b"INFO") {
+            handle_info(stream, &request, &self.registry, &self.pubsub, Some(executor))?;
+        }
+        else if command.eq_ignore_ascii_case(b"CONFIG") {
+            handle_config(stream, &request, &self.registry)?;
+        }
+        else if command.eq_ignore_ascii_case(b"ACL") {
+            handle_acl(stream, &request, self.state.protocol)?;
+        }
+        else {
+            super::connection::write_unknown_command(stream, arguments)?;
+        }
+        Ok(true)
+    }
+}
+
+impl Default for EmbeddedServerFace {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
