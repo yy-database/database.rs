@@ -170,7 +170,7 @@ pub fn execute_server_command(
     executor: &dyn KeyValueExecutor,
     database: u8,
     protocol: u8,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     session.set_session(database, protocol);
-    session.execute(stream, arguments, executor).map(|_| ())
+    session.execute(stream, arguments, executor)
 }
