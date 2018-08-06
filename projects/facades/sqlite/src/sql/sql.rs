@@ -1889,6 +1889,14 @@ pub enum Statement {
         /// Schema name as written.
         name: String,
     },
+    /// `EXPLAIN [QUERY PLAN] statement`.
+    Explain {
+        /// `QUERY PLAN` was written: the rows describe the query planner's
+        /// chosen access path instead of the executor's stepping program.
+        query_plan: bool,
+        /// The statement that would run.
+        statement: Box<Statement>,
+    },
     /// `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE` and
     /// `ROLLBACK TO SAVEPOINT`.
     Transaction {
@@ -1945,6 +1953,7 @@ impl Statement {
             Self::Pragma { .. } => "pragma",
             Self::Attach { .. } => "attach",
             Self::Detach { .. } => "detach",
+            Self::Explain { .. } => "explain",
             Self::Transaction { action } => match action {
                 TransactionAction::Begin => "begin",
                 TransactionAction::Commit => "commit",
@@ -3770,6 +3779,19 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self) -> Result<Statement, SqlError> {
         self.statement_start = self.at;
+        if self.eat_word("explain") {
+            // `EXPLAIN QUERY PLAN` and `EXPLAIN` both take one full statement.
+            let query_plan = if self.eat_word("query") {
+                self.expect_word("plan")?;
+                true
+            }
+            else {
+                false
+            };
+            self.kind = Some("explain");
+            let statement = self.statement()?;
+            return Ok(Statement::Explain { query_plan, statement: Box::new(statement) });
+        }
         if self.eat_word("create") {
             if self.eat_word("temp") || self.eat_word("temporary") {
                 if self.eat_word("table") {
