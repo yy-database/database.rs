@@ -165,6 +165,9 @@ struct ForeignKeyDef {
     on_delete_action: ForeignKeyAction,
     /// `ON UPDATE` action as parsed, applied when parent keys are rewritten.
     on_update_action: ForeignKeyAction,
+    /// `DEFERRABLE INITIALLY DEFERRED`: verification waits for `COMMIT` while
+    /// an explicit transaction is open.
+    deferred: bool,
 }
 
 impl TableDef {
@@ -1081,9 +1084,14 @@ impl Engine {
                 self.transaction = Some(TransactionState { from_begin: true, savepoints: Vec::new() });
             }
             TransactionAction::Commit => {
-                if self.transaction.take().is_none() {
+                if self.transaction.is_none() {
                     return Err(SqlError::new("transaction-missing", "cannot commit - no transaction is active").in_statement("commit"));
                 }
+                self.check_deferred_foreign_keys()?;
+                for attached in &self.attached {
+                    attached.engine.check_deferred_foreign_keys()?;
+                }
+                self.transaction.take();
                 self.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
                 for attached in &mut self.attached {
                     attached.engine.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
@@ -5315,6 +5323,9 @@ impl Engine {
         }
         let live = self.live_rows(def, statement)?;
         for key in &def.foreign_keys {
+            if key.deferred && self.in_transaction() {
+                continue;
+            }
             let (parent_position, parent_columns) = self.foreign_key_parent(def, key, statement)?;
             let parent = &self.tables[parent_position];
             let parent_rows = self.live_rows(parent, statement)?;
@@ -5350,6 +5361,9 @@ impl Engine {
         statement: &'static str,
     ) -> Result<(), SqlError> {
         for key in &def.foreign_keys {
+            if key.deferred && self.in_transaction() {
+                continue;
+            }
             if !key.columns.iter().any(|position| assigned[*position]) {
                 continue;
             }
@@ -5368,6 +5382,9 @@ impl Engine {
             }
         }
         for (child_position, key) in self.referencing_foreign_keys(&def.name) {
+            if key.deferred && self.in_transaction() && key.on_update_action != ForeignKeyAction::Restrict {
+                continue;
+            }
             let child = &self.tables[child_position];
             let (parent_position, parent_columns) = self.foreign_key_parent(child, &key, statement)?;
             if !parent_columns.iter().any(|position| assigned.get(*position).copied().unwrap_or(false)) {
@@ -5420,6 +5437,9 @@ impl Engine {
             self.foreign_key_parent(def, key, statement)?;
         }
         for (child_position, key) in self.referencing_foreign_keys(&def.name) {
+            if key.deferred && self.in_transaction() && key.on_delete_action != ForeignKeyAction::Restrict {
+                continue;
+            }
             let child = &self.tables[child_position];
             let (_, parent_columns) = self.foreign_key_parent(child, &key, statement)?;
             let mut gone: Vec<Vec<Cell>> = Vec::new();
@@ -5444,6 +5464,34 @@ impl Engine {
                 }
                 if gone.iter().any(|value| cells_equal(value, &child_values)) {
                     return Err(foreign_key_violation(statement));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-checks every deferred foreign key against the state `COMMIT` would
+    /// publish. Immediate keys were already enforced per statement, so only
+    /// deferred keys are walked. A violation leaves the transaction open, as
+    /// SQLite does, so the caller can repair the rows and commit again.
+    fn check_deferred_foreign_keys(&self) -> Result<(), SqlError> {
+        if !self.foreign_keys {
+            return Ok(());
+        }
+        for child in &self.tables {
+            for key in child.foreign_keys.iter().filter(|key| key.deferred) {
+                let (parent_position, parent_columns) = self.foreign_key_parent(child, key, "commit")?;
+                let parent = &self.tables[parent_position];
+                let parent_rows = self.live_rows(parent, "commit")?;
+                let child_rows = self.live_rows(child, "commit")?;
+                for (_, cells) in &child_rows {
+                    let values = pick(cells, &key.columns);
+                    if values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                        continue;
+                    }
+                    if !parent_rows.iter().any(|(_, parent_cells)| keys_equal(&values, parent_cells, &parent_columns)) {
+                        return Err(foreign_key_violation("commit"));
+                    }
                 }
             }
         }
@@ -11410,6 +11458,7 @@ fn resolve_foreign_keys(columns: &[ColumnSpec], keys: &[ForeignKey]) -> Result<V
             on_update: foreign_key_action_text(key.on_update),
             on_delete_action: key.on_delete,
             on_update_action: key.on_update,
+            deferred: key.deferred,
         });
     }
     Ok(resolved)
@@ -13869,7 +13918,7 @@ mod tests {
     }
 
     #[test]
-    fn referential_actions_run_and_deferred_keys_stay_rejected() {
+    fn referential_actions_run_and_deferred_keys_wait_for_commit() {
         let mut engine = Engine::new(None).expect("blank engine");
         engine.execute_one("CREATE TABLE p (id INTEGER PRIMARY KEY)").expect("create parent");
         engine
@@ -13903,8 +13952,25 @@ mod tests {
         );
         let deferred = engine
             .execute_one("CREATE TABLE c4 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
-            .expect_err("deferred");
-        assert_eq!(deferred.code, "unsupported-deferred-foreign-key");
+            .expect("deferred accepted");
+        assert_eq!(deferred.statement, "create-table");
+        // Autocommit: the statement boundary is also the commit boundary.
+        let orphan = engine.execute_one("INSERT INTO c4 VALUES (5, 77)").expect_err("orphan");
+        assert_eq!(orphan.message, "FOREIGN KEY constraint failed");
+        // In a transaction the reference may be repaired before COMMIT.
+        engine.execute_one("BEGIN").expect("begin");
+        engine.execute_one("INSERT INTO c4 VALUES (5, 77)").expect("deferred insert");
+        engine.execute_one("INSERT INTO p VALUES (77)").expect("repair parent");
+        engine.execute_one("COMMIT").expect("commit repaired");
+        assert_eq!(engine.execute_one("SELECT pid FROM c4").expect("deferred row").rows, vec![vec![Cell::Integer(77)]]);
+        // An unresolvable reference fails COMMIT and keeps the transaction open.
+        engine.execute_one("BEGIN").expect("begin again");
+        engine.execute_one("INSERT INTO c4 VALUES (6, 88)").expect("deferred insert again");
+        let violation = engine.execute_one("COMMIT").expect_err("commit fails");
+        assert_eq!(violation.message, "FOREIGN KEY constraint failed");
+        assert!(engine.in_transaction(), "a deferred failure must leave the transaction open");
+        engine.execute_one("INSERT INTO p VALUES (88)").expect("repair after failure");
+        engine.execute_one("COMMIT").expect("second commit");
     }
 
     #[test]

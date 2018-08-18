@@ -1062,6 +1062,9 @@ pub struct ForeignKey {
     pub on_delete: ForeignKeyAction,
     /// `ON UPDATE` action; `NO ACTION` when absent.
     pub on_update: ForeignKeyAction,
+    /// `DEFERRABLE INITIALLY DEFERRED`: the reference is verified at `COMMIT`
+    /// instead of at the end of each statement.
+    pub deferred: bool,
 }
 
 /// Referential action written after `ON DELETE` / `ON UPDATE`.
@@ -4664,13 +4667,20 @@ impl<'a> Parser<'a> {
     /// `CASCADE`, `SET NULL` and `SET DEFAULT` are rejected here: this engine
     /// checks foreign keys immediately and never rewrites the child row, so
     /// accepting the action would silently drop its effect. `DEFERRABLE
-    /// INITIALLY DEFERRED` is rejected for the same reason.
+    /// INITIALLY DEFERRED` is accepted and moves the reference check to
+    /// `COMMIT`.
     fn references_clause(&mut self, columns: Vec<String>) -> Result<ForeignKey, SqlError> {
         let parent = self.name()?;
         self.reject_qualified(&parent)?;
         let parent_columns = if self.peek() == Some(&Token::LParen) { self.column_list()? } else { Vec::new() };
-        let mut key =
-            ForeignKey { columns, parent, parent_columns, on_delete: ForeignKeyAction::NoAction, on_update: ForeignKeyAction::NoAction };
+        let mut key = ForeignKey {
+            columns,
+            parent,
+            parent_columns,
+            on_delete: ForeignKeyAction::NoAction,
+            on_update: ForeignKeyAction::NoAction,
+            deferred: false,
+        };
         loop {
             if self.eat_word("on") {
                 if self.eat_word("delete") {
@@ -4692,14 +4702,12 @@ impl<'a> Parser<'a> {
             else if self.eat_word("deferrable") {
                 if self.eat_word("initially") {
                     if self.eat_word("deferred") {
-                        let mut error = self.error(
-                            "unsupported-deferred-foreign-key",
-                            "`DEFERRABLE INITIALLY DEFERRED` is not supported: foreign keys are checked immediately",
-                        );
-                        error.clause = Some("DEFERRABLE".to_string());
-                        return Err(error);
+                        key.deferred = true;
                     }
-                    self.expect_word("immediate")?;
+                    else {
+                        self.expect_word("immediate")?;
+                        key.deferred = false;
+                    }
                 }
             }
             else {
