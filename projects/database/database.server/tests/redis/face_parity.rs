@@ -396,6 +396,30 @@ fn embedded_server_face_keeps_session_state() {
     assert_eq!(run(&mut session, 3, &[b"ACL", b"GETUSER", b"nosuch"]), "_\r\n");
 }
 
+#[test]
+fn embedded_server_face_kills_a_peer_session() {
+    let shard = ShardId("redis-server-entry".into());
+    let executor = LocalExecutor::new(
+        ShardMap::new(ShardEpoch(1), vec![shard.clone()]).unwrap(),
+        HashMap::from([(shard, MemoryShard::new())]),
+        Vec::new(),
+    )
+    .unwrap();
+    let registry = Arc::new(ClientRegistry::standalone());
+    let mut client = EmbeddedServerFace::with_id(Arc::clone(&registry), 1);
+    let _victim = EmbeddedServerFace::with_id(Arc::clone(&registry), 2);
+    let run = |session: &mut EmbeddedServerFace, arguments: &[&[u8]]| {
+        let mut output = Vec::new();
+        execute_server_command(session, &mut output, arguments, &executor, 0, 2).unwrap();
+        String::from_utf8(output).unwrap()
+    };
+    assert!(run(&mut client, &[b"CLIENT", b"LIST"]).contains("id=2 "));
+    assert_eq!(run(&mut client, &[b"CLIENT", b"KILL", b"ID", b"2"]), ":1\r\n");
+    assert_eq!(registry.take_killed(), vec![2]);
+    let listing = run(&mut client, &[b"CLIENT", b"LIST"]);
+    assert!(!listing.contains("id=2 "), "killed session stayed in CLIENT LIST: {listing}");
+}
+
 /// 把同一条命令同时发给两面并按顺序读回，避免一方阻塞时另一方的回复串位。
 fn read_pair(l1: &mut TcpStream, ts: &mut TcpStream, command: &[&str]) -> io::Result<(Frame, Frame)> {
     send(l1, command);

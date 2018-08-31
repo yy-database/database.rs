@@ -13,7 +13,7 @@ use std::{
     io::{self, Write},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -74,6 +74,9 @@ pub(crate) struct ClientRecord {
     created: Instant,
     /// 写侧句柄，`CLIENT KILL` 通过它关闭 socket；嵌入式会话没有 socket。
     sink: Option<Arc<ClientSink>>,
+    /// 是否已被 `CLIENT KILL` 选中。监听器靠关闭 socket 结束连接，无 socket 的
+    /// 嵌入式会话由宿主读取这个标志后自行断开。
+    closed: AtomicBool,
     /// 可变会话字段。
     state: Mutex<ClientState>,
 }
@@ -95,6 +98,7 @@ impl ClientRecord {
             local,
             created: now,
             sink,
+            closed: AtomicBool::new(false),
             state: Mutex::new(ClientState {
                 name: None,
                 lib_name: Vec::new(),
@@ -169,11 +173,25 @@ impl ClientRecord {
         }
     }
 
-    /// 立即关闭这条连接的 socket，唤醒它可能阻塞中的读写。
+    /// 标记这条连接已被关闭，并立即关闭它的 socket。
+    ///
+    /// 无 socket 的嵌入式会话只留下标志，宿主读完 `CLIENT LIST` 语义所需的状态后
+    /// 自行断开。
     fn kill(&self) {
+        self.closed.store(true, Ordering::Release);
         if let Some(sink) = &self.sink {
             sink.shutdown();
         }
+    }
+
+    /// 是否已被 `CLIENT KILL` 选中。
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// 无写侧的会话由嵌入式宿主登记，`CLIENT KILL` 后需要宿主回收。
+    fn detached(&self) -> bool {
+        self.sink.is_none()
     }
 
     fn age_seconds(&self) -> u64 {
@@ -266,12 +284,12 @@ impl ClientRegistry {
         record
     }
 
-    /// 登记一条没有 socket 的会话，供嵌入式绑定复用同一套服务器面语义。
+    /// 用宿主给定的 id 登记一条没有 socket 的会话。
     ///
-    /// `CLIENT LIST` / `CLIENT INFO` 读到的身份字段与真机同形，`CLIENT KILL` 命中它时
-    /// 没有可关闭的写侧，只保留回复计数语义。
-    pub(crate) fn attach_detached(&self) -> Arc<ClientRecord> {
-        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+    /// 嵌入式宿主按自己的连接号登记，`CLIENT ID` / `CLIENT LIST` / `CLIENT KILL`
+    /// 因此能直接命中宿主侧的连接，不需要额外的 id 映射。
+    pub fn attach_detached_with(&self, id: u64) -> Arc<ClientRecord> {
+        self.next_id.fetch_max(id.saturating_add(1), Ordering::AcqRel);
         self.connections.fetch_add(1, Ordering::AcqRel);
         let address = "127.0.0.1:0".to_string();
         let record = Arc::new(ClientRecord::new(id, id, address.clone(), address, None));
@@ -280,8 +298,27 @@ impl ClientRegistry {
     }
 
     /// 连接结束时移除登记，避免 `CLIENT LIST` 读到已关闭的连接。
-    pub(crate) fn detach(&self, id: u64) {
+    pub fn detach(&self, id: u64) {
         self.lock().retain(|entry| entry.id != id);
+    }
+
+    /// 回收被 `CLIENT KILL` 关闭的无 socket 会话并返回它们的 id。
+    ///
+    /// 监听器连接会在读循环结束时自行 [`detach`](Self::detach)，这里只处理嵌入式
+    /// 会话，宿主据返回的 id 关闭对应的宿主连接。
+    pub fn take_killed(&self) -> Vec<u64> {
+        let mut entries = self.lock();
+        let mut killed = Vec::new();
+        entries.retain(|entry| {
+            if entry.is_closed() && entry.detached() {
+                killed.push(entry.id);
+                false
+            }
+            else {
+                true
+            }
+        });
+        killed
     }
 
     fn snapshot(&self) -> Vec<Arc<ClientRecord>> {
@@ -1335,11 +1372,11 @@ pub(crate) fn handle_acl(stream: &mut dyn Write, request: &Request<'_>, protocol
 
 /// 嵌入式服务器面会话，复用监听器同一套 `CLIENT` / `COMMAND` / `INFO` / `CONFIG` / `ACL`。
 ///
-/// 监听器用真实 socket 登记连接；语言绑定没有 socket，因此这里持有一条无写侧的登记
-/// 记录，只把会话字段（名字、库号、协议、配置）跨调用保留下来。`CLIENT KILL` 命中这条
-/// 记录时没有可关闭的写侧，计数与回复形态仍与真机一致。
+/// 监听器用真实 socket 登记连接；语言绑定没有 socket，因此这里按宿主给定的连接号登记
+/// 一条无写侧的记录。多条嵌入式会话共享同一个 [`ClientRegistry`]，`CLIENT LIST` 与
+/// `CLIENT KILL` 因此能看到并关闭宿主侧的其它连接。
 pub struct EmbeddedServerFace {
-    registry: ClientRegistry,
+    registry: Arc<ClientRegistry>,
     pubsub: PubSubRegistry,
     state: ConnectionState,
 }
@@ -1347,9 +1384,13 @@ pub struct EmbeddedServerFace {
 impl EmbeddedServerFace {
     /// 创建一条独立会话，配置取真机默认值。
     pub fn new() -> Self {
-        let registry = ClientRegistry::standalone();
+        Self::with_id(Arc::new(ClientRegistry::standalone()), 1)
+    }
+
+    /// 在共享登记表里用宿主连接号创建一条会话。
+    pub fn with_id(registry: Arc<ClientRegistry>, id: u64) -> Self {
         let pubsub = PubSubRegistry::new();
-        let state = ConnectionState::new(registry.attach_detached());
+        let state = ConnectionState::new(registry.attach_detached_with(id));
         Self { registry, pubsub, state }
     }
 

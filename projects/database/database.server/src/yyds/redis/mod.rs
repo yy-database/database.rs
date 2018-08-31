@@ -155,7 +155,10 @@ pub fn startup_banner(port: u16) -> String {
 }
 
 /// 服务器面会话：`CLIENT` / `COMMAND` / `INFO` / `CONFIG` / `ACL`。
-pub use server_face::EmbeddedServerFace;
+///
+/// [`ClientRegistry`] 是监听器级状态，嵌入式宿主可让多条 [`EmbeddedServerFace`]
+/// 共享同一张登记表，使 `CLIENT LIST` 与 `CLIENT KILL` 看到宿主侧的其它连接。
+pub use server_face::{ClientRegistry, EmbeddedServerFace};
 
 /// Executes one server-face request against an external executor and writes the RESP reply.
 ///
