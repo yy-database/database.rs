@@ -9,10 +9,46 @@ use std::{
     time::{Duration, Instant},
 };
 
-use database_protocol_mongo::bson::BsonValue;
+use database_protocol_mongo::bson::{encode_bson, BsonValue};
 
 /// Idle time after which a cursor is reclaimed.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// First batch `find` returns when `batchSize` is absent, matching `mongod`.
+pub const DEFAULT_FIRST_BATCH: usize = 101;
+
+/// Documents are packed into a batch until the next one would push the reply
+/// past the BSON object ceiling `mongod 8.0.9` applies to a batch.
+pub const MAX_BATCH_BYTES: usize = 16_777_216;
+
+/// Encoded size of one cursor document.
+fn document_bytes(value: &BsonValue) -> usize {
+    match value {
+        BsonValue::Document(document) => encode_bson(document).len(),
+        _ => 0,
+    }
+}
+
+/// Drains up to `limit` documents while staying under [`MAX_BATCH_BYTES`].
+///
+/// One document is always taken, so a cursor that holds a single very large
+/// document still answers instead of stalling on the byte cap.
+fn take_batch(documents: &mut Vec<BsonValue>, limit: usize) -> Vec<BsonValue> {
+    let mut count = 0_usize;
+    let mut bytes = 0_usize;
+    for document in documents.iter() {
+        if count >= limit {
+            break;
+        }
+        let size = document_bytes(document);
+        if count > 0 && bytes + size > MAX_BATCH_BYTES {
+            break;
+        }
+        bytes += size;
+        count += 1;
+    }
+    documents.drain(..count).collect()
+}
 
 /// One open cursor.
 #[derive(Debug)]
@@ -89,21 +125,27 @@ impl CursorStore {
 
     /// Stores the unsent documents and returns the first batch.
     ///
+    /// `None` means `batchSize` was absent, which `mongod` answers with the
+    /// default 101 documents. An explicit `Some(0)` opens the cursor with an
+    /// empty first batch, so the caller has to `getMore` for every document.
     /// A cursor id of `0` means everything fit into the first batch.
-    pub fn open(&mut self, namespace: &str, mut documents: Vec<BsonValue>, batch_size: usize) -> (i64, Vec<BsonValue>) {
+    pub fn open(&mut self, namespace: &str, mut documents: Vec<BsonValue>, batch_size: Option<usize>) -> (i64, Vec<BsonValue>) {
         self.reclaim();
-        if batch_size == 0 || documents.len() <= batch_size {
-            return (0, documents);
+        let first_batch = take_batch(&mut documents, batch_size.unwrap_or(DEFAULT_FIRST_BATCH));
+        if documents.is_empty() {
+            return (0, first_batch);
         }
-        let first_batch: Vec<BsonValue> = documents.drain(..batch_size).collect();
         let id = self.next_id;
         self.next_id += 1;
         self.cursors.insert(id, Cursor { namespace: namespace.to_string(), remaining: documents, killed: false, last_used: Instant::now() });
         (id, first_batch)
     }
 
-    /// Drains `batch_size` documents (or everything when `batch_size` is zero).
-    pub fn get_more(&mut self, id: i64, batch_size: usize) -> Result<(Vec<BsonValue>, String), GetMoreError> {
+    /// Drains the next batch, filling it up to [`MAX_BATCH_BYTES`].
+    ///
+    /// `None` (absent or zero `batchSize`) drains everything that fits, as
+    /// `mongod 8.0.9` does for `getMore`.
+    pub fn get_more(&mut self, id: i64, batch_size: Option<usize>) -> Result<(Vec<BsonValue>, String), GetMoreError> {
         self.reclaim();
         let Some(cursor) = self.cursors.get(&id)
         else {
@@ -116,9 +158,8 @@ impl CursorStore {
         }
         let cursor = self.cursors.get_mut(&id).expect("cursor was just read");
         cursor.last_used = Instant::now();
-        let take = if batch_size == 0 { cursor.remaining.len() } else { batch_size.min(cursor.remaining.len()) };
         let namespace = cursor.namespace.clone();
-        let batch: Vec<BsonValue> = cursor.remaining.drain(..take).collect();
+        let batch = take_batch(&mut cursor.remaining, batch_size.unwrap_or(usize::MAX));
         let drained = cursor.remaining.is_empty();
         if drained {
             self.cursors.remove(&id);
@@ -136,6 +177,22 @@ impl CursorStore {
         let mut killed = 0;
         for cursor in self.cursors.values_mut() {
             if !cursor.killed && cursor.namespace.starts_with(&prefix) {
+                cursor.killed = true;
+                cursor.remaining.clear();
+                killed += 1;
+            }
+        }
+        killed
+    }
+
+    /// Marks every cursor on one namespace as killed by a collection drop.
+    ///
+    /// Like [`Self::drop_database`], the entry stays in the table so the first
+    /// `getMore` answers `QueryPlanKilled` and removes it.
+    pub fn drop_collection(&mut self, namespace: &str) -> usize {
+        let mut killed = 0;
+        for cursor in self.cursors.values_mut() {
+            if !cursor.killed && cursor.namespace == namespace {
                 cursor.killed = true;
                 cursor.remaining.clear();
                 killed += 1;

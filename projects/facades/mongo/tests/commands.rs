@@ -317,7 +317,7 @@ fn find_batch_leaves_a_get_more_cursor() {
 #[test]
 fn kill_cursors_reports_killed_and_unknown_ids() {
     let mut cursors = CursorStore::new();
-    let (id, first) = cursors.open("app.items", (0..4).map(BsonValue::Int32).collect(), 2);
+    let (id, first) = cursors.open("app.items", (0..4).map(BsonValue::Int32).collect(), Some(2));
     assert!(id > 0);
     assert_eq!(first.len(), 2);
 
@@ -331,10 +331,10 @@ fn kill_cursors_reports_killed_and_unknown_ids() {
 #[test]
 fn idle_cursors_are_reclaimed_lazily() {
     let mut cursors = CursorStore::with_idle_timeout(Duration::from_millis(1));
-    let (id, _) = cursors.open("app.items", (0..4).map(BsonValue::Int32).collect(), 2);
+    let (id, _) = cursors.open("app.items", (0..4).map(BsonValue::Int32).collect(), Some(2));
     assert_eq!(cursors.len(), 1);
     std::thread::sleep(Duration::from_millis(20));
-    assert!(cursors.get_more(id, 2).is_err());
+    assert!(cursors.get_more(id, None).is_err());
     assert!(cursors.is_empty());
     assert_eq!(CursorStore::new().idle_timeout(), Duration::from_secs(600));
 }

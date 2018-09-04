@@ -433,6 +433,23 @@ impl WriteError {
     }
 }
 
+/// Largest BSON object `mongod 8.0.9` accepts, as its own error message states
+/// (`Size must be between 0 and 16793600(16MB)`).
+const MAX_BSON_OBJECT_SIZE: usize = 16_793_600;
+
+/// Rejects one stored document above the BSON ceiling before it reaches the
+/// store, with the code and wording `mongod 8.0.9` uses.
+fn ensure_document_size(document: &BsonDocument, collection: &str) -> Result<(), CommandError> {
+    let size = encode_bson(document).len();
+    if size > MAX_BSON_OBJECT_SIZE {
+        return Err(CommandError::new(
+            10334,
+            format!("BSONObj size: {size} (0x{size:X}) is invalid. Size must be between 0 and 16793600(16MB) First element: insert: \"{collection}\""),
+        ));
+    }
+    Ok(())
+}
+
 /// `insert`, with `_id` generation, `11000` duplicate mapping, unique-index
 /// enforcement, and ordered / unordered continuation.
 pub fn insert(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDocument, CommandError> {
@@ -445,6 +462,12 @@ pub fn insert(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
     };
     if documents.is_empty() || documents.len() > 100_000 {
         return Err(CommandError::new(16, format!("Write batch sizes must be between 1 and 100000. Got {} operations.", documents.len())));
+    }
+    let collection = namespace.rsplit_once('.').map(|(_, name)| name).unwrap_or(&namespace);
+    for item in documents {
+        if let BsonValue::Document(document) = item {
+            ensure_document_size(document, collection)?;
+        }
     }
 
     let ordered = match command.get("ordered") {
@@ -1514,7 +1537,9 @@ pub fn find(command: &BsonDocument, store: &dyn MongoStorage, cursors: &mut Curs
     let sort = parse_sort(command.get("sort"));
     let skip = parse_count(command.get("skip"));
     let limit = parse_count(command.get("limit"));
-    let batch_size = parse_count(command.get("batchSize"));
+    // `None` keeps the absence of `batchSize`, which means the default 101
+    // documents; an explicit `0` opens a cursor with an empty first batch.
+    let batch_size = command.get("batchSize").and_then(int_value).map(|count| count.max(0) as usize);
     let projection = match command.get("projection") {
         Some(BsonValue::Document(projection)) => Some(projection.clone()),
         _ => None,
@@ -3326,7 +3351,9 @@ pub fn get_more(command: &BsonDocument, cursors: &mut CursorStore) -> Result<Bso
     else {
         return Err(CommandError::new(2, "getMore requires a cursor id"));
     };
-    let batch_size = parse_count(command.get("batchSize"));
+    // Absent and explicit `0` both mean "fill the batch", which `mongod 8.0.9`
+    // answers by draining everything that fits under the BSON ceiling.
+    let batch_size = command.get("batchSize").and_then(int_value).filter(|count| *count > 0).map(|count| count as usize);
     let (batch, namespace) = cursors.get_more(cursor_id, batch_size).map_err(|error| match error {
         GetMoreError::NotFound(id) => CommandError::new(43, format!("cursor id {id} not found")),
         // `mongod 8.0.9` kills the cursor with the collection and answers one
