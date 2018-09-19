@@ -1288,7 +1288,14 @@ fn handle_copy(
         if request.arguments[index].eq_ignore_ascii_case(b"DB") && index + 1 < request.arguments.len() {
             let Some(database) = parse_database(request.arguments[index + 1])
             else {
-                return write_error(stream, "DB index is out of range");
+                // 真机先按整数解析再判范围：非整数报值错误，越界（含负数与溢出）报范围错误。
+                let message = if parse_integer(request.arguments[index + 1]).is_some() {
+                    "DB index is out of range"
+                }
+                else {
+                    "value is not an integer or out of range"
+                };
+                return write_error(stream, message);
             };
             destination_database = Some(database);
             index += 2;
@@ -1483,7 +1490,7 @@ fn object_encoding(kind: KeyKind, value: &[u8]) -> &'static str {
             if value.len() <= 20 && parse_integer(value).is_some() {
                 "int"
             }
-            else if value.len() <= 36 {
+            else if value.len() <= 44 {
                 "embstr"
             }
             else {
