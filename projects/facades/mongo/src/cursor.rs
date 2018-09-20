@@ -67,6 +67,14 @@ pub struct Cursor {
 pub enum GetMoreError {
     /// No live cursor carries that id.
     NotFound(i64),
+    /// The request named a namespace the cursor does not belong to. `mongod`
+    /// refuses it with `Unauthorized` instead of serving the other namespace.
+    NamespaceMismatch {
+        /// Namespace the request asked for, as `<database>.<collection>`.
+        requested: String,
+        /// Namespace the cursor was opened on.
+        cursor: String,
+    },
     /// The collection behind the cursor was dropped. The cursor is removed by
     /// this `getMore`, exactly like `mongod 8.0.9`: one `QueryPlanKilled` reply,
     /// then `CursorNotFound`.
@@ -143,14 +151,21 @@ impl CursorStore {
 
     /// Drains the next batch, filling it up to [`MAX_BATCH_BYTES`].
     ///
+    /// `namespace` is the namespace the request asks for. A cursor belongs to the
+    /// namespace it was opened on, so a request that names another one is refused
+    /// before any document is returned.
+    ///
     /// `None` (absent or zero `batchSize`) drains everything that fits, as
     /// `mongod 8.0.9` does for `getMore`.
-    pub fn get_more(&mut self, id: i64, batch_size: Option<usize>) -> Result<(Vec<BsonValue>, String), GetMoreError> {
+    pub fn get_more(&mut self, id: i64, namespace: &str, batch_size: Option<usize>) -> Result<(Vec<BsonValue>, String), GetMoreError> {
         self.reclaim();
         let Some(cursor) = self.cursors.get(&id)
         else {
             return Err(GetMoreError::NotFound(id));
         };
+        if cursor.namespace != namespace {
+            return Err(GetMoreError::NamespaceMismatch { requested: namespace.to_string(), cursor: cursor.namespace.clone() });
+        }
         if cursor.killed {
             let namespace = cursor.namespace.clone();
             self.cursors.remove(&id);

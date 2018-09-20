@@ -3346,16 +3346,33 @@ fn increment_value(current: &BsonValue, amount: &BsonValue) -> Option<BsonValue>
 }
 
 /// `getMore`: drains the caller-owned cursor table.
+///
+/// A cursor is bound to the namespace it was opened on. `mongod` requires the
+/// `collection` field and refuses a request that names another namespace, so the
+/// lookup is scoped before any document is read.
 pub fn get_more(command: &BsonDocument, cursors: &mut CursorStore) -> Result<BsonDocument, CommandError> {
     let Some(cursor_id) = command.get("getMore").and_then(int_value)
     else {
         return Err(CommandError::new(2, "getMore requires a cursor id"));
     };
+    let Some(collection) = command.get("collection").and_then(|value| match value {
+        BsonValue::String(collection) => Some(collection.as_str()),
+        _ => None,
+    })
+    else {
+        return Err(CommandError::new(40415, "BSON field 'getMore.collection' is missing but a required field"));
+    };
+    let namespace = format!("{}.{collection}", command.database());
     // Absent and explicit `0` both mean "fill the batch", which `mongod 8.0.9`
     // answers by draining everything that fits under the BSON ceiling.
     let batch_size = command.get("batchSize").and_then(int_value).filter(|count| *count > 0).map(|count| count as usize);
-    let (batch, namespace) = cursors.get_more(cursor_id, batch_size).map_err(|error| match error {
+    let (batch, namespace) = cursors.get_more(cursor_id, &namespace, batch_size).map_err(|error| match error {
         GetMoreError::NotFound(id) => CommandError::new(43, format!("cursor id {id} not found")),
+        // `mongod` refuses a cross-namespace request with `Unauthorized` before
+        // it looks at the cursor's state.
+        GetMoreError::NamespaceMismatch { requested, cursor } => {
+            CommandError::new(13, format!("Requested getMore on namespace '{requested}', but cursor belongs to a different namespace {cursor}"))
+        }
         // `mongod 8.0.9` kills the cursor with the collection and answers one
         // `QueryPlanKilled` naming the collection UUID.
         GetMoreError::CollectionDropped { namespace, .. } => {

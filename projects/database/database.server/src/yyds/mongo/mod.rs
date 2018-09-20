@@ -16,7 +16,7 @@
 #![warn(missing_docs)]
 
 use std::{
-    sync::{Mutex, MutexGuard, OnceLock},
+    sync::{Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -100,12 +100,15 @@ fn command_kind(name: &str) -> &'static str {
 /// optional checksum. Errors are always turned into a generic
 /// `{ ok: 0, errmsg: ... }` BSON response so the connection layer never has to carry
 /// IO-result-like fallbacks.
-pub fn handle_op_msg(op_msg_body: &[u8], executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
+///
+/// `cursors` belongs to the service instance that owns the connection. Cursor
+/// state is never shared between two instances in the same process.
+pub fn handle_op_msg(op_msg_body: &[u8], executor: Option<&dyn KeyValueExecutor>, cursors: &Mutex<CursorStore>) -> Vec<u8> {
     let bson_doc = match decode_op_msg_command(op_msg_body) {
         Ok(doc) => doc,
         Err(message) => return generic_error_body(&message),
     };
-    dispatch_command(&bson_doc, executor)
+    dispatch_command(&bson_doc, executor, cursors)
 }
 
 /// Handles a legacy OP_QUERY payload and returns the response BSON document,
@@ -113,20 +116,18 @@ pub fn handle_op_msg(op_msg_body: &[u8], executor: Option<&dyn KeyValueExecutor>
 ///
 /// Drivers send their first `isMaster` / `hello` probe as OP_QUERY because they
 /// cannot assume the server speaks OP_MSG yet. The command is the query document
-/// itself (optionally under `$query`).
+/// itself (optionally under `$query`). Legacy frames only carry the handshake, so
+/// they get a throwaway cursor table.
 pub fn handle_op_query(op_query_body: &[u8], executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
     let bson_doc = match decode_op_query_command(op_query_body) {
         Ok(doc) => doc,
         Err(message) => return generic_error_body(&message),
     };
-    dispatch_command(&bson_doc, executor)
+    dispatch_command(&bson_doc, executor, &Mutex::new(CursorStore::default()))
 }
 
-/// 全网关共享的游标表，游标编号由门面的命令层分配。
-static CURSORS: OnceLock<Mutex<CursorStore>> = OnceLock::new();
-
-fn cursors() -> MutexGuard<'static, CursorStore> {
-    CURSORS.get_or_init(|| Mutex::new(CursorStore::default())).lock().unwrap_or_else(|poison| poison.into_inner())
+fn lock_cursors(cursors: &Mutex<CursorStore>) -> MutexGuard<'_, CursorStore> {
+    cursors.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// 把门面返回的命令文档或错误文档编码成应答帧。
@@ -152,7 +153,7 @@ fn run(
 }
 
 /// Routes one decoded command document to its handler.
-fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
+fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>, cursors: &Mutex<CursorStore>) -> Vec<u8> {
     let Some(command_name) = bson_doc.command_name()
     else {
         return generic_error_body("empty command");
@@ -168,7 +169,7 @@ fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecu
                 return build_error_bson(2, "find requires an executor");
             };
             let storage = storage::ExecutorStorage::new(executor);
-            let mut cursor_store = cursors();
+            let mut cursor_store = lock_cursors(cursors);
             render(commands::find(bson_doc, &storage, &mut cursor_store))
         }
         "count" => run(executor, "count", |storage| commands::count(bson_doc, storage)),
@@ -176,8 +177,8 @@ fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecu
         "delete" => run(executor, "delete", |storage| commands::delete(bson_doc, storage)),
         "update" => run(executor, "update", |storage| commands::update(bson_doc, storage)),
         "createIndexes" => run(executor, "createIndexes", |storage| commands::create_indexes(bson_doc, storage)),
-        "getMore" => render(commands::get_more(bson_doc, &mut cursors())),
-        "killCursors" => render(commands::kill_cursors(bson_doc, &mut cursors())),
+        "getMore" => render(commands::get_more(bson_doc, &mut lock_cursors(cursors))),
+        "killCursors" => render(commands::kill_cursors(bson_doc, &mut lock_cursors(cursors))),
         other => generic_error_body(other),
     }
 }

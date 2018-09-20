@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     net::{SocketAddr, TcpListener},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -13,6 +13,7 @@ use std::{
 
 use database_cluster::control::NodeLease;
 use database_execution::cluster::KeyValueExecutor;
+use mongo::cursor::CursorStore;
 
 use super::{
     connection::{serve_cancellable, serve_cancellable_with_executor},
@@ -63,9 +64,12 @@ impl MongoService {
         let address = listener.local_addr()?;
         let stopping = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&stopping);
+        // Cursor state belongs to this service instance. A second instance in the
+        // same process gets its own table, so neither can read the other's cursors.
+        let cursors = Arc::new(Mutex::new(CursorStore::default()));
         let worker = thread::Builder::new().name("yyds-mongo-listener".into()).spawn(move || {
             let _owner = owner;
-            listen(listener, signal, limits, executor)
+            listen(listener, signal, limits, executor, cursors)
         })?;
         Ok(Self { address, stopping, worker: Some(worker) })
     }
@@ -135,6 +139,7 @@ fn listen(
     stopping: Arc<AtomicBool>,
     limits: FrameLimits,
     executor: Option<Arc<dyn KeyValueExecutor>>,
+    cursors: Arc<Mutex<CursorStore>>,
 ) -> io::Result<()> {
     let mut clients = Clients { workers: Vec::new(), stopping: Arc::clone(&stopping) };
     while !stopping.load(Ordering::Acquire) {
@@ -152,10 +157,11 @@ fn listen(
                 }
                 let cancellation = Arc::clone(&stopping);
                 let connection_executor = executor.clone();
+                let connection_cursors = Arc::clone(&cursors);
                 let worker = thread::Builder::new().name("yyds-mongo-client".into()).spawn(move || {
                     let _ = match connection_executor {
-                        Some(executor) => serve_cancellable_with_executor(stream, limits, cancellation, executor),
-                        None => serve_cancellable(stream, limits, cancellation),
+                        Some(executor) => serve_cancellable_with_executor(stream, limits, cancellation, executor, connection_cursors),
+                        None => serve_cancellable(stream, limits, cancellation, connection_cursors),
                     };
                 })?;
                 clients.workers.push(worker);

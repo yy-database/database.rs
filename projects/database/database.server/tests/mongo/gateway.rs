@@ -6,7 +6,7 @@
 use std::{
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    sync::atomic::AtomicBool,
+    sync::{Arc, Mutex, atomic::AtomicBool},
     thread,
     time::Duration,
 };
@@ -15,6 +15,7 @@ use database_server::yyds::mongo::{
     connection::serve_cancellable,
     wire::{self, FrameLimits},
 };
+use mongo::cursor::CursorStore;
 
 /// Build a hello command OP_MSG frame — `{ hello: 1, $db: "admin" }`.
 /// OP_MSG body layout: [flags u32][kind u8=0x00][BSON doc].
@@ -55,10 +56,11 @@ fn spawn_handshake_server() -> (TcpStream, thread::JoinHandle<()>) {
     let address = listener.local_addr().unwrap();
     let stopping = std::sync::Arc::new(AtomicBool::new(false));
     let stopping_clone = std::sync::Arc::clone(&stopping);
+    let cursors = Arc::new(Mutex::new(CursorStore::default()));
 
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve_cancellable(stream, FrameLimits::default(), stopping_clone).unwrap();
+        serve_cancellable(stream, FrameLimits::default(), stopping_clone, cursors).unwrap();
     });
 
     let client = TcpStream::connect(address).unwrap();

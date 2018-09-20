@@ -315,6 +315,38 @@ fn find_batch_leaves_a_get_more_cursor() {
 }
 
 #[test]
+fn get_more_refuses_another_namespace() {
+    let store = store();
+    insert_documents(&store, "items", (0..4).map(|index| document(&[("_id", BsonValue::Int32(index))])).collect());
+
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(BsonDocument::new()));
+    find.push("batchSize", BsonValue::Int32(2));
+    let mut cursors = CursorStore::new();
+    let response = commands::find(&find, &store, &mut cursors).expect("find");
+    let id = cursor_id(&response);
+
+    let foreign = document(&[("getMore", BsonValue::Int64(id)), ("collection", text("items")), ("$db", text("tenant_b"))]);
+    let error = commands::get_more(&foreign, &mut cursors).expect_err("a foreign namespace must be refused");
+    assert_eq!(error.code, 13);
+    assert_eq!(error.message, "Requested getMore on namespace 'tenant_b.items', but cursor belongs to a different namespace app.items");
+
+    // The cursor itself stays intact for the namespace that opened it.
+    let own = document(&[("getMore", BsonValue::Int64(id)), ("collection", text("items")), ("$db", text("app"))]);
+    let next = commands::get_more(&own, &mut cursors).expect("getMore on its own namespace");
+    assert_eq!(batch(&next, "nextBatch").len(), 2);
+}
+
+#[test]
+fn get_more_requires_a_collection() {
+    let mut cursors = CursorStore::new();
+    let (id, _) = cursors.open("app.items", (0..4).map(BsonValue::Int32).collect(), Some(2));
+    let request = document(&[("getMore", BsonValue::Int64(id)), ("$db", text("app"))]);
+    let error = commands::get_more(&request, &mut cursors).expect_err("collection is required");
+    assert_eq!(error.code, 40415);
+}
+
+#[test]
 fn kill_cursors_reports_killed_and_unknown_ids() {
     let mut cursors = CursorStore::new();
     let (id, first) = cursors.open("app.items", (0..4).map(BsonValue::Int32).collect(), Some(2));
@@ -334,7 +366,7 @@ fn idle_cursors_are_reclaimed_lazily() {
     let (id, _) = cursors.open("app.items", (0..4).map(BsonValue::Int32).collect(), Some(2));
     assert_eq!(cursors.len(), 1);
     std::thread::sleep(Duration::from_millis(20));
-    assert!(cursors.get_more(id, None).is_err());
+    assert!(cursors.get_more(id, "app.items", None).is_err());
     assert!(cursors.is_empty());
     assert_eq!(CursorStore::new().idle_timeout(), Duration::from_secs(600));
 }

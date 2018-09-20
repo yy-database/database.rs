@@ -10,6 +10,7 @@
 //! 逐字节比较没有意义，改为只断言 `ok`、`code`、`codeName`、消息前缀与 namespace。
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use database_cluster::topology::ShardMap;
 use database_execution::cluster::{KeyValueExecutor, LocalExecutor};
@@ -19,6 +20,7 @@ use database_server::yyds::mongo::{
 };
 use database_storage::cluster_kv::MemoryShard;
 use database_types::cluster::{ShardEpoch, ShardId};
+use mongo::cursor::CursorStore;
 
 /// 结构化断言：真机 `createIndexes` 失败消息含随机 operation id 与集合 UUID，
 /// 只冻结稳定字段，不比较完整字符串。
@@ -514,8 +516,8 @@ fn op_msg_body(document: &BsonDocument) -> Vec<u8> {
     body
 }
 
-fn execute(executor: &dyn KeyValueExecutor, step: &Step) -> Vec<u8> {
-    normalize(handle_op_msg(&op_msg_body(&step.document), Some(executor)))
+fn execute(executor: &dyn KeyValueExecutor, cursors: &Mutex<CursorStore>, step: &Step) -> Vec<u8> {
+    normalize(handle_op_msg(&op_msg_body(&step.document), Some(executor), cursors))
 }
 
 /// 游标 id 是服务端生成的不透明值：统一替换为 `1`，其余字节原样保留。
@@ -577,12 +579,14 @@ fn reconcile_corpus_matches_frozen_wire_baseline() {
     let steps = corpus();
     assert_eq!(steps.len(), 38, "对账语料条数漂移");
 
+    // 语料在同一服务实例的游标表上按序推进，跨步骤保留游标状态。
+    let cursors = Mutex::new(CursorStore::default());
     let mut matched = 0_usize;
     let mut structured = 0_usize;
     let mut drift = Vec::new();
 
     for (index, step) in steps.iter().enumerate() {
-        let reply_bytes = execute(&executor, step);
+        let reply_bytes = execute(&executor, &cursors, step);
         let reply = hex(&reply_bytes);
         let position = index + 1;
         match &step.expected {

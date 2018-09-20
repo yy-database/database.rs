@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     thread,
     time::Duration,
 };
@@ -18,6 +18,7 @@ use database_server::yyds::mongo::{
 };
 use database_storage::cluster_kv::MemoryShard;
 use database_types::cluster::{ShardEpoch, ShardId};
+use mongo::cursor::CursorStore;
 
 fn executor_server() -> (TcpStream, thread::JoinHandle<()>) {
     let shard = ShardId("mongo-local".into());
@@ -33,9 +34,10 @@ fn executor_server() -> (TcpStream, thread::JoinHandle<()>) {
     let address = listener.local_addr().unwrap();
     let stopping = Arc::new(AtomicBool::new(false));
     let stopping_clone = Arc::clone(&stopping);
+    let cursors = Arc::new(Mutex::new(CursorStore::default()));
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve_cancellable_with_executor(stream, FrameLimits::default(), stopping_clone, executor).unwrap();
+        serve_cancellable_with_executor(stream, FrameLimits::default(), stopping_clone, executor, cursors).unwrap();
     });
     let client = TcpStream::connect(address).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -264,6 +266,78 @@ fn find_exact_id_after_insert_returns_one_document() {
 
     let _ = client.shutdown(Shutdown::Write);
     let _ = server.join();
+}
+
+#[test]
+fn get_more_refuses_a_namespace_that_did_not_open_the_cursor() {
+    let (mut client, server) = executor_server();
+
+    let documents: Vec<Vec<u8>> = (0..4).map(|index| bson_document(&[bson_int32("_id", index)])).collect();
+    let insert_cmd =
+        bson_document(&[bson_string("insert", "private"), bson_string("$db", "tenant_a"), bson_array_element("documents", &documents)]);
+    let _ = roundtrip(&mut client, 1, &insert_cmd);
+
+    let find_cmd = bson_document(&[
+        bson_string("find", "private"),
+        bson_string("$db", "tenant_a"),
+        bson_doc_element("filter", &bson_document(&[])),
+        bson_int32("batchSize", 2),
+    ]);
+    let find_reply = roundtrip(&mut client, 2, &find_cmd);
+    let id = extract_cursor_id(&find_reply).expect("find leaves a cursor");
+    assert_ne!(id, 0, "find must keep the cursor alive");
+    assert_eq!(extract_cursor_firstbatch_len(&find_reply), Some(2));
+
+    // The id alone is not an authorization to read another namespace.
+    let foreign = bson_document(&[bson_int64("getMore", id), bson_string("collection", "other"), bson_string("$db", "tenant_b")]);
+    let refused = roundtrip(&mut client, 3, &foreign);
+    assert_eq!(extract_int32(&refused, "code"), Some(13), "cross-namespace getMore reply={refused:?}");
+    assert_eq!(extract_string(&refused, "codeName"), Some("Unauthorized".to_string()));
+    assert_eq!(
+        extract_string(&refused, "errmsg"),
+        Some("Requested getMore on namespace 'tenant_b.other', but cursor belongs to a different namespace tenant_a.private".to_string())
+    );
+
+    // The refusal does not consume the cursor for the namespace that owns it.
+    let own = bson_document(&[bson_int64("getMore", id), bson_string("collection", "private"), bson_string("$db", "tenant_a")]);
+    let next = roundtrip(&mut client, 4, &own);
+    assert_eq!(extract_cursor_batch_len(&next, "nextBatch"), Some(2), "reply={next:?}");
+
+    let _ = client.shutdown(Shutdown::Write);
+    let _ = server.join();
+}
+
+#[test]
+fn cursor_tables_of_two_services_do_not_cross() {
+    let (mut first, first_server) = executor_server();
+    let (mut second, second_server) = executor_server();
+
+    let documents: Vec<Vec<u8>> = (0..4).map(|index| bson_document(&[bson_int32("_id", index)])).collect();
+    let insert_cmd =
+        bson_document(&[bson_string("insert", "private"), bson_string("$db", "tenant_a"), bson_array_element("documents", &documents)]);
+    let _ = roundtrip(&mut first, 1, &insert_cmd);
+
+    let find_cmd = bson_document(&[
+        bson_string("find", "private"),
+        bson_string("$db", "tenant_a"),
+        bson_doc_element("filter", &bson_document(&[])),
+        bson_int32("batchSize", 2),
+    ]);
+    let find_reply = roundtrip(&mut first, 2, &find_cmd);
+    let id = extract_cursor_id(&find_reply).expect("find leaves a cursor");
+
+    // The same numeric id on a second service instance must not resolve.
+    let crossing = bson_document(&[bson_int64("getMore", id), bson_string("collection", "private"), bson_string("$db", "tenant_a")]);
+    let stranger = roundtrip(&mut second, 1, &crossing);
+    assert_eq!(extract_int32(&stranger, "code"), Some(43), "a second instance must not see the cursor, reply={stranger:?}");
+
+    let own = roundtrip(&mut first, 3, &crossing);
+    assert_eq!(extract_cursor_batch_len(&own, "nextBatch"), Some(2), "reply={own:?}");
+
+    let _ = first.shutdown(Shutdown::Write);
+    let _ = second.shutdown(Shutdown::Write);
+    let _ = first_server.join();
+    let _ = second_server.join();
 }
 
 #[test]
@@ -584,12 +658,13 @@ fn extract_int64(bson: &[u8], key: &str) -> Option<i64> {
 }
 
 fn extract_cursor_firstbatch_len(bson: &[u8]) -> Option<usize> {
-    let cursor_doc = walk_bson(bson, |elem| match elem {
-        BsonElem::Document(k, v) if k == "cursor" => Some(v.clone()),
-        _ => None,
-    })?;
+    extract_cursor_batch_len(bson, "firstBatch")
+}
+
+fn extract_cursor_batch_len(bson: &[u8], key: &str) -> Option<usize> {
+    let cursor_doc = extract_document(bson, "cursor")?;
     let batch_doc = walk_bson(&cursor_doc, |elem| match elem {
-        BsonElem::Array(k, v) if k == "firstBatch" => Some(v.clone()),
+        BsonElem::Array(k, v) if k == key => Some(v.clone()),
         _ => None,
     })?;
     // batch_doc is a BSON array encoded as a document; count top-level keys.
@@ -602,6 +677,17 @@ fn extract_cursor_firstbatch_len(bson: &[u8]) -> Option<usize> {
         None::<()>
     });
     Some(count)
+}
+
+fn extract_cursor_id(bson: &[u8]) -> Option<i64> {
+    extract_int64(&extract_document(bson, "cursor")?, "id")
+}
+
+fn extract_string(bson: &[u8], key: &str) -> Option<String> {
+    walk_bson(bson, |elem| match elem {
+        BsonElem::String(k, v) if k == key => Some(v.to_string()),
+        _ => None,
+    })
 }
 
 // Minimal BSON walker for test use.

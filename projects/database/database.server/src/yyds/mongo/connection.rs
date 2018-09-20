@@ -8,21 +8,28 @@ use std::{
     io,
     net::TcpStream,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
 use database_execution::cluster::KeyValueExecutor;
+use mongo::cursor::CursorStore;
 
 use super::wire::{FrameLimits, OP_QUERY, read_frame, write_frame, write_reply_frame};
 
 /// Runs the request/reply loop on a single TCP stream.
 ///
 /// `cancellation` is polled after every frame so a listener shutdown can
-/// interrupt idle connections.
-pub fn serve_cancellable(stream: TcpStream, limits: FrameLimits, cancellation: Arc<AtomicBool>) -> io::Result<()> {
-    serve_inner(stream, limits, cancellation, None)
+/// interrupt idle connections. `cursors` is the table of the service instance
+/// that owns this connection, shared with its sibling connections only.
+pub fn serve_cancellable(
+    stream: TcpStream,
+    limits: FrameLimits,
+    cancellation: Arc<AtomicBool>,
+    cursors: Arc<Mutex<CursorStore>>,
+) -> io::Result<()> {
+    serve_inner(stream, limits, cancellation, None, &cursors)
 }
 
 /// Same as [`serve_cancellable`] but additionally runs command bodies through
@@ -33,8 +40,9 @@ pub fn serve_cancellable_with_executor(
     limits: FrameLimits,
     cancellation: Arc<AtomicBool>,
     executor: Arc<dyn KeyValueExecutor>,
+    cursors: Arc<Mutex<CursorStore>>,
 ) -> io::Result<()> {
-    serve_inner(stream, limits, cancellation, Some(executor))
+    serve_inner(stream, limits, cancellation, Some(executor), &cursors)
 }
 
 fn serve_inner(
@@ -42,6 +50,7 @@ fn serve_inner(
     limits: FrameLimits,
     cancellation: Arc<AtomicBool>,
     executor: Option<Arc<dyn KeyValueExecutor>>,
+    cursors: &Mutex<CursorStore>,
 ) -> io::Result<()> {
     while !cancellation.load(Ordering::Acquire) {
         let frame = match read_frame(&mut stream, limits) {
@@ -66,7 +75,7 @@ fn serve_inner(
 
         // Dispatch through the BSON-aware handler. All errors are already
         // turned into a generic BSON document by the handler itself.
-        let body = super::handle_op_msg(&frame.body, executor.as_deref());
+        let body = super::handle_op_msg(&frame.body, executor.as_deref(), cursors);
 
         // OP_MSG replies carry flag bits and a section kind before the BSON
         // document. Drivers reject a bare document as a malformed message.
