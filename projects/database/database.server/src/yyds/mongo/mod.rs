@@ -36,7 +36,7 @@ pub use database_protocol_mongo::bson;
 /// OP_MSG / OP_QUERY 组帧（来自 `database-protocol-mongo`）。
 pub use database_protocol_mongo::wire;
 
-use bson::{encode_bson, parse_bson, BsonDocument, BsonValue};
+use bson::{BsonDocument, BsonValue, encode_bson, parse_bson};
 
 /// Gateway kind implemented by this crate.
 pub const GATEWAY_KIND: database_protocol::GatewayKind = database_protocol::GatewayKind::Mongo;
@@ -318,6 +318,7 @@ fn build_error_bson(code: i32, errmsg: &str) -> Vec<u8> {
 /// 三字段形态，与 `mongod` 对未知符号名的处理一致。
 fn code_name(code: i32) -> Option<&'static str> {
     match code {
+        1 => Some("InternalError"),
         2 => Some("BadValue"),
         73 => Some("InvalidNamespace"),
         _ => None,

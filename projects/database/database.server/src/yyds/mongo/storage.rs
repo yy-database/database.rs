@@ -16,8 +16,8 @@ use database_types::cluster::Namespace;
 use mongo::{
     oplog::OplogEntry,
     storage::{
-        CollectionOptions, IndexSpec, InsertReport, MongoStorage, SessionWriteState, StoreError, TransactionAbort, TransactionBegin,
-        TransactionCommit, TransactionWrite, TtlMonitorState,
+        CollectionOptions, IndexSpec, MongoStorage, SessionWriteState, StoreError, TransactionAbort, TransactionBegin, TransactionCommit,
+        TransactionWrite, TtlMonitorState,
     },
     store::{collection_record, parse_collection_record},
 };
@@ -43,10 +43,10 @@ impl<'a> ExecutorStorage<'a> {
             .map_err(|error| StoreError::Shard(error.to_string()))
     }
 
-    fn read(&self, namespace: &str, key: &[u8]) -> Option<Vec<u8>> {
-        match self.run(namespace, key.to_vec(), KeyValueAction::Get) {
-            Ok(KeyValueResult::Get(value)) => value,
-            _ => None,
+    fn read(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        match self.run(namespace, key.to_vec(), KeyValueAction::Get)? {
+            KeyValueResult::Get(value) => Ok(value),
+            other => Err(StoreError::Shard(format!("unexpected storage result for read: {other:?}"))),
         }
     }
 
@@ -54,14 +54,20 @@ impl<'a> ExecutorStorage<'a> {
         self.run(namespace, key, KeyValueAction::Put(value)).map(|_| ())
     }
 
-    fn scan_namespace(&self, namespace: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.executor.execute_scan(None, &Namespace(namespace.to_string()), b"", None, None, 0).unwrap_or_default()
+    fn scan_namespace(&self, namespace: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        self.executor
+            .execute_scan(None, &Namespace(namespace.to_string()), b"", None, None, 0)
+            .map_err(|error| StoreError::Shard(error.to_string()))
     }
 
-    fn catalog_record(&self, namespace: &str) -> Option<(CollectionOptions, Vec<IndexSpec>)> {
-        let bytes = self.read(CATALOG_NAMESPACE, namespace.as_bytes())?;
-        let text = String::from_utf8(bytes).ok()?;
-        parse_collection_record(namespace, &text).ok()
+    fn catalog_record(&self, namespace: &str) -> Result<Option<(CollectionOptions, Vec<IndexSpec>)>, StoreError> {
+        let Some(bytes) = self.read(CATALOG_NAMESPACE, namespace.as_bytes())?
+        else {
+            return Ok(None);
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|error| StoreError::Catalog(format!("collection record `{namespace}` is not UTF-8: {error}")))?;
+        parse_collection_record(namespace, &text).map(Some)
     }
 }
 
@@ -80,39 +86,28 @@ struct Transaction {
 }
 
 impl MongoStorage for ExecutorStorage<'_> {
-    fn get(&self, namespace: &str, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         self.read(namespace, key)
     }
 
-    fn insert(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)], ordered: bool) -> Result<InsertReport, StoreError> {
-        let mut report = InsertReport { inserted: 0, duplicates: Vec::new(), invalid: Vec::new() };
-        for (position, (key, value)) in documents.iter().enumerate() {
-            match self.run(namespace, key.clone(), KeyValueAction::Exists) {
-                Ok(KeyValueResult::Exists(true)) => {
-                    report.duplicates.push(position);
-                    if ordered {
-                        break;
-                    }
-                }
-                Ok(_) => {
-                    self.write(namespace, key.clone(), value.clone())?;
-                    report.inserted += 1;
-                }
-                Err(error) => return Err(error),
-            }
+    fn insert_if_absent(&self, namespace: &str, key: Vec<u8>, value: Vec<u8>) -> Result<bool, StoreError> {
+        match self.run(namespace, key, KeyValueAction::PutIfAbsent(value))? {
+            KeyValueResult::PutIfAbsent { revision } => Ok(revision.is_some()),
+            other => Err(StoreError::Shard(format!("unexpected storage result for insert: {other:?}"))),
         }
-        Ok(report)
     }
 
-    fn scan(&self, namespace: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan(&self, namespace: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
         self.scan_namespace(namespace)
     }
 
     fn delete(&self, namespace: &str, keys: &[Vec<u8>]) -> Result<usize, StoreError> {
         let mut removed = 0;
         for key in keys {
-            if let Ok(KeyValueResult::Delete { removed: true }) = self.run(namespace, key.clone(), KeyValueAction::Delete) {
-                removed += 1;
+            match self.run(namespace, key.clone(), KeyValueAction::Delete)? {
+                KeyValueResult::Delete { removed: true } => removed += 1,
+                KeyValueResult::Delete { removed: false } => {}
+                other => return Err(StoreError::Shard(format!("unexpected storage result for delete: {other:?}"))),
             }
         }
         Ok(removed)
@@ -129,19 +124,22 @@ impl MongoStorage for ExecutorStorage<'_> {
         self.replace(namespace, documents)
     }
 
-    fn namespaces(&self) -> Vec<String> {
+    fn namespaces(&self) -> Result<Vec<String>, StoreError> {
         let mut namespaces: Vec<String> =
-            self.scan_namespace(CATALOG_NAMESPACE).into_iter().filter_map(|(key, _)| String::from_utf8(key).ok()).collect();
+            self.scan_namespace(CATALOG_NAMESPACE)?.into_iter().filter_map(|(key, _)| String::from_utf8(key).ok()).collect();
         namespaces.sort();
-        namespaces
+        Ok(namespaces)
     }
 
-    fn namespace_exists(&self, namespace: &str) -> bool {
-        matches!(self.run(CATALOG_NAMESPACE, namespace.as_bytes().to_vec(), KeyValueAction::Exists), Ok(KeyValueResult::Exists(true)))
+    fn namespace_exists(&self, namespace: &str) -> Result<bool, StoreError> {
+        match self.run(CATALOG_NAMESPACE, namespace.as_bytes().to_vec(), KeyValueAction::Exists)? {
+            KeyValueResult::Exists(exists) => Ok(exists),
+            other => Err(StoreError::Shard(format!("unexpected storage result for exists: {other:?}"))),
+        }
     }
 
     fn create_collection(&self, namespace: &str, options: CollectionOptions) -> Result<bool, StoreError> {
-        if self.namespace_exists(namespace) {
+        if self.namespace_exists(namespace)? {
             return Ok(false);
         }
         self.write(CATALOG_NAMESPACE, namespace.as_bytes().to_vec(), collection_record(namespace, &options, &[]).into_bytes())?;
@@ -149,8 +147,8 @@ impl MongoStorage for ExecutorStorage<'_> {
     }
 
     fn drop_namespace(&self, namespace: &str) -> Result<bool, StoreError> {
-        let existing = self.namespace_exists(namespace);
-        let keys: Vec<Vec<u8>> = self.scan_namespace(namespace).into_iter().map(|(key, _)| key).collect();
+        let existing = self.namespace_exists(namespace)?;
+        let keys: Vec<Vec<u8>> = self.scan_namespace(namespace)?.into_iter().map(|(key, _)| key).collect();
         self.delete(namespace, &keys)?;
         self.run(CATALOG_NAMESPACE, namespace.as_bytes().to_vec(), KeyValueAction::Delete)?;
         Ok(existing)
@@ -159,36 +157,36 @@ impl MongoStorage for ExecutorStorage<'_> {
     fn drop_database(&self, database: &str) -> Result<usize, StoreError> {
         let prefix = format!("{database}.");
         let mut dropped = 0;
-        for namespace in self.namespaces().into_iter().filter(|namespace| namespace.starts_with(&prefix)) {
+        for namespace in self.namespaces()?.into_iter().filter(|namespace| namespace.starts_with(&prefix)) {
             self.drop_namespace(&namespace)?;
             dropped += 1;
         }
         Ok(dropped)
     }
 
-    fn collection_options(&self, namespace: &str) -> CollectionOptions {
-        self.catalog_record(namespace).map(|(options, _)| options).unwrap_or_default()
+    fn collection_options(&self, namespace: &str) -> Result<CollectionOptions, StoreError> {
+        Ok(self.catalog_record(namespace)?.map(|(options, _)| options).unwrap_or_default())
     }
 
     fn set_collection_options(&self, namespace: &str, options: CollectionOptions) -> Result<(), StoreError> {
-        let indexes = self.index_specs(namespace);
+        let indexes = self.index_specs(namespace)?;
         self.write(CATALOG_NAMESPACE, namespace.as_bytes().to_vec(), collection_record(namespace, &options, &indexes).into_bytes())
     }
 
-    fn index_specs(&self, namespace: &str) -> Vec<IndexSpec> {
-        self.catalog_record(namespace).map(|(_, indexes)| indexes).unwrap_or_default()
+    fn index_specs(&self, namespace: &str) -> Result<Vec<IndexSpec>, StoreError> {
+        Ok(self.catalog_record(namespace)?.map(|(_, indexes)| indexes).unwrap_or_default())
     }
 
     fn add_indexes(&self, namespace: &str, indexes: &[IndexSpec]) -> Result<(), StoreError> {
-        let options = self.collection_options(namespace);
-        let mut existing = self.index_specs(namespace);
+        let options = self.collection_options(namespace)?;
+        let mut existing = self.index_specs(namespace)?;
         existing.extend(indexes.iter().cloned());
         self.write(CATALOG_NAMESPACE, namespace.as_bytes().to_vec(), collection_record(namespace, &options, &existing).into_bytes())
     }
 
     fn drop_indexes(&self, namespace: &str, name: &str) -> Result<usize, StoreError> {
-        let options = self.collection_options(namespace);
-        let existing = self.index_specs(namespace);
+        let options = self.collection_options(namespace)?;
+        let existing = self.index_specs(namespace)?;
         let retained: Vec<IndexSpec> =
             if name == "*" { Vec::new() } else { existing.iter().filter(|index| index.name != name).cloned().collect() };
         let dropped = existing.len() - retained.len();
@@ -276,10 +274,13 @@ impl MongoStorage for ExecutorStorage<'_> {
         TransactionWrite::Staged
     }
 
-    fn transaction_scan(&self, session: &str, namespace: &str) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    fn transaction_scan(&self, session: &str, namespace: &str) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, StoreError> {
         let sessions = self.sessions.lock().unwrap_or_else(|poison| poison.into_inner());
-        let transaction = sessions.transactions.get(session)?;
-        let mut documents: BTreeMap<Vec<u8>, Vec<u8>> = self.scan_namespace(namespace).into_iter().collect();
+        let Some(transaction) = sessions.transactions.get(session)
+        else {
+            return Ok(None);
+        };
+        let mut documents: BTreeMap<Vec<u8>, Vec<u8>> = self.scan_namespace(namespace)?.into_iter().collect();
         for ((target, key), value) in &transaction.writes {
             if target != namespace {
                 continue;
@@ -293,13 +294,19 @@ impl MongoStorage for ExecutorStorage<'_> {
                 }
             }
         }
-        Some(documents.into_iter().collect())
+        Ok(Some(documents.into_iter().collect()))
     }
 
-    fn transaction_get(&self, session: &str, namespace: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+    fn transaction_get(&self, session: &str, namespace: &str, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, StoreError> {
         let sessions = self.sessions.lock().unwrap_or_else(|poison| poison.into_inner());
-        let transaction = sessions.transactions.get(session)?;
-        Some(transaction.writes.get(&(namespace.to_string(), key.to_vec())).cloned().unwrap_or_else(|| self.read(namespace, key)))
+        let Some(transaction) = sessions.transactions.get(session)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match transaction.writes.get(&(namespace.to_string(), key.to_vec())) {
+            Some(staged) => staged.clone(),
+            None => self.read(namespace, key)?,
+        }))
     }
 
     fn transaction_commit(&self, session: &str, txn_number: i64) -> TransactionCommit {
@@ -341,5 +348,134 @@ impl MongoStorage for ExecutorStorage<'_> {
         transaction.aborted = true;
         transaction.writes.clear();
         TransactionAbort::Aborted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+    };
+
+    use database_cluster::topology::ShardMap;
+    use database_execution::cluster::{KeyValueExecutor, LocalExecutor};
+    use database_query::cluster_kv::{KeyValueCommand, KeyValueResult};
+    use database_storage::cluster_kv::MemoryShard;
+    use database_types::cluster::{Error, FenceToken, Namespace, Result as ClusterResult, ShardEpoch, ShardId};
+
+    use super::ExecutorStorage;
+    use mongo::storage::MongoStorage;
+
+    fn local_executor() -> LocalExecutor<MemoryShard> {
+        let shard = ShardId("mongo-contract".into());
+        LocalExecutor::new(ShardMap::new(ShardEpoch(1), vec![shard.clone()]).unwrap(), HashMap::from([(shard, MemoryShard::new())]), Vec::new())
+            .unwrap()
+    }
+
+    /// An executor that can be switched between healthy and failing, so the same
+    /// adapter instance can be checked before and after a failure.
+    #[derive(Debug)]
+    struct SwitchableExecutor {
+        broken: AtomicBool,
+        inner: LocalExecutor<MemoryShard>,
+    }
+
+    impl SwitchableExecutor {
+        fn new() -> Self {
+            Self { broken: AtomicBool::new(false), inner: local_executor() }
+        }
+
+        fn break_storage(&self) {
+            self.broken.store(true, Ordering::SeqCst);
+        }
+
+        fn repair(&self) {
+            self.broken.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl KeyValueExecutor for SwitchableExecutor {
+        fn execute(&self, fence: Option<&FenceToken>, command: KeyValueCommand) -> ClusterResult<KeyValueResult> {
+            if self.broken.load(Ordering::SeqCst) {
+                return Err(Error::Corrupt("injected storage failure"));
+            }
+            self.inner.execute(fence, command)
+        }
+
+        fn execute_scan(
+            &self,
+            fence: Option<&FenceToken>,
+            namespace: &Namespace,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            before: Option<&[u8]>,
+            limit: usize,
+        ) -> ClusterResult<Vec<(Vec<u8>, Vec<u8>)>> {
+            if self.broken.load(Ordering::SeqCst) {
+                return Err(Error::Corrupt("injected scan failure"));
+            }
+            self.inner.execute_scan(fence, namespace, prefix, after, before, limit)
+        }
+    }
+
+    /// The conditional write must be the uniqueness point: eight writers racing on
+    /// one `_id` leave exactly one winner.
+    #[test]
+    fn concurrent_insert_if_absent_keeps_one_winner() {
+        let executor = local_executor();
+        let storage = ExecutorStorage::new(&executor);
+        let barrier = Barrier::new(8);
+        let landed = AtomicUsize::new(0);
+        let duplicates = AtomicUsize::new(0);
+
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    match storage.insert_if_absent("app.items", b"same-id".to_vec(), b"payload".to_vec()) {
+                        Ok(true) => {
+                            landed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(false) => {
+                            duplicates.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(error) => panic!("conditional write failed: {error}"),
+                    }
+                });
+            }
+        });
+
+        assert_eq!(landed.load(Ordering::SeqCst), 1);
+        assert_eq!(duplicates.load(Ordering::SeqCst), 7);
+        assert_eq!(storage.get("app.items", b"same-id").unwrap(), Some(b"payload".to_vec()));
+    }
+
+    /// A failing executor must surface as `Err` on every read path, and the same
+    /// adapter must succeed again once the executor recovers.
+    #[test]
+    fn storage_failures_are_reported_and_retryable() {
+        let executor = Arc::new(SwitchableExecutor::new());
+        let storage = ExecutorStorage::new(executor.as_ref());
+
+        executor.break_storage();
+        assert!(storage.get("app.items", b"k").is_err(), "read failure must not read as missing");
+        assert!(storage.scan("app.items").is_err(), "scan failure must not read as empty");
+        assert!(storage.delete("app.items", &[b"k".to_vec()]).is_err(), "delete failure must not be swallowed");
+        assert!(storage.insert("app.items", &[(b"k".to_vec(), b"v".to_vec())], true).is_err());
+        assert!(storage.namespaces().is_err());
+        assert!(storage.namespace_exists("app.items").is_err());
+        assert!(storage.index_specs("app.items").is_err());
+
+        executor.repair();
+        assert!(storage.insert_if_absent("app.items", b"k".to_vec(), b"v".to_vec()).unwrap());
+        assert_eq!(storage.get("app.items", b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(storage.scan("app.items").unwrap().len(), 1);
+        assert_eq!(storage.delete("app.items", &[b"k".to_vec()]).unwrap(), 1);
+        assert!(!storage.namespace_exists("app.items").unwrap());
     }
 }

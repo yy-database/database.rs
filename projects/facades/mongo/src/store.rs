@@ -747,7 +747,7 @@ impl Store {
     /// oldest first, exactly like a capped collection created with that size.
     pub fn enable_oplog(&self, namespace: &str, max_bytes: i64) -> Result<(), StoreError> {
         self.register_namespace(namespace)?;
-        let records = self.scan(namespace);
+        let records = self.scan(namespace)?;
         let mut bytes = 0_i64;
         let mut last = None;
         for (_, payload) in &records {
@@ -853,7 +853,7 @@ impl Store {
         }
         let namespace = state.namespace.clone();
         let max_bytes = state.max_bytes;
-        let records = self.scan(&namespace);
+        let records = self.scan(&namespace)?;
         drop(guard);
 
         let total = records.len();
@@ -1007,16 +1007,19 @@ impl Store {
 
     /// The namespace as the transaction sees it, `None` when the session has no
     /// active transaction and the caller should read the committed data.
-    pub fn transaction_scan(&self, session: &str, namespace: &str) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn transaction_scan(&self, session: &str, namespace: &str) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, StoreError> {
         let staged: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
             let registry = self.sessions_lock();
-            let state = registry.transactions.get(session)?;
+            let Some(state) = registry.transactions.get(session)
+            else {
+                return Ok(None);
+            };
             if state.aborted {
-                return None;
+                return Ok(None);
             }
             state.writes.iter().filter(|((owner, _), _)| owner == namespace).map(|((_, key), value)| (key.clone(), value.clone())).collect()
         };
-        let mut documents = self.scan(namespace);
+        let mut documents = self.scan(namespace)?;
         for (key, value) in staged {
             match value {
                 Some(payload) => match documents.iter_mut().find(|(candidate, _)| candidate == &key) {
@@ -1026,18 +1029,21 @@ impl Store {
                 None => documents.retain(|(candidate, _)| candidate != &key),
             }
         }
-        Some(documents)
+        Ok(Some(documents))
     }
 
     /// One document as the transaction sees it. The outer `Option` is `None`
     /// when the key is not staged, so the caller reads the committed value.
-    pub fn transaction_get(&self, session: &str, namespace: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+    pub fn transaction_get(&self, session: &str, namespace: &str, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, StoreError> {
         let registry = self.sessions_lock();
-        let state = registry.transactions.get(session)?;
+        let Some(state) = registry.transactions.get(session)
+        else {
+            return Ok(None);
+        };
         if state.aborted {
-            return None;
+            return Ok(None);
         }
-        state.writes.get(&(namespace.to_string(), key.to_vec())).cloned().map(Some).unwrap_or(None)
+        Ok(state.writes.get(&(namespace.to_string(), key.to_vec())).cloned().map(Some).unwrap_or(None))
     }
 
     /// Applies every staged write, or reports the conflict that prevents it.
@@ -1143,8 +1149,8 @@ impl Store {
 
     /// Reads the collection options, defaulting to no validator and `strict` /
     /// `error` when the catalog has no entry.
-    pub fn collection_options(&self, namespace: &str) -> CollectionOptions {
-        self.catalog_lock().collections.get(namespace).cloned().unwrap_or_default()
+    pub fn collection_options(&self, namespace: &str) -> Result<CollectionOptions, StoreError> {
+        Ok(self.catalog_lock().collections.get(namespace).cloned().unwrap_or_default())
     }
 
     /// Writes collection options and registers the namespace in one durable
@@ -1208,13 +1214,27 @@ impl Store {
     }
 
     /// Reads one document by its encoded `_id`.
-    pub fn get(&self, namespace: &str, key: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// A shard read failure is reported instead of being collapsed into "no such
+    /// document", so a broken shard cannot masquerade as missing data.
+    pub fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         let shard = self.lock();
-        let record = shard.get(&Key::new(namespace, key.to_vec())).ok().flatten()?;
-        match record.value {
-            StoredValue::Inline(InlineValue(bytes)) => Some(bytes),
-            StoredValue::Object(_) => None,
-        }
+        let record = shard.get(&Key::new(namespace, key.to_vec())).map_err(|error| StoreError::Shard(error.to_string()))?;
+        Ok(match record {
+            Some(record) => match record.value {
+                StoredValue::Inline(InlineValue(bytes)) => Some(bytes),
+                StoredValue::Object(_) => None,
+            },
+            None => None,
+        })
+    }
+
+    /// Atomically creates one document when its `_id` is absent.
+    ///
+    /// The existence check and the write share one shard commit under the store
+    /// lock, so two concurrent inserts of the same `_id` cannot both land.
+    pub fn insert_if_absent(&self, namespace: &str, key: Vec<u8>, value: Vec<u8>) -> Result<bool, StoreError> {
+        Ok(self.insert(namespace, &[(key, value)], true)?.inserted == 1)
     }
 
     /// Writes one batch and reports duplicate / invalid positions.
@@ -1235,7 +1255,8 @@ impl Store {
                 // lookups, so intra-batch duplicates share the numeric equivalence
                 // rules (int32/int64/integral double) without a second comparator.
                 let already_staged = !staged.insert(key_bytes.clone());
-                let exists = already_staged || matches!(shard.get(&key), Ok(Some(_)));
+                let exists =
+                    if already_staged { true } else { shard.get(&key).map_err(|error| StoreError::Shard(error.to_string()))?.is_some() };
                 if exists {
                     report.duplicates.push(index);
                     if ordered {
@@ -1265,19 +1286,19 @@ impl Store {
     }
 
     /// Every document in one namespace, ordered by encoded `_id`.
-    pub fn scan(&self, namespace: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ///
+    /// A scan failure is reported instead of being turned into an empty set.
+    pub fn scan(&self, namespace: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
         let shard = self.lock();
-        let records = match shard.scan(&Namespace(namespace.to_string()), b"", None, None, 0) {
-            Ok(records) => records,
-            Err(_) => return Vec::new(),
-        };
-        records
+        let records =
+            shard.scan(&Namespace(namespace.to_string()), b"", None, None, 0).map_err(|error| StoreError::Shard(error.to_string()))?;
+        Ok(records
             .into_iter()
             .filter_map(|record| match record.value {
                 StoredValue::Inline(InlineValue(bytes)) => Some((record.key.bytes, bytes)),
                 StoredValue::Object(_) => None,
             })
-            .collect()
+            .collect())
     }
 
     /// Deletes the given encoded `_id` keys and reports how many existed.
@@ -1336,18 +1357,18 @@ impl Store {
     }
 
     /// Namespaces registered in the `.yyds` catalog, sorted.
-    pub fn namespaces(&self) -> Vec<String> {
-        self.catalog_lock().namespaces.iter().cloned().collect()
+    pub fn namespaces(&self) -> Result<Vec<String>, StoreError> {
+        Ok(self.catalog_lock().namespaces.iter().cloned().collect())
     }
 
     /// Whether `namespace` is registered in the catalog.
-    pub fn namespace_exists(&self, namespace: &str) -> bool {
-        self.catalog_lock().namespaces.contains(namespace)
+    pub fn namespace_exists(&self, namespace: &str) -> Result<bool, StoreError> {
+        Ok(self.catalog_lock().namespaces.contains(namespace))
     }
 
     /// User indexes of one namespace in creation order, `_id_` excluded.
-    pub fn index_specs(&self, namespace: &str) -> Vec<IndexSpec> {
-        self.catalog_lock().indexes.iter().filter(|index| index.namespace == namespace).cloned().collect()
+    pub fn index_specs(&self, namespace: &str) -> Result<Vec<IndexSpec>, StoreError> {
+        Ok(self.catalog_lock().indexes.iter().filter(|index| index.namespace == namespace).cloned().collect())
     }
 
     /// Registers `namespace` and appends the new index definitions in one flush.
@@ -1510,15 +1531,19 @@ impl RepairReport {
 /// 命令层只通过该 trait 访问数据，因此换成 `KeyValueExecutor` 适配器时不需要改
 /// 任何命令实现。
 impl crate::storage::MongoStorage for Store {
-    fn get(&self, namespace: &str, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         Store::get(self, namespace, key)
+    }
+
+    fn insert_if_absent(&self, namespace: &str, key: Vec<u8>, value: Vec<u8>) -> Result<bool, StoreError> {
+        Store::insert_if_absent(self, namespace, key, value)
     }
 
     fn insert(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)], ordered: bool) -> Result<InsertReport, StoreError> {
         Store::insert(self, namespace, documents, ordered)
     }
 
-    fn scan(&self, namespace: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan(&self, namespace: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
         Store::scan(self, namespace)
     }
 
@@ -1534,11 +1559,11 @@ impl crate::storage::MongoStorage for Store {
         Store::import(self, namespace, documents)
     }
 
-    fn namespaces(&self) -> Vec<String> {
+    fn namespaces(&self) -> Result<Vec<String>, StoreError> {
         Store::namespaces(self)
     }
 
-    fn namespace_exists(&self, namespace: &str) -> bool {
+    fn namespace_exists(&self, namespace: &str) -> Result<bool, StoreError> {
         Store::namespace_exists(self, namespace)
     }
 
@@ -1554,7 +1579,7 @@ impl crate::storage::MongoStorage for Store {
         Store::drop_database(self, database)
     }
 
-    fn collection_options(&self, namespace: &str) -> CollectionOptions {
+    fn collection_options(&self, namespace: &str) -> Result<CollectionOptions, StoreError> {
         Store::collection_options(self, namespace)
     }
 
@@ -1562,7 +1587,7 @@ impl crate::storage::MongoStorage for Store {
         Store::set_collection_options(self, namespace, options)
     }
 
-    fn index_specs(&self, namespace: &str) -> Vec<IndexSpec> {
+    fn index_specs(&self, namespace: &str) -> Result<Vec<IndexSpec>, StoreError> {
         Store::index_specs(self, namespace)
     }
 
@@ -1630,11 +1655,11 @@ impl crate::storage::MongoStorage for Store {
         Store::transaction_write(self, session, namespace, key, value)
     }
 
-    fn transaction_scan(&self, session: &str, namespace: &str) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    fn transaction_scan(&self, session: &str, namespace: &str) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, StoreError> {
         Store::transaction_scan(self, session, namespace)
     }
 
-    fn transaction_get(&self, session: &str, namespace: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+    fn transaction_get(&self, session: &str, namespace: &str, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, StoreError> {
         Store::transaction_get(self, session, namespace, key)
     }
 

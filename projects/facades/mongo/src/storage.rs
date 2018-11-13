@@ -23,15 +23,43 @@ use crate::oplog::OplogEntry;
 /// 实现必须是线程安全的：同一个实例会被命令层的多个调用共享。
 pub trait MongoStorage: Send + Sync {
     /// 读取一个文档，按编码后的 `_id` 定位。
-    fn get(&self, namespace: &str, key: &[u8]) -> Option<Vec<u8>>;
+    ///
+    /// 读取失败必须作为 `Err` 上报：把失败当成「文档不存在」会让客户端看到
+    /// 一份静默缺失的数据。
+    fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError>;
+
+    /// 原子条件写：仅当 `_id` 尚不存在时写入一条文档，返回是否落地。
+    ///
+    /// `_id` 唯一性只能由这条原语保证。实现必须使用底座的原子条件写，不得
+    /// 先探测再写；否则并发插入同一 `_id` 会同时成功。
+    fn insert_if_absent(&self, namespace: &str, key: Vec<u8>, value: Vec<u8>) -> Result<bool, StoreError>;
 
     /// 写入一批文档，返回写入数、重复 `_id` 位置与非法位置。
     ///
-    /// `ordered` 为真时遇到第一个重复就停止，否则跳过重复继续写。
-    fn insert(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)], ordered: bool) -> Result<InsertReport, StoreError>;
+    /// 默认实现逐条走 [`Self::insert_if_absent`]，因此并发下也不会出现两个
+    /// 相同 `_id`。`ordered` 为真时遇到第一个重复就停止，否则跳过重复继续写。
+    /// 后端可以覆盖为一次批量提交，但必须保持同样的条件写语义。
+    fn insert(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)], ordered: bool) -> Result<InsertReport, StoreError> {
+        let mut report = InsertReport::default();
+        for (position, (key, value)) in documents.iter().enumerate() {
+            if self.insert_if_absent(namespace, key.clone(), value.clone())? {
+                report.inserted += 1;
+            }
+            else {
+                report.duplicates.push(position);
+                if ordered {
+                    break;
+                }
+            }
+        }
+        Ok(report)
+    }
 
     /// 按编码 `_id` 升序读取整个 namespace。
-    fn scan(&self, namespace: &str) -> Vec<(Vec<u8>, Vec<u8>)>;
+    ///
+    /// 扫描失败必须作为 `Err` 上报：把失败当成空集合会让查询静默返回不完整
+    /// 的结果。
+    fn scan(&self, namespace: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError>;
 
     /// 删除给定的编码 `_id`，返回实际存在的条数。
     fn delete(&self, namespace: &str, keys: &[Vec<u8>]) -> Result<usize, StoreError>;
@@ -43,10 +71,10 @@ pub trait MongoStorage: Send + Sync {
     fn import(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError>;
 
     /// 已注册的 namespace，按字典序排列。
-    fn namespaces(&self) -> Vec<String>;
+    fn namespaces(&self) -> Result<Vec<String>, StoreError>;
 
     /// namespace 是否已在目录中注册。
-    fn namespace_exists(&self, namespace: &str) -> bool;
+    fn namespace_exists(&self, namespace: &str) -> Result<bool, StoreError>;
 
     /// 创建集合，已存在时返回 `false`。
     fn create_collection(&self, namespace: &str, options: CollectionOptions) -> Result<bool, StoreError>;
@@ -58,13 +86,13 @@ pub trait MongoStorage: Send + Sync {
     fn drop_database(&self, database: &str) -> Result<usize, StoreError>;
 
     /// 读取集合选项，目录无记录时返回默认值。
-    fn collection_options(&self, namespace: &str) -> CollectionOptions;
+    fn collection_options(&self, namespace: &str) -> Result<CollectionOptions, StoreError>;
 
     /// 写入集合选项并注册 namespace。
     fn set_collection_options(&self, namespace: &str, options: CollectionOptions) -> Result<(), StoreError>;
 
     /// 一个 namespace 的用户索引，按创建顺序排列，不含 `_id_`。
-    fn index_specs(&self, namespace: &str) -> Vec<IndexSpec>;
+    fn index_specs(&self, namespace: &str) -> Result<Vec<IndexSpec>, StoreError>;
 
     /// 注册 namespace 并追加索引定义。
     fn add_indexes(&self, namespace: &str, indexes: &[IndexSpec]) -> Result<(), StoreError>;
@@ -115,10 +143,10 @@ pub trait MongoStorage: Send + Sync {
     fn transaction_write(&self, session: &str, namespace: &str, key: &[u8], value: Option<Vec<u8>>) -> TransactionWrite;
 
     /// 事务视角下的整个 namespace；会话无活跃事务时返回 `None`，调用方读已提交数据。
-    fn transaction_scan(&self, session: &str, namespace: &str) -> Option<Vec<(Vec<u8>, Vec<u8>)>>;
+    fn transaction_scan(&self, session: &str, namespace: &str) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, StoreError>;
 
     /// 事务视角下的单个文档。外层 `None` 表示该键未被暂存，调用方读已提交值。
-    fn transaction_get(&self, session: &str, namespace: &str, key: &[u8]) -> Option<Option<Vec<u8>>>;
+    fn transaction_get(&self, session: &str, namespace: &str, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, StoreError>;
 
     /// 提交事务；被其他事务改过的文档会让本次提交冲突。
     fn transaction_commit(&self, session: &str, txn_number: i64) -> TransactionCommit;

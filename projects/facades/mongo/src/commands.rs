@@ -18,7 +18,8 @@ use crate::{
     id::generate_object_id,
     oplog::OplogEntry,
     storage::{
-        CollectionOptions, IndexSpec, MongoStorage, SessionWriteState, TransactionAbort, TransactionBegin, TransactionCommit, TransactionWrite,
+        CollectionOptions, IndexSpec, MongoStorage, SessionWriteState, StoreError, TransactionAbort, TransactionBegin, TransactionCommit,
+        TransactionWrite,
     },
 };
 
@@ -87,6 +88,15 @@ impl std::fmt::Display for CommandError {
 }
 
 impl std::error::Error for CommandError {}
+
+/// A storage failure is a server-side failure, never a client mistake and never
+/// "not found". It is surfaced as `InternalError` (`1`) with the backend reason
+/// kept verbatim so a broken store cannot look like an empty collection.
+impl From<StoreError> for CommandError {
+    fn from(error: StoreError) -> Self {
+        Self::new(1, format!("storage failure: {error}"))
+    }
+}
 
 /// Rejects every filter that uses an operator outside [`FILTER_OPERATORS`].
 ///
@@ -475,7 +485,7 @@ pub fn insert(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
         _ => true,
     };
 
-    let index_specs: Vec<IndexSpec> = store.index_specs(&namespace);
+    let index_specs: Vec<IndexSpec> = store.index_specs(&namespace)?;
     let unique_indexes: Vec<IndexSpec> = index_specs.iter().filter(|index| index.unique).cloned().collect();
     let mut candidates: Vec<(usize, BsonDocument, BsonValue)> = Vec::with_capacity(documents.len());
     let mut write_errors: Vec<WriteError> = Vec::new();
@@ -500,7 +510,7 @@ pub fn insert(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
             }
             continue;
         }
-        if let Some(info) = insert_validation_failure(store, &namespace, &stored) {
+        if let Some(info) = insert_validation_failure(store, &namespace, &stored)? {
             write_errors.push(WriteError::validation(index, info));
             if ordered {
                 break;
@@ -560,7 +570,7 @@ fn commit_insert(
 ) -> Result<(usize, Vec<BsonDocument>), CommandError> {
     let mut indexed: Vec<BTreeSet<Vec<u8>>> = vec![BTreeSet::new(); unique_indexes.len()];
     let mut existing: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for (key, payload) in namespace_documents(store, namespace, session) {
+    for (key, payload) in namespace_documents(store, namespace, session)? {
         existing.insert(key);
         let Ok(document) = parse_bson(&payload)
         else {
@@ -864,13 +874,13 @@ fn resolve_hint(
         BsonValue::String(_) | BsonValue::Document(_) => {}
         _ => return Err(CommandError::new(9, "Hint must be a string or an object")),
     }
-    if !store.namespace_exists(namespace) {
+    if !store.namespace_exists(namespace)? {
         return Ok(Hint::None);
     }
     let planner_error = || hint_planner_error(namespace, filter, sort, projection);
     match value {
         BsonValue::String(name) => store
-            .index_specs(namespace)
+            .index_specs(namespace)?
             .into_iter()
             .find(|spec| spec.is_visible() && spec.name == *name)
             .map(Hint::Index)
@@ -889,7 +899,7 @@ fn resolve_hint(
                 return Err(CommandError::new(2, "$natural hint cannot be set to a value other than -1 or 1."));
             }
             store
-                .index_specs(namespace)
+                .index_specs(namespace)?
                 .into_iter()
                 .find(|spec| spec.is_visible() && spec.key == *document)
                 .map(Hint::Index)
@@ -2162,7 +2172,7 @@ pub fn delete(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
         else {
             let mut keys = Vec::new();
             let mut identifiers = Vec::new();
-            for (key, value) in namespace_documents(store, &namespace, session.key()) {
+            for (key, value) in namespace_documents(store, &namespace, session.key())? {
                 if limit > 0 && keys.len() >= limit {
                     break;
                 }
@@ -2224,11 +2234,11 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
 
     let mut matched: i64 = 0;
     let mut modified: i64 = 0;
-    let index_specs: Vec<IndexSpec> = store.index_specs(&namespace);
+    let index_specs: Vec<IndexSpec> = store.index_specs(&namespace)?;
     let unique_indexes: Vec<IndexSpec> = index_specs.iter().filter(|index| index.unique).cloned().collect();
     let mut indexed: BTreeMap<Vec<u8>, Vec<BTreeSet<Vec<u8>>>> = BTreeMap::new();
     if !unique_indexes.is_empty() {
-        for (key, value) in namespace_documents(store, &namespace, session.key()) {
+        for (key, value) in namespace_documents(store, &namespace, session.key())? {
             if let Ok(document) = parse_bson(&value) {
                 indexed.insert(key, unique_indexes.iter().map(|spec| tuples_of(&document, spec)).collect());
             }
@@ -2266,7 +2276,7 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
 
         let mut changes = Vec::new();
         let mut oplog_pairs: Vec<(BsonDocument, BsonDocument)> = Vec::new();
-        for (key, value) in namespace_documents(store, &namespace, session.key()) {
+        for (key, value) in namespace_documents(store, &namespace, session.key())? {
             let Ok(document) = parse_bson(&value)
             else {
                 continue;
@@ -2296,7 +2306,7 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
                     return Ok(write_reply(0, Some(0), &[WriteError::plain(index, error.code, error.message.clone())]));
                 }
             };
-            if let Some(info) = update_validation_failure(store, &namespace, &document, &updated) {
+            if let Some(info) = update_validation_failure(store, &namespace, &document, &updated)? {
                 if !changes.is_empty() {
                     store.replace(&namespace, &changes).map_err(|replace| CommandError::new(2, replace.to_string()))?;
                 }
@@ -2363,7 +2373,7 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
             if inserted.get("_id").is_none() {
                 inserted.fields.insert(0, ("_id".to_string(), BsonValue::ObjectId(generate_object_id())));
             }
-            if let Some(info) = insert_validation_failure(store, &namespace, &inserted) {
+            if let Some(info) = insert_validation_failure(store, &namespace, &inserted)? {
                 return Ok(write_reply(0, Some(0), &[WriteError::validation(index, info)]));
             }
             let Some(identifier) = inserted.get("_id").cloned()
@@ -3433,7 +3443,7 @@ pub fn list_collections(command: &BsonDocument, store: &dyn MongoStorage) -> Res
     };
 
     let mut entries = Vec::new();
-    for namespace in store.namespaces() {
+    for namespace in store.namespaces()? {
         let Some(collection) = namespace.strip_prefix(&prefix)
         else {
             continue;
@@ -3460,10 +3470,10 @@ pub fn list_collections(command: &BsonDocument, store: &dyn MongoStorage) -> Res
             }
         }
         else {
-            if let Some(validator) = collection_validator_value(store, &namespace) {
+            if let Some(validator) = collection_validator_value(store, &namespace)? {
                 options.push("validator".to_string(), validator);
             }
-            let stored = store.collection_options(&namespace);
+            let stored = store.collection_options(&namespace)?;
             if let Some(level) = &stored.validation_level {
                 options.push("validationLevel".to_string(), BsonValue::String(level.clone()));
             }
@@ -3548,26 +3558,29 @@ fn create_conflict_message(namespace: &str, options: &CollectionOptions) -> Stri
     format!("namespace {namespace} already exists, but with different options: {{ {} }}", rendered.join(", "))
 }
 
-fn collection_validator_value(store: &dyn MongoStorage, namespace: &str) -> Option<BsonValue> {
-    store.collection_options(namespace).validator.and_then(|validator| json::from_json(&validator).ok())
+fn collection_validator_value(store: &dyn MongoStorage, namespace: &str) -> Result<Option<BsonValue>, CommandError> {
+    Ok(store.collection_options(namespace)?.validator.and_then(|validator| json::from_json(&validator).ok()))
 }
 
 /// The validator schema, level, and action in force for a namespace. A missing
 /// `$jsonSchema` validator means no schema validation happens.
-fn collection_schema(store: &dyn MongoStorage, namespace: &str) -> Option<(BsonDocument, String, String)> {
-    let options = store.collection_options(namespace);
-    let validator = options.validator.and_then(|value| json::from_json(&value).ok())?;
+fn collection_schema(store: &dyn MongoStorage, namespace: &str) -> Result<Option<(BsonDocument, String, String)>, CommandError> {
+    let options = store.collection_options(namespace)?;
+    let Some(validator) = options.validator.and_then(|value| json::from_json(&value).ok())
+    else {
+        return Ok(None);
+    };
     let BsonValue::Document(validator) = validator
     else {
-        return None;
+        return Ok(None);
     };
     let schema = match validator.get("$jsonSchema") {
         Some(BsonValue::Document(schema)) => schema.clone(),
-        _ => return None,
+        _ => return Ok(None),
     };
     let level = options.validation_level.unwrap_or_else(|| "strict".to_string());
     let action = options.validation_action.unwrap_or_else(|| "error".to_string());
-    Some((schema, level, action))
+    Ok(Some((schema, level, action)))
 }
 
 fn schema_rules(schema: &BsonDocument, document: &BsonDocument) -> Vec<BsonValue> {
@@ -3720,16 +3733,19 @@ fn validation_err_info(document: &BsonDocument, rules: Vec<BsonValue>) -> BsonDo
 }
 
 /// Insert-path validation: `off` and `warn` never fail a write.
-fn insert_validation_failure(store: &dyn MongoStorage, namespace: &str, document: &BsonDocument) -> Option<BsonDocument> {
-    let (schema, level, action) = collection_schema(store, namespace)?;
+fn insert_validation_failure(store: &dyn MongoStorage, namespace: &str, document: &BsonDocument) -> Result<Option<BsonDocument>, CommandError> {
+    let Some((schema, level, action)) = collection_schema(store, namespace)?
+    else {
+        return Ok(None);
+    };
     if level == "off" || action == "warn" {
-        return None;
+        return Ok(None);
     }
     let rules = schema_rules(&schema, document);
     if rules.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(validation_err_info(document, rules))
+    Ok(Some(validation_err_info(document, rules)))
 }
 
 /// Update-path validation: `moderate` skips documents that were already
@@ -3739,22 +3755,25 @@ fn update_validation_failure(
     namespace: &str,
     original: &BsonDocument,
     updated: &BsonDocument,
-) -> Option<BsonDocument> {
-    let (schema, level, action) = collection_schema(store, namespace)?;
+) -> Result<Option<BsonDocument>, CommandError> {
+    let Some((schema, level, action)) = collection_schema(store, namespace)?
+    else {
+        return Ok(None);
+    };
     if level == "off" || action == "warn" {
-        return None;
+        return Ok(None);
     }
     if level == "moderate" {
         let before = schema_rules(&schema, original);
         if !before.is_empty() {
-            return None;
+            return Ok(None);
         }
     }
     let rules = schema_rules(&schema, updated);
     if rules.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(validation_err_info(updated, rules))
+    Ok(Some(validation_err_info(updated, rules)))
 }
 
 fn validation_options(command: &BsonDocument) -> Result<CollectionOptions, CommandError> {
@@ -3802,8 +3821,8 @@ pub fn create(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
     let options = validation_options(command)?;
     // `mongod 8.0.9` treats `create` as idempotent when the stored options
     // match, and refuses only when they differ.
-    if store.namespace_exists(&namespace) {
-        let existing = store.collection_options(&namespace);
+    if store.namespace_exists(&namespace)? {
+        let existing = store.collection_options(&namespace)?;
         if existing != options {
             return Err(CommandError::new(48, create_conflict_message(&namespace, &existing)));
         }
@@ -3895,13 +3914,13 @@ pub fn drop(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDocu
     if matches!(database.as_str(), "admin" | "local" | "config") && collection.starts_with("system.") {
         return Err(CommandError::new(20, format!("cannot drop system collection {namespace}")));
     }
-    if !store.namespace_exists(&namespace) {
+    if !store.namespace_exists(&namespace)? {
         let mut response = BsonDocument::new();
         response.push("ok".to_string(), BsonValue::Double(1.0));
         return Ok(response);
     }
-    let records = store.scan(&namespace).len() as i32;
-    let user_indexes = store.index_specs(&namespace).len() as i32;
+    let records = store.scan(&namespace)?.len() as i32;
+    let user_indexes = store.index_specs(&namespace)?.len() as i32;
     if store.oplog_enabled() {
         let mut object = BsonDocument::new();
         object.push("drop".to_string(), BsonValue::String(collection.clone()));
@@ -3928,10 +3947,10 @@ pub fn coll_mod(command: &BsonDocument, store: &dyn MongoStorage) -> Result<Bson
         return Err(CommandError::new(73, "collMod command missing collection name"));
     };
     let namespace = format!("{}.{collection}", command.database());
-    if !store.namespace_exists(&namespace) {
+    if !store.namespace_exists(&namespace)? {
         return Err(CommandError::new(26, "ns does not exist".to_string()));
     }
-    let mut options = store.collection_options(&namespace);
+    let mut options = store.collection_options(&namespace)?;
     let changes = validation_options(command)?;
     if changes.validator.is_some() {
         options.validator = changes.validator;
@@ -4162,22 +4181,24 @@ fn stage_delete(store: &dyn MongoStorage, session: Option<&str>, namespace: &str
 
 /// The namespace as seen by the session: staged writes layered over committed
 /// data when a transaction is open, committed data otherwise.
-fn namespace_documents(store: &dyn MongoStorage, namespace: &str, session: Option<&str>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    match session.and_then(|key| store.transaction_scan(key, namespace)) {
-        Some(documents) => documents,
-        None => store.scan(namespace),
+fn namespace_documents(store: &dyn MongoStorage, namespace: &str, session: Option<&str>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommandError> {
+    if let Some(session) = session
+        && let Some(documents) = store.transaction_scan(session, namespace)?
+    {
+        return Ok(documents);
     }
+    Ok(store.scan(namespace)?)
 }
 
 /// One document as seen by the session, including staged inserts, updates, and
 /// deletes.
-fn namespace_document(store: &dyn MongoStorage, namespace: &str, key: &[u8], session: Option<&str>) -> Option<Vec<u8>> {
+fn namespace_document(store: &dyn MongoStorage, namespace: &str, key: &[u8], session: Option<&str>) -> Result<Option<Vec<u8>>, CommandError> {
     if let Some(session) = session
-        && let Some(staged) = store.transaction_get(session, namespace, key)
+        && let Some(staged) = store.transaction_get(session, namespace, key)?
     {
-        return staged;
+        return Ok(staged);
     }
-    store.get(namespace, key)
+    Ok(store.get(namespace, key)?)
 }
 
 fn command_bool(command: &BsonDocument, field: &str, default: bool) -> bool {
@@ -4249,7 +4270,7 @@ pub fn find_and_modify(command: &BsonDocument, store: &dyn MongoStorage) -> Resu
 
     let update_document = update.expect("update checked above");
     let operator_update = update_document.fields.iter().any(|(field, _)| field.starts_with('$'));
-    let index_specs = store.index_specs(&namespace);
+    let index_specs = store.index_specs(&namespace)?;
     if let Some(document) = &matched {
         let identifier_value = document.get("_id").cloned();
         let identifier = identifier_value.as_ref().map(describe_id).unwrap_or_else(|| "<missing>".to_string());
@@ -4259,7 +4280,7 @@ pub fn find_and_modify(command: &BsonDocument, store: &dyn MongoStorage) -> Resu
         else {
             build_replacement(update_document, identifier_value.as_ref())?
         };
-        if let Some(info) = update_validation_failure(store, &namespace, document, &updated) {
+        if let Some(info) = update_validation_failure(store, &namespace, document, &updated)? {
             return Ok(find_and_modify_validation_failure(info));
         }
         if let Some(error) = parallel_array_error(&updated, &index_specs) {
@@ -4269,7 +4290,7 @@ pub fn find_and_modify(command: &BsonDocument, store: &dyn MongoStorage) -> Resu
         if !unique_indexes.is_empty() {
             let key = value_to_key(identifier_value.as_ref().unwrap_or(&BsonValue::Null));
             let mut indexed: BTreeMap<Vec<u8>, Vec<BTreeSet<Vec<u8>>>> = BTreeMap::new();
-            for (other_key, payload) in namespace_documents(store, &namespace, session.key()) {
+            for (other_key, payload) in namespace_documents(store, &namespace, session.key())? {
                 if let Ok(candidate) = parse_bson(&payload) {
                     indexed.insert(other_key, unique_indexes.iter().map(|spec| tuples_of(&candidate, spec)).collect());
                 }
@@ -4315,7 +4336,7 @@ pub fn find_and_modify(command: &BsonDocument, store: &dyn MongoStorage) -> Resu
         if inserted.get("_id").is_none() {
             inserted.fields.insert(0, ("_id".to_string(), BsonValue::ObjectId(generate_object_id())));
         }
-        if let Some(info) = insert_validation_failure(store, &namespace, &inserted) {
+        if let Some(info) = insert_validation_failure(store, &namespace, &inserted)? {
             return Ok(find_and_modify_validation_failure(info));
         }
         let identifier = inserted.get("_id").cloned().unwrap_or(BsonValue::Null);
@@ -4428,7 +4449,7 @@ pub fn distinct(command: &BsonDocument, store: &dyn MongoStorage) -> Result<Bson
     let segments: Vec<&str> = key.split('.').collect();
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut values = Vec::new();
-    for (_key, payload) in namespace_documents(store, &namespace, session.key()) {
+    for (_key, payload) in namespace_documents(store, &namespace, session.key())? {
         let Ok(document) = parse_bson(&payload)
         else {
             continue;
@@ -4676,9 +4697,9 @@ pub fn bulk_write(command: &BsonDocument, store: &dyn MongoStorage) -> Result<Bs
 }
 
 /// `listDatabases`, derived from the stored namespaces.
-pub fn list_databases(store: &dyn MongoStorage) -> BsonDocument {
+pub fn list_databases(store: &dyn MongoStorage) -> Result<BsonDocument, CommandError> {
     let mut names: Vec<String> =
-        store.namespaces().iter().filter_map(|namespace| namespace.split_once('.').map(|(db, _)| db.to_string())).collect();
+        store.namespaces()?.iter().filter_map(|namespace| namespace.split_once('.').map(|(db, _)| db.to_string())).collect();
     names.sort();
     names.dedup();
 
@@ -4698,7 +4719,7 @@ pub fn list_databases(store: &dyn MongoStorage) -> BsonDocument {
     response.push("totalSize".to_string(), BsonValue::Int64(0));
     response.push("totalSizeMb".to_string(), BsonValue::Int64(0));
     response.push("ok".to_string(), BsonValue::Double(1.0));
-    response
+    Ok(response)
 }
 
 /// `dropDatabase` reply.
@@ -4739,7 +4760,7 @@ pub fn drop_database(command: &BsonDocument, store: &dyn MongoStorage) -> Result
         return Err(CommandError::new(20, "Dropping the 'admin' database is prohibited."));
     }
     let prefix = format!("{database}.");
-    let had_namespaces = store.namespaces().iter().any(|namespace| namespace.starts_with(&prefix));
+    let had_namespaces = store.namespaces()?.iter().any(|namespace| namespace.starts_with(&prefix));
     if had_namespaces && store.oplog_enabled() {
         let mut object = BsonDocument::new();
         object.push("dropDatabase".to_string(), BsonValue::Int32(1));
@@ -4771,17 +4792,17 @@ fn index_record_bytes(values: &[BsonValue]) -> i64 {
 ///
 /// The values are logical key bytes, not `mongod`'s WiredTiger page allocation;
 /// `KNOWN-DIFFERENCES.md` records the measured difference.
-pub fn collection_index_sizes(store: &dyn MongoStorage, namespace: &str) -> Vec<(String, i64)> {
+pub fn collection_index_sizes(store: &dyn MongoStorage, namespace: &str) -> Result<Vec<(String, i64)>, CommandError> {
     if store.oplog_namespace().as_deref() == Some(namespace) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let specifications = store.index_specs(namespace);
+    let specifications = store.index_specs(namespace)?;
     let mut sizes: Vec<(String, i64)> = Vec::with_capacity(1 + specifications.len());
     sizes.push(("_id_".to_string(), encode_bson(&id_index_listing()).len() as i64));
     for specification in &specifications {
         sizes.push((specification.name.clone(), encode_bson(&stored_index_listing(specification)).len() as i64));
     }
-    for (_, payload) in store.scan(namespace) {
+    for (_, payload) in store.scan(namespace)? {
         let Ok(document) = parse_bson(&payload)
         else {
             continue;
@@ -4795,7 +4816,7 @@ pub fn collection_index_sizes(store: &dyn MongoStorage, namespace: &str) -> Vec<
             }
         }
     }
-    sizes
+    Ok(sizes)
 }
 
 /// `dbStats` reply, computed from the documents and keys the shard really holds.
@@ -4821,7 +4842,7 @@ pub fn db_stats(command: &BsonDocument, store: &dyn MongoStorage, filesystem: Op
     let mut storage_size = 0_i64;
     let mut index_size = 0_i64;
     let mut indexes = 0_i64;
-    for namespace in store.namespaces() {
+    for namespace in store.namespaces()? {
         let Some(collection) = namespace.strip_prefix(&prefix)
         else {
             continue;
@@ -4831,10 +4852,10 @@ pub fn db_stats(command: &BsonDocument, store: &dyn MongoStorage, filesystem: Op
             continue;
         }
         collections += 1;
-        let sizes = collection_index_sizes(store, &namespace);
+        let sizes = collection_index_sizes(store, &namespace)?;
         indexes += sizes.len() as i64;
         index_size += sizes.iter().map(|(_, bytes)| *bytes).sum::<i64>();
-        for (key, value) in store.scan(&namespace) {
+        for (key, value) in store.scan(&namespace)? {
             objects += 1;
             data_size += value.len() as i64;
             storage_size += (key.len() + value.len()) as i64;
@@ -4931,7 +4952,7 @@ pub fn coll_stats(command: &BsonDocument, store: &dyn MongoStorage) -> Result<Bs
 
     let mut document = BsonDocument::new();
     document.push("ns".to_string(), BsonValue::String(namespace.clone()));
-    if !store.namespace_exists(&namespace) {
+    if !store.namespace_exists(&namespace)? {
         document.push("size".to_string(), count_value(0));
         document.push("count".to_string(), count_value(0));
         document.push("numOrphanDocs".to_string(), count_value(0));
@@ -4948,12 +4969,12 @@ pub fn coll_stats(command: &BsonDocument, store: &dyn MongoStorage) -> Result<Bs
     let mut count = 0_i64;
     let mut data_size = 0_i64;
     let mut storage_size = 0_i64;
-    for (key, value) in store.scan(&namespace) {
+    for (key, value) in store.scan(&namespace)? {
         count += 1;
         data_size += value.len() as i64;
         storage_size += (key.len() + value.len()) as i64;
     }
-    let sizes = collection_index_sizes(store, &namespace);
+    let sizes = collection_index_sizes(store, &namespace)?;
     let total_index_size: i64 = sizes.iter().map(|(_, bytes)| *bytes).sum();
 
     document.push("size".to_string(), scaled(data_size));
@@ -5478,8 +5499,8 @@ pub fn create_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Resul
         return Err(CommandError::new(2, "Must specify at least one index to create"));
     }
 
-    let existing = store.index_specs(&namespace);
-    let existed = store.namespace_exists(&namespace);
+    let existing = store.index_specs(&namespace)?;
+    let existed = store.namespace_exists(&namespace)?;
     let mut known = existing.clone();
     let mut accepted: Vec<IndexSpec> = Vec::new();
     let mut skipped = 0_usize;
@@ -5642,7 +5663,7 @@ pub fn create_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Resul
 /// Refuses to build a unique index over documents that already collide.
 fn verify_unique_build(store: &dyn MongoStorage, namespace: &str, specification: &IndexSpec) -> Result<(), CommandError> {
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for (_, payload) in store.scan(namespace) {
+    for (_, payload) in store.scan(namespace)? {
         let Ok(document) = parse_bson(&payload)
         else {
             continue;
@@ -5747,13 +5768,13 @@ fn stored_index_listing(specification: &IndexSpec) -> BsonDocument {
 pub fn list_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDocument, CommandError> {
     let namespace =
         namespace_from_command(command, "listIndexes").ok_or_else(|| CommandError::new(73, "listIndexes command missing collection name"))?;
-    if !store.namespace_exists(&namespace) {
+    if !store.namespace_exists(&namespace)? {
         return Err(CommandError::new(26, format!("ns does not exist: {namespace}")));
     }
 
     let mut first_batch: Vec<BsonValue> = Vec::new();
     first_batch.push(BsonValue::Document(id_index_listing()));
-    for specification in store.index_specs(&namespace) {
+    for specification in store.index_specs(&namespace)? {
         first_batch.push(BsonValue::Document(stored_index_listing(&specification)));
     }
 
@@ -5771,10 +5792,10 @@ pub fn list_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Result<
 pub fn drop_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDocument, CommandError> {
     let namespace =
         namespace_from_command(command, "dropIndexes").ok_or_else(|| CommandError::new(73, "dropIndexes command missing collection name"))?;
-    if !store.namespace_exists(&namespace) {
+    if !store.namespace_exists(&namespace)? {
         return Err(CommandError::new(26, format!("ns not found {namespace}")));
     }
-    let existing = store.index_specs(&namespace);
+    let existing = store.index_specs(&namespace)?;
     let name = match command.get("index") {
         Some(BsonValue::String(name)) => name.clone(),
         Some(BsonValue::Document(key)) => {
@@ -5873,9 +5894,9 @@ pub fn ttl_monitor(store: &dyn MongoStorage, now_ms: i64) -> Result<TtlReport, C
     }
     report.scanned = true;
 
-    for namespace in store.namespaces() {
+    for namespace in store.namespaces()? {
         let mut deleted = 0_usize;
-        for specification in store.index_specs(&namespace) {
+        for specification in store.index_specs(&namespace)? {
             let Some(seconds) = specification.expire_after_seconds
             else {
                 continue;
@@ -5892,7 +5913,7 @@ pub fn ttl_monitor(store: &dyn MongoStorage, now_ms: i64) -> Result<TtlReport, C
             };
             let threshold = now_ms.saturating_sub(i64::from(seconds) * 1_000);
             let mut candidates: Vec<Vec<u8>> = Vec::new();
-            for (key, payload) in store.scan(&namespace) {
+            for (key, payload) in store.scan(&namespace)? {
                 let Ok(document) = parse_bson(&payload)
                 else {
                     continue;
@@ -5981,7 +6002,7 @@ fn collect_matching(
 ) -> Result<Vec<BsonDocument>, CommandError> {
     if let Some(identifier) = single_id_lookup(filter) {
         let key = value_to_key(identifier);
-        return match namespace_document(store, namespace, &key, session) {
+        return match namespace_document(store, namespace, &key, session)? {
             Some(bytes) => match parse_bson(&bytes) {
                 Ok(document) if document_matches(&document, filter)? => Ok(vec![document]),
                 _ => Ok(Vec::new()),
@@ -5991,7 +6012,7 @@ fn collect_matching(
     }
 
     let mut documents = Vec::new();
-    for (_key, value) in namespace_documents(store, namespace, session) {
+    for (_key, value) in namespace_documents(store, namespace, session)? {
         if let Ok(candidate) = parse_bson(&value)
             && document_matches(&candidate, filter)?
         {
@@ -7662,7 +7683,7 @@ fn out_stage(
             return Err(out_duplicate_error(&temporary, "_id_", &key_value));
         }
     }
-    let indexes = store.index_specs(&target);
+    let indexes = store.index_specs(&target)?;
     for specification in indexes.iter().filter(|index| index.unique) {
         let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
         for document in &staged_documents {
@@ -7677,7 +7698,7 @@ fn out_stage(
             }
         }
     }
-    let target_keys: Vec<Vec<u8>> = namespace_documents(store, &target, session).into_iter().map(|(key, _)| key).collect();
+    let target_keys: Vec<Vec<u8>> = namespace_documents(store, &target, session)?.into_iter().map(|(key, _)| key).collect();
     if !target_keys.is_empty() {
         stage_delete(store, session, &target, &target_keys)?;
     }
@@ -7937,10 +7958,10 @@ fn merge_stage(
     };
 
     // A missing target is created before the index check, exactly like `mongod`.
-    if !store.namespace_exists(&target) {
+    if !store.namespace_exists(&target)? {
         store.import(&target, &[]).map_err(|error| CommandError::new(2, format!("$merge failed: {error}")))?;
     }
-    let Some((index_name, key_pattern)) = merge_unique_index(store, &target, &on_fields)
+    let Some((index_name, key_pattern)) = merge_unique_index(store, &target, &on_fields)?
     else {
         return Err(CommandError::new(51183, "Cannot find index to verify that join fields will be unique"));
     };
@@ -8109,21 +8130,21 @@ fn merge_on_fields(specification: &BsonDocument) -> Result<Vec<String>, CommandE
 }
 
 /// The unique index backing the `on` fields, as `(name, key pattern)`.
-fn merge_unique_index(store: &dyn MongoStorage, namespace: &str, on_fields: &[String]) -> Option<(String, BsonDocument)> {
+fn merge_unique_index(store: &dyn MongoStorage, namespace: &str, on_fields: &[String]) -> Result<Option<(String, BsonDocument)>, CommandError> {
     if on_fields.len() == 1 && on_fields[0] == "_id" {
         let mut pattern = BsonDocument::new();
         pattern.push("_id".to_string(), BsonValue::Int32(1));
-        return Some(("_id_".to_string(), pattern));
+        return Ok(Some(("_id_".to_string(), pattern)));
     }
-    for spec in store.index_specs(namespace) {
+    for spec in store.index_specs(namespace)? {
         if !spec.unique || spec.key.fields.len() != on_fields.len() {
             continue;
         }
         if spec.key.fields.iter().zip(on_fields).all(|((field, _), wanted)| field == wanted) {
-            return Some((spec.name.clone(), spec.key.clone()));
+            return Ok(Some((spec.name.clone(), spec.key.clone())));
         }
     }
-    None
+    Ok(None)
 }
 
 fn merge_document(existing: &BsonDocument, incoming: &BsonDocument) -> Result<BsonDocument, CommandError> {

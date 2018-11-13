@@ -396,8 +396,8 @@ fn documents_survive_a_reopen() {
         insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1))])]);
     }
     let store = Store::open(directory.join("store.yykv")).expect("reopen shard");
-    assert_eq!(store.scan("app.items").len(), 1);
-    assert_eq!(store.namespaces(), vec!["app.items".to_string()]);
+    assert_eq!(store.scan("app.items").expect("scan lands").len(), 1);
+    assert_eq!(store.namespaces().expect("catalog is readable"), vec!["app.items".to_string()]);
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn mongodump_stream_is_imported() {
     stream.extend_from_slice(&encode_bson(&document(&[("_id", BsonValue::Int32(2)), ("name", text("two"))])));
     let imported = mongo::import::import_bson_documents(&store, "app.items", &stream).expect("import");
     assert_eq!(imported, 2);
-    assert_eq!(store.scan("app.items").len(), 2);
+    assert_eq!(store.scan("app.items").expect("scan lands").len(), 2);
 }
 
 #[test]

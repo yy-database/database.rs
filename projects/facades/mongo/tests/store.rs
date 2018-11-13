@@ -42,21 +42,21 @@ fn contract_round_trips_documents_and_catalog() {
     assert_eq!(duplicate.inserted, 1);
     assert_eq!(duplicate.duplicates, vec![0]);
 
-    let scanned = storage.scan("shop.orders");
+    let scanned = storage.scan("shop.orders").expect("scan lands");
     assert_eq!(scanned.len(), 3);
     assert_eq!(scanned[0].0, entry(1).0);
 
-    assert!(storage.namespace_exists("shop.orders"));
+    assert!(storage.namespace_exists("shop.orders").expect("catalog is readable"));
     storage.create_collection("shop.empty", Default::default()).expect("collection is created");
-    assert!(storage.namespace_exists("shop.empty"));
+    assert!(storage.namespace_exists("shop.empty").expect("catalog is readable"));
 
     let deleted = storage.delete("shop.orders", &[entry(2).0]).expect("delete lands");
     assert_eq!(deleted, 1);
 
     drop(store);
     let reopened = Store::open(&base).expect("store reopens");
-    assert!(reopened.namespace_exists("shop.orders"));
-    assert!(reopened.namespace_exists("shop.empty"));
+    assert!(reopened.namespace_exists("shop.orders").expect("catalog is readable"));
+    assert!(reopened.namespace_exists("shop.empty").expect("catalog is readable"));
 
     let _ = std::fs::remove_file(base.with_extension("yyds"));
     let _ = std::fs::remove_file(base.with_extension("yykv"));
@@ -74,9 +74,9 @@ fn contract_commits_transactions_and_caps_the_oplog() {
         storage.transaction_write("session", "shop.orders", &entry(2).0, Some(entry(2).1)),
         mongo::storage::TransactionWrite::Staged
     ));
-    assert_eq!(storage.transaction_scan("session", "shop.orders").map(|documents| documents.len()), Some(2));
+    assert_eq!(storage.transaction_scan("session", "shop.orders").expect("scan lands").map(|documents| documents.len()), Some(2));
     assert!(matches!(storage.transaction_commit("session", 1), mongo::storage::TransactionCommit::Committed));
-    assert!(storage.get("shop.orders", &entry(2).0).is_some());
+    assert!(storage.get("shop.orders", &entry(2).0).expect("read lands").is_some());
 
     storage.enable_oplog("local.oplog.rs", 4096).expect("oplog is enabled");
     assert!(storage.oplog_enabled());
