@@ -1490,7 +1490,7 @@ fn object_encoding(kind: KeyKind, value: &[u8]) -> &'static str {
             if value.len() <= 20 && parse_integer(value).is_some() {
                 "int"
             }
-            else if value.len() <= 44 {
+            else if value.len() <= 38 {
                 "embstr"
             }
             else {

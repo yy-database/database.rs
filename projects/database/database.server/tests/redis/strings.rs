@@ -297,12 +297,13 @@ fn object_encoding_reports_real_values() {
         send(&mut client, &["OBJECT", "ENCODING", parts[1]]);
         expect_bulk(&mut client, Some(expected));
     }
-    let embstr = "a".repeat(36);
+    // 真机 Redis 8.10.3：38 字节仍是 embstr，39 字节起才是 raw。
+    let embstr = "a".repeat(38);
     send(&mut client, &["SET", "embstr", &embstr]);
     expect_status(&mut client, "OK");
     send(&mut client, &["OBJECT", "ENCODING", "embstr"]);
     expect_bulk(&mut client, Some("embstr"));
-    let raw = "a".repeat(37);
+    let raw = "a".repeat(39);
     send(&mut client, &["SET", "raw", &raw]);
     expect_status(&mut client, "OK");
     send(&mut client, &["OBJECT", "ENCODING", "raw"]);
