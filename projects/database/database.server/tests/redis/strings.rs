@@ -297,16 +297,35 @@ fn object_encoding_reports_real_values() {
         send(&mut client, &["OBJECT", "ENCODING", parts[1]]);
         expect_bulk(&mut client, Some(expected));
     }
-    // 真机 Redis 8.10.3：38 字节仍是 embstr，39 字节起才是 raw。
-    let embstr = "a".repeat(38);
+    // 真机 Redis 8.10.3 把键名和值一起嵌进同一个 cache line：键长 + 值长 <= 41
+    // 报 embstr，超过报 raw，过期元数据不计入。下面每条都在真机上实测过。
+    let embstr = "a".repeat(35);
     send(&mut client, &["SET", "embstr", &embstr]);
     expect_status(&mut client, "OK");
     send(&mut client, &["OBJECT", "ENCODING", "embstr"]);
     expect_bulk(&mut client, Some("embstr"));
+    // 同一个键名再加一个字节就跨过 41，编码翻到 raw。
+    let boundary = "a".repeat(36);
+    send(&mut client, &["SET", "embstr", &boundary]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["OBJECT", "ENCODING", "embstr"]);
+    expect_bulk(&mut client, Some("raw"));
     let raw = "a".repeat(39);
     send(&mut client, &["SET", "raw", &raw]);
     expect_status(&mut client, "OK");
     send(&mut client, &["OBJECT", "ENCODING", "raw"]);
+    expect_bulk(&mut client, Some("raw"));
+    // 键名长度参与判定：37 字节的值放在 1 字节键名下仍是 embstr。
+    let same_value = "a".repeat(37);
+    send(&mut client, &["SET", "k", &same_value]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["OBJECT", "ENCODING", "k"]);
+    expect_bulk(&mut client, Some("embstr"));
+    // 过期元数据放在对象之前，不改变上面的尺寸判定。
+    let with_expiry = "a".repeat(39);
+    send(&mut client, &["SET", "expiring", &with_expiry, "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["OBJECT", "ENCODING", "expiring"]);
     expect_bulk(&mut client, Some("raw"));
     send(&mut client, &["OBJECT", "BOGUS", "x"]);
     expect_error(&mut client, "ERR unknown subcommand 'BOGUS'. Try OBJECT HELP.");

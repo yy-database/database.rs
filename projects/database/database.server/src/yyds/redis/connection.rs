@@ -1457,7 +1457,7 @@ fn handle_object(
         else {
             return write_null(stream, protocol);
         };
-        return write_bulk(stream, object_encoding(kind, &value).as_bytes());
+        return write_bulk(stream, object_encoding(kind, key, &value).as_bytes());
     }
     if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
         // 纯内存计时：不写 `.yykv`、不升格式版本，重启后从零开始，与真机 RDB 的行为一致。
@@ -1482,15 +1482,18 @@ fn handle_object(
 
 /// 真机 `OBJECT ENCODING` 的报告值。
 ///
-/// 存储只保存逻辑值，编码由内容与真机默认阈值推出：字符串按整数与 44 字节分界，
+/// 存储只保存逻辑值，编码由键名、内容与真机默认阈值推出。字符串按整数编码，
+/// 其余按真机 8.10.3 的 `kvobj` 内嵌规则判定：键与值嵌在同一个 cache line
+/// （`sizeof(robj)` 16 + 键长 + 3 + 值长 + 4 ≤ 64，即键长 + 值长 ≤ 41）时报
+/// `embstr`，否则报 `raw`；过期元数据放在对象之前，不计入这个尺寸。
 /// 集合类型按条目数、单条长度与整数成员判定。
-fn object_encoding(kind: KeyKind, value: &[u8]) -> &'static str {
+fn object_encoding(kind: KeyKind, key: &[u8], value: &[u8]) -> &'static str {
     match kind {
         KeyKind::String => {
             if value.len() <= 20 && parse_integer(value).is_some() {
                 "int"
             }
-            else if value.len() <= 38 {
+            else if key.len() + value.len() <= 41 {
                 "embstr"
             }
             else {
