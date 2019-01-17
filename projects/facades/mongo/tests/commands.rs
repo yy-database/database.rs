@@ -205,6 +205,54 @@ fn count_respects_the_query_filter() {
     assert_eq!(int(&commands::count(&count, &store).expect("count"), "n"), 2);
 }
 
+fn count_with(store: &Store, field: &str, operators: &[(&str, BsonValue)]) -> Result<i64, CommandError> {
+    let mut count = command("count", "items", "app");
+    count.push("query", BsonValue::Document(document(&[(field, BsonValue::Document(document(operators)))])));
+    commands::count(&count, store).map(|reply| int(&reply, "n"))
+}
+
+#[test]
+fn count_supports_mod_and_bitwise_operators() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![9, 10, 11, 12]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| document(&[("_id", BsonValue::Int32(index as i32)), ("value", BsonValue::Int32(value))]))
+            .collect(),
+    );
+
+    assert_eq!(count_with(&store, "value", &[("$mod", BsonValue::Array(vec![BsonValue::Int32(4), BsonValue::Int32(1)]))]).unwrap(), 1);
+    assert_eq!(count_with(&store, "value", &[("$mod", BsonValue::Array(vec![BsonValue::Int32(4), BsonValue::Int32(2)]))]).unwrap(), 1);
+    assert_eq!(count_with(&store, "value", &[("$mod", BsonValue::Array(vec![BsonValue::Int32(4), BsonValue::Int32(0)]))]).unwrap(), 1);
+
+    let positions = |values: &[i32]| BsonValue::Array(values.iter().copied().map(BsonValue::Int32).collect());
+    assert_eq!(count_with(&store, "value", &[("$bitsAllSet", positions(&[1, 3]))]).unwrap(), 2);
+    assert_eq!(count_with(&store, "value", &[("$bitsAnySet", positions(&[0, 2]))]).unwrap(), 3);
+    assert_eq!(count_with(&store, "value", &[("$bitsAllClear", positions(&[0, 2]))]).unwrap(), 1);
+    assert_eq!(count_with(&store, "value", &[("$bitsAnyClear", BsonValue::Int32(10))]).unwrap(), 2);
+}
+
+#[test]
+fn malformed_mod_and_bit_operands_are_client_errors() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("value", BsonValue::Int32(9))])]);
+
+    let zero_divisor = count_with(&store, "value", &[("$mod", BsonValue::Array(vec![BsonValue::Int32(0), BsonValue::Int32(1)]))]);
+    assert_eq!(zero_divisor.expect_err("zero divisor must fail").code, 2);
+
+    let short_mod = count_with(&store, "value", &[("$mod", BsonValue::Array(vec![BsonValue::Int32(4)]))]);
+    assert_eq!(short_mod.expect_err("short operand must fail").code, 2);
+
+    let out_of_range = count_with(&store, "value", &[("$bitsAllSet", BsonValue::Array(vec![BsonValue::Int32(64)]))]);
+    assert_eq!(out_of_range.expect_err("bit 64 must fail").code, 2);
+
+    let not_a_mask = count_with(&store, "value", &[("$bitsAnyClear", text("nope"))]);
+    assert_eq!(not_a_mask.expect_err("string mask must fail").code, 2);
+}
+
 #[test]
 fn aggregate_matches_groups_and_projects() {
     let store = store();

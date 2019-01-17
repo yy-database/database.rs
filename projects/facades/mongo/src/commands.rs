@@ -25,7 +25,7 @@ use crate::{
 
 /// Filter operators this gateway implements. Anything outside this list is a
 /// hard error: an unrecognised operator must never silently match nothing.
-pub const FILTER_OPERATORS: [&str; 16] = [
+pub const FILTER_OPERATORS: [&str; 21] = [
     "$eq",
     "$ne",
     "$gt",
@@ -42,6 +42,11 @@ pub const FILTER_OPERATORS: [&str; 16] = [
     "$elemMatch",
     "$all",
     "$not",
+    "$mod",
+    "$bitsAllSet",
+    "$bitsAnySet",
+    "$bitsAllClear",
+    "$bitsAnyClear",
 ];
 
 /// Logical operators accepted at the top of a filter.
@@ -198,6 +203,12 @@ fn validate_operator_document(operators: &BsonDocument, operation: &str, field: 
                 if integer_of(operand).filter(|size| *size >= 0).is_none() {
                     return Err(bad("requires a non-negative integer"));
                 }
+            }
+            "$mod" => {
+                parse_mod_operand(operand).map_err(bad)?;
+            }
+            "$bitsAllSet" | "$bitsAnySet" | "$bitsAllClear" | "$bitsAnyClear" => {
+                bit_mask(operand).map_err(bad)?;
             }
             "$regex" => {
                 let BsonValue::String(pattern) = operand
@@ -9449,6 +9460,11 @@ fn operator_matches(candidates: &[&BsonValue], operators: &BsonDocument, field: 
             "$elemMatch" => elem_match_candidates(candidates, operand)?,
             "$all" => all_candidates(candidates, operand)?,
             "$not" => not_candidates(candidates, operand)?,
+            "$mod" => mod_candidates(candidates, operand)?,
+            "$bitsAllSet" => bits_candidates(candidates, operand, BitTest::AllSet)?,
+            "$bitsAnySet" => bits_candidates(candidates, operand, BitTest::AnySet)?,
+            "$bitsAllClear" => bits_candidates(candidates, operand, BitTest::AllClear)?,
+            "$bitsAnyClear" => bits_candidates(candidates, operand, BitTest::AnyClear)?,
             other => return Err(unknown_operator(other, "filter", field, field_index, operator_index)),
         };
         if !matched {
@@ -9808,6 +9824,121 @@ fn number_of(value: &BsonValue) -> Option<f64> {
         BsonValue::Int64(number) => Some(*number as f64),
         BsonValue::Double(number) => Some(*number),
         _ => None,
+    }
+}
+
+/// Exact integer view of a numeric value, when the value is integral and fits in
+/// `i64`. `$mod` and the bitwise operators only inspect integral numbers.
+fn integral_i64(value: &BsonValue) -> Option<i64> {
+    match value {
+        BsonValue::Int32(number) => Some(i64::from(*number)),
+        BsonValue::Int64(number) => Some(*number),
+        BsonValue::Double(number) if number.fract() == 0.0 && *number >= i64::MIN as f64 && *number <= i64::MAX as f64 => Some(*number as i64),
+        _ => None,
+    }
+}
+
+/// Parses a `$mod` operand: `[divisor, remainder]`.
+///
+/// The texts match the parser messages `mongod` reports and are pinned by the
+/// unit tests; their exact wording still awaits a real `mongod 8.0.9` recording.
+fn parse_mod_operand(operand: &BsonValue) -> Result<(&BsonValue, &BsonValue), &'static str> {
+    let BsonValue::Array(parts) = operand
+    else {
+        return Err("malformed mod, needs to be an array");
+    };
+    if parts.len() < 2 {
+        return Err("malformed mod, not enough elements");
+    }
+    if parts.len() > 2 {
+        return Err("malformed mod, too many elements");
+    }
+    let Some(divisor) = number_of(&parts[0])
+    else {
+        return Err("malformed mod, divisor not a number");
+    };
+    if number_of(&parts[1]).is_none() {
+        return Err("malformed mod, remainder not a number");
+    }
+    if divisor == 0.0 {
+        return Err("divisor cannot be 0");
+    }
+    Ok((&parts[0], &parts[1]))
+}
+
+fn mod_candidates(candidates: &[&BsonValue], operand: &BsonValue) -> Result<bool, CommandError> {
+    let (divisor, remainder) = parse_mod_operand(operand).map_err(|detail| CommandError::new(2, detail))?;
+    Ok(candidates.iter().any(|candidate| mod_value_matches(candidate, divisor, remainder)))
+}
+
+fn mod_value_matches(candidate: &BsonValue, divisor: &BsonValue, remainder: &BsonValue) -> bool {
+    if let BsonValue::Array(items) = candidate {
+        return items.iter().any(|item| mod_value_matches(item, divisor, remainder));
+    }
+    if let (Some(value), Some(divisor), Some(remainder)) = (integral_i64(candidate), integral_i64(divisor), integral_i64(remainder)) {
+        return value.checked_rem(divisor) == Some(remainder);
+    }
+    let (Some(value), Some(divisor), Some(remainder)) = (number_of(candidate), number_of(divisor), number_of(remainder))
+    else {
+        return false;
+    };
+    // `%` on `f64` is `fmod`, which is how `mongod` applies `$mod` to doubles.
+    value % divisor == remainder
+}
+
+/// Which bit predicate a `$bits*` operator applies.
+#[derive(Debug, Clone, Copy)]
+enum BitTest {
+    AllSet,
+    AnySet,
+    AllClear,
+    AnyClear,
+}
+
+/// Parses a bitwise operand: a 64-bit two's complement mask, or explicit bit
+/// positions. `mongod` documents the mask as a signed 64-bit integer, so a
+/// negative number sets the high bits.
+fn bit_mask(operand: &BsonValue) -> Result<u64, &'static str> {
+    match operand {
+        BsonValue::Int32(value) => Ok(i64::from(*value) as u64),
+        BsonValue::Int64(value) => Ok(*value as u64),
+        BsonValue::Double(value) if value.fract() == 0.0 && *value >= i64::MIN as f64 && *value <= i64::MAX as f64 => Ok(*value as i64 as u64),
+        BsonValue::Array(positions) => {
+            let mut mask = 0_u64;
+            for position in positions {
+                let Some(position) = integral_i64(position)
+                else {
+                    return Err("bit positions must be integers");
+                };
+                if !(0..64).contains(&position) {
+                    return Err("bit positions must be between 0 and 63");
+                }
+                mask |= 1_u64 << (position as u32);
+            }
+            Ok(mask)
+        }
+        _ => Err("bitwise operators need an integer mask or an array of bit positions"),
+    }
+}
+
+fn bits_candidates(candidates: &[&BsonValue], operand: &BsonValue, test: BitTest) -> Result<bool, CommandError> {
+    let mask = bit_mask(operand).map_err(|detail| CommandError::new(2, detail))?;
+    Ok(candidates.iter().any(|candidate| bits_value_matches(candidate, mask, test)))
+}
+
+fn bits_value_matches(candidate: &BsonValue, mask: u64, test: BitTest) -> bool {
+    if let BsonValue::Array(items) = candidate {
+        return items.iter().any(|item| bits_value_matches(item, mask, test));
+    }
+    let Some(bits) = integral_i64(candidate).map(|value| value as u64)
+    else {
+        return false;
+    };
+    match test {
+        BitTest::AllSet => bits & mask == mask,
+        BitTest::AnySet => bits & mask != 0,
+        BitTest::AllClear => bits & mask == 0,
+        BitTest::AnyClear => bits & mask != mask,
     }
 }
 
