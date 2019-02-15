@@ -7,7 +7,7 @@ use std::{
 };
 
 use mongo::{
-    bson::{BsonDocument, BsonValue, encode_bson, parse_bson},
+    bson::{BinaryData, BsonDocument, BsonValue, encode_bson, parse_bson},
     commands::{self, CommandError},
     cursor::CursorStore,
     json,
@@ -251,6 +251,76 @@ fn malformed_mod_and_bit_operands_are_client_errors() {
 
     let not_a_mask = count_with(&store, "value", &[("$bitsAnyClear", text("nope"))]);
     assert_eq!(not_a_mask.expect_err("string mask must fail").code, 2);
+}
+
+fn session_document() -> BsonValue {
+    BsonValue::Document(document(&[("id", BsonValue::Binary(BinaryData::new(0x04, vec![0x2a; 16])))]))
+}
+
+fn transaction_insert(store: &Store, collection: &str, session: &BsonValue, txn_number: i64, id: i32, value: &str) -> BsonDocument {
+    let mut insert = command("insert", collection, "app");
+    insert.push("lsid", session.clone());
+    insert.push("txnNumber", BsonValue::Int64(txn_number));
+    insert.push("startTransaction", BsonValue::Bool(true));
+    insert.push("autocommit", BsonValue::Bool(false));
+    insert.push("documents", BsonValue::Array(vec![BsonValue::Document(document(&[("_id", BsonValue::Int32(id)), ("value", text(value))]))]));
+    commands::insert(&insert, store).expect("transactional insert")
+}
+
+fn find_in_session(store: &Store, collection: &str, session: &BsonValue, txn_number: i64) -> usize {
+    let mut find = command("find", collection, "app");
+    find.push("filter", BsonValue::Document(BsonDocument::new()));
+    find.push("lsid", session.clone());
+    find.push("txnNumber", BsonValue::Int64(txn_number));
+    find.push("autocommit", BsonValue::Bool(false));
+    let mut cursors = CursorStore::new();
+    batch(&commands::find(&find, store, &mut cursors).expect("find"), "firstBatch").len()
+}
+
+fn end_transaction(store: &Store, name: &str, session: &BsonValue, txn_number: i64) -> Result<BsonDocument, CommandError> {
+    let mut command = command(name, "ledger", "admin");
+    command.push("lsid", session.clone());
+    command.push("txnNumber", BsonValue::Int64(txn_number));
+    if name == "commitTransaction" { commands::commit_transaction(&command, store) } else { commands::abort_transaction(&command, store) }
+}
+
+#[test]
+fn transactions_hide_staged_writes_until_commit_and_discard_them_on_abort() {
+    let store = store();
+    let session = session_document();
+
+    let inserted = transaction_insert(&store, "ledger", &session, 1, 1, "kept");
+    assert_eq!(int(&inserted, "n"), 1);
+
+    let mut cursors = CursorStore::new();
+    assert!(find_all(&store, "ledger", &mut cursors).is_empty(), "staged writes must stay invisible outside the session");
+    assert_eq!(find_in_session(&store, "ledger", &session, 1), 1, "the owning session reads its own write");
+
+    assert_eq!(int(&end_transaction(&store, "commitTransaction", &session, 1).expect("commit"), "ok"), 1);
+    assert_eq!(find_all(&store, "ledger", &mut cursors).len(), 1, "commit publishes the staged write");
+
+    let staged = transaction_insert(&store, "ledger", &session, 2, 2, "dropped");
+    assert_eq!(int(&staged, "n"), 1);
+    assert_eq!(int(&end_transaction(&store, "abortTransaction", &session, 2).expect("abort"), "ok"), 1);
+    assert_eq!(find_all(&store, "ledger", &mut cursors).len(), 1, "abort discards the staged write");
+}
+
+#[test]
+fn transaction_commands_reject_a_command_without_a_session() {
+    let store = store();
+    let mut commit = command("commitTransaction", "ledger", "admin");
+    commit.push("txnNumber", BsonValue::Int64(1));
+    assert_eq!(commands::commit_transaction(&commit, &store).expect_err("no session").code, 40414);
+
+    let mut abort = command("abortTransaction", "ledger", "admin");
+    abort.push("txnNumber", BsonValue::Int64(1));
+    assert_eq!(commands::abort_transaction(&abort, &store).expect_err("no session").code, 40414);
+
+    let session = session_document();
+    let mut short_txn = command("commitTransaction", "ledger", "admin");
+    short_txn.push("lsid", session);
+    short_txn.push("txnNumber", BsonValue::Int32(1));
+    assert_eq!(commands::commit_transaction(&short_txn, &store).expect_err("txnNumber must be Int64").code, 14);
 }
 
 #[test]
