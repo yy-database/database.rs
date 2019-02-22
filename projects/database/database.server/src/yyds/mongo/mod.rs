@@ -4,9 +4,12 @@
 //! 返回 MongoDB 形态的应答。不是完整的 MongoDB 服务端，命令子集如下：
 //!
 //! - 握手：`hello` / `isMaster` / `ismaster` / `ping`
-//! - 写入：`insert` / `update` / `delete`
-//! - 读取：`find` / `count` / `aggregate`
-//! - 索引：`createIndexes`
+//! - 写入：`insert` / `update` / `delete` / `findAndModify` / `bulkWrite`
+//! - 读取：`find` / `count` / `aggregate` / `distinct`
+//! - 集合与库：`create` / `drop` / `collMod` / `dropDatabase` / `listCollections` /
+//!   `listDatabases` / `collStats` / `dbStats` / `explain`
+//! - 索引：`createIndexes` / `listIndexes` / `dropIndexes`
+//! - 事务：`commitTransaction` / `abortTransaction`（入口已接，逻辑会话状态待裁定）
 //! - 游标：`getMore` / `killCursors`
 //!
 //! 命令语义全部由上游 `mongo` 门面的命令层提供，本模块只做 OP_MSG / OP_QUERY
@@ -86,6 +89,22 @@ fn command_kind(name: &str) -> &'static str {
         "delete" => "delete",
         "update" => "update",
         "createIndexes" => "createIndexes",
+        "listIndexes" => "listIndexes",
+        "dropIndexes" => "dropIndexes",
+        "create" => "create",
+        "drop" => "drop",
+        "dropDatabase" => "dropDatabase",
+        "collMod" => "collMod",
+        "listCollections" => "listCollections",
+        "listDatabases" => "listDatabases",
+        "collStats" => "collStats",
+        "dbStats" => "dbStats",
+        "explain" => "explain",
+        "distinct" => "distinct",
+        "findAndModify" | "findandmodify" => "findAndModify",
+        "bulkWrite" => "bulkWrite",
+        "commitTransaction" => "commitTransaction",
+        "abortTransaction" => "abortTransaction",
         "getMore" => "getMore",
         "killCursors" => "killCursors",
         _ => "unknown",
@@ -177,6 +196,22 @@ fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecu
         "delete" => run(executor, "delete", |storage| commands::delete(bson_doc, storage)),
         "update" => run(executor, "update", |storage| commands::update(bson_doc, storage)),
         "createIndexes" => run(executor, "createIndexes", |storage| commands::create_indexes(bson_doc, storage)),
+        "listIndexes" => run(executor, "listIndexes", |storage| commands::list_indexes(bson_doc, storage)),
+        "dropIndexes" => run(executor, "dropIndexes", |storage| commands::drop_indexes(bson_doc, storage)),
+        "create" => run(executor, "create", |storage| commands::create(bson_doc, storage)),
+        "drop" => run(executor, "drop", |storage| commands::drop(bson_doc, storage)),
+        "dropDatabase" => run(executor, "dropDatabase", |storage| commands::drop_database(bson_doc, storage)),
+        "collMod" => run(executor, "collMod", |storage| commands::coll_mod(bson_doc, storage)),
+        "listCollections" => run(executor, "listCollections", |storage| commands::list_collections(bson_doc, storage)),
+        "listDatabases" => run(executor, "listDatabases", |storage| commands::list_databases(storage)),
+        "collStats" => run(executor, "collStats", |storage| commands::coll_stats(bson_doc, storage)),
+        "dbStats" => run(executor, "dbStats", |storage| commands::db_stats(bson_doc, storage, None)),
+        "explain" => run(executor, "explain", |storage| commands::explain(bson_doc, storage)),
+        "distinct" => run(executor, "distinct", |storage| commands::distinct(bson_doc, storage)),
+        "findAndModify" | "findandmodify" => run(executor, "findAndModify", |storage| commands::find_and_modify(bson_doc, storage)),
+        "bulkWrite" => run(executor, "bulkWrite", |storage| commands::bulk_write(bson_doc, storage)),
+        "commitTransaction" => run(executor, "commitTransaction", |storage| commands::commit_transaction(bson_doc, storage)),
+        "abortTransaction" => run(executor, "abortTransaction", |storage| commands::abort_transaction(bson_doc, storage)),
         "getMore" => render(commands::get_more(bson_doc, &mut lock_cursors(cursors))),
         "killCursors" => render(commands::kill_cursors(bson_doc, &mut lock_cursors(cursors))),
         other => generic_error_body(other),

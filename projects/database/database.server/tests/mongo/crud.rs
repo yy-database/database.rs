@@ -787,6 +787,13 @@ where
                 f(BsonElem::ObjectId(key, bytes))
             }
             0x06 => f(BsonElem::Undefined(key)),
+            0x08 => {
+                if cursor + 1 > bson.len() {
+                    break;
+                }
+                cursor += 1;
+                None
+            }
             0x10 => {
                 if cursor + 4 > bson.len() {
                     break;
@@ -838,6 +845,116 @@ fn insert_reads_documents_from_a_document_sequence_section() {
     let find_cmd = bson_document(&[bson_string("find", "users"), bson_string("$db", "test"), bson_doc_element("filter", &empty_filter)]);
     let find_reply = roundtrip(&mut client, 2, &find_cmd);
     assert_eq!(extract_cursor_firstbatch_len(&find_reply), Some(1), "reply={find_reply:?}");
+
+    let _ = client.shutdown(Shutdown::Write);
+    let _ = server.join();
+}
+
+fn expect_ok(reply: &[u8], command: &str) {
+    assert_eq!(extract_double(reply, "ok"), Some(1.0), "{command} failed: reply={reply:?}");
+}
+
+#[test]
+fn catalog_and_admin_commands_are_routed_over_op_msg() {
+    let (mut client, server) = executor_server();
+    let empty = bson_document(&[]);
+
+    let create = bson_document(&[bson_string("create", "ledger"), bson_string("$db", "app")]);
+    expect_ok(&roundtrip(&mut client, 1, &create), "create");
+
+    let first = bson_document(&[bson_int32("_id", 1), bson_string("value", "a")]);
+    let second = bson_document(&[bson_int32("_id", 2), bson_string("value", "a")]);
+    let insert =
+        bson_document(&[bson_string("insert", "ledger"), bson_string("$db", "app"), bson_array_element("documents", &[first, second])]);
+    expect_ok(&roundtrip(&mut client, 2, &insert), "insert");
+
+    let list_collections = bson_document(&[bson_int32("listCollections", 1), bson_string("$db", "app")]);
+    let collections = roundtrip(&mut client, 3, &list_collections);
+    assert_eq!(extract_cursor_firstbatch_len(&collections), Some(1), "reply={collections:?}");
+
+    let coll_stats = bson_document(&[bson_string("collStats", "ledger"), bson_string("$db", "app")]);
+    expect_ok(&roundtrip(&mut client, 4, &coll_stats), "collStats");
+
+    let db_stats = bson_document(&[bson_int32("dbStats", 1), bson_string("$db", "app")]);
+    expect_ok(&roundtrip(&mut client, 5, &db_stats), "dbStats");
+
+    let list_databases = bson_document(&[bson_int32("listDatabases", 1), bson_string("$db", "admin")]);
+    expect_ok(&roundtrip(&mut client, 6, &list_databases), "listDatabases");
+
+    let distinct = bson_document(&[
+        bson_string("distinct", "ledger"),
+        bson_string("key", "value"),
+        bson_string("$db", "app"),
+        bson_doc_element("query", &empty),
+    ]);
+    expect_ok(&roundtrip(&mut client, 7, &distinct), "distinct");
+
+    let find_and_modify = bson_document(&[
+        bson_string("findAndModify", "ledger"),
+        bson_string("$db", "app"),
+        bson_doc_element("query", &bson_document(&[bson_int32("_id", 1)])),
+        bson_doc_element("update", &bson_document(&[bson_doc_element("$set", &bson_document(&[bson_string("value", "b")]))])),
+    ]);
+    expect_ok(&roundtrip(&mut client, 8, &find_and_modify), "findAndModify");
+
+    let operation = bson_document(&[
+        bson_int32("insert", 0),
+        bson_doc_element("document", &bson_document(&[bson_int32("_id", 3), bson_string("value", "c")])),
+    ]);
+    let namespace = bson_document(&[bson_string("ns", "app.ledger")]);
+    let bulk_write = bson_document(&[
+        bson_int32("bulkWrite", 1),
+        bson_string("$db", "admin"),
+        bson_array_element("ops", &[operation]),
+        bson_array_element("nsInfo", &[namespace]),
+    ]);
+    expect_ok(&roundtrip(&mut client, 9, &bulk_write), "bulkWrite");
+
+    let explain = bson_document(&[
+        bson_doc_element("explain", &bson_document(&[bson_string("find", "ledger"), bson_doc_element("filter", &empty)])),
+        bson_string("$db", "app"),
+    ]);
+    expect_ok(&roundtrip(&mut client, 10, &explain), "explain");
+
+    let index = bson_document(&[bson_doc_element("key", &bson_document(&[bson_int32("value", 1)])), bson_string("name", "value_1")]);
+    let create_indexes =
+        bson_document(&[bson_string("createIndexes", "ledger"), bson_string("$db", "app"), bson_array_element("indexes", &[index])]);
+    expect_ok(&roundtrip(&mut client, 11, &create_indexes), "createIndexes");
+
+    let list_indexes = bson_document(&[bson_string("listIndexes", "ledger"), bson_string("$db", "app")]);
+    let indexes = roundtrip(&mut client, 12, &list_indexes);
+    assert_eq!(extract_cursor_firstbatch_len(&indexes), Some(2), "reply={indexes:?}");
+
+    let drop_indexes = bson_document(&[bson_string("dropIndexes", "ledger"), bson_string("index", "value_1"), bson_string("$db", "app")]);
+    expect_ok(&roundtrip(&mut client, 13, &drop_indexes), "dropIndexes");
+
+    let coll_mod = bson_document(&[bson_string("collMod", "ledger"), bson_string("$db", "app"), bson_doc_element("validator", &empty)]);
+    expect_ok(&roundtrip(&mut client, 14, &coll_mod), "collMod");
+
+    let drop = bson_document(&[bson_string("drop", "ledger"), bson_string("$db", "app")]);
+    expect_ok(&roundtrip(&mut client, 15, &drop), "drop");
+
+    let drop_database = bson_document(&[bson_int32("dropDatabase", 1), bson_string("$db", "app")]);
+    expect_ok(&roundtrip(&mut client, 16, &drop_database), "dropDatabase");
+
+    let _ = client.shutdown(Shutdown::Write);
+    let _ = server.join();
+}
+
+#[test]
+fn transaction_commands_reach_facade_semantics_instead_of_unknown_command() {
+    let (mut client, server) = executor_server();
+    let lsid = bson_document(&[bson_string("id", "no-uuid")]);
+
+    // The route exists so the pending logical-session decision only needs state
+    // plumbing. Until then the facade answers with its real `NoSuchTransaction`
+    // code instead of the gateway's `unknown` fallback.
+    for (request_id, name) in [(1, "commitTransaction"), (2, "abortTransaction")] {
+        let command = bson_document(&[bson_int32(name, 1), bson_string("$db", "admin"), bson_doc_element("lsid", &lsid)]);
+        let reply = roundtrip(&mut client, request_id, &command);
+        assert_eq!(extract_double(&reply, "ok"), Some(0.0), "{name} reply={reply:?}");
+        assert!(extract_int32(&reply, "code").is_some(), "{name} must carry a facade error code: reply={reply:?}");
+    }
 
     let _ = client.shutdown(Shutdown::Write);
     let _ = server.join();
