@@ -3690,7 +3690,7 @@ fn parse_sort_options(stream: &mut dyn io::Write, arguments: &[&[u8]]) -> io::Re
             }
             let (Some(offset), Some(count)) = (parse_index(arguments[index + 1]), parse_index(arguments[index + 2]))
             else {
-                write_error(stream, "syntax error")?;
+                write_error(stream, "value is not an integer or out of range")?;
                 return Ok(None);
             };
             options.limit = Some((offset.max(0) as usize, (count >= 0).then_some(count as usize)));

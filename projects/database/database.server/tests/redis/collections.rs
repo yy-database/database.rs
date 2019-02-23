@@ -2673,7 +2673,7 @@ fn sort_commands() {
     send(&mut client, &["SORT", "nums", "BOGUS"]);
     expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["SORT", "nums", "LIMIT", "1", "x"]);
-    expect_error(&mut client, "ERR syntax error");
+    expect_error(&mut client, "ERR value is not an integer or out of range");
     send(&mut client, &["SORT"]);
     expect_error(&mut client, "ERR wrong number of arguments for 'sort' command");
 }
