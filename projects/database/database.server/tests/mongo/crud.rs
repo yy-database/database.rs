@@ -946,9 +946,8 @@ fn transaction_commands_reach_facade_semantics_instead_of_unknown_command() {
     let (mut client, server) = executor_server();
     let lsid = bson_document(&[bson_string("id", "no-uuid")]);
 
-    // The route exists so the pending logical-session decision only needs state
-    // plumbing. Until then the facade answers with its real `NoSuchTransaction`
-    // code instead of the gateway's `unknown` fallback.
+    // 入口已接，待定的逻辑会话裁定只需补状态管道。在此之前门面返回真实的
+    // `NoSuchTransaction` 错误码，而不是网关的 `unknown` 兜底。
     for (request_id, name) in [(1, "commitTransaction"), (2, "abortTransaction")] {
         let command = bson_document(&[bson_int32(name, 1), bson_string("$db", "admin"), bson_doc_element("lsid", &lsid)]);
         let reply = roundtrip(&mut client, request_id, &command);

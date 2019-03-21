@@ -9827,8 +9827,8 @@ fn number_of(value: &BsonValue) -> Option<f64> {
     }
 }
 
-/// Exact integer view of a numeric value, when the value is integral and fits in
-/// `i64`. `$mod` and the bitwise operators only inspect integral numbers.
+/// 取数值的精确整数视图：仅当值可整除且落在 `i64` 范围内。
+/// `$mod` 与位算子只检查整数值。
 fn integral_i64(value: &BsonValue) -> Option<i64> {
     match value {
         BsonValue::Int32(number) => Some(i64::from(*number)),
@@ -9838,10 +9838,10 @@ fn integral_i64(value: &BsonValue) -> Option<i64> {
     }
 }
 
-/// Parses a `$mod` operand: `[divisor, remainder]`.
+/// 解析 `$mod` 操作数：`[divisor, remainder]`。
 ///
-/// The texts match the parser messages `mongod` reports and are pinned by the
-/// unit tests; their exact wording still awaits a real `mongod 8.0.9` recording.
+/// 文案对齐 `mongod` 解析器的报错，并由单测钉住；确切措辞仍待真实
+/// `mongod 8.0.9` 录制核对。
 fn parse_mod_operand(operand: &BsonValue) -> Result<(&BsonValue, &BsonValue), &'static str> {
     let BsonValue::Array(parts) = operand
     else {
@@ -9882,11 +9882,11 @@ fn mod_value_matches(candidate: &BsonValue, divisor: &BsonValue, remainder: &Bso
     else {
         return false;
     };
-    // `%` on `f64` is `fmod`, which is how `mongod` applies `$mod` to doubles.
+    // `f64` 上的 `%` 就是 `fmod`，`mongod` 对 double 应用 `$mod` 也是这个语义。
     value % divisor == remainder
 }
 
-/// Which bit predicate a `$bits*` operator applies.
+/// `$bits*` 系列算子各自的判定方式。
 #[derive(Debug, Clone, Copy)]
 enum BitTest {
     AllSet,
@@ -9895,9 +9895,8 @@ enum BitTest {
     AnyClear,
 }
 
-/// Parses a bitwise operand: a 64-bit two's complement mask, or explicit bit
-/// positions. `mongod` documents the mask as a signed 64-bit integer, so a
-/// negative number sets the high bits.
+/// 解析位运算操作数：64 位二补码掩码，或显式位号列表。
+/// `mongod` 把掩码文档化为有符号 64 位整数，因此负数会置起高位。
 fn bit_mask(operand: &BsonValue) -> Result<u64, &'static str> {
     match operand {
         BsonValue::Int32(value) => Ok(i64::from(*value) as u64),
