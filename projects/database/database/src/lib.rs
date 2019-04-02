@@ -100,3 +100,9 @@ pub mod client {
 pub mod server {
     pub use database_server::*;
 }
+
+/// 测试与基准判定协议：语料身份、已知差异台账与报告信封。
+#[cfg(feature = "harness")]
+pub mod harness {
+    pub use database_harness::*;
+}

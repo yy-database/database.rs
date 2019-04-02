@@ -43,6 +43,7 @@ protocol-redis = ["protocol", "dep:database-protocol-redis"]
 protocol-mongo = ["protocol", "dep:database-protocol-mongo"]
 client = ["dep:database-client"]
 server = ["dep:database-server"]
+harness = ["dep:database-harness"]
 
 [dependencies]
 database-types = { workspace = true, optional = true }
@@ -61,3 +62,4 @@ database-protocol-redis = { workspace = true, optional = true }
 database-protocol-mongo = { workspace = true, optional = true }
 database-client = { workspace = true, optional = true }
 database-server = { workspace = true, optional = true }
+database-harness = { workspace = true, optional = true }

@@ -44,6 +44,7 @@ database-protocol-redis = { path = "projects/database/database.protocol.redis" }
 database-protocol-mongo = { path = "projects/database/database.protocol.mongo" }
 database-client = { path = "projects/database/database.client" }
 database-server = { path = "projects/database/database.server" }
+database-harness = { path = "projects/database/database.harness" }
 sqlite = { path = "projects/facades/sqlite" }
 mongo = { path = "projects/facades/mongo" }
 regex = "1"
