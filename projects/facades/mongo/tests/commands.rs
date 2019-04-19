@@ -362,6 +362,106 @@ fn aggregate_matches_groups_and_projects() {
 }
 
 #[test]
+fn arithmetic_expressions_follow_numeric_promotion() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("n", BsonValue::Int32(7))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("sum", operator("$add", BsonValue::Array(vec![BsonValue::Int32(2), BsonValue::Int32(3)]))),
+            ("wide", operator("$add", BsonValue::Array(vec![BsonValue::Int32(2), BsonValue::Int64(3)]))),
+            ("mixed", operator("$add", BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Double(2.5)]))),
+            ("from_field", operator("$add", BsonValue::Array(vec![text("$n"), BsonValue::Int32(1)]))),
+            ("difference", operator("$subtract", BsonValue::Array(vec![BsonValue::Int32(10), BsonValue::Int32(4)]))),
+            ("product", operator("$multiply", BsonValue::Array(vec![BsonValue::Int32(3), BsonValue::Int32(4)]))),
+            ("quotient", operator("$divide", BsonValue::Array(vec![BsonValue::Int32(7), BsonValue::Int32(2)]))),
+            ("remainder", operator("$mod", BsonValue::Array(vec![BsonValue::Int32(7), BsonValue::Int32(4)]))),
+            ("power", operator("$pow", BsonValue::Array(vec![BsonValue::Int32(2), BsonValue::Int32(10)]))),
+            ("fractional_power", operator("$pow", BsonValue::Array(vec![BsonValue::Int32(2), BsonValue::Int32(-1)]))),
+            ("absolute", operator("$abs", BsonValue::Int32(-3))),
+            ("ceiling", operator("$ceil", BsonValue::Double(2.1))),
+            ("flooring", operator("$floor", BsonValue::Double(2.9))),
+            ("rounded", operator("$round", BsonValue::Array(vec![BsonValue::Double(2.5)]))),
+            ("rounded_away", operator("$round", BsonValue::Array(vec![BsonValue::Double(3.5)]))),
+            ("truncated", operator("$trunc", BsonValue::Array(vec![BsonValue::Double(2.9)]))),
+            ("negative_place", operator("$trunc", BsonValue::Array(vec![BsonValue::Int32(1234), BsonValue::Int32(-2)]))),
+            ("root", operator("$sqrt", BsonValue::Int32(9))),
+        ]),
+    );
+
+    assert_eq!(row.get("sum"), Some(&BsonValue::Int32(5)));
+    assert_eq!(row.get("wide"), Some(&BsonValue::Int64(5)));
+    assert_eq!(row.get("mixed"), Some(&BsonValue::Double(3.5)));
+    assert_eq!(row.get("from_field"), Some(&BsonValue::Int32(8)));
+    assert_eq!(row.get("difference"), Some(&BsonValue::Int32(6)));
+    assert_eq!(row.get("product"), Some(&BsonValue::Int32(12)));
+    assert_eq!(row.get("quotient"), Some(&BsonValue::Double(3.5)));
+    assert_eq!(row.get("remainder"), Some(&BsonValue::Int32(3)));
+    assert_eq!(row.get("power"), Some(&BsonValue::Int32(1024)));
+    assert_eq!(row.get("fractional_power"), Some(&BsonValue::Double(0.5)));
+    assert_eq!(row.get("absolute"), Some(&BsonValue::Int32(3)));
+    assert_eq!(row.get("ceiling"), Some(&BsonValue::Double(3.0)));
+    assert_eq!(row.get("flooring"), Some(&BsonValue::Double(2.0)));
+    assert_eq!(row.get("rounded"), Some(&BsonValue::Double(2.0)));
+    assert_eq!(row.get("rounded_away"), Some(&BsonValue::Double(4.0)));
+    assert_eq!(row.get("truncated"), Some(&BsonValue::Double(2.0)));
+    assert_eq!(row.get("negative_place"), Some(&BsonValue::Int32(1200)));
+    assert_eq!(row.get("root"), Some(&BsonValue::Double(3.0)));
+}
+
+#[test]
+fn arithmetic_expressions_handle_dates() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("delta", operator("$subtract", BsonValue::Array(vec![BsonValue::DateTime(1000), BsonValue::DateTime(400)]))),
+            ("shifted", operator("$add", BsonValue::Array(vec![BsonValue::DateTime(1000), BsonValue::Int32(500)]))),
+            ("pulled", operator("$subtract", BsonValue::Array(vec![BsonValue::DateTime(1000), BsonValue::Int32(500)]))),
+        ]),
+    );
+
+    assert_eq!(row.get("delta"), Some(&BsonValue::Int64(600)));
+    assert_eq!(row.get("shifted"), Some(&BsonValue::DateTime(1500)));
+    assert_eq!(row.get("pulled"), Some(&BsonValue::DateTime(500)));
+}
+
+#[test]
+fn arithmetic_expressions_propagate_null_and_reject_bad_operands() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("word", text("nope"))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("null_sum", operator("$add", BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Null]))),
+            ("null_division", operator("$divide", BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Null]))),
+            ("null_root", operator("$sqrt", BsonValue::Null)),
+        ]),
+    );
+    assert_eq!(row.get("null_sum"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_division"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_root"), Some(&BsonValue::Null));
+
+    let failure = |projection: BsonDocument| -> CommandError {
+        let aggregate = aggregate_pipeline("items", vec![stage("$project", BsonValue::Document(projection))]);
+        commands::aggregate(&aggregate, &store).expect_err("expression must fail")
+    };
+
+    assert_eq!(failure(document(&[("x", operator("$add", BsonValue::Array(vec![text("$word"), BsonValue::Int32(1)])))])).code, 16554);
+    assert_eq!(failure(document(&[("x", operator("$subtract", BsonValue::Array(vec![BsonValue::Int32(1)])))])).code, 2);
+    assert_eq!(failure(document(&[("x", operator("$divide", BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Int32(0)])))])).code, 2);
+    assert_eq!(failure(document(&[("x", operator("$sqrt", BsonValue::Int32(-1)))])).code, 28714);
+    assert_eq!(failure(document(&[("x", operator("$round", BsonValue::Array(vec![BsonValue::Double(1.5), BsonValue::Int32(101)])),)])).code, 2);
+}
+
+#[test]
 fn aggregate_rejects_unsupported_stages_even_after_match() {
     let store = store();
     let search = BsonValue::Document(document(&[("text", text("x"))]));
@@ -791,6 +891,16 @@ fn aggregate_pipeline(collection: &str, stages: Vec<BsonValue>) -> BsonDocument 
 
 fn stage(name: &str, body: BsonValue) -> BsonValue {
     BsonValue::Document(document(&[(name, body)]))
+}
+
+fn operator(name: &str, argument: BsonValue) -> BsonValue {
+    BsonValue::Document(document(&[(name, argument)]))
+}
+
+/// 用一条 `$project` 把表达式结果投影出来，供算术算子断言使用。
+fn expression_projection(store: &Store, projection: BsonDocument) -> BsonDocument {
+    let aggregate = aggregate_pipeline("items", vec![stage("$project", BsonValue::Document(projection))]);
+    batch(&commands::aggregate(&aggregate, store).expect("aggregate"), "firstBatch").into_iter().next().expect("one projected document")
 }
 
 #[test]

@@ -9155,30 +9155,70 @@ fn evaluate_expression_vars(
                         evaluate_expression_vars(document, else_value, variables)
                     }
                 }
-                "$add" => {
-                    let BsonValue::Array(arguments) = argument
-                    else {
-                        return Err(CommandError::new(2, "$add requires an array of expressions"));
-                    };
-                    let mut total: i128 = 0;
-                    let mut double_total: Option<f64> = None;
-                    for expression in arguments {
-                        match evaluate_expression_vars(document, expression, variables)? {
-                            BsonValue::Int32(number) => total += i128::from(number),
-                            BsonValue::Int64(number) => total += i128::from(number),
-                            BsonValue::Double(number) => *double_total.get_or_insert(0.0) += number,
-                            other => {
-                                return Err(CommandError::new(2, format!("$add requires numeric arguments, got {other:?}")));
+                "$add" | "$subtract" | "$multiply" | "$divide" | "$mod" | "$pow" => {
+                    evaluate_arithmetic(document, operator, argument, variables)
+                }
+                "$abs" | "$ceil" | "$floor" | "$sqrt" => {
+                    let operand = evaluate_expression_vars(document, argument, variables)?;
+                    match numeric_operand(&operand, operator)? {
+                        ArithmeticOperand::Null => Ok(BsonValue::Null),
+                        ArithmeticOperand::Integer { value, long } => match operator.as_str() {
+                            "$abs" => integer_arithmetic_result(value.abs(), long, operator),
+                            "$ceil" | "$floor" => integer_arithmetic_result(value, long, operator),
+                            _ => {
+                                if value < 0 {
+                                    return Err(CommandError::new(28714, "$sqrt's argument must be greater than or equal to 0"));
+                                }
+                                Ok(BsonValue::Double((value as f64).sqrt()))
                             }
-                        }
-                    }
-                    Ok(match double_total {
-                        Some(double) => BsonValue::Double(double + total as f64),
-                        None => match i64::try_from(total) {
-                            Ok(exact) => count_value(exact),
-                            Err(_) => BsonValue::Double(total as f64),
                         },
-                    })
+                        ArithmeticOperand::Double(number) => match operator.as_str() {
+                            "$abs" => Ok(BsonValue::Double(number.abs())),
+                            "$ceil" => Ok(BsonValue::Double(number.ceil())),
+                            "$floor" => Ok(BsonValue::Double(number.floor())),
+                            _ => {
+                                if number < 0.0 {
+                                    return Err(CommandError::new(28714, "$sqrt's argument must be greater than or equal to 0"));
+                                }
+                                Ok(BsonValue::Double(number.sqrt()))
+                            }
+                        },
+                        ArithmeticOperand::DateTime(_) => unreachable!("numeric_operand rejects dates"),
+                    }
+                }
+                "$round" | "$trunc" => {
+                    let arguments = match argument {
+                        BsonValue::Array(arguments) if !arguments.is_empty() && arguments.len() <= 2 => arguments.as_slice(),
+                        _ => {
+                            return Err(CommandError::new(2, format!("{operator} requires an array of one or two expressions")));
+                        }
+                    };
+                    let number = evaluate_expression_vars(document, &arguments[0], variables)?;
+                    let place = match arguments.get(1) {
+                        Some(expression) => evaluate_expression_vars(document, expression, variables)?,
+                        None => BsonValue::Int32(0),
+                    };
+                    let place = match integral_i64(&place) {
+                        Some(place) if (-20..=100).contains(&place) => place as i32,
+                        Some(_) => {
+                            return Err(CommandError::new(2, format!("{operator} places must be between -20 and 100")));
+                        }
+                        None => {
+                            return Err(CommandError::new(2, format!("{operator} places must be an integer")));
+                        }
+                    };
+                    match numeric_operand(&number, operator)? {
+                        ArithmeticOperand::Null => Ok(BsonValue::Null),
+                        ArithmeticOperand::Integer { value, long } => {
+                            let rounded = round_integer_to_place(value, place, operator == "$round");
+                            integer_arithmetic_result(rounded, long, operator)
+                        }
+                        ArithmeticOperand::Double(number) => {
+                            let rounded = round_double_to_place(number, place, operator == "$round");
+                            Ok(BsonValue::Double(rounded))
+                        }
+                        ArithmeticOperand::DateTime(_) => unreachable!("numeric_operand rejects dates"),
+                    }
                 }
                 "$concat" => {
                     let BsonValue::Array(arguments) = argument
@@ -9227,7 +9267,7 @@ fn evaluate_expression_vars(
                 other => Err(CommandError::new(
                     59,
                     format!(
-                        "unknown $project expression: {other} (supported: $add, $concat, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
+                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
                     ),
                 )),
             }
@@ -9246,6 +9286,310 @@ fn evaluate_expression_vars(
         }
         other => Ok(other.clone()),
     }
+}
+
+/// 算术算子归一化后的操作数。
+///
+/// `Null` 同时覆盖 `null` 与已废弃的 `undefined`；`DateTime` 只在 `$add` 与
+/// `$subtract` 里合法。Decimal128 的精确十进制算术尚未实现，按不支持处理。
+enum ArithmeticOperand {
+    /// `null` 或 `undefined`，算术结果直接是 `null`。
+    Null,
+    /// 整数操作数；`long` 标记原始 BSON 类型是否为 64 位。
+    Integer {
+        /// 以 `i128` 承载，避免 `int` / `long` 相加时中途丢失精度。
+        value: i128,
+        /// 原始类型是 `long` 时，结果只能落在 `long`。
+        long: bool,
+    },
+    /// 双精度操作数。
+    Double(f64),
+    /// BSON Date，自 Unix 纪元起的毫秒数。
+    DateTime(i64),
+}
+
+impl ArithmeticOperand {
+    /// 排除 `null` 与日期之后的 `f64` 视图，供 `$divide` / `$mod` / `$pow` 使用。
+    fn as_double(&self) -> Option<f64> {
+        match self {
+            Self::Integer { value, .. } => Some(*value as f64),
+            Self::Double(number) => Some(*number),
+            Self::Null | Self::DateTime(_) => None,
+        }
+    }
+}
+
+/// 把表达式结果归一化成算术操作数。
+///
+/// 接受 `int`、`long`、`double` 与 `date`，其余类型按 `mongod` 的
+/// `TypeMismatch` 拒绝。错误码与措辞待真实 `mongod 8.0.9` 录制核对。
+fn arithmetic_operand(value: &BsonValue, operator: &str) -> Result<ArithmeticOperand, CommandError> {
+    Ok(match value {
+        BsonValue::Null | BsonValue::Undefined => ArithmeticOperand::Null,
+        BsonValue::Int32(number) => ArithmeticOperand::Integer { value: i128::from(*number), long: false },
+        BsonValue::Int64(number) => ArithmeticOperand::Integer { value: i128::from(*number), long: true },
+        BsonValue::Double(number) => ArithmeticOperand::Double(*number),
+        BsonValue::DateTime(milliseconds) => ArithmeticOperand::DateTime(*milliseconds),
+        other => {
+            return Err(CommandError::new(16554, format!("{operator} only supports numeric or date types, not {}", bson_type_name(other))));
+        }
+    })
+}
+
+/// 只接受数值的算术算子（乘、除、取模、乘方、取整）使用的入口。
+fn numeric_operand(value: &BsonValue, operator: &str) -> Result<ArithmeticOperand, CommandError> {
+    match value {
+        BsonValue::DateTime(_) => Err(CommandError::new(16555, format!("{operator} only supports numeric types, not date"))),
+        BsonValue::Null | BsonValue::Undefined | BsonValue::Int32(_) | BsonValue::Int64(_) | BsonValue::Double(_) => {
+            arithmetic_operand(value, operator)
+        }
+        other => Err(CommandError::new(16555, format!("{operator} only supports numeric types, not {}", bson_type_name(other)))),
+    }
+}
+
+/// 把精确整数结果按最小可用的 BSON 整数类型写出。
+///
+/// 两侧都曾是 `int` 时优先 `int32`，放不下升到 `int64`；任一侧是 `long` 时
+/// 只允许 `int64`，溢出即报错。
+fn integer_arithmetic_result(value: i128, long: bool, operator: &str) -> Result<BsonValue, CommandError> {
+    if !long && let Ok(small) = i32::try_from(value) {
+        return Ok(BsonValue::Int32(small));
+    }
+    i64::try_from(value).map(BsonValue::Int64).map_err(|_| CommandError::new(2, format!("{operator} result overflows a 64-bit integer")))
+}
+
+/// 实现 `$add`、`$subtract`、`$multiply`、`$divide`、`$mod` 与 `$pow`。
+///
+/// 数值提升规则：任一操作数为 `double` 时结果为 `double`；两侧都是整数时保持
+/// 整数，`int32` 放不下才升到 `int64`，`int64` 溢出报错。日期只参与 `$add`
+/// 与 `$subtract`，且偏移量必须是整毫秒。所有错误码、错误措辞与 `$round`
+/// 的浮点精度均待真实 `mongod 8.0.9` 录制核对。
+fn evaluate_arithmetic(
+    document: &BsonDocument,
+    operator: &str,
+    argument: &BsonValue,
+    variables: &ExpressionVariables,
+) -> Result<BsonValue, CommandError> {
+    let BsonValue::Array(arguments) = argument
+    else {
+        return Err(CommandError::new(2, format!("{operator} requires an array of expressions")));
+    };
+    let mut values = Vec::with_capacity(arguments.len());
+    for expression in arguments {
+        values.push(evaluate_expression_vars(document, expression, variables)?);
+    }
+    match operator {
+        "$add" => {
+            let mut integer_total: i128 = 0;
+            let mut long = false;
+            let mut double_total: Option<f64> = None;
+            let mut date: Option<i64> = None;
+            for value in &values {
+                match arithmetic_operand(value, operator)? {
+                    ArithmeticOperand::Null => return Ok(BsonValue::Null),
+                    ArithmeticOperand::Integer { value, long: operand_long } => {
+                        integer_total += value;
+                        long |= operand_long;
+                    }
+                    ArithmeticOperand::Double(number) => *double_total.get_or_insert(0.0) += number,
+                    ArithmeticOperand::DateTime(milliseconds) => {
+                        if date.replace(milliseconds).is_some() {
+                            return Err(CommandError::new(2, "$add cannot add two dates"));
+                        }
+                    }
+                }
+            }
+            if let Some(milliseconds) = date {
+                let offset = match double_total {
+                    Some(number) if number.fract() == 0.0 && number >= i64::MIN as f64 && number <= i64::MAX as f64 => {
+                        integer_total + number as i128
+                    }
+                    Some(_) => return Err(CommandError::new(2, "$add cannot add a non-integral value to a date")),
+                    None => integer_total,
+                };
+                let shifted = i64::try_from(offset).ok().and_then(|offset| milliseconds.checked_add(offset));
+                return shifted.map(BsonValue::DateTime).ok_or_else(|| CommandError::new(2, "$add date result is out of range"));
+            }
+            Ok(match double_total {
+                Some(total) => BsonValue::Double(total + integer_total as f64),
+                None => integer_arithmetic_result(integer_total, long, operator)?,
+            })
+        }
+        "$subtract" => {
+            if values.len() != 2 {
+                return Err(CommandError::new(2, "$subtract requires exactly two expressions"));
+            }
+            let left = arithmetic_operand(&values[0], operator)?;
+            let right = arithmetic_operand(&values[1], operator)?;
+            match (left, right) {
+                (ArithmeticOperand::Null, _) | (_, ArithmeticOperand::Null) => Ok(BsonValue::Null),
+                (ArithmeticOperand::DateTime(left), ArithmeticOperand::DateTime(right)) => {
+                    left.checked_sub(right).map(BsonValue::Int64).ok_or_else(|| CommandError::new(2, "$subtract date result is out of range"))
+                }
+                (ArithmeticOperand::DateTime(left), ArithmeticOperand::Integer { value, .. }) => i64::try_from(value)
+                    .ok()
+                    .and_then(|offset| left.checked_sub(offset))
+                    .map(BsonValue::DateTime)
+                    .ok_or_else(|| CommandError::new(2, "$subtract date result is out of range")),
+                (ArithmeticOperand::DateTime(left), ArithmeticOperand::Double(number)) => integral_i64(&BsonValue::Double(number))
+                    .and_then(|offset| left.checked_sub(offset))
+                    .map(BsonValue::DateTime)
+                    .ok_or_else(|| CommandError::new(2, "$subtract cannot subtract a non-integral value from a date")),
+                (ArithmeticOperand::Integer { .. } | ArithmeticOperand::Double(_), ArithmeticOperand::DateTime(_)) => {
+                    Err(CommandError::new(2, "$subtract cannot subtract a date from a number"))
+                }
+                (
+                    ArithmeticOperand::Integer { value: left, long: left_long },
+                    ArithmeticOperand::Integer { value: right, long: right_long },
+                ) => integer_arithmetic_result(left - right, left_long || right_long, operator),
+                (ArithmeticOperand::Integer { value, .. }, ArithmeticOperand::Double(right)) => Ok(BsonValue::Double(value as f64 - right)),
+                (ArithmeticOperand::Double(left), ArithmeticOperand::Integer { value, .. }) => Ok(BsonValue::Double(left - value as f64)),
+                (ArithmeticOperand::Double(left), ArithmeticOperand::Double(right)) => Ok(BsonValue::Double(left - right)),
+            }
+        }
+        "$multiply" => {
+            if values.is_empty() {
+                return Err(CommandError::new(2, "$multiply requires at least one expression"));
+            }
+            let mut integer_total: i128 = 1;
+            let mut long = false;
+            let mut double_total: Option<f64> = None;
+            for value in &values {
+                match numeric_operand(value, operator)? {
+                    ArithmeticOperand::Null => return Ok(BsonValue::Null),
+                    ArithmeticOperand::Integer { value, long: operand_long } => {
+                        integer_total = integer_total
+                            .checked_mul(value)
+                            .ok_or_else(|| CommandError::new(2, "$multiply result overflows a 64-bit integer"))?;
+                        long |= operand_long;
+                    }
+                    ArithmeticOperand::Double(number) => *double_total.get_or_insert(1.0) *= number,
+                    ArithmeticOperand::DateTime(_) => unreachable!("numeric_operand rejects dates"),
+                }
+            }
+            Ok(match double_total {
+                Some(total) => BsonValue::Double(total * integer_total as f64),
+                None => integer_arithmetic_result(integer_total, long, operator)?,
+            })
+        }
+        "$divide" => {
+            if values.len() != 2 {
+                return Err(CommandError::new(2, "$divide requires exactly two expressions"));
+            }
+            let left = numeric_operand(&values[0], operator)?;
+            let right = numeric_operand(&values[1], operator)?;
+            if matches!(&left, ArithmeticOperand::Null) || matches!(&right, ArithmeticOperand::Null) {
+                return Ok(BsonValue::Null);
+            }
+            let divisor = right.as_double().expect("non-null numeric operand");
+            if divisor == 0.0 {
+                return Err(CommandError::new(2, "can't $divide by zero"));
+            }
+            let dividend = left.as_double().expect("non-null numeric operand");
+            Ok(BsonValue::Double(dividend / divisor))
+        }
+        "$mod" => {
+            if values.len() != 2 {
+                return Err(CommandError::new(2, "$mod requires exactly two expressions"));
+            }
+            let left = numeric_operand(&values[0], operator)?;
+            let right = numeric_operand(&values[1], operator)?;
+            match (&left, &right) {
+                (ArithmeticOperand::Null, _) | (_, ArithmeticOperand::Null) => Ok(BsonValue::Null),
+                (
+                    ArithmeticOperand::Integer { value: left, long: left_long },
+                    ArithmeticOperand::Integer { value: right, long: right_long },
+                ) => {
+                    if *right == 0 {
+                        return Err(CommandError::new(2, "can't $mod by zero"));
+                    }
+                    integer_arithmetic_result(left % right, *left_long || *right_long, operator)
+                }
+                _ => {
+                    let divisor = right.as_double().expect("non-null numeric operand");
+                    if divisor == 0.0 {
+                        return Err(CommandError::new(2, "can't $mod by zero"));
+                    }
+                    let dividend = left.as_double().expect("non-null numeric operand");
+                    Ok(BsonValue::Double(dividend % divisor))
+                }
+            }
+        }
+        "$pow" => {
+            if values.len() != 2 {
+                return Err(CommandError::new(2, "$pow requires exactly two expressions"));
+            }
+            let base = numeric_operand(&values[0], operator)?;
+            let exponent = numeric_operand(&values[1], operator)?;
+            match (&base, &exponent) {
+                (ArithmeticOperand::Null, _) | (_, ArithmeticOperand::Null) => Ok(BsonValue::Null),
+                (ArithmeticOperand::Integer { value: base, long }, ArithmeticOperand::Integer { value: exponent, .. }) if *exponent >= 0 => {
+                    integer_power(*base, *exponent, *long, operator)
+                }
+                _ => {
+                    let base = base.as_double().expect("non-null numeric operand");
+                    let exponent = exponent.as_double().expect("non-null numeric operand");
+                    if base == 0.0 && exponent < 0.0 {
+                        return Err(CommandError::new(2, "can't take 0 to a negative exponent"));
+                    }
+                    Ok(BsonValue::Double(base.powf(exponent)))
+                }
+            }
+        }
+        other => Err(CommandError::new(59, format!("unknown arithmetic expression: {other}"))),
+    }
+}
+
+/// 整数乘方：只处理非负指数，结果按整数类型提升规则写出。
+fn integer_power(base: i128, exponent: i128, long: bool, operator: &str) -> Result<BsonValue, CommandError> {
+    let result = match base {
+        0 if exponent == 0 => 1,
+        0 => 0,
+        1 => 1,
+        -1 if exponent % 2 == 0 => 1,
+        -1 => -1,
+        _ => {
+            // 绝对值大于 1 时，指数超过 63 必然溢出 64 位整数。
+            if exponent > 63 {
+                return Err(CommandError::new(2, format!("{operator} result overflows a 64-bit integer")));
+            }
+            let mut result: i128 = 1;
+            for _ in 0..exponent {
+                result =
+                    result.checked_mul(base).ok_or_else(|| CommandError::new(2, format!("{operator} result overflows a 64-bit integer")))?;
+            }
+            result
+        }
+    };
+    integer_arithmetic_result(result, long, operator)
+}
+
+/// 整数按 `10^-place` 取舍；`round` 为 `false` 时向零截断。
+///
+/// `$round` 用半偶数（银行家）舍入，与 `mongod` 的整数路径一致。
+fn round_integer_to_place(value: i128, place: i32, round: bool) -> i128 {
+    if place >= 0 {
+        return value;
+    }
+    let factor = 10i128.pow((-place) as u32);
+    let quotient = value / factor;
+    if !round {
+        return quotient * factor;
+    }
+    let remainder = value % factor;
+    let doubled = remainder.abs() * 2;
+    let step = if doubled > factor || (doubled == factor && quotient % 2 != 0) { value.signum() } else { 0 };
+    (quotient + step) * factor
+}
+
+/// 双精度按 `10^-place` 取舍；`$round` 用半偶数舍入。
+///
+/// 缩放用的是二进制浮点，极端位数上的舍入可能与 `mongod` 不同，待真机核对。
+fn round_double_to_place(value: f64, place: i32, round: bool) -> f64 {
+    let factor = 10f64.powi(place);
+    let scaled = value * factor;
+    let rounded = if round { scaled.round_ties_even() } else { scaled.trunc() };
+    rounded / factor
 }
 
 /// Aggregation truthiness: `false`, `0`, `null`, and missing are false.
