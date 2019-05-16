@@ -462,6 +462,115 @@ fn arithmetic_expressions_propagate_null_and_reject_bad_operands() {
 }
 
 #[test]
+fn string_expressions_follow_the_manual() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("word", text("  Hello World  "))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("lower", operator("$toLower", text("$word"))),
+            ("upper", operator("$toUpper", text("Hello"))),
+            ("code_points", operator("$strLenCP", text("héllo"))),
+            ("bytes", operator("$strLenBytes", text("héllo"))),
+            ("head", operator("$substrCP", BsonValue::Array(vec![text("héllo"), BsonValue::Int32(1), BsonValue::Int32(3)]))),
+            ("rest", operator("$substrBytes", BsonValue::Array(vec![text("abcdef"), BsonValue::Int32(2), BsonValue::Int32(-1)]))),
+            ("legacy", operator("$substr", BsonValue::Array(vec![text("abcdef"), BsonValue::Int32(2), BsonValue::Int32(2)]))),
+            ("negative", operator("$substrCP", BsonValue::Array(vec![text("abc"), BsonValue::Int32(-1), BsonValue::Int32(2)]))),
+        ]),
+    );
+
+    assert_eq!(row.get("lower"), Some(&text("  hello world  ")));
+    assert_eq!(row.get("upper"), Some(&text("HELLO")));
+    assert_eq!(row.get("code_points"), Some(&BsonValue::Int32(5)));
+    assert_eq!(row.get("bytes"), Some(&BsonValue::Int32(6)));
+    assert_eq!(row.get("head"), Some(&text("éll")));
+    assert_eq!(row.get("rest"), Some(&text("cdef")));
+    assert_eq!(row.get("legacy"), Some(&text("cd")));
+    assert_eq!(row.get("negative"), Some(&text("")));
+}
+
+#[test]
+fn string_search_and_replacement_expressions_follow_the_manual() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("csv", text("a,b,,c"))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("parts", operator("$split", BsonValue::Array(vec![text("$csv"), text(",")]))),
+            ("trimmed", operator("$trim", BsonValue::Document(document(&[("input", text("  padded  "))])))),
+            ("left", operator("$ltrim", BsonValue::Document(document(&[("input", text("xxhixx")), ("chars", text("x"))])))),
+            ("right", operator("$rtrim", BsonValue::Document(document(&[("input", text("xxhixx")), ("chars", text("x"))])))),
+            ("found", operator("$indexOfCP", BsonValue::Array(vec![text("héllo"), text("llo")]))),
+            ("found_bytes", operator("$indexOfBytes", BsonValue::Array(vec![text("héllo"), text("llo")]))),
+            ("bounded", operator("$indexOfCP", BsonValue::Array(vec![text("abcabc"), text("abc"), BsonValue::Int32(1)]))),
+            ("missing", operator("$indexOfCP", BsonValue::Array(vec![text("abc"), text("z")]))),
+            ("one", operator("$replaceOne", BsonValue::Array(vec![text("a-a-a"), text("a"), text("b")]))),
+            ("all", operator("$replaceAll", BsonValue::Array(vec![text("a-a-a"), text("a"), text("b")]))),
+            ("same", operator("$strcasecmp", BsonValue::Array(vec![text("Apple"), text("apple")]))),
+            ("less", operator("$strcasecmp", BsonValue::Array(vec![text("apple"), text("Banana")]))),
+        ]),
+    );
+
+    assert_eq!(row.get("parts"), Some(&BsonValue::Array(vec![text("a"), text("b"), text(""), text("c")])));
+    assert_eq!(row.get("trimmed"), Some(&text("padded")));
+    assert_eq!(row.get("left"), Some(&text("hixx")));
+    assert_eq!(row.get("right"), Some(&text("xxhi")));
+    assert_eq!(row.get("found"), Some(&BsonValue::Int32(2)));
+    assert_eq!(row.get("found_bytes"), Some(&BsonValue::Int32(3)));
+    assert_eq!(row.get("bounded"), Some(&BsonValue::Int32(3)));
+    assert_eq!(row.get("missing"), Some(&BsonValue::Int32(-1)));
+    assert_eq!(row.get("one"), Some(&text("b-a-a")));
+    assert_eq!(row.get("all"), Some(&text("b-b-b")));
+    assert_eq!(row.get("same"), Some(&BsonValue::Int32(0)));
+    assert_eq!(row.get("less"), Some(&BsonValue::Int32(-1)));
+}
+
+#[test]
+fn string_expressions_propagate_null_and_reject_bad_operands() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("n", BsonValue::Int32(7))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("null_lower", operator("$toLower", BsonValue::Null)),
+            ("null_length", operator("$strLenCP", BsonValue::Null)),
+            ("null_split", operator("$split", BsonValue::Array(vec![BsonValue::Null, text(",")]))),
+            ("null_trim", operator("$trim", BsonValue::Null)),
+            ("null_index", operator("$indexOfCP", BsonValue::Array(vec![BsonValue::Null, text("a")]))),
+            ("null_replace", operator("$replaceOne", BsonValue::Array(vec![text("abc"), BsonValue::Null, text("x")]))),
+            ("null_cmp", operator("$strcasecmp", BsonValue::Array(vec![BsonValue::Null, BsonValue::Null]))),
+        ]),
+    );
+
+    assert_eq!(row.get("null_lower"), Some(&text("")));
+    assert_eq!(row.get("null_length"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_split"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_trim"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_index"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_replace"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_cmp"), Some(&BsonValue::Int32(0)));
+
+    let failure = |projection: BsonDocument| -> CommandError {
+        let aggregate = aggregate_pipeline("items", vec![stage("$project", BsonValue::Document(projection))]);
+        commands::aggregate(&aggregate, &store).expect_err("expression must fail")
+    };
+
+    assert_eq!(failure(document(&[("x", operator("$strLenCP", text("$n")))])).code, 34471);
+    assert_eq!(failure(document(&[("x", operator("$split", BsonValue::Array(vec![text("a"), text("")])))])).code, 40086);
+    assert_eq!(failure(document(&[("x", operator("$substrCP", BsonValue::Array(vec![text("abc"), BsonValue::Int32(1)])))])).code, 2);
+    assert_eq!(
+        failure(document(&[("x", operator("$indexOfCP", BsonValue::Array(vec![text("abc"), text("a"), BsonValue::Int32(-1)])))])).code,
+        40093
+    );
+}
+
+#[test]
 fn aggregate_rejects_unsupported_stages_even_after_match() {
     let store = store();
     let search = BsonValue::Document(document(&[("text", text("x"))]));

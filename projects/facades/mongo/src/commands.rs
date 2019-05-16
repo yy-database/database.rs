@@ -9238,6 +9238,10 @@ fn evaluate_expression_vars(
                     }
                     Ok(BsonValue::String(joined))
                 }
+                "$toLower" | "$toUpper" | "$strLenCP" | "$strLenBytes" | "$substr" | "$substrBytes" | "$substrCP" | "$split" | "$trim"
+                | "$ltrim" | "$rtrim" | "$indexOfCP" | "$indexOfBytes" | "$replaceOne" | "$replaceAll" | "$strcasecmp" => {
+                    evaluate_string_operator(document, operator, argument, variables)
+                }
                 "$size" => {
                     let value = evaluate_expression_vars(document, argument, variables)?;
                     match value {
@@ -9267,7 +9271,7 @@ fn evaluate_expression_vars(
                 other => Err(CommandError::new(
                     59,
                     format!(
-                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
+                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $toLower, $toUpper, $strLenCP, $strLenBytes, $substr, $substrBytes, $substrCP, $split, $trim, $ltrim, $rtrim, $indexOfCP, $indexOfBytes, $replaceOne, $replaceAll, $strcasecmp, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
                     ),
                 )),
             }
@@ -9590,6 +9594,309 @@ fn round_double_to_place(value: f64, place: i32, round: bool) -> f64 {
     let scaled = value * factor;
     let rounded = if round { scaled.round_ties_even() } else { scaled.trunc() };
     rounded / factor
+}
+
+/// 字符串算子归一化后的输入。
+enum StringArgument {
+    /// `null` 或缺失；各算子自行决定按空串、`null` 还是报错处理。
+    Null,
+    /// 已求值的字符串。
+    Text(String),
+}
+
+/// 把字符串算子的单个输入归一化。
+///
+/// 非字符串按 `TypeMismatch` 拒绝，各算子传入手册对应的错误码；错误码与措辞
+/// 待真实 `mongod 8.0.9` 录制核对。
+fn string_argument(value: BsonValue, operator: &str, code: i32) -> Result<StringArgument, CommandError> {
+    match value {
+        BsonValue::Null | BsonValue::Undefined => Ok(StringArgument::Null),
+        BsonValue::String(text) => Ok(StringArgument::Text(text)),
+        other => Err(CommandError::new(code, format!("{operator} requires a string argument, found: {}", bson_type_name(&other)))),
+    }
+}
+
+/// 取字符串算子的定长参数列表。
+fn string_arguments<'a>(argument: &'a BsonValue, operator: &str, minimum: usize, maximum: usize) -> Result<&'a [BsonValue], CommandError> {
+    let BsonValue::Array(arguments) = argument
+    else {
+        return Err(CommandError::new(2, format!("{operator} requires an array of expressions")));
+    };
+    if arguments.len() < minimum || arguments.len() > maximum {
+        return Err(CommandError::new(2, format!("{operator} requires between {minimum} and {maximum} expressions")));
+    }
+    Ok(arguments)
+}
+
+/// 取非负整数参数；浮点必须先有精确整数视图才接受。
+fn non_negative_integer(value: &BsonValue, operator: &str, code: i32) -> Result<i64, CommandError> {
+    match integral_i64(value) {
+        Some(number) if number >= 0 => Ok(number),
+        _ => Err(CommandError::new(code, format!("{operator} requires a non-negative integer argument"))),
+    }
+}
+
+/// `$trim` / `$ltrim` / `$rtrim` 未指定 `chars` 时的默认字符集。
+///
+/// `mongod` 手册给的默认集合包含空字符、空格、制表、回车、换行、垂直制表与换页。
+fn default_trim_chars() -> String {
+    "\u{0} \t\n\r\u{b}\u{c}".to_string()
+}
+
+/// 求值字符串类聚合算子。
+///
+/// 语义按 `mongod` 手册实现：`$toLower` / `$toUpper` 把 `null` 当空串，
+/// `$strcasecmp` 把 `null` 当空串参与比较，其余长度、截取、拆分、裁剪、查找、
+/// 替换类算子遇到 `null` 直接返回 `null`。所有错误码、错误措辞、非 ASCII 大小写
+/// 映射与 UTF-8 边界判定均待真实 `mongod 8.0.9` 录制核对。
+fn evaluate_string_operator(
+    document: &BsonDocument,
+    operator: &str,
+    argument: &BsonValue,
+    variables: &ExpressionVariables,
+) -> Result<BsonValue, CommandError> {
+    match operator {
+        "$toLower" | "$toUpper" => {
+            let value = evaluate_expression_vars(document, argument, variables)?;
+            let text = match string_argument(value, operator, 16007)? {
+                StringArgument::Null => String::new(),
+                StringArgument::Text(text) => text,
+            };
+            Ok(BsonValue::String(if operator == "$toLower" { text.to_lowercase() } else { text.to_uppercase() }))
+        }
+        "$strLenCP" | "$strLenBytes" => {
+            let value = evaluate_expression_vars(document, argument, variables)?;
+            let code = if operator == "$strLenCP" { 34471 } else { 34473 };
+            match string_argument(value, operator, code)? {
+                StringArgument::Null => Ok(BsonValue::Null),
+                StringArgument::Text(text) => {
+                    let length = if operator == "$strLenCP" { text.chars().count() } else { text.len() };
+                    Ok(count_value(length as i64))
+                }
+            }
+        }
+        "$substr" | "$substrBytes" | "$substrCP" => {
+            let arguments = string_arguments(argument, operator, 3, 3)?;
+            let value = evaluate_expression_vars(document, &arguments[0], variables)?;
+            let text = match string_argument(value, operator, 34450)? {
+                StringArgument::Null => return Ok(BsonValue::Null),
+                StringArgument::Text(text) => text,
+            };
+            let start = evaluate_expression_vars(document, &arguments[1], variables)?;
+            let start =
+                integral_i64(&start).ok_or_else(|| CommandError::new(34452, format!("{operator} requires an integer starting index")))?;
+            let length = evaluate_expression_vars(document, &arguments[2], variables)?;
+            let length = integral_i64(&length).ok_or_else(|| CommandError::new(34453, format!("{operator} requires an integer length")))?;
+            if start < 0 {
+                // 负起点按手册返回空串。
+                return Ok(BsonValue::String(String::new()));
+            }
+            if operator == "$substrCP" {
+                Ok(BsonValue::String(substring_by_code_point(&text, start as usize, length)))
+            }
+            else {
+                substring_by_byte(&text, start as usize, length, operator)
+            }
+        }
+        "$split" => {
+            let arguments = string_arguments(argument, operator, 2, 2)?;
+            let input = evaluate_expression_vars(document, &arguments[0], variables)?;
+            let separator = evaluate_expression_vars(document, &arguments[1], variables)?;
+            let input = string_argument(input, operator, 40085)?;
+            let separator = string_argument(separator, operator, 40086)?;
+            match (input, separator) {
+                (StringArgument::Null, _) | (_, StringArgument::Null) => Ok(BsonValue::Null),
+                (StringArgument::Text(input), StringArgument::Text(separator)) => {
+                    if separator.is_empty() {
+                        return Err(CommandError::new(40086, "$split requires a non-empty separator"));
+                    }
+                    Ok(BsonValue::Array(input.split(separator.as_str()).map(|part| BsonValue::String(part.to_string())).collect()))
+                }
+            }
+        }
+        "$trim" | "$ltrim" | "$rtrim" => {
+            let (input_expression, chars_expression) = match argument {
+                BsonValue::Document(options) => {
+                    for (field, _) in &options.fields {
+                        if field != "input" && field != "chars" {
+                            return Err(CommandError::new(2, format!("{operator} found an unknown argument: {field}")));
+                        }
+                    }
+                    let input = options.get("input").ok_or_else(|| CommandError::new(2, format!("{operator} requires an 'input' field")))?;
+                    (input, options.get("chars"))
+                }
+                other => (other, None),
+            };
+            let input = evaluate_expression_vars(document, input_expression, variables)?;
+            let input = match string_argument(input, operator, 50699)? {
+                StringArgument::Null => return Ok(BsonValue::Null),
+                StringArgument::Text(text) => text,
+            };
+            let chars = match chars_expression {
+                Some(expression) => {
+                    let chars = evaluate_expression_vars(document, expression, variables)?;
+                    match string_argument(chars, operator, 50702)? {
+                        // `chars` 为 `null` 时按未提供处理，用默认字符集，待真机核对。
+                        StringArgument::Null => default_trim_chars(),
+                        StringArgument::Text(text) => text,
+                    }
+                }
+                None => default_trim_chars(),
+            };
+            let trimmed = match operator {
+                "$trim" => input.trim_matches(|character| chars.contains(character)),
+                "$ltrim" => input.trim_start_matches(|character| chars.contains(character)),
+                _ => input.trim_end_matches(|character| chars.contains(character)),
+            };
+            Ok(BsonValue::String(trimmed.to_string()))
+        }
+        "$indexOfCP" | "$indexOfBytes" => {
+            let arguments = string_arguments(argument, operator, 2, 4)?;
+            let input = evaluate_expression_vars(document, &arguments[0], variables)?;
+            let search = evaluate_expression_vars(document, &arguments[1], variables)?;
+            let input = string_argument(input, operator, 40091)?;
+            let search = string_argument(search, operator, 40092)?;
+            let (input, search) = match (input, search) {
+                (StringArgument::Null, _) | (_, StringArgument::Null) => return Ok(BsonValue::Null),
+                (StringArgument::Text(input), StringArgument::Text(search)) => (input, search),
+            };
+            let start = match arguments.get(2) {
+                Some(expression) => non_negative_integer(&evaluate_expression_vars(document, expression, variables)?, operator, 40093)?,
+                None => 0,
+            };
+            if operator == "$indexOfCP" {
+                index_of_code_point(&input, &search, start, arguments.get(3), document, variables)
+            }
+            else {
+                index_of_byte(&input, &search, start, arguments.get(3), document, variables)
+            }
+        }
+        "$replaceOne" | "$replaceAll" => {
+            let arguments = string_arguments(argument, operator, 3, 3)?;
+            let input = evaluate_expression_vars(document, &arguments[0], variables)?;
+            let find = evaluate_expression_vars(document, &arguments[1], variables)?;
+            let replacement = evaluate_expression_vars(document, &arguments[2], variables)?;
+            let input = string_argument(input, operator, 51745)?;
+            let find = string_argument(find, operator, 51746)?;
+            let replacement = string_argument(replacement, operator, 51747)?;
+            match (input, find, replacement) {
+                (StringArgument::Null, _, _) | (_, StringArgument::Null, _) | (_, _, StringArgument::Null) => Ok(BsonValue::Null),
+                (StringArgument::Text(input), StringArgument::Text(find), StringArgument::Text(replacement)) => {
+                    if find.is_empty() {
+                        // 空 `find` 按手册原样返回输入串。
+                        return Ok(BsonValue::String(input));
+                    }
+                    Ok(BsonValue::String(if operator == "$replaceOne" {
+                        input.replacen(find.as_str(), replacement.as_str(), 1)
+                    }
+                    else {
+                        input.replace(find.as_str(), replacement.as_str())
+                    }))
+                }
+            }
+        }
+        "$strcasecmp" => {
+            let arguments = string_arguments(argument, operator, 2, 2)?;
+            let left = evaluate_expression_vars(document, &arguments[0], variables)?;
+            let right = evaluate_expression_vars(document, &arguments[1], variables)?;
+            let text = |value: BsonValue| -> Result<String, CommandError> {
+                match string_argument(value, "$strcasecmp", 16007)? {
+                    StringArgument::Null => Ok(String::new()),
+                    StringArgument::Text(text) => Ok(text),
+                }
+            };
+            let left = text(left)?;
+            let right = text(right)?;
+            Ok(BsonValue::Int32(match left.to_lowercase().cmp(&right.to_lowercase()) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            }))
+        }
+        other => unreachable!("evaluate_string_operator called with {other}"),
+    }
+}
+
+/// 按字节截取；起点与终点都必须落在 UTF-8 字符边界上。
+///
+/// 负 `length` 表示取到串尾，越界一律截断到串尾；起始下标落在续字节上属于
+/// 手册定义的范围错误，错误码与措辞待真机核对。
+fn substring_by_byte(text: &str, start: usize, length: i64, operator: &str) -> Result<BsonValue, CommandError> {
+    if start >= text.len() {
+        return Ok(BsonValue::String(String::new()));
+    }
+    if !text.is_char_boundary(start) {
+        return Err(CommandError::new(28656, format!("{operator}: invalid range, starting index is a UTF-8 continuation byte")));
+    }
+    let end = if length < 0 { text.len() } else { start.saturating_add(usize::try_from(length).unwrap_or(usize::MAX)).min(text.len()) };
+    if !text.is_char_boundary(end) {
+        return Err(CommandError::new(28657, format!("{operator}: invalid range, ending index is in the middle of a UTF-8 character")));
+    }
+    Ok(BsonValue::String(text[start..end].to_string()))
+}
+
+/// 按 Unicode 码点截取；负 `length` 表示取到串尾。
+fn substring_by_code_point(text: &str, start: usize, length: i64) -> String {
+    let count = text.chars().count();
+    if start >= count {
+        return String::new();
+    }
+    let end = if length < 0 { count } else { start.saturating_add(usize::try_from(length).unwrap_or(usize::MAX)).min(count) };
+    text.chars().skip(start).take(end - start).collect()
+}
+
+/// `$indexOfCP`：在码点窗口内查找，返回码点下标。
+fn index_of_code_point(
+    input: &str,
+    search: &str,
+    start: i64,
+    end_expression: Option<&BsonValue>,
+    document: &BsonDocument,
+    variables: &ExpressionVariables,
+) -> Result<BsonValue, CommandError> {
+    let haystack: Vec<char> = input.chars().collect();
+    let needle: Vec<char> = search.chars().collect();
+    let count = haystack.len() as i64;
+    let end = match end_expression {
+        Some(expression) => non_negative_integer(&evaluate_expression_vars(document, expression, variables)?, "$indexOfCP", 40094)?,
+        None => count,
+    };
+    if start > count || start > end || needle.len() as i64 > count {
+        return Ok(BsonValue::Int32(-1));
+    }
+    let end = end.min(count) as usize;
+    let start = start as usize;
+    let window = &haystack[start..end];
+    let position = if needle.is_empty() { Some(0) } else { window.windows(needle.len()).position(|candidate| candidate == needle.as_slice()) };
+    Ok(count_value(position.map_or(-1, |offset| (start + offset) as i64)))
+}
+
+/// `$indexOfBytes`：在字节窗口内查找，返回字节下标。
+///
+/// 起点与终点必须落在 UTF-8 字符边界上，否则按手册报范围错误；错误码与措辞
+/// 待真机核对。
+fn index_of_byte(
+    input: &str,
+    search: &str,
+    start: i64,
+    end_expression: Option<&BsonValue>,
+    document: &BsonDocument,
+    variables: &ExpressionVariables,
+) -> Result<BsonValue, CommandError> {
+    let count = input.len() as i64;
+    let end = match end_expression {
+        Some(expression) => non_negative_integer(&evaluate_expression_vars(document, expression, variables)?, "$indexOfBytes", 40094)?,
+        None => count,
+    };
+    if start > count || start > end {
+        return Ok(BsonValue::Int32(-1));
+    }
+    let start = start as usize;
+    let end = end.min(count) as usize;
+    if !input.is_char_boundary(start) || !input.is_char_boundary(end) {
+        return Err(CommandError::new(40095, "$indexOfBytes requires a starting and ending index on UTF-8 character boundaries"));
+    }
+    Ok(count_value(input[start..end].find(search).map_or(-1, |offset| (start + offset) as i64)))
 }
 
 /// Aggregation truthiness: `false`, `0`, `null`, and missing are false.
