@@ -571,6 +571,109 @@ fn string_expressions_propagate_null_and_reject_bad_operands() {
 }
 
 #[test]
+fn array_expressions_follow_the_manual() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![document(&[("_id", BsonValue::Int32(1)), ("tags", BsonValue::Array(vec![text("a"), text("b"), text("c")]))])],
+    );
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("is_array", operator("$isArray", text("$tags"))),
+            ("is_not_array", operator("$isArray", text("$missing"))),
+            ("second", operator("$arrayElemAt", BsonValue::Array(vec![text("$tags"), BsonValue::Int32(1)]))),
+            ("last_by_negative", operator("$arrayElemAt", BsonValue::Array(vec![text("$tags"), BsonValue::Int32(-1)]))),
+            ("first", operator("$first", text("$tags"))),
+            ("last", operator("$last", text("$tags"))),
+            ("joined", operator("$concatArrays", BsonValue::Array(vec![text("$tags"), BsonValue::Array(vec![text("d")])]))),
+            ("reversed", operator("$reverseArray", text("$tags"))),
+            ("position", operator("$indexOfArray", BsonValue::Array(vec![text("$tags"), text("b")]))),
+            ("bounded", operator("$indexOfArray", BsonValue::Array(vec![text("$tags"), text("a"), BsonValue::Int32(1)]))),
+            ("series", operator("$range", BsonValue::Array(vec![BsonValue::Int32(0), BsonValue::Int32(5), BsonValue::Int32(2)]))),
+            ("counting_down", operator("$range", BsonValue::Array(vec![BsonValue::Int32(3), BsonValue::Int32(0), BsonValue::Int32(-1)]))),
+            ("head", operator("$slice", BsonValue::Array(vec![text("$tags"), BsonValue::Int32(2)]))),
+            ("tail", operator("$slice", BsonValue::Array(vec![text("$tags"), BsonValue::Int32(-2)]))),
+            ("window", operator("$slice", BsonValue::Array(vec![text("$tags"), BsonValue::Int32(1), BsonValue::Int32(2)]))),
+            ("from_end", operator("$slice", BsonValue::Array(vec![text("$tags"), BsonValue::Int32(-2), BsonValue::Int32(1)]))),
+            ("out_of_range", operator("$arrayElemAt", BsonValue::Array(vec![text("$tags"), BsonValue::Int32(9)]))),
+        ]),
+    );
+
+    assert_eq!(row.get("is_array"), Some(&BsonValue::Bool(true)));
+    assert_eq!(row.get("is_not_array"), Some(&BsonValue::Bool(false)));
+    assert_eq!(row.get("second"), Some(&text("b")));
+    assert_eq!(row.get("last_by_negative"), Some(&text("c")));
+    assert_eq!(row.get("first"), Some(&text("a")));
+    assert_eq!(row.get("last"), Some(&text("c")));
+    assert_eq!(row.get("joined"), Some(&BsonValue::Array(vec![text("a"), text("b"), text("c"), text("d")])));
+    assert_eq!(row.get("reversed"), Some(&BsonValue::Array(vec![text("c"), text("b"), text("a")])));
+    assert_eq!(row.get("position"), Some(&BsonValue::Int32(1)));
+    assert_eq!(row.get("bounded"), Some(&BsonValue::Int32(-1)));
+    assert_eq!(row.get("series"), Some(&BsonValue::Array(vec![BsonValue::Int32(0), BsonValue::Int32(2), BsonValue::Int32(4)])));
+    assert_eq!(row.get("counting_down"), Some(&BsonValue::Array(vec![BsonValue::Int32(3), BsonValue::Int32(2), BsonValue::Int32(1)])));
+    assert_eq!(row.get("head"), Some(&BsonValue::Array(vec![text("a"), text("b")])));
+    assert_eq!(row.get("tail"), Some(&BsonValue::Array(vec![text("b"), text("c")])));
+    assert_eq!(row.get("window"), Some(&BsonValue::Array(vec![text("b"), text("c")])));
+    assert_eq!(row.get("from_end"), Some(&BsonValue::Array(vec![text("b")])));
+    assert_eq!(row.get("out_of_range"), Some(&BsonValue::Null));
+}
+
+#[test]
+fn array_expressions_propagate_null_and_reject_bad_operands() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("value", text("nope"))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("null_elem", operator("$arrayElemAt", BsonValue::Array(vec![BsonValue::Null, BsonValue::Int32(0)]))),
+            ("null_first", operator("$first", BsonValue::Null)),
+            ("null_concat", operator("$concatArrays", BsonValue::Array(vec![BsonValue::Array(Vec::new()), BsonValue::Null]))),
+            ("null_reverse", operator("$reverseArray", BsonValue::Null)),
+            ("null_index", operator("$indexOfArray", BsonValue::Array(vec![BsonValue::Null, BsonValue::Int32(1)]))),
+            ("null_slice", operator("$slice", BsonValue::Array(vec![BsonValue::Null, BsonValue::Int32(1)]))),
+        ]),
+    );
+
+    assert_eq!(row.get("null_elem"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_first"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_concat"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_reverse"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_index"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_slice"), Some(&BsonValue::Null));
+
+    let failure = |projection: BsonDocument| -> CommandError {
+        let aggregate = aggregate_pipeline("items", vec![stage("$project", BsonValue::Document(projection))]);
+        commands::aggregate(&aggregate, &store).expect_err("expression must fail")
+    };
+
+    assert_eq!(failure(document(&[("x", operator("$arrayElemAt", BsonValue::Array(vec![text("$value"), BsonValue::Int32(0)])))])).code, 28689);
+    assert_eq!(
+        failure(document(&[("x", operator("$arrayElemAt", BsonValue::Array(vec![BsonValue::Array(Vec::new()), text("x")])))])).code,
+        28690
+    );
+    assert_eq!(failure(document(&[("x", operator("$concatArrays", BsonValue::Array(vec![text("$value")])))])).code, 28664);
+    assert_eq!(
+        failure(document(&[("x", operator("$range", BsonValue::Array(vec![BsonValue::Int32(0), BsonValue::Int32(3), BsonValue::Int32(0)])))]))
+            .code,
+        34449
+    );
+    assert_eq!(
+        failure(document(&[(
+            "x",
+            operator("$slice", BsonValue::Array(vec![BsonValue::Array(vec![BsonValue::Int32(1)]), BsonValue::Int32(0), BsonValue::Int32(0)]))
+        )]))
+        .code,
+        28729
+    );
+}
+
+#[test]
 fn aggregate_rejects_unsupported_stages_even_after_match() {
     let store = store();
     let search = BsonValue::Document(document(&[("text", text("x"))]));

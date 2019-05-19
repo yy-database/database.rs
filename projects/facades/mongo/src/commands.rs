@@ -9242,6 +9242,8 @@ fn evaluate_expression_vars(
                 | "$ltrim" | "$rtrim" | "$indexOfCP" | "$indexOfBytes" | "$replaceOne" | "$replaceAll" | "$strcasecmp" => {
                     evaluate_string_operator(document, operator, argument, variables)
                 }
+                "$isArray" | "$arrayElemAt" | "$first" | "$last" | "$concatArrays" | "$reverseArray" | "$indexOfArray" | "$range"
+                | "$slice" => evaluate_array_operator(document, operator, argument, variables),
                 "$size" => {
                     let value = evaluate_expression_vars(document, argument, variables)?;
                     match value {
@@ -9271,7 +9273,7 @@ fn evaluate_expression_vars(
                 other => Err(CommandError::new(
                     59,
                     format!(
-                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $toLower, $toUpper, $strLenCP, $strLenBytes, $substr, $substrBytes, $substrCP, $split, $trim, $ltrim, $rtrim, $indexOfCP, $indexOfBytes, $replaceOne, $replaceAll, $strcasecmp, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
+                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $toLower, $toUpper, $strLenCP, $strLenBytes, $substr, $substrBytes, $substrCP, $split, $trim, $ltrim, $rtrim, $indexOfCP, $indexOfBytes, $replaceOne, $replaceAll, $strcasecmp, $isArray, $arrayElemAt, $first, $last, $concatArrays, $reverseArray, $indexOfArray, $range, $slice, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
                     ),
                 )),
             }
@@ -9616,8 +9618,8 @@ fn string_argument(value: BsonValue, operator: &str, code: i32) -> Result<String
     }
 }
 
-/// 取字符串算子的定长参数列表。
-fn string_arguments<'a>(argument: &'a BsonValue, operator: &str, minimum: usize, maximum: usize) -> Result<&'a [BsonValue], CommandError> {
+/// 取算子的定长参数列表。
+fn operator_arguments<'a>(argument: &'a BsonValue, operator: &str, minimum: usize, maximum: usize) -> Result<&'a [BsonValue], CommandError> {
     let BsonValue::Array(arguments) = argument
     else {
         return Err(CommandError::new(2, format!("{operator} requires an array of expressions")));
@@ -9676,7 +9678,7 @@ fn evaluate_string_operator(
             }
         }
         "$substr" | "$substrBytes" | "$substrCP" => {
-            let arguments = string_arguments(argument, operator, 3, 3)?;
+            let arguments = operator_arguments(argument, operator, 3, 3)?;
             let value = evaluate_expression_vars(document, &arguments[0], variables)?;
             let text = match string_argument(value, operator, 34450)? {
                 StringArgument::Null => return Ok(BsonValue::Null),
@@ -9699,7 +9701,7 @@ fn evaluate_string_operator(
             }
         }
         "$split" => {
-            let arguments = string_arguments(argument, operator, 2, 2)?;
+            let arguments = operator_arguments(argument, operator, 2, 2)?;
             let input = evaluate_expression_vars(document, &arguments[0], variables)?;
             let separator = evaluate_expression_vars(document, &arguments[1], variables)?;
             let input = string_argument(input, operator, 40085)?;
@@ -9751,7 +9753,7 @@ fn evaluate_string_operator(
             Ok(BsonValue::String(trimmed.to_string()))
         }
         "$indexOfCP" | "$indexOfBytes" => {
-            let arguments = string_arguments(argument, operator, 2, 4)?;
+            let arguments = operator_arguments(argument, operator, 2, 4)?;
             let input = evaluate_expression_vars(document, &arguments[0], variables)?;
             let search = evaluate_expression_vars(document, &arguments[1], variables)?;
             let input = string_argument(input, operator, 40091)?;
@@ -9772,7 +9774,7 @@ fn evaluate_string_operator(
             }
         }
         "$replaceOne" | "$replaceAll" => {
-            let arguments = string_arguments(argument, operator, 3, 3)?;
+            let arguments = operator_arguments(argument, operator, 3, 3)?;
             let input = evaluate_expression_vars(document, &arguments[0], variables)?;
             let find = evaluate_expression_vars(document, &arguments[1], variables)?;
             let replacement = evaluate_expression_vars(document, &arguments[2], variables)?;
@@ -9796,7 +9798,7 @@ fn evaluate_string_operator(
             }
         }
         "$strcasecmp" => {
-            let arguments = string_arguments(argument, operator, 2, 2)?;
+            let arguments = operator_arguments(argument, operator, 2, 2)?;
             let left = evaluate_expression_vars(document, &arguments[0], variables)?;
             let right = evaluate_expression_vars(document, &arguments[1], variables)?;
             let text = |value: BsonValue| -> Result<String, CommandError> {
@@ -9897,6 +9899,184 @@ fn index_of_byte(
         return Err(CommandError::new(40095, "$indexOfBytes requires a starting and ending index on UTF-8 character boundaries"));
     }
     Ok(count_value(input[start..end].find(search).map_or(-1, |offset| (start + offset) as i64)))
+}
+
+/// 数组算子归一化后的输入。
+enum ArrayArgument {
+    /// `null` 或缺失，多数数组算子直接返回 `null`。
+    Null,
+    /// 已求值的数组元素。
+    Items(Vec<BsonValue>),
+}
+
+/// 把数组算子的单个输入归一化。
+///
+/// 非数组按 `TypeMismatch` 拒绝，各算子传入手册对应的错误码；错误码与措辞
+/// 待真实 `mongod 8.0.9` 录制核对。
+fn array_argument(value: BsonValue, operator: &str, code: i32) -> Result<ArrayArgument, CommandError> {
+    match value {
+        BsonValue::Null | BsonValue::Undefined => Ok(ArrayArgument::Null),
+        BsonValue::Array(items) => Ok(ArrayArgument::Items(items)),
+        other => Err(CommandError::new(code, format!("{operator} requires an array argument, found: {}", bson_type_name(&other)))),
+    }
+}
+
+/// 取数组元素；越界返回 `null`。
+///
+/// `mongod` 对越界返回缺失字段（投影时字段消失），本仓暂以 `null` 表达，
+/// 差异待真机录制后决定是否需要独立的缺失值。
+fn array_element(items: &[BsonValue], position: i64) -> BsonValue {
+    usize::try_from(position).ok().and_then(|index| items.get(index)).cloned().unwrap_or(BsonValue::Null)
+}
+
+/// 求值数组类聚合算子。
+///
+/// 语义按 `mongod` 手册实现：`null` 输入一律返回 `null`，越界取元素与空数组
+/// 的 `$first` / `$last` 在 `mongod` 里是缺失字段，这里暂以 `null` 表达。
+/// 所有错误码与错误措辞均待真实 `mongod 8.0.9` 录制核对。
+fn evaluate_array_operator(
+    document: &BsonDocument,
+    operator: &str,
+    argument: &BsonValue,
+    variables: &ExpressionVariables,
+) -> Result<BsonValue, CommandError> {
+    match operator {
+        "$isArray" => {
+            let value = evaluate_expression_vars(document, argument, variables)?;
+            Ok(BsonValue::Bool(matches!(value, BsonValue::Array(_))))
+        }
+        "$arrayElemAt" | "$first" | "$last" => {
+            let (value, index) = if operator == "$arrayElemAt" {
+                let arguments = operator_arguments(argument, operator, 2, 2)?;
+                (evaluate_expression_vars(document, &arguments[0], variables)?, Some(&arguments[1]))
+            }
+            else {
+                (evaluate_expression_vars(document, argument, variables)?, None)
+            };
+            let items = match array_argument(value, operator, 28689)? {
+                ArrayArgument::Null => return Ok(BsonValue::Null),
+                ArrayArgument::Items(items) => items,
+            };
+            let position = match index {
+                Some(expression) => {
+                    let index = evaluate_expression_vars(document, expression, variables)?;
+                    integral_i64(&index).ok_or_else(|| CommandError::new(28690, format!("{operator}'s second argument must be an integer")))?
+                }
+                None if operator == "$first" => 0,
+                None => items.len() as i64 - 1,
+            };
+            let position = if position < 0 { (items.len() as i64).saturating_add(position) } else { position };
+            Ok(array_element(&items, position))
+        }
+        "$concatArrays" => {
+            let arguments = operator_arguments(argument, operator, 1, usize::MAX)?;
+            let mut combined = Vec::new();
+            for expression in arguments {
+                let value = evaluate_expression_vars(document, expression, variables)?;
+                match array_argument(value, operator, 28664)? {
+                    ArrayArgument::Null => return Ok(BsonValue::Null),
+                    ArrayArgument::Items(items) => combined.extend(items),
+                }
+            }
+            Ok(BsonValue::Array(combined))
+        }
+        "$reverseArray" => {
+            let value = evaluate_expression_vars(document, argument, variables)?;
+            match array_argument(value, operator, 34435)? {
+                ArrayArgument::Null => Ok(BsonValue::Null),
+                ArrayArgument::Items(mut items) => {
+                    items.reverse();
+                    Ok(BsonValue::Array(items))
+                }
+            }
+        }
+        "$indexOfArray" => {
+            let arguments = operator_arguments(argument, operator, 2, 4)?;
+            let value = evaluate_expression_vars(document, &arguments[0], variables)?;
+            let search = evaluate_expression_vars(document, &arguments[1], variables)?;
+            let items = match array_argument(value, operator, 40090)? {
+                ArrayArgument::Null => return Ok(BsonValue::Null),
+                ArrayArgument::Items(items) => items,
+            };
+            let start = match arguments.get(2) {
+                Some(expression) => non_negative_integer(&evaluate_expression_vars(document, expression, variables)?, operator, 40096)?,
+                None => 0,
+            };
+            let end = match arguments.get(3) {
+                Some(expression) => non_negative_integer(&evaluate_expression_vars(document, expression, variables)?, operator, 40097)?,
+                None => items.len() as i64,
+            };
+            let end = end.min(items.len() as i64);
+            if start > end {
+                return Ok(BsonValue::Int32(-1));
+            }
+            let start = start as usize;
+            let end = end as usize;
+            let position = items[start..end].iter().position(|item| compare_values(item, &search) == Ordering::Equal);
+            Ok(count_value(position.map_or(-1, |offset| (start + offset) as i64)))
+        }
+        "$range" => {
+            let arguments = operator_arguments(argument, operator, 2, 3)?;
+            let values: Vec<BsonValue> =
+                arguments.iter().map(|expression| evaluate_expression_vars(document, expression, variables)).collect::<Result<_, _>>()?;
+            let numbers = values
+                .iter()
+                .map(|value| integral_i64(value).ok_or_else(|| CommandError::new(34443, format!("{operator} requires integer arguments"))))
+                .collect::<Result<Vec<_>, _>>()?;
+            let start = numbers[0];
+            let end = numbers[1];
+            let step = numbers.get(2).copied().unwrap_or(1);
+            if step == 0 {
+                return Err(CommandError::new(34449, "$range requires a non-zero step value"));
+            }
+            let long = values.iter().any(|value| matches!(value, BsonValue::Int64(_)));
+            let mut items = Vec::new();
+            let mut current = start;
+            while (step > 0 && current < end) || (step < 0 && current > end) {
+                // 元素上限防止一条表达式把内存打满，具体上限待真机核对。
+                if items.len() >= 1_000_000 {
+                    return Err(CommandError::new(2, "$range result exceeds 1000000 elements"));
+                }
+                items.push(if long {
+                    BsonValue::Int64(current)
+                }
+                else {
+                    i32::try_from(current).map(BsonValue::Int32).unwrap_or(BsonValue::Int64(current))
+                });
+                current = current.checked_add(step).ok_or_else(|| CommandError::new(2, "$range step overflows a 64-bit integer"))?;
+            }
+            Ok(BsonValue::Array(items))
+        }
+        "$slice" => {
+            let arguments = operator_arguments(argument, operator, 2, 3)?;
+            let value = evaluate_expression_vars(document, &arguments[0], variables)?;
+            let items = match array_argument(value, operator, 28724)? {
+                ArrayArgument::Null => return Ok(BsonValue::Null),
+                ArrayArgument::Items(items) => items,
+            };
+            let length = items.len() as i64;
+            let integer = |expression: &BsonValue| -> Result<i64, CommandError> {
+                let value = evaluate_expression_vars(document, expression, variables)?;
+                integral_i64(&value).ok_or_else(|| CommandError::new(28729, format!("{operator} requires integer arguments")))
+            };
+            if arguments.len() == 2 {
+                let count = integer(&arguments[1])?;
+                let (start, end) = if count >= 0 { (0, count.min(length)) } else { ((length.saturating_add(count)).max(0), length) };
+                Ok(BsonValue::Array(items[start as usize..end as usize].to_vec()))
+            }
+            else {
+                let position = integer(&arguments[1])?;
+                let count = integer(&arguments[2])?;
+                if count <= 0 {
+                    return Err(CommandError::new(28729, "$slice third argument must be positive"));
+                }
+                let start = if position < 0 { (length.saturating_add(position)).max(0) } else { position.min(length) };
+                let end = start.saturating_add(count).min(length);
+                Ok(BsonValue::Array(items[start as usize..end as usize].to_vec()))
+            }
+        }
+        other => unreachable!("evaluate_array_operator called with {other}"),
+    }
 }
 
 /// Aggregation truthiness: `false`, `0`, `null`, and missing are false.
