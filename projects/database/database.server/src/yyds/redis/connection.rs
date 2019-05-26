@@ -3057,6 +3057,7 @@ pub(crate) fn handle_string(
             namespace,
             &request.arguments,
             command.eq_ignore_ascii_case(b"BITFIELD_RO"),
+            protocol,
         )?;
         return Ok(true);
     }

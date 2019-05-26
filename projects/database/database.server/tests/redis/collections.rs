@@ -2776,6 +2776,54 @@ fn bitfield_commands() {
     send(&mut client, &["BITFIELD", "grow", "GET", "u8", "0"]);
     expect_values(&mut client, &[Some(0)]);
 
+    // 真机把 OVERFLOW 同样作用于 SET：SAT 饱和到上界，FAIL 返回空并建键补零。
+    send(&mut client, &["BITFIELD", "setov", "OVERFLOW", "SAT", "SET", "u8", "0", "300", "GET", "u8", "0"]);
+    expect_values(&mut client, &[Some(0), Some(255)]);
+    send(&mut client, &["BITFIELD", "setfail", "OVERFLOW", "FAIL", "SET", "u8", "0", "300"]);
+    expect_values(&mut client, &[None]);
+    send(&mut client, &["EXISTS", "setfail"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["STRLEN", "setfail"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["GET", "setfail"]);
+    match read_reply(&mut client) {
+        Reply::Bulk(Some(bytes)) => assert_eq!(bytes, vec![0x00]),
+        other => panic!("expected zero byte, got {}", describe(&other)),
+    }
+    // 无符号 SAT 把负数按 u64 视角处理，落到上界而不是下限。
+    send(&mut client, &["BITFIELD", "setneg", "OVERFLOW", "SAT", "SET", "u8", "0", "-1"]);
+    expect_values(&mut client, &[Some(0)]);
+    send(&mut client, &["BITFIELD", "setneg", "GET", "u8", "0"]);
+    expect_values(&mut client, &[Some(255)]);
+    // FAIL 的 INCRBY 也要按键宽补零，键照样存在。
+    send(&mut client, &["BITFIELD", "failgrow", "OVERFLOW", "FAIL", "INCRBY", "u8", "16", "256"]);
+    expect_values(&mut client, &[None]);
+    send(&mut client, &["EXISTS", "failgrow"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["STRLEN", "failgrow"]);
+    assert_eq!(expect_integer(&mut client), 3);
+
+    // u63 用满 63 位：最大值写入后最高字节是 0xfe，加一回绕到 0。
+    send(&mut client, &["BITFIELD", "u63", "SET", "u63", "0", "9223372036854775807", "GET", "u63", "0"]);
+    expect_values(&mut client, &[Some(0), Some(9223372036854775807)]);
+    send(&mut client, &["GET", "u63"]);
+    match read_reply(&mut client) {
+        Reply::Bulk(Some(bytes)) => {
+            assert_eq!(bytes, vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe])
+        }
+        other => panic!("expected u63 bytes, got {}", describe(&other)),
+    }
+    send(&mut client, &["BITFIELD", "u63", "INCRBY", "u63", "0", "1"]);
+    expect_values(&mut client, &[Some(0)]);
+    send(&mut client, &["BITFIELD", "u63", "SET", "u63", "0", "9223372036854775807"]);
+    expect_values(&mut client, &[Some(0)]);
+    send(&mut client, &["BITFIELD", "u63", "OVERFLOW", "SAT", "INCRBY", "u63", "0", "1"]);
+    expect_values(&mut client, &[Some(9223372036854775807)]);
+    send(&mut client, &["BITFIELD", "u63", "SET", "u63", "0", "9223372036854775807"]);
+    expect_values(&mut client, &[Some(9223372036854775807)]);
+    send(&mut client, &["BITFIELD", "u63", "OVERFLOW", "FAIL", "INCRBY", "u63", "0", "1"]);
+    expect_values(&mut client, &[None]);
+
     send(&mut client, &["HSET", "h", "f", "1"]);
     assert_eq!(expect_integer(&mut client), 1);
     send(&mut client, &["BITFIELD", "h", "GET", "u8", "0"]);
@@ -2786,7 +2834,15 @@ fn bitfield_commands() {
     expect_error(&mut client, "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.");
     send(&mut client, &["BITFIELD", "bf", "GET", "i65", "0"]);
     expect_error(&mut client, "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.");
+    send(&mut client, &["BITFIELD", "bf", "GET", "U8", "0"]);
+    expect_error(&mut client, "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.");
+    send(&mut client, &["BITFIELD", "bf", "GET", "i08", "0"]);
+    expect_error(&mut client, "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.");
     send(&mut client, &["BITFIELD", "bf", "GET", "u8", "-1"]);
+    expect_error(&mut client, "ERR bit offset is not an integer or out of range");
+    send(&mut client, &["BITFIELD", "bf", "GET", "u8", "+8"]);
+    expect_error(&mut client, "ERR bit offset is not an integer or out of range");
+    send(&mut client, &["BITFIELD", "bf", "GET", "u8", "08"]);
     expect_error(&mut client, "ERR bit offset is not an integer or out of range");
     send(&mut client, &["BITFIELD", "bf", "SET", "u8", "0", "x"]);
     expect_error(&mut client, "ERR value is not an integer or out of range");

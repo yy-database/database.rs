@@ -3935,7 +3935,12 @@ enum BitOverflow {
 /// 一条 `BITFIELD` 子命令。
 enum BitFieldOp {
     Get { encoding: BitEncoding, offset: u64 },
-    Set { encoding: BitEncoding, offset: u64, value: i64 },
+    Set {
+        encoding: BitEncoding,
+        offset: u64,
+        value: i64,
+        overflow: BitOverflow,
+    },
     Incr {
         encoding: BitEncoding,
         offset: u64,
@@ -3947,25 +3952,36 @@ enum BitFieldOp {
 const MAX_BIT_OFFSET: u64 = 0xffff_ffff;
 
 /// 解析 `iN` / `uN`，无符号上限 `u63`，有符号上限 `i64`。
+///
+/// 真机只认小写前缀与规范十进制，`I8`、`i08`、`i+8` 一律按非法编码报错。
 fn parse_bit_encoding(raw: &[u8]) -> Option<BitEncoding> {
     let text = std::str::from_utf8(raw).ok()?;
     let mut characters = text.chars();
     let signed = match characters.next()? {
-        'i' | 'I' => true,
-        'u' | 'U' => false,
+        'i' => true,
+        'u' => false,
         _ => return None,
     };
-    let bits = characters.as_str().parse::<u32>().ok()?;
+    let digits = characters.as_str();
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    let bits = digits.parse::<u32>().ok()?;
     let limit = if signed { 64 } else { 63 };
     (bits >= 1 && bits <= limit).then_some(BitEncoding { signed, bits })
 }
 
 /// 解析偏移：纯数字按位计，`#n` 按编码宽度倍乘。
+///
+/// 偏移与真机一样按规范整数校验，`+8`、`08`、`#+1` 都算越界参数。
 fn parse_bitfield_offset(raw: &[u8], bits: u32) -> Option<u64> {
     let text = std::str::from_utf8(raw).ok()?;
     let value = match text.strip_prefix('#') {
-        Some(rest) => rest.parse::<i64>().ok()?.checked_mul(bits as i64)?,
-        None => text.parse::<i64>().ok()?,
+        Some(rest) => parse_index(rest.as_bytes())?.checked_mul(bits as i64)?,
+        None => parse_index(raw)?,
     };
     (value >= 0 && value as u64 <= MAX_BIT_OFFSET).then_some(value as u64)
 }
@@ -4037,7 +4053,7 @@ fn parse_bitfield_ops(
                 return Ok(None);
             };
             if keyword.eq_ignore_ascii_case(b"SET") {
-                operations.push(BitFieldOp::Set { encoding, offset, value });
+                operations.push(BitFieldOp::Set { encoding, offset, value, overflow });
             }
             else {
                 operations.push(BitFieldOp::Incr { encoding, offset, increment: value, overflow });
@@ -4065,15 +4081,22 @@ fn read_bitfield(body: &[u8], offset: u64, encoding: BitEncoding) -> i128 {
     }
 }
 
+/// 把位域末端补齐到完整字节。
+///
+/// 真机连 `FAIL` 分支也会建键并补零，所以扩容与是否真正落值必须拆开。
+fn ensure_bitfield_len(body: &mut Vec<u8>, offset: u64, bits: u32) {
+    let needed = ((offset + bits as u64 + 7) / 8) as usize;
+    if body.len() < needed {
+        body.resize(needed, 0);
+    }
+}
+
 /// 写入一个位域值，必要时按位增长并补零。
 fn write_bitfield(body: &mut Vec<u8>, offset: u64, encoding: BitEncoding, value: i128) {
     let bits = encoding.bits;
     let mask = (1_u128 << bits) - 1;
     let raw = (value as u128) & mask;
-    let needed = ((offset + bits as u64 + 7) / 8) as usize;
-    if body.len() < needed {
-        body.resize(needed, 0);
-    }
+    ensure_bitfield_len(body, offset, bits);
     for step in 0..bits as u64 {
         let position = offset + step;
         let byte = (position / 8) as usize;
@@ -4109,6 +4132,26 @@ fn normalize_bitfield(value: i128, encoding: BitEncoding, overflow: BitOverflow)
     }
 }
 
+/// `SET` 的取值规整。
+///
+/// 真机在 `SET` 上同样应用 `OVERFLOW`，但无符号编码把负数当成 `u64` 视角的超大值，
+/// 因此 `SAT` 落到上界、`FAIL` 直接失败，而不是按有符号下限裁剪到 0。
+fn normalize_set_bitfield(value: i64, encoding: BitEncoding, overflow: BitOverflow) -> Option<i128> {
+    if encoding.signed {
+        return normalize_bitfield(value as i128, encoding, overflow);
+    }
+    let maximum = (1_i128 << encoding.bits) - 1;
+    let raw = if value < 0 { (1_i128 << 64) + value as i128 } else { value as i128 };
+    if raw <= maximum {
+        return Some(raw);
+    }
+    match overflow {
+        BitOverflow::Fail => None,
+        BitOverflow::Sat => Some(maximum),
+        BitOverflow::Wrap => Some(raw & maximum),
+    }
+}
+
 /// 执行 `BITFIELD` / `BITFIELD_RO`。
 pub(crate) fn handle_bitfield(
     stream: &mut dyn io::Write,
@@ -4116,6 +4159,7 @@ pub(crate) fn handle_bitfield(
     base: &Namespace,
     arguments: &[&[u8]],
     readonly: bool,
+    protocol: u8,
 ) -> io::Result<()> {
     let name = if readonly { "bitfield_ro" } else { "bitfield" };
     if arguments.len() < 2 {
@@ -4144,18 +4188,26 @@ pub(crate) fn handle_bitfield(
     for operation in operations {
         match operation {
             BitFieldOp::Get { encoding, offset } => results.push(Some(read_bitfield(&body, offset, encoding))),
-            BitFieldOp::Set { encoding, offset, value } => {
+            BitFieldOp::Set { encoding, offset, value, overflow } => {
                 let previous = read_bitfield(&body, offset, encoding);
-                write_bitfield(&mut body, offset, encoding, value as i128);
+                ensure_bitfield_len(&mut body, offset, encoding.bits);
+                // 真机对 SET 也应用当前 OVERFLOW，失败时同样建键补零。
                 changed = true;
-                results.push(Some(previous));
+                match normalize_set_bitfield(value, encoding, overflow) {
+                    Some(written) => {
+                        write_bitfield(&mut body, offset, encoding, written);
+                        results.push(Some(previous));
+                    }
+                    None => results.push(None),
+                }
             }
             BitFieldOp::Incr { encoding, offset, increment, overflow } => {
                 let previous = read_bitfield(&body, offset, encoding);
+                ensure_bitfield_len(&mut body, offset, encoding.bits);
+                changed = true;
                 match normalize_bitfield(previous + increment as i128, encoding, overflow) {
                     Some(value) => {
                         write_bitfield(&mut body, offset, encoding, value);
-                        changed = true;
                         results.push(Some(value));
                     }
                     None => results.push(None),
@@ -4172,7 +4224,7 @@ pub(crate) fn handle_bitfield(
     for result in results {
         match result {
             Some(value) => write_integer(stream, value as i64)?,
-            None => stream.write_all(b"$-1\r\n")?,
+            None => write_null(stream, protocol)?,
         }
     }
     Ok(())
