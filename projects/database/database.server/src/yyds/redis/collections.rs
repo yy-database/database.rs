@@ -986,6 +986,10 @@ fn handle_lpos(
             else {
                 return write_error(stream, "value is not an integer or out of range");
             };
+            // 真机把 `RANK` 限制在 `[-i64::MAX, i64::MAX]`，`i64::MIN` 单独报范围错误。
+            if rank == i64::MIN {
+                return write_error(stream, "value is out of range, value must between -9223372036854775807 and 9223372036854775807");
+            }
             if rank == 0 {
                 return write_error(stream, "RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list");
             }
@@ -998,9 +1002,10 @@ fn handle_lpos(
             else {
                 return write_error(stream, "syntax error");
             };
+            // 真机把解析失败与负数都归为同一条错误，不区分具体原因。
             let Some(count) = parse_index(raw)
             else {
-                return write_error(stream, "value is not an integer or out of range");
+                return write_error(stream, "COUNT can't be negative");
             };
             if count < 0 {
                 return write_error(stream, "COUNT can't be negative");
@@ -1014,9 +1019,10 @@ fn handle_lpos(
             else {
                 return write_error(stream, "syntax error");
             };
+            // `MAXLEN` 与 `COUNT` 一致：解析失败与负数共用一条错误。
             let Some(length) = parse_index(raw)
             else {
-                return write_error(stream, "value is not an integer or out of range");
+                return write_error(stream, "MAXLEN can't be negative");
             };
             if length < 0 {
                 return write_error(stream, "MAXLEN can't be negative");

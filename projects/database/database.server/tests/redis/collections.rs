@@ -2928,6 +2928,22 @@ fn list_position_commands() {
     expect_error(&mut client, "ERR COUNT can't be negative");
     send(&mut client, &["LPOS", "l", "a", "MAXLEN", "-1"]);
     expect_error(&mut client, "ERR MAXLEN can't be negative");
+    // 解析失败与负数共用一条错误，真机对 `COUNT`/`MAXLEN` 不区分原因。
+    send(&mut client, &["LPOS", "l", "a", "COUNT", "x"]);
+    expect_error(&mut client, "ERR COUNT can't be negative");
+    send(&mut client, &["LPOS", "l", "a", "COUNT", "+2"]);
+    expect_error(&mut client, "ERR COUNT can't be negative");
+    send(&mut client, &["LPOS", "l", "a", "MAXLEN", "x"]);
+    expect_error(&mut client, "ERR MAXLEN can't be negative");
+    send(&mut client, &["LPOS", "l", "a", "MAXLEN", "+2"]);
+    expect_error(&mut client, "ERR MAXLEN can't be negative");
+    // `RANK` 只接受 `[-i64::MAX, i64::MAX]`，越界与非法文本都报整数错误。
+    send(&mut client, &["LPOS", "l", "a", "RANK", "-9223372036854775808"]);
+    expect_error(&mut client, "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807");
+    send(&mut client, &["LPOS", "l", "a", "RANK", "+2"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["LPOS", "l", "a", "RANK", "9223372036854775807"]);
+    expect_bulk(&mut client, None);
     send(&mut client, &["LPOS", "l", "a", "RANK"]);
     expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["LPOS", "l", "a", "BOGUS", "1"]);
