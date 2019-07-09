@@ -126,6 +126,25 @@ pub fn execute_zset_command(
     collections::handle_zset(stream, &request, Some(executor), namespace, protocol)
 }
 
+/// Executes one HyperLogLog family request and writes the RESP reply.
+///
+/// Command semantics, reply framing and type checks stay in the redis collection
+/// handler. The caller only supplies the logical database namespace and the
+/// key-value backend, so an embedder such as a language binding can reuse this
+/// family without reimplementing the hash, register and estimation logic.
+pub fn execute_hyperloglog_command(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    executor: &dyn KeyValueExecutor,
+    namespace: &database_types::cluster::Namespace,
+) -> io::Result<()> {
+    let request = resp::Request {
+        arguments: arguments.to_vec(),
+        consumed: 0,
+    };
+    collections::handle_hyperloglog(stream, &request, Some(executor), namespace)
+}
+
 /// Executes one string or key family request and writes the RESP reply.
 ///
 /// Command semantics, reply framing and type checks stay in the redis connection
