@@ -674,6 +674,290 @@ fn array_expressions_propagate_null_and_reject_bad_operands() {
 }
 
 #[test]
+fn date_field_expressions_follow_the_manual() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("when", BsonValue::DateTime(1_614_834_367_008))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("year", operator("$year", text("$when"))),
+            ("month", operator("$month", text("$when"))),
+            ("day", operator("$dayOfMonth", text("$when"))),
+            ("hour", operator("$hour", text("$when"))),
+            ("minute", operator("$minute", text("$when"))),
+            ("second", operator("$second", text("$when"))),
+            ("millisecond", operator("$millisecond", text("$when"))),
+            ("day_of_week", operator("$dayOfWeek", text("$when"))),
+            ("day_of_year", operator("$dayOfYear", text("$when"))),
+            ("week", operator("$week", text("$when"))),
+            ("iso_week", operator("$isoWeek", text("$when"))),
+            ("iso_week_year", operator("$isoWeekYear", text("$when"))),
+            ("iso_day_of_week", operator("$isoDayOfWeek", text("$when"))),
+            ("local_hour", operator("$hour", BsonValue::Document(document(&[("date", text("$when")), ("timezone", text("+08:00"))])))),
+        ]),
+    );
+
+    assert_eq!(row.get("year"), Some(&BsonValue::Int32(2021)));
+    assert_eq!(row.get("month"), Some(&BsonValue::Int32(3)));
+    assert_eq!(row.get("day"), Some(&BsonValue::Int32(4)));
+    assert_eq!(row.get("hour"), Some(&BsonValue::Int32(5)));
+    assert_eq!(row.get("minute"), Some(&BsonValue::Int32(6)));
+    assert_eq!(row.get("second"), Some(&BsonValue::Int32(7)));
+    assert_eq!(row.get("millisecond"), Some(&BsonValue::Int32(8)));
+    assert_eq!(row.get("day_of_week"), Some(&BsonValue::Int32(5)));
+    assert_eq!(row.get("day_of_year"), Some(&BsonValue::Int32(63)));
+    assert_eq!(row.get("week"), Some(&BsonValue::Int32(9)));
+    assert_eq!(row.get("iso_week"), Some(&BsonValue::Int32(9)));
+    assert_eq!(row.get("iso_week_year"), Some(&BsonValue::Int32(2021)));
+    assert_eq!(row.get("iso_day_of_week"), Some(&BsonValue::Int32(4)));
+    assert_eq!(row.get("local_hour"), Some(&BsonValue::Int32(13)));
+}
+
+#[test]
+fn date_conversion_expressions_follow_the_manual() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("when", BsonValue::DateTime(1_614_834_367_008))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("rendered", operator("$dateToString", BsonValue::Document(document(&[("date", text("$when"))])))),
+            (
+                "formatted",
+                operator("$dateToString", BsonValue::Document(document(&[("date", text("$when")), ("format", text("%Y-%m-%d %H:%M:%S.%L"))]))),
+            ),
+            (
+                "formatted_local",
+                operator(
+                    "$dateToString",
+                    BsonValue::Document(document(&[("date", text("$when")), ("format", text("%H:%M %z")), ("timezone", text("+08:00"))])),
+                ),
+            ),
+            ("parsed", operator("$dateFromString", BsonValue::Document(document(&[("dateString", text("2021-03-04T05:06:07.008Z"))])))),
+            (
+                "parsed_offset",
+                operator("$dateFromString", BsonValue::Document(document(&[("dateString", text("2021-03-04 13:06:07.008+08:00"))]))),
+            ),
+            (
+                "parsed_format",
+                operator(
+                    "$dateFromString",
+                    BsonValue::Document(document(&[
+                        ("dateString", text("2021-03-04 05:06:07.008")),
+                        ("format", text("%Y-%m-%d %H:%M:%S.%L")),
+                        ("timezone", text("UTC")),
+                    ])),
+                ),
+            ),
+            ("parts", operator("$dateToParts", BsonValue::Document(document(&[("date", text("$when"))])))),
+            (
+                "iso_parts",
+                operator("$dateToParts", BsonValue::Document(document(&[("date", text("$when")), ("iso8601", BsonValue::Bool(true))]))),
+            ),
+            (
+                "built",
+                operator(
+                    "$dateFromParts",
+                    BsonValue::Document(document(&[
+                        ("year", BsonValue::Int32(2021)),
+                        ("month", BsonValue::Int32(2)),
+                        ("day", BsonValue::Int32(31)),
+                    ])),
+                ),
+            ),
+            (
+                "built_iso",
+                operator(
+                    "$dateFromParts",
+                    BsonValue::Document(document(&[
+                        ("isoWeekYear", BsonValue::Int32(2021)),
+                        ("isoWeek", BsonValue::Int32(9)),
+                        ("isoDayOfWeek", BsonValue::Int32(4)),
+                    ])),
+                ),
+            ),
+        ]),
+    );
+
+    assert_eq!(row.get("rendered"), Some(&text("2021-03-04T05:06:07.008Z")));
+    assert_eq!(row.get("formatted"), Some(&text("2021-03-04 05:06:07.008")));
+    assert_eq!(row.get("formatted_local"), Some(&text("13:06 +0800")));
+    assert_eq!(row.get("parsed"), Some(&BsonValue::DateTime(1_614_834_367_008)));
+    assert_eq!(row.get("parsed_offset"), Some(&BsonValue::DateTime(1_614_834_367_008)));
+    assert_eq!(row.get("parsed_format"), Some(&BsonValue::DateTime(1_614_834_367_008)));
+    assert_eq!(
+        row.get("parts"),
+        Some(&BsonValue::Document(document(&[
+            ("year", BsonValue::Int32(2021)),
+            ("month", BsonValue::Int32(3)),
+            ("day", BsonValue::Int32(4)),
+            ("hour", BsonValue::Int32(5)),
+            ("minute", BsonValue::Int32(6)),
+            ("second", BsonValue::Int32(7)),
+            ("millisecond", BsonValue::Int32(8)),
+        ])))
+    );
+    assert_eq!(
+        row.get("iso_parts"),
+        Some(&BsonValue::Document(document(&[
+            ("isoWeekYear", BsonValue::Int32(2021)),
+            ("isoWeek", BsonValue::Int32(9)),
+            ("isoDayOfWeek", BsonValue::Int32(4)),
+            ("hour", BsonValue::Int32(5)),
+            ("minute", BsonValue::Int32(6)),
+            ("second", BsonValue::Int32(7)),
+            ("millisecond", BsonValue::Int32(8)),
+        ])))
+    );
+    assert_eq!(row.get("built"), Some(&BsonValue::DateTime(1_614_729_600_000)));
+    assert_eq!(row.get("built_iso"), Some(&BsonValue::DateTime(1_614_816_000_000)));
+}
+
+#[test]
+fn date_arithmetic_expressions_follow_the_manual() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![document(&[
+            ("_id", BsonValue::Int32(1)),
+            ("january", BsonValue::DateTime(1_612_051_200_000)),
+            ("when", BsonValue::DateTime(1_614_834_367_008)),
+            ("before", BsonValue::DateTime(1_609_459_199_000)),
+            ("after", BsonValue::DateTime(1_609_459_200_000)),
+        ])],
+    );
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            (
+                "next_month",
+                operator(
+                    "$dateAdd",
+                    BsonValue::Document(document(&[("startDate", text("$january")), ("unit", text("month")), ("amount", BsonValue::Int32(1))])),
+                ),
+            ),
+            (
+                "previous_day",
+                operator(
+                    "$dateSubtract",
+                    BsonValue::Document(document(&[("startDate", text("$when")), ("unit", text("day")), ("amount", BsonValue::Int32(1))])),
+                ),
+            ),
+            (
+                "years",
+                operator(
+                    "$dateDiff",
+                    BsonValue::Document(document(&[("startDate", text("$before")), ("endDate", text("$after")), ("unit", text("year"))])),
+                ),
+            ),
+            (
+                "hours",
+                operator(
+                    "$dateDiff",
+                    BsonValue::Document(document(&[("startDate", text("$before")), ("endDate", text("$after")), ("unit", text("hour"))])),
+                ),
+            ),
+            ("truncated_month", operator("$dateTrunc", BsonValue::Document(document(&[("date", text("$when")), ("unit", text("month"))])))),
+            ("truncated_day", operator("$dateTrunc", BsonValue::Document(document(&[("date", text("$when")), ("unit", text("day"))])))),
+            (
+                "truncated_week",
+                operator(
+                    "$dateTrunc",
+                    BsonValue::Document(document(&[("date", text("$when")), ("unit", text("week")), ("startOfWeek", text("monday"))])),
+                ),
+            ),
+        ]),
+    );
+
+    assert_eq!(row.get("next_month"), Some(&BsonValue::DateTime(1_614_470_400_000)));
+    assert_eq!(row.get("previous_day"), Some(&BsonValue::DateTime(1_614_747_967_008)));
+    assert_eq!(row.get("years"), Some(&BsonValue::Int32(1)));
+    assert_eq!(row.get("hours"), Some(&BsonValue::Int32(1)));
+    assert_eq!(row.get("truncated_month"), Some(&BsonValue::DateTime(1_614_556_800_000)));
+    assert_eq!(row.get("truncated_day"), Some(&BsonValue::DateTime(1_614_816_000_000)));
+    assert_eq!(row.get("truncated_week"), Some(&BsonValue::DateTime(1_614_556_800_000)));
+}
+
+#[test]
+fn date_expressions_propagate_null_and_reject_bad_operands() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("n", BsonValue::Int32(7))])]);
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("null_year", operator("$year", BsonValue::Null)),
+            ("null_rendered", operator("$dateToString", BsonValue::Document(document(&[("date", BsonValue::Null), ("onNull", text("none"))])))),
+            (
+                "bad_parsed",
+                operator("$dateFromString", BsonValue::Document(document(&[("dateString", text("not a date")), ("onError", text("bad"))]))),
+            ),
+            (
+                "null_parsed",
+                operator("$dateFromString", BsonValue::Document(document(&[("dateString", BsonValue::Null), ("onNull", text("none"))]))),
+            ),
+        ]),
+    );
+
+    assert_eq!(row.get("null_year"), Some(&BsonValue::Null));
+    assert_eq!(row.get("null_rendered"), Some(&text("none")));
+    assert_eq!(row.get("bad_parsed"), Some(&text("bad")));
+    assert_eq!(row.get("null_parsed"), Some(&text("none")));
+
+    let failure = |projection: BsonDocument| -> CommandError {
+        let aggregate = aggregate_pipeline("items", vec![stage("$project", BsonValue::Document(projection))]);
+        commands::aggregate(&aggregate, &store).expect_err("expression must fail")
+    };
+
+    assert_eq!(failure(document(&[("x", operator("$year", text("$n")))])).code, 16006);
+    assert_eq!(
+        failure(document(&[(
+            "x",
+            operator(
+                "$dateAdd",
+                BsonValue::Document(document(&[
+                    ("startDate", BsonValue::DateTime(0)),
+                    ("unit", text("fortnight")),
+                    ("amount", BsonValue::Int32(1)),
+                ]))
+            )
+        )]))
+        .code,
+        2
+    );
+    assert_eq!(
+        failure(document(&[(
+            "x",
+            operator("$hour", BsonValue::Document(document(&[("date", BsonValue::DateTime(0)), ("timezone", text("Asia/Shanghai"))])))
+        )]))
+        .code,
+        40485
+    );
+    assert_eq!(
+        failure(document(&[("x", operator("$dateFromString", BsonValue::Document(document(&[("dateString", text("not a date"))]))))])).code,
+        40516
+    );
+    assert_eq!(
+        failure(document(&[(
+            "x",
+            operator(
+                "$dateTrunc",
+                BsonValue::Document(document(&[("date", BsonValue::DateTime(0)), ("unit", text("day")), ("binSize", BsonValue::Int32(0))]))
+            )
+        )]))
+        .code,
+        2
+    );
+}
+
+#[test]
 fn aggregate_rejects_unsupported_stages_even_after_match() {
     let store = store();
     let search = BsonValue::Document(document(&[("text", text("x"))]));

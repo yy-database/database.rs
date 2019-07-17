@@ -9244,6 +9244,11 @@ fn evaluate_expression_vars(
                 }
                 "$isArray" | "$arrayElemAt" | "$first" | "$last" | "$concatArrays" | "$reverseArray" | "$indexOfArray" | "$range"
                 | "$slice" => evaluate_array_operator(document, operator, argument, variables),
+                "$year" | "$month" | "$dayOfMonth" | "$hour" | "$minute" | "$second" | "$millisecond" | "$dayOfWeek" | "$dayOfYear"
+                | "$week" | "$isoWeek" | "$isoWeekYear" | "$isoDayOfWeek" | "$dateToString" | "$dateFromString" | "$dateToParts"
+                | "$dateFromParts" | "$dateAdd" | "$dateSubtract" | "$dateDiff" | "$dateTrunc" => {
+                    evaluate_date_operator(document, operator, argument, variables)
+                }
                 "$size" => {
                     let value = evaluate_expression_vars(document, argument, variables)?;
                     match value {
@@ -9273,7 +9278,7 @@ fn evaluate_expression_vars(
                 other => Err(CommandError::new(
                     59,
                     format!(
-                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $toLower, $toUpper, $strLenCP, $strLenBytes, $substr, $substrBytes, $substrCP, $split, $trim, $ltrim, $rtrim, $indexOfCP, $indexOfBytes, $replaceOne, $replaceAll, $strcasecmp, $isArray, $arrayElemAt, $first, $last, $concatArrays, $reverseArray, $indexOfArray, $range, $slice, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
+                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $toLower, $toUpper, $strLenCP, $strLenBytes, $substr, $substrBytes, $substrCP, $split, $trim, $ltrim, $rtrim, $indexOfCP, $indexOfBytes, $replaceOne, $replaceAll, $strcasecmp, $isArray, $arrayElemAt, $first, $last, $concatArrays, $reverseArray, $indexOfArray, $range, $slice, $year, $month, $dayOfMonth, $hour, $minute, $second, $millisecond, $dayOfWeek, $dayOfYear, $week, $isoWeek, $isoWeekYear, $isoDayOfWeek, $dateToString, $dateFromString, $dateToParts, $dateFromParts, $dateAdd, $dateSubtract, $dateDiff, $dateTrunc, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
                     ),
                 )),
             }
@@ -10077,6 +10082,903 @@ fn evaluate_array_operator(
         }
         other => unreachable!("evaluate_array_operator called with {other}"),
     }
+}
+
+/// 日期算子解释时使用的固定偏移。
+///
+/// 本仓不内置 IANA 时区数据库：只支持 `UTC` / `GMT` / `Z` 与 `±HH[:MM]` 形式的
+/// 固定偏移。`Asia/Shanghai` 一类的 Olson 名称一律拒绝，夏令时与历史时区规则
+/// 的边界语义待真实 `mongod 8.0.9` 录制核对。
+#[derive(Clone, Copy)]
+struct FixedOffset {
+    seconds: i64,
+}
+
+impl FixedOffset {
+    fn utc() -> Self {
+        Self { seconds: 0 }
+    }
+
+    fn parse(value: &str) -> Result<Self, CommandError> {
+        let trimmed = value.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if matches!(upper.as_str(), "UTC" | "GMT" | "Z") {
+            return Ok(Self::utc());
+        }
+        let sign = match upper.as_bytes().first() {
+            Some(b'+') => 1,
+            Some(b'-') => -1,
+            _ => return Err(invalid_timezone(value)),
+        };
+        let rest = &upper[1..];
+        let (hours, minutes) = match rest.len() {
+            2 => (rest, "00"),
+            4 => (&rest[..2], &rest[2..]),
+            5 if rest.as_bytes()[2] == b':' => (&rest[..2], &rest[3..]),
+            _ => return Err(invalid_timezone(value)),
+        };
+        let parse_part = |part: &str| part.parse::<i64>().map_err(|_| invalid_timezone(value));
+        let hours = parse_part(hours)?;
+        let minutes = parse_part(minutes)?;
+        if hours > 23 || minutes > 59 {
+            return Err(invalid_timezone(value));
+        }
+        Ok(Self { seconds: sign * (hours * 3600 + minutes * 60) })
+    }
+
+    /// `+HHMM` 形式的文本，供 `%z` 使用。
+    fn text(self) -> String {
+        let sign = if self.seconds < 0 { '-' } else { '+' };
+        let total = self.seconds.abs();
+        format!("{sign}{:02}{:02}", total / 3600, (total % 3600) / 60)
+    }
+}
+
+fn invalid_timezone(value: &str) -> CommandError {
+    CommandError::new(
+        40485,
+        format!(
+            "unrecognized time zone identifier: \"{value}\"; this facade supports UTC and fixed ±HH:MM offsets only (IANA zone rules pending real mongod verification)"
+        ),
+    )
+}
+
+/// 日期记录：UTC 毫秒与解释用的固定偏移。
+#[derive(Clone, Copy)]
+struct DateValue {
+    millis: i64,
+    offset: FixedOffset,
+}
+
+/// 从算子参数文档里取可选的 `timezone`。
+fn evaluate_timezone(document: &BsonDocument, options: &BsonDocument, variables: &ExpressionVariables) -> Result<FixedOffset, CommandError> {
+    match options.get("timezone") {
+        None | Some(BsonValue::Null) => Ok(FixedOffset::utc()),
+        Some(expression) => match evaluate_expression_vars(document, expression, variables)? {
+            BsonValue::String(name) => FixedOffset::parse(&name),
+            other => Err(CommandError::new(40517, format!("timezone must evaluate to a string, found: {}", bson_type_name(&other)))),
+        },
+    }
+}
+
+/// 把 BSON 值解释为 UTC 毫秒；`null` 与缺失返回 `None`。
+///
+/// Date、Timestamp 与 ObjectId 都按手册接受；错误码与措辞待真机核对。
+fn date_millis(value: &BsonValue, operator: &str) -> Result<Option<i64>, CommandError> {
+    match value {
+        BsonValue::Null | BsonValue::Undefined => Ok(None),
+        BsonValue::DateTime(millis) => Ok(Some(*millis)),
+        BsonValue::Timestamp { t, .. } => Ok(Some(i64::from(*t) * 1000)),
+        BsonValue::ObjectId(bytes) => Ok(Some(i64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) * 1000)),
+        other => Err(CommandError::new(16006, format!("{operator} only supports Date, Timestamp, or ObjectId, not {}", bson_type_name(other)))),
+    }
+}
+
+/// 字段类日期算子的参数：既可以是裸日期表达式，也可以是 `{ date, timezone }`。
+fn evaluate_date_argument(
+    document: &BsonDocument,
+    argument: &BsonValue,
+    variables: &ExpressionVariables,
+    operator: &str,
+) -> Result<Option<DateValue>, CommandError> {
+    if let BsonValue::Document(options) = argument
+        && let Some(date) = options.get("date")
+    {
+        let offset = evaluate_timezone(document, options, variables)?;
+        let value = evaluate_expression_vars(document, date, variables)?;
+        return Ok(date_millis(&value, operator)?.map(|millis| DateValue { millis, offset }));
+    }
+    let value = evaluate_expression_vars(document, argument, variables)?;
+    Ok(date_millis(&value, operator)?.map(|millis| DateValue { millis, offset: FixedOffset::utc() }))
+}
+
+/// UTC 民用日期时间，不携带时区偏移。
+#[derive(Clone, Copy)]
+struct CivilDateTime {
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    millisecond: u32,
+}
+
+/// 把本地偏移加到 UTC 毫秒上，供民用历字段计算使用。
+fn local_millis(value: DateValue) -> Result<i64, CommandError> {
+    let offset =
+        value.offset.seconds.checked_mul(1000).ok_or_else(|| CommandError::new(2, "timezone offset overflows a 64-bit millisecond count"))?;
+    value.millis.checked_add(offset).ok_or_else(|| CommandError::new(2, "date arithmetic overflows a 64-bit millisecond count"))
+}
+
+/// 公历日期转自 Unix 纪元起的天数，供日期算子复用既有的民用历换算。
+fn date_days(year: i64, month: u32, day: u32) -> i64 {
+    days_from_civil(year, i64::from(month), i64::from(day))
+}
+
+impl CivilDateTime {
+    fn from_millis(millis: i64) -> Self {
+        let days = millis.div_euclid(86_400_000);
+        let within = millis.rem_euclid(86_400_000);
+        let (year, month, day) = civil_from_days(days);
+        Self {
+            year,
+            month: month as u32,
+            day: day as u32,
+            hour: (within / 3_600_000) as u32,
+            minute: ((within / 60_000) % 60) as u32,
+            second: ((within / 1_000) % 60) as u32,
+            millisecond: (within % 1_000) as u32,
+        }
+    }
+
+    fn to_millis(self) -> i64 {
+        date_days(self.year, self.month, self.day) * 86_400_000
+            + i64::from(self.hour) * 3_600_000
+            + i64::from(self.minute) * 60_000
+            + i64::from(self.second) * 1_000
+            + i64::from(self.millisecond)
+    }
+
+    fn days(self) -> i64 {
+        date_days(self.year, self.month, self.day)
+    }
+
+    fn day_of_year(self) -> i64 {
+        self.days() - date_days(self.year, 1, 1) + 1
+    }
+
+    /// Sunday 记 1 的星期序号。
+    fn day_of_week(self) -> i64 {
+        sunday_day_of_week(self.days())
+    }
+
+    /// ISO 星期序号，Monday 记 1。
+    fn iso_day_of_week(self) -> i64 {
+        iso_day_of_week(self.days())
+    }
+
+    /// Sunday 记 1 的周序号，年初不足一周的部分记 0。
+    fn week_of_year(self) -> i64 {
+        (self.day_of_year() - 1 + 7 - self.day_of_week()) / 7
+    }
+
+    /// ISO 周年与周序号。
+    fn iso_week(self) -> (i64, i64) {
+        let thursday = self.days() - (self.iso_day_of_week() - 4);
+        let (iso_year, _, _) = civil_from_days(thursday);
+        let january_fourth = days_from_civil(iso_year, 1, 4);
+        let first_thursday = january_fourth + (4 - iso_day_of_week(january_fourth));
+        (iso_year, (thursday - first_thursday) / 7 + 1)
+    }
+}
+
+/// Sunday 记 1 的星期序号。
+fn sunday_day_of_week(days: i64) -> i64 {
+    (days + 4).rem_euclid(7) + 1
+}
+
+/// ISO 星期序号，Monday 记 1。
+fn iso_day_of_week(days: i64) -> i64 {
+    (days + 3).rem_euclid(7) + 1
+}
+
+/// 日期算子支持的时间单位。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DateUnit {
+    Year,
+    Quarter,
+    Month,
+    Week,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+}
+
+impl DateUnit {
+    fn parse(value: &str, operator: &str) -> Result<Self, CommandError> {
+        Ok(match value {
+            "year" => Self::Year,
+            "quarter" => Self::Quarter,
+            "month" => Self::Month,
+            "week" => Self::Week,
+            "day" => Self::Day,
+            "hour" => Self::Hour,
+            "minute" => Self::Minute,
+            "second" => Self::Second,
+            "millisecond" => Self::Millisecond,
+            other => return Err(CommandError::new(2, format!("{operator} does not support unit \"{other}\""))),
+        })
+    }
+
+    /// 年 / 季 / 月折算的月数；其余单位返回 0。
+    fn months(self) -> i64 {
+        match self {
+            Self::Year => 12,
+            Self::Quarter => 3,
+            Self::Month => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// 解析 `startOfWeek`，返回 Sunday 记 1 的星期序号；缺省为 Sunday。
+fn parse_start_of_week(options: &BsonDocument, operator: &str) -> Result<i64, CommandError> {
+    let Some(expression) = options.get("startOfWeek")
+    else {
+        return Ok(1);
+    };
+    let name = match expression {
+        BsonValue::String(name) => name.to_ascii_lowercase(),
+        other => return Err(CommandError::new(2, format!("{operator} startOfWeek must be a string, found: {}", bson_type_name(other)))),
+    };
+    Ok(match name.as_str() {
+        "sunday" | "sun" => 1,
+        "monday" | "mon" => 2,
+        "tuesday" | "tue" => 3,
+        "wednesday" | "wed" => 4,
+        "thursday" | "thu" => 5,
+        "friday" | "fri" => 6,
+        "saturday" | "sat" => 7,
+        other => return Err(CommandError::new(2, format!("{operator} does not recognize startOfWeek \"{other}\""))),
+    })
+}
+
+/// 求值日期类聚合算子。
+///
+/// 语义按 `mongod` 手册实现：`null` 输入返回 `null`，字段算子接受 Date、
+/// Timestamp 与 ObjectId。时区只支持 UTC 与固定偏移，`$dateFromString` 的格式
+/// 串只支持本文档列出的数字型占位符。所有错误码、错误措辞、月末截断、周边界与
+/// `$dateTrunc` 的参考日期语义均待真实 `mongod 8.0.9` 录制核对。
+fn evaluate_date_operator(
+    document: &BsonDocument,
+    operator: &str,
+    argument: &BsonValue,
+    variables: &ExpressionVariables,
+) -> Result<BsonValue, CommandError> {
+    match operator {
+        "$year" | "$month" | "$dayOfMonth" | "$hour" | "$minute" | "$second" | "$millisecond" | "$dayOfWeek" | "$dayOfYear" | "$week"
+        | "$isoWeek" | "$isoWeekYear" | "$isoDayOfWeek" => {
+            let Some(value) = evaluate_date_argument(document, argument, variables, operator)?
+            else {
+                return Ok(BsonValue::Null);
+            };
+            let civil = CivilDateTime::from_millis(local_millis(value)?);
+            let number = match operator {
+                "$year" => civil.year,
+                "$month" => i64::from(civil.month),
+                "$dayOfMonth" => i64::from(civil.day),
+                "$hour" => i64::from(civil.hour),
+                "$minute" => i64::from(civil.minute),
+                "$second" => i64::from(civil.second),
+                "$millisecond" => i64::from(civil.millisecond),
+                "$dayOfWeek" => civil.day_of_week(),
+                "$dayOfYear" => civil.day_of_year(),
+                "$week" => civil.week_of_year(),
+                "$isoWeek" => civil.iso_week().1,
+                "$isoWeekYear" => civil.iso_week().0,
+                _ => civil.iso_day_of_week(),
+            };
+            Ok(count_value(number))
+        }
+        "$dateToString" => {
+            let BsonValue::Document(options) = argument
+            else {
+                return Err(CommandError::new(2, "$dateToString requires a document argument"));
+            };
+            let date_expression = options.get("date").ok_or_else(|| CommandError::new(2, "$dateToString requires a 'date' field"))?;
+            let value = evaluate_expression_vars(document, date_expression, variables)?;
+            let Some(millis) = date_millis(&value, operator)?
+            else {
+                return match options.get("onNull") {
+                    Some(expression) => evaluate_expression_vars(document, expression, variables),
+                    None => Ok(BsonValue::Null),
+                };
+            };
+            let offset = evaluate_timezone(document, options, variables)?;
+            let format = match options.get("format") {
+                Some(expression) => match evaluate_expression_vars(document, expression, variables)? {
+                    BsonValue::String(format) => format,
+                    other => {
+                        return Err(CommandError::new(
+                            18533,
+                            format!("$dateToString format must be a string, found: {}", bson_type_name(&other)),
+                        ));
+                    }
+                },
+                None => "%Y-%m-%dT%H:%M:%S.%LZ".to_string(),
+            };
+            let civil = CivilDateTime::from_millis(local_millis(DateValue { millis, offset })?);
+            Ok(BsonValue::String(format_date(&civil, &format, offset)?))
+        }
+        "$dateToParts" => {
+            let BsonValue::Document(options) = argument
+            else {
+                return Err(CommandError::new(2, "$dateToParts requires a document argument"));
+            };
+            let date_expression = options.get("date").ok_or_else(|| CommandError::new(2, "$dateToParts requires a 'date' field"))?;
+            let value = evaluate_expression_vars(document, date_expression, variables)?;
+            let Some(millis) = date_millis(&value, operator)?
+            else {
+                return Ok(BsonValue::Null);
+            };
+            let offset = evaluate_timezone(document, options, variables)?;
+            let iso = match options.get("iso8601") {
+                Some(expression) => match evaluate_expression_vars(document, expression, variables)? {
+                    BsonValue::Bool(flag) => flag,
+                    other => {
+                        return Err(CommandError::new(2, format!("$dateToParts iso8601 must be a boolean, found: {}", bson_type_name(&other))));
+                    }
+                },
+                None => false,
+            };
+            let civil = CivilDateTime::from_millis(local_millis(DateValue { millis, offset })?);
+            let mut parts = BsonDocument::new();
+            if iso {
+                let (year, week) = civil.iso_week();
+                parts.push("isoWeekYear", count_value(year));
+                parts.push("isoWeek", count_value(week));
+                parts.push("isoDayOfWeek", count_value(civil.iso_day_of_week()));
+            }
+            else {
+                parts.push("year", count_value(civil.year));
+                parts.push("month", count_value(i64::from(civil.month)));
+                parts.push("day", count_value(i64::from(civil.day)));
+            }
+            parts.push("hour", count_value(i64::from(civil.hour)));
+            parts.push("minute", count_value(i64::from(civil.minute)));
+            parts.push("second", count_value(i64::from(civil.second)));
+            parts.push("millisecond", count_value(i64::from(civil.millisecond)));
+            Ok(BsonValue::Document(parts))
+        }
+        "$dateFromParts" => {
+            let BsonValue::Document(options) = argument
+            else {
+                return Err(CommandError::new(2, "$dateFromParts requires a document argument"));
+            };
+            let offset = evaluate_timezone(document, options, variables)?;
+            let number = |name: &str| -> Result<Option<i64>, CommandError> {
+                match options.get(name) {
+                    Some(expression) => match integral_i64(&evaluate_expression_vars(document, expression, variables)?) {
+                        Some(number) => Ok(Some(number)),
+                        None => Err(CommandError::new(40515, format!("$dateFromParts '{name}' must be an integer"))),
+                    },
+                    None => Ok(None),
+                }
+            };
+            let hour = number("hour")?.unwrap_or(0);
+            let minute = number("minute")?.unwrap_or(0);
+            let second = number("second")?.unwrap_or(0);
+            let millisecond = number("millisecond")?.unwrap_or(0);
+            let time = hour
+                .checked_mul(3_600_000)
+                .and_then(|value| value.checked_add(minute.checked_mul(60_000)?))
+                .and_then(|value| value.checked_add(second.checked_mul(1_000)?))
+                .and_then(|value| value.checked_add(millisecond))
+                .ok_or_else(|| CommandError::new(2, "$dateFromParts time components overflow"))?;
+            let days = if options.get("isoWeekYear").is_some() {
+                let year = number("isoWeekYear")?.ok_or_else(|| CommandError::new(2, "$dateFromParts requires 'isoWeekYear'"))?;
+                let week = number("isoWeek")?.unwrap_or(1);
+                let weekday = number("isoDayOfWeek")?.unwrap_or(1);
+                let january_fourth = days_from_civil(year, 1, 4);
+                let monday = january_fourth - (iso_day_of_week(january_fourth) - 1);
+                week.checked_sub(1)
+                    .and_then(|week| week.checked_mul(7))
+                    .and_then(|offset| monday.checked_add(offset))
+                    .and_then(|offset| offset.checked_add(weekday.checked_sub(1)?))
+                    .ok_or_else(|| CommandError::new(2, "$dateFromParts result overflows"))?
+            }
+            else {
+                let year = number("year")?.ok_or_else(|| CommandError::new(2, "$dateFromParts requires a 'year' or 'isoWeekYear' field"))?;
+                let month = number("month")?.unwrap_or(1);
+                let day = number("day")?.unwrap_or(1);
+                let total_months = year
+                    .checked_mul(12)
+                    .and_then(|value| value.checked_add(month.checked_sub(1)?))
+                    .ok_or_else(|| CommandError::new(2, "$dateFromParts month index overflows"))?;
+                let normalized_year = total_months.div_euclid(12);
+                let normalized_month = (total_months.rem_euclid(12) + 1) as u32;
+                date_days(normalized_year, normalized_month, 1)
+                    .checked_add(day.checked_sub(1).ok_or_else(|| CommandError::new(2, "$dateFromParts day index overflows"))?)
+                    .ok_or_else(|| CommandError::new(2, "$dateFromParts result overflows"))?
+            };
+            let millis = days
+                .checked_mul(86_400_000)
+                .and_then(|value| value.checked_add(time))
+                .and_then(|value| value.checked_sub(offset.seconds.checked_mul(1000)?))
+                .ok_or_else(|| CommandError::new(2, "$dateFromParts result overflows a 64-bit millisecond count"))?;
+            Ok(BsonValue::DateTime(millis))
+        }
+        "$dateAdd" | "$dateSubtract" => {
+            let BsonValue::Document(options) = argument
+            else {
+                return Err(CommandError::new(2, format!("{operator} requires a document argument")));
+            };
+            let start_expression =
+                options.get("startDate").ok_or_else(|| CommandError::new(2, format!("{operator} requires a 'startDate' field")))?;
+            let unit_expression = options.get("unit").ok_or_else(|| CommandError::new(2, format!("{operator} requires a 'unit' field")))?;
+            let amount_expression =
+                options.get("amount").ok_or_else(|| CommandError::new(2, format!("{operator} requires an 'amount' field")))?;
+            let offset = evaluate_timezone(document, options, variables)?;
+            let value = evaluate_expression_vars(document, start_expression, variables)?;
+            let Some(millis) = date_millis(&value, operator)?
+            else {
+                return Ok(BsonValue::Null);
+            };
+            let unit = match evaluate_expression_vars(document, unit_expression, variables)? {
+                BsonValue::String(name) => DateUnit::parse(&name, operator)?,
+                other => return Err(CommandError::new(2, format!("{operator} unit must be a string, found: {}", bson_type_name(&other)))),
+            };
+            let amount_value = evaluate_expression_vars(document, amount_expression, variables)?;
+            let amount = integral_i64(&amount_value).ok_or_else(|| CommandError::new(2, format!("{operator} amount must be an integer")))?;
+            let amount = if operator == "$dateSubtract" {
+                amount.checked_neg().ok_or_else(|| CommandError::new(2, format!("{operator} amount overflows")))?
+            }
+            else {
+                amount
+            };
+            Ok(BsonValue::DateTime(add_date(DateValue { millis, offset }, unit, amount)?))
+        }
+        "$dateDiff" => {
+            let BsonValue::Document(options) = argument
+            else {
+                return Err(CommandError::new(2, "$dateDiff requires a document argument"));
+            };
+            let start_expression = options.get("startDate").ok_or_else(|| CommandError::new(2, "$dateDiff requires a 'startDate' field"))?;
+            let end_expression = options.get("endDate").ok_or_else(|| CommandError::new(2, "$dateDiff requires an 'endDate' field"))?;
+            let unit_expression = options.get("unit").ok_or_else(|| CommandError::new(2, "$dateDiff requires a 'unit' field"))?;
+            let offset = evaluate_timezone(document, options, variables)?;
+            let start_value = evaluate_expression_vars(document, start_expression, variables)?;
+            let end_value = evaluate_expression_vars(document, end_expression, variables)?;
+            let (Some(start), Some(end)) = (date_millis(&start_value, operator)?, date_millis(&end_value, operator)?)
+            else {
+                return Ok(BsonValue::Null);
+            };
+            let unit = match evaluate_expression_vars(document, unit_expression, variables)? {
+                BsonValue::String(name) => DateUnit::parse(&name, operator)?,
+                other => return Err(CommandError::new(2, format!("$dateDiff unit must be a string, found: {}", bson_type_name(&other)))),
+            };
+            let start_of_week = parse_start_of_week(options, operator)?;
+            let start_local = local_millis(DateValue { millis: start, offset })?;
+            let end_local = local_millis(DateValue { millis: end, offset })?;
+            let start_civil = CivilDateTime::from_millis(start_local);
+            let end_civil = CivilDateTime::from_millis(end_local);
+            let difference = match unit {
+                DateUnit::Year => end_civil.year - start_civil.year,
+                DateUnit::Quarter => {
+                    (end_civil.year * 4 + i64::from((end_civil.month - 1) / 3))
+                        - (start_civil.year * 4 + i64::from((start_civil.month - 1) / 3))
+                }
+                DateUnit::Month => {
+                    (end_civil.year * 12 + i64::from(end_civil.month) - 1) - (start_civil.year * 12 + i64::from(start_civil.month) - 1)
+                }
+                DateUnit::Week => week_index(end_civil.days(), start_of_week) - week_index(start_civil.days(), start_of_week),
+                DateUnit::Day => end_civil.days() - start_civil.days(),
+                DateUnit::Hour => end_local.div_euclid(3_600_000) - start_local.div_euclid(3_600_000),
+                DateUnit::Minute => end_local.div_euclid(60_000) - start_local.div_euclid(60_000),
+                DateUnit::Second => end_local.div_euclid(1_000) - start_local.div_euclid(1_000),
+                DateUnit::Millisecond => end_local - start_local,
+            };
+            Ok(count_value(difference))
+        }
+        "$dateTrunc" => {
+            let BsonValue::Document(options) = argument
+            else {
+                return Err(CommandError::new(2, "$dateTrunc requires a document argument"));
+            };
+            let date_expression = options.get("date").ok_or_else(|| CommandError::new(2, "$dateTrunc requires a 'date' field"))?;
+            let unit_expression = options.get("unit").ok_or_else(|| CommandError::new(2, "$dateTrunc requires a 'unit' field"))?;
+            let offset = evaluate_timezone(document, options, variables)?;
+            let start_of_week = parse_start_of_week(options, operator)?;
+            let bin_size = match options.get("binSize") {
+                Some(expression) => match integral_i64(&evaluate_expression_vars(document, expression, variables)?) {
+                    Some(number) if number > 0 => number,
+                    _ => return Err(CommandError::new(2, "$dateTrunc binSize must be a positive integer")),
+                },
+                None => 1,
+            };
+            let value = evaluate_expression_vars(document, date_expression, variables)?;
+            let Some(millis) = date_millis(&value, operator)?
+            else {
+                return Ok(BsonValue::Null);
+            };
+            let unit = match evaluate_expression_vars(document, unit_expression, variables)? {
+                BsonValue::String(name) => DateUnit::parse(&name, operator)?,
+                other => return Err(CommandError::new(2, format!("$dateTrunc unit must be a string, found: {}", bson_type_name(&other)))),
+            };
+            let local = local_millis(DateValue { millis, offset })?;
+            let truncated = truncate_local(local, unit, bin_size, start_of_week)?;
+            Ok(BsonValue::DateTime(
+                truncated
+                    .checked_sub(offset.seconds.checked_mul(1000).ok_or_else(|| CommandError::new(2, "timezone offset overflows"))?)
+                    .ok_or_else(|| CommandError::new(2, "date arithmetic overflows a 64-bit millisecond count"))?,
+            ))
+        }
+        "$dateFromString" => {
+            let BsonValue::Document(options) = argument
+            else {
+                return Err(CommandError::new(2, "$dateFromString requires a document argument"));
+            };
+            let string_expression =
+                options.get("dateString").ok_or_else(|| CommandError::new(2, "$dateFromString requires a 'dateString' field"))?;
+            let value = evaluate_expression_vars(document, string_expression, variables)?;
+            let text = match value {
+                BsonValue::Null | BsonValue::Undefined => {
+                    return match options.get("onNull") {
+                        Some(expression) => evaluate_expression_vars(document, expression, variables),
+                        None => Ok(BsonValue::Null),
+                    };
+                }
+                BsonValue::String(text) => text,
+                other => {
+                    let message = format!("$dateFromString requires a string, found: {}", bson_type_name(&other));
+                    return match options.get("onError") {
+                        Some(expression) => evaluate_expression_vars(document, expression, variables),
+                        None => Err(CommandError::new(40516, message)),
+                    };
+                }
+            };
+            let offset = evaluate_timezone(document, options, variables)?;
+            let parsed = match options.get("format") {
+                Some(expression) => match evaluate_expression_vars(document, expression, variables)? {
+                    BsonValue::String(format) => parse_formatted_datetime(&text, &format),
+                    other => Err(format!("format must be a string, found: {}", bson_type_name(&other))),
+                },
+                None => parse_iso_datetime(&text),
+            };
+            match parsed {
+                Ok((local, embedded)) => {
+                    let shift = embedded.unwrap_or(offset.seconds);
+                    let millis = local
+                        .checked_sub(shift.checked_mul(1000).ok_or_else(|| CommandError::new(2, "timezone offset overflows"))?)
+                        .ok_or_else(|| CommandError::new(2, "date arithmetic overflows a 64-bit millisecond count"))?;
+                    Ok(BsonValue::DateTime(millis))
+                }
+                Err(message) => match options.get("onError") {
+                    Some(expression) => evaluate_expression_vars(document, expression, variables),
+                    None => Err(CommandError::new(40516, format!("$dateFromString could not parse \"{text}\": {message}"))),
+                },
+            }
+        }
+        other => unreachable!("evaluate_date_operator called with {other}"),
+    }
+}
+
+/// 按 `$dateToString` 的格式串渲染日期。
+///
+/// 支持的占位符：`%Y %m %d %H %M %S %L %j %w %u %U %V %G %z %Z %%`。其余
+/// 占位符按不支持处理，具体错误码与措辞待真机核对。
+fn format_date(civil: &CivilDateTime, format: &str, offset: FixedOffset) -> Result<String, CommandError> {
+    let mut output = String::new();
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            output.push(character);
+            continue;
+        }
+        let specifier = characters.next().ok_or_else(|| CommandError::new(18536, "$dateToString format ends with a lone '%'"))?;
+        match specifier {
+            'Y' => output.push_str(&format!("{:04}", civil.year)),
+            'm' => output.push_str(&format!("{:02}", civil.month)),
+            'd' => output.push_str(&format!("{:02}", civil.day)),
+            'H' => output.push_str(&format!("{:02}", civil.hour)),
+            'M' => output.push_str(&format!("{:02}", civil.minute)),
+            'S' => output.push_str(&format!("{:02}", civil.second)),
+            'L' => output.push_str(&format!("{:03}", civil.millisecond)),
+            'j' => output.push_str(&format!("{:03}", civil.day_of_year())),
+            'w' => output.push_str(&format!("{:01}", civil.day_of_week())),
+            'u' => output.push_str(&format!("{:01}", civil.iso_day_of_week())),
+            'U' => output.push_str(&format!("{:02}", civil.week_of_year())),
+            'V' => output.push_str(&format!("{:02}", civil.iso_week().1)),
+            'G' => output.push_str(&format!("{:04}", civil.iso_week().0)),
+            'z' => output.push_str(&offset.text()),
+            'Z' => output.push_str(&offset.seconds.div_euclid(60).to_string()),
+            '%' => output.push('%'),
+            other => return Err(CommandError::new(18536, format!("unrecognized format specifier: %{other}"))),
+        }
+    }
+    Ok(output)
+}
+
+/// 解析 ISO-8601 日期时间，返回本地毫秒与串内自带的偏移秒数。
+///
+/// 支持 `YYYY-MM-DD`、可选的 `THH:MM[:SS[.fff]]` 与可选的 `Z` / `±HH[:MM]`。
+/// 闰秒、负年份与扩展年份不支持；具体报错文案待真机核对。
+fn parse_iso_datetime(text: &str) -> Result<(i64, Option<i64>), String> {
+    let text = text.trim();
+    let separator = text.find(['T', 't', ' ']);
+    let (date_part, time_part) = match separator {
+        Some(index) => (&text[..index], Some(&text[index + 1..])),
+        None => (text, None),
+    };
+    if date_part.len() != 10 || !date_part.is_ascii() {
+        return Err(format!("cannot parse \"{text}\" as an ISO-8601 date"));
+    }
+    let bytes = date_part.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return Err(format!("cannot parse \"{text}\" as an ISO-8601 date"));
+    }
+    let year: i64 = date_part[0..4].parse().map_err(|_| format!("cannot parse year in \"{text}\""))?;
+    let month: u32 = date_part[5..7].parse().map_err(|_| format!("cannot parse month in \"{text}\""))?;
+    let day: u32 = date_part[8..10].parse().map_err(|_| format!("cannot parse day in \"{text}\""))?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, i64::from(month)) as u32 {
+        return Err(format!("date out of range in \"{text}\""));
+    }
+    let (hour, minute, second, millisecond, offset) = match time_part {
+        Some(rest) => parse_clock_with_zone(rest, text)?,
+        None => (0, 0, 0, 0, None),
+    };
+    let local = CivilDateTime { year, month, day, hour, minute, second, millisecond }.to_millis();
+    Ok((local, offset))
+}
+
+/// 解析 `HH:MM[:SS[.fff]]` 与其后的时区偏移。
+fn parse_clock_with_zone(text: &str, original: &str) -> Result<(u32, u32, u32, u32, Option<i64>), String> {
+    let (clock, offset) = if text.ends_with('Z') || text.ends_with('z') {
+        (&text[..text.len() - 1], Some(0))
+    }
+    else {
+        match text[1..].find(['+', '-']).map(|index| index + 1) {
+            Some(index) => {
+                let offset = FixedOffset::parse(&text[index..]).map_err(|error| error.message)?;
+                (&text[..index], Some(offset.seconds))
+            }
+            None => (text, None),
+        }
+    };
+    let mut parts = clock.split(':');
+    let hour: u32 = parts
+        .next()
+        .ok_or_else(|| format!("missing hour in \"{original}\""))?
+        .parse()
+        .map_err(|_| format!("cannot parse hour in \"{original}\""))?;
+    let minute: u32 = parts
+        .next()
+        .ok_or_else(|| format!("missing minute in \"{original}\""))?
+        .parse()
+        .map_err(|_| format!("cannot parse minute in \"{original}\""))?;
+    let (second, millisecond) = match parts.next() {
+        Some(part) => {
+            let (second_text, fraction) = match part.split_once('.') {
+                Some((second, fraction)) => (second, Some(fraction)),
+                None => (part, None),
+            };
+            let second: u32 = second_text.parse().map_err(|_| format!("cannot parse second in \"{original}\""))?;
+            let millisecond = match fraction {
+                Some(fraction) => {
+                    if fraction.is_empty() || fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err(format!("cannot parse fractional seconds in \"{original}\""));
+                    }
+                    let digits: String = format!("{fraction:0<3}").chars().take(3).collect();
+                    digits.parse().map_err(|_| format!("cannot parse fractional seconds in \"{original}\""))?
+                }
+                None => 0,
+            };
+            (second, millisecond)
+        }
+        None => (0, 0),
+    };
+    if parts.next().is_some() {
+        return Err(format!("trailing time components in \"{original}\""));
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(format!("time out of range in \"{original}\""));
+    }
+    Ok((hour, minute, second, millisecond, offset))
+}
+
+/// 按格式串解析日期时间。
+///
+/// 只支持 `%Y %m %d %H %M %S %L %z %Z %%`，且数字宽度按输出格式固定；其余
+/// 占位符与宽松匹配行为待真机核对。
+fn parse_formatted_datetime(text: &str, format: &str) -> Result<(i64, Option<i64>), String> {
+    let mut year = 1970i64;
+    let mut month = 1u32;
+    let mut day = 1u32;
+    let mut hour = 0u32;
+    let mut minute = 0u32;
+    let mut second = 0u32;
+    let mut millisecond = 0u32;
+    let mut offset = None;
+    let mut remaining = text;
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            let mut buffer = [0u8; 4];
+            let literal: &str = character.encode_utf8(&mut buffer);
+            remaining = remaining.strip_prefix(literal).ok_or_else(|| format!("expected '{character}' in \"{text}\""))?;
+            continue;
+        }
+        let specifier = characters.next().ok_or_else(|| "format ends with a lone '%'".to_string())?;
+        match specifier {
+            '%' => remaining = remaining.strip_prefix('%').ok_or_else(|| format!("expected '%' in \"{text}\""))?,
+            'z' | 'Z' => {
+                let (zone, rest) = parse_zone_prefix(remaining)?;
+                offset = Some(zone);
+                remaining = rest;
+            }
+            'Y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'L' => {
+                let width = if specifier == 'Y' {
+                    4
+                }
+                else if specifier == 'L' {
+                    3
+                }
+                else {
+                    2
+                };
+                let (digits, rest) = take_digits(remaining, width)?;
+                let number: u32 = digits.parse().map_err(|_| format!("cannot parse %{specifier} in \"{text}\""))?;
+                match specifier {
+                    'Y' => year = i64::from(number),
+                    'm' => month = number,
+                    'd' => day = number,
+                    'H' => hour = number,
+                    'M' => minute = number,
+                    'S' => second = number,
+                    _ => millisecond = number,
+                }
+                remaining = rest;
+            }
+            other => return Err(format!("unrecognized format specifier: %{other}")),
+        }
+    }
+    if !remaining.is_empty() {
+        return Err(format!("trailing characters in \"{text}\""));
+    }
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, i64::from(month)) as u32 {
+        return Err(format!("date out of range in \"{text}\""));
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(format!("time out of range in \"{text}\""));
+    }
+    Ok((CivilDateTime { year, month, day, hour, minute, second, millisecond }.to_millis(), offset))
+}
+
+/// 从输入开头取固定宽度的 ASCII 数字。
+fn take_digits(text: &str, width: usize) -> Result<(&str, &str), String> {
+    if text.len() < width || !text.as_bytes()[..width].iter().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("expected {width} digits"));
+    }
+    Ok((&text[..width], &text[width..]))
+}
+
+/// 从输入开头取时区偏移，返回偏移秒数与剩余文本。
+fn parse_zone_prefix(text: &str) -> Result<(i64, &str), String> {
+    let bytes = text.as_bytes();
+    match bytes.first() {
+        Some(b'Z') | Some(b'z') => return Ok((0, &text[1..])),
+        Some(b'+') | Some(b'-') => {}
+        _ => return Err("missing timezone offset".to_string()),
+    }
+    let length = if text.len() >= 6 && bytes[3] == b':' {
+        6
+    }
+    else if text.len() >= 5 {
+        5
+    }
+    else if text.len() >= 3 {
+        3
+    }
+    else {
+        return Err("truncated timezone offset".to_string());
+    };
+    let offset = FixedOffset::parse(&text[..length]).map_err(|error| error.message)?;
+    Ok((offset.seconds, &text[length..]))
+}
+
+/// 按单位平移日期。年 / 季 / 月先落到目标月的同一天，超出月末则截到月末。
+fn add_date(value: DateValue, unit: DateUnit, amount: i64) -> Result<i64, CommandError> {
+    if unit.months() > 0 {
+        let civil = CivilDateTime::from_millis(local_millis(value)?);
+        let months =
+            amount.checked_mul(unit.months()).ok_or_else(|| CommandError::new(2, "date arithmetic overflows a 64-bit millisecond count"))?;
+        let total = civil
+            .year
+            .checked_mul(12)
+            .and_then(|total| total.checked_add(i64::from(civil.month) - 1))
+            .and_then(|total| total.checked_add(months))
+            .ok_or_else(|| CommandError::new(2, "date arithmetic overflows a 64-bit millisecond count"))?;
+        let year = total.div_euclid(12);
+        let month = (total.rem_euclid(12) + 1) as u32;
+        let day = civil.day.min(days_in_month(year, i64::from(month)) as u32);
+        let updated = CivilDateTime { year, month, day, ..civil };
+        let offset = value.offset.seconds.checked_mul(1000).ok_or_else(|| CommandError::new(2, "timezone offset overflows"))?;
+        return updated
+            .to_millis()
+            .checked_sub(offset)
+            .ok_or_else(|| CommandError::new(2, "date arithmetic overflows a 64-bit millisecond count"));
+    }
+    let unit_millis = match unit {
+        DateUnit::Week => 7 * 86_400_000,
+        DateUnit::Day => 86_400_000,
+        DateUnit::Hour => 3_600_000,
+        DateUnit::Minute => 60_000,
+        DateUnit::Second => 1_000,
+        _ => 1,
+    };
+    let delta = amount.checked_mul(unit_millis).ok_or_else(|| CommandError::new(2, "date arithmetic overflows a 64-bit millisecond count"))?;
+    value.millis.checked_add(delta).ok_or_else(|| CommandError::new(2, "date arithmetic overflows a 64-bit millisecond count"))
+}
+
+/// 以 `startOfWeek` 为界，把本地天数折算成周序号。
+fn week_index(days: i64, start_of_week: i64) -> i64 {
+    // 1970-01-01 是星期四，Sunday 记 1 时为 5。
+    let reference = start_of_week - 5;
+    (days - reference).div_euclid(7)
+}
+
+/// `$dateTrunc` 的参考点是本地时间 2000-01-01T00:00:00，按 `binSize` 向下取整。
+fn truncate_local(local: i64, unit: DateUnit, bin_size: i64, start_of_week: i64) -> Result<i64, CommandError> {
+    let reference_days = days_from_civil(2000, 1, 1);
+    let reference_millis = reference_days * 86_400_000;
+    let zero = |year: i64, month: u32| CivilDateTime { year, month, day: 1, hour: 0, minute: 0, second: 0, millisecond: 0 };
+    Ok(match unit {
+        DateUnit::Year => {
+            let civil = CivilDateTime::from_millis(local);
+            let index = (civil.year - 2000).div_euclid(bin_size);
+            zero(2000 + index * bin_size, 1).to_millis()
+        }
+        DateUnit::Quarter => {
+            let civil = CivilDateTime::from_millis(local);
+            let index = (civil.year - 2000) * 4 + i64::from((civil.month - 1) / 3);
+            let start = index.div_euclid(bin_size) * bin_size;
+            zero(2000 + start.div_euclid(4), (start.rem_euclid(4) * 3 + 1) as u32).to_millis()
+        }
+        DateUnit::Month => {
+            let civil = CivilDateTime::from_millis(local);
+            let index = (civil.year - 2000) * 12 + i64::from(civil.month) - 1;
+            let start = index.div_euclid(bin_size) * bin_size;
+            zero(2000 + start.div_euclid(12), (start.rem_euclid(12) + 1) as u32).to_millis()
+        }
+        DateUnit::Week => {
+            let days = local.div_euclid(86_400_000);
+            let reference_week = reference_days - (sunday_day_of_week(reference_days) - start_of_week).rem_euclid(7);
+            let index = (days - reference_week).div_euclid(7 * bin_size);
+            (reference_week + index * 7 * bin_size)
+                .checked_mul(86_400_000)
+                .ok_or_else(|| CommandError::new(2, "$dateTrunc result overflows a 64-bit millisecond count"))?
+        }
+        DateUnit::Day | DateUnit::Hour | DateUnit::Minute | DateUnit::Second | DateUnit::Millisecond => {
+            let unit_millis = match unit {
+                DateUnit::Day => 86_400_000,
+                DateUnit::Hour => 3_600_000,
+                DateUnit::Minute => 60_000,
+                DateUnit::Second => 1_000,
+                _ => 1,
+            };
+            let index = (local - reference_millis).div_euclid(unit_millis * bin_size);
+            reference_millis
+                .checked_add(
+                    index
+                        .checked_mul(unit_millis * bin_size)
+                        .ok_or_else(|| CommandError::new(2, "$dateTrunc result overflows a 64-bit millisecond count"))?,
+                )
+                .ok_or_else(|| CommandError::new(2, "$dateTrunc result overflows a 64-bit millisecond count"))?
+        }
+    })
 }
 
 /// Aggregation truthiness: `false`, `0`, `null`, and missing are false.
