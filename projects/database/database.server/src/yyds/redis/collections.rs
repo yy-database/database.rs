@@ -56,6 +56,13 @@ impl KeyKind {
         }
     }
 
+    /// `SCAN TYPE` 选项里的类型名，未知名称返回 `None`。
+    ///
+    /// 真机对未知类型名不回错误，只是没有任何键能命中，调用方据此过滤掉全部键。
+    pub(crate) fn from_name(name: &[u8]) -> Option<KeyKind> {
+        KeyKind::ALL.into_iter().find(|kind| kind.name().as_bytes().eq_ignore_ascii_case(name))
+    }
+
     /// 该类型使用的存储命名空间。
     ///
     /// 字符串沿用调用方传入的逻辑库命名空间，其它类型加类型后缀，因此既有数据无需迁移。

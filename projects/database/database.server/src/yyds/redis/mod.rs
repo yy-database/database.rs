@@ -168,6 +168,28 @@ pub fn execute_string_command(
     connection::write_unknown_command(stream, arguments)
 }
 
+/// Executes one keyspace-family request and writes the RESP reply.
+///
+/// `KEYS` / `SCAN` / `TYPE` / `OBJECT` 语义、回复分帧与类型探测都留在上游连接处理器，
+/// 调用方只提供逻辑库命名空间、协议版本与键值后端，嵌入宿主不必再实现键枚举、
+/// 游标分批或对象编码判定。
+pub fn execute_keyspace_command(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    executor: &dyn KeyValueExecutor,
+    namespace: &database_types::cluster::Namespace,
+    protocol: u8,
+) -> io::Result<()> {
+    let request = resp::Request {
+        arguments: arguments.to_vec(),
+        consumed: 0,
+    };
+    if connection::handle_keyspace(stream, &request, Some(executor), Some(executor), None, namespace, protocol)? {
+        return Ok(());
+    }
+    connection::write_unknown_command(stream, arguments)
+}
+
 /// Banner shown when a disguise server starts.
 pub fn startup_banner(port: u16) -> String {
     protocol_startup_banner(&GatewayConfig::new(GATEWAY_KIND).with_port(port))

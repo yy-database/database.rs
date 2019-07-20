@@ -1114,11 +1114,12 @@ fn class_match(pattern: &[u8], byte: u8) -> Option<(usize, bool)> {
     Some((index, if negated { !matched } else { matched }))
 }
 
-/// `SCAN cursor [MATCH pattern] [COUNT count]`。
+/// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`。
 ///
 /// 游标是「已检查键数」的十进制下标：每次返回 `COUNT` 个键（不足则到末尾），返回 0
 /// 表示迭代结束。所有值类型都参与扫描，键按字节序合并后去重，因此一次调用不保证
-/// 返回全部键，但持续回传游标直到 0 能覆盖当前键空间。
+/// 返回全部键，但持续回传游标直到 0 能覆盖当前键空间。`TYPE` 只筛出该类型的键；
+/// 真机对未知类型名不回错误，只是没有任何键能命中，这里同样返回空结果。
 fn handle_scan(
     stream: &mut dyn Write,
     request: &Request<'_>,
@@ -1147,6 +1148,7 @@ fn handle_scan(
         return Ok(());
     };
     let mut pattern: Option<Vec<u8>> = None;
+    let mut kind_filter: Option<Option<KeyKind>> = None;
     let mut count = 10usize;
     let mut index = 2;
     while index < request.arguments.len() {
@@ -1158,16 +1160,21 @@ fn handle_scan(
             pattern = Some(request.arguments[index + 1].to_vec());
         }
         else if request.arguments[index].eq_ignore_ascii_case(b"COUNT") {
-            let Ok(value) = std::str::from_utf8(request.arguments[index + 1]).unwrap_or("").parse::<u64>()
+            // 真机把越界的 COUNT 报成整数错误，把非正数报成语法错误，两者不能混用。
+            let Ok(value) = std::str::from_utf8(request.arguments[index + 1]).unwrap_or("").parse::<i64>()
             else {
-                write_error(stream, "syntax error")?;
+                write_error(stream, "value is not an integer or out of range")?;
                 return Ok(());
             };
-            if value == 0 {
+            if value <= 0 {
                 write_error(stream, "syntax error")?;
                 return Ok(());
             }
-            count = value.min(usize::MAX as u64) as usize;
+            count = usize::try_from(value).unwrap_or(usize::MAX);
+        }
+        else if request.arguments[index].eq_ignore_ascii_case(b"TYPE") {
+            // 未知类型名在真机上不是错误，只是筛不出任何键，所以这里保留 `None` 并继续过滤。
+            kind_filter = Some(KeyKind::from_name(request.arguments[index + 1]));
         }
         else {
             write_error(stream, "syntax error")?;
@@ -1177,6 +1184,11 @@ fn handle_scan(
     }
     let mut keys: Vec<Vec<u8>> = Vec::new();
     for kind in KeyKind::ALL {
+        if let Some(filter) = kind_filter {
+            if filter != Some(kind) {
+                continue;
+            }
+        }
         match executor.execute_scan(None, &kind.namespace(namespace), &[], None, None, 0) {
             Ok(records) => keys.extend(records.into_iter().map(|(key, _)| key)),
             Err(error) => {
@@ -1581,6 +1593,76 @@ pub(crate) fn is_string_command(command: &[u8]) -> bool {
     )
 }
 
+/// 键空间族（`KEYS` / `SCAN` / `TYPE` / `OBJECT`）的命令清单。
+///
+/// 四个命令都只读键空间元信息：枚举键名、按游标分批返回、报告类型与对象编码。
+/// 它们与字符串共享同一套类型探测与过期判定，单独成族只是为了给绑定层一个稳定入口。
+pub(crate) fn is_keyspace_command(command: &[u8]) -> bool {
+    matches!(command, b"KEYS" | b"SCAN" | b"TYPE" | b"OBJECT")
+}
+
+/// 服务键空间族，返回 `false` 表示命令不属于该族。
+pub(crate) fn handle_keyspace(
+    stream: &mut dyn Write,
+    request: &Request<'_>,
+    executor: Option<&dyn KeyValueExecutor>,
+    probe: Option<&dyn KeyValueExecutor>,
+    tracker: Option<&KeyAccessTracker>,
+    namespace: &Namespace,
+    protocol: u8,
+) -> io::Result<bool> {
+    let command = request.arguments[0];
+    if !is_keyspace_command(command) {
+        return Ok(false);
+    }
+    let count = request.arguments.len();
+    if command.eq_ignore_ascii_case(b"TYPE") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 2 {
+            stream.write_all(b"-ERR wrong number of arguments for 'type' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Kind(kind) => stream.write_all(format!("+{}\r\n", kind.name()).as_bytes())?,
+            Resolved::Missing => stream.write_all(b"+none\r\n")?,
+            Resolved::Rejected => return Ok(true),
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"KEYS") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 2 {
+            write_error(stream, "wrong number of arguments for 'keys' command")?;
+            return Ok(true);
+        }
+        match collect_keys(executor, namespace) {
+            Ok(keys) => {
+                let matched: Vec<Vec<u8>> = keys.into_iter().filter(|key| glob_match(request.arguments[1], key)).collect();
+                stream.write_all(format!("*{}\r\n", matched.len()).as_bytes())?;
+                for key in &matched {
+                    write_bulk(stream, key)?;
+                }
+            }
+            Err(message) => write_error(stream, &message)?,
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"SCAN") {
+        handle_scan(stream, request, executor, namespace)?;
+    }
+    else {
+        handle_object(stream, request, probe, tracker, namespace, protocol)?;
+    }
+    Ok(true)
+}
+
 /// Serves the string and key family, returning `false` when the command belongs to a
 /// different family so the caller keeps dispatching.
 pub(crate) fn handle_string(
@@ -1596,6 +1678,11 @@ pub(crate) fn handle_string(
     let count = request.arguments.len();
     if !is_string_command(command) {
         return Ok(false);
+    }
+    // 键空间族的四个命令曾经散落在这条长链里，抽成独立族后仍从这里分派，
+    // 因此旧调用方（监听器与字符串绑定原语）行为不变。
+    if is_keyspace_command(command) {
+        return handle_keyspace(stream, request, executor, probe, tracker, namespace, protocol);
     }
     if command.eq_ignore_ascii_case(b"EXPIRE") || command.eq_ignore_ascii_case(b"PEXPIRE") {
         let Some(executor) = executor
@@ -1916,23 +2003,6 @@ pub(crate) fn handle_string(
             }
         };
         write!(stream, ":{value}\r\n")?;
-    }
-    else if command.eq_ignore_ascii_case(b"TYPE") {
-        let Some(executor) = executor
-        else {
-            stream.write_all(b"-ERR unsupported command\r\n")?;
-            return Ok(true);
-        };
-        if count != 2 {
-            stream.write_all(b"-ERR wrong number of arguments for 'type' command\r\n")?;
-            return Ok(true);
-        }
-        let key = request.arguments[1];
-        match resolve_kind(stream, executor, namespace, key)? {
-            Resolved::Kind(kind) => stream.write_all(format!("+{}\r\n", kind.name()).as_bytes())?,
-            Resolved::Missing => stream.write_all(b"+none\r\n")?,
-            Resolved::Rejected => return Ok(true),
-        }
     }
     else if command.eq_ignore_ascii_case(b"STRLEN") {
         let Some(executor) = executor
@@ -2659,12 +2729,6 @@ pub(crate) fn handle_string(
         }
         write_bulk(stream, &value)?;
     }
-    else if command.eq_ignore_ascii_case(b"SCAN") {
-        handle_scan(stream, request, executor, namespace)?;
-    }
-    else if command.eq_ignore_ascii_case(b"OBJECT") {
-        handle_object(stream, request, probe, tracker, namespace, protocol)?;
-    }
     else if command.eq_ignore_ascii_case(b"RENAME") || command.eq_ignore_ascii_case(b"RENAMENX") {
         // Session / token rotation: the record moves together with its remaining deadline in
         // one shard-local durable commit, so no read-write-delete window can lose it and the
@@ -2785,27 +2849,6 @@ pub(crate) fn handle_string(
             }
         }
         write!(stream, ":{removed}\r\n")?;
-    }
-    else if command.eq_ignore_ascii_case(b"KEYS") {
-        let Some(executor) = executor
-        else {
-            stream.write_all(b"-ERR unsupported command\r\n")?;
-            return Ok(true);
-        };
-        if count != 2 {
-            write_error(stream, "wrong number of arguments for 'keys' command")?;
-            return Ok(true);
-        }
-        match collect_keys(executor, namespace) {
-            Ok(keys) => {
-                let matched: Vec<Vec<u8>> = keys.into_iter().filter(|key| glob_match(request.arguments[1], key)).collect();
-                stream.write_all(format!("*{}\r\n", matched.len()).as_bytes())?;
-                for key in &matched {
-                    write_bulk(stream, key)?;
-                }
-            }
-            Err(message) => write_error(stream, &message)?,
-        }
     }
     else if command.eq_ignore_ascii_case(b"RANDOMKEY") {
         let Some(executor) = executor
