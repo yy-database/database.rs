@@ -1149,33 +1149,46 @@ fn block_until<T>(
     }
 }
 
+/// 真机超时上限：秒换算成毫秒后不得超过 `i64::MAX`。
+const TIMEOUT_MAX_MILLIS: f64 = i64::MAX as f64;
+
+/// 按真机口径给阻塞超时分类。
+///
+/// 先按浮点秒解析，非数字回「不是浮点」，负值回「负数」，正值换算成毫秒后越过
+/// `i64::MAX` 回「越界」。零与负的亚毫秒值表示无限等待，正的亚毫秒值按最短 1 毫秒
+/// 处理，避免把极小正数误当成永久阻塞。`Ok(None)` 表示无限等待。
+fn classify_timeout(raw: &[u8]) -> Result<Option<Duration>, &'static str> {
+    let text = std::str::from_utf8(raw).map_err(|_| "timeout is not a float or out of range")?;
+    let seconds = text.parse::<f64>().map_err(|_| "timeout is not a float or out of range")?;
+    if seconds.is_nan() {
+        return Err("timeout is not a float or out of range");
+    }
+    if seconds < 0.0 {
+        return Err("timeout is negative");
+    }
+    let milliseconds = seconds * 1000.0;
+    if milliseconds > TIMEOUT_MAX_MILLIS {
+        return Err("timeout is out of range");
+    }
+    let whole = milliseconds.trunc();
+    if whole == 0.0 {
+        return Ok(if seconds > 0.0 { Some(Duration::from_millis(1)) } else { None });
+    }
+    Ok(Some(Duration::from_millis(whole as u64)))
+}
+
 /// 解析阻塞命令的超时参数。`0` 表示无限等待。
 ///
-/// 真机把超时按浮点秒解析，负数与非数字分别回不同的错误文案；返回 `None` 表示错误
-/// 已经写进连接。
+/// 真机把超时按浮点秒解析，负数、非数字与越界分别回不同的错误文案；返回 `None`
+/// 表示错误已经写进连接。
 fn parse_timeout(stream: &mut dyn io::Write, raw: &[u8]) -> io::Result<Option<Option<Duration>>> {
-    let Ok(text) = std::str::from_utf8(raw)
-    else {
-        write_error(stream, "timeout is not a float or out of range")?;
-        return Ok(None);
-    };
-    let Ok(value) = text.parse::<f64>()
-    else {
-        write_error(stream, "timeout is not a float or out of range")?;
-        return Ok(None);
-    };
-    if !value.is_finite() {
-        write_error(stream, "timeout is not a float or out of range")?;
-        return Ok(None);
+    match classify_timeout(raw) {
+        Ok(timeout) => Ok(Some(timeout)),
+        Err(message) => {
+            write_error(stream, message)?;
+            Ok(None)
+        }
     }
-    if value < 0.0 {
-        write_error(stream, "timeout is negative")?;
-        return Ok(None);
-    }
-    if value == 0.0 {
-        return Ok(Some(None));
-    }
-    Ok(Some(Some(Duration::from_secs_f64(value))))
 }
 
 /// 阻塞命令开始前的类型扫描。
@@ -3534,11 +3547,7 @@ fn parse_zset_combine_plan(
 
 /// 校验阻塞命令的 `timeout` 参数，返回真机的错误文案。
 fn validate_timeout(raw: &[u8]) -> Option<&'static str> {
-    match parse_score(raw) {
-        Some(value) if value < 0.0 => Some("timeout is negative"),
-        Some(_) => None,
-        None => Some("timeout is not a float or out of range"),
-    }
+    classify_timeout(raw).err()
 }
 
 /// 取一个 `0..bound` 的伪随机下标。
