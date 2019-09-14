@@ -11,7 +11,7 @@ use std::{
 
 use database_protocol_mongo::bson::{BinaryData, BsonDocument, BsonValue, encode_bson, integral_value, parse_bson, value_to_key};
 
-use database_protocol_mongo::json;
+use database_protocol_mongo::{decimal128::Decimal128, json};
 
 use crate::{
     cursor::{CursorStore, GetMoreError},
@@ -9249,6 +9249,8 @@ fn evaluate_expression_vars(
                 | "$dateFromParts" | "$dateAdd" | "$dateSubtract" | "$dateDiff" | "$dateTrunc" => {
                     evaluate_date_operator(document, operator, argument, variables)
                 }
+                "$toString" | "$toInt" | "$toLong" | "$toDouble" | "$toDecimal" | "$toBool" | "$toObjectId" | "$toDate" | "$type"
+                | "$convert" | "$isNumber" => evaluate_conversion_operator(document, operator, argument, variables),
                 "$size" => {
                     let value = evaluate_expression_vars(document, argument, variables)?;
                     match value {
@@ -9278,7 +9280,7 @@ fn evaluate_expression_vars(
                 other => Err(CommandError::new(
                     59,
                     format!(
-                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $toLower, $toUpper, $strLenCP, $strLenBytes, $substr, $substrBytes, $substrCP, $split, $trim, $ltrim, $rtrim, $indexOfCP, $indexOfBytes, $replaceOne, $replaceAll, $strcasecmp, $isArray, $arrayElemAt, $first, $last, $concatArrays, $reverseArray, $indexOfArray, $range, $slice, $year, $month, $dayOfMonth, $hour, $minute, $second, $millisecond, $dayOfWeek, $dayOfYear, $week, $isoWeek, $isoWeekYear, $isoDayOfWeek, $dateToString, $dateFromString, $dateToParts, $dateFromParts, $dateAdd, $dateSubtract, $dateDiff, $dateTrunc, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
+                        "unknown $project expression: {other} (supported: $add, $subtract, $multiply, $divide, $mod, $pow, $abs, $ceil, $floor, $round, $trunc, $sqrt, $concat, $toLower, $toUpper, $strLenCP, $strLenBytes, $substr, $substrBytes, $substrCP, $split, $trim, $ltrim, $rtrim, $indexOfCP, $indexOfBytes, $replaceOne, $replaceAll, $strcasecmp, $isArray, $arrayElemAt, $first, $last, $concatArrays, $reverseArray, $indexOfArray, $range, $slice, $year, $month, $dayOfMonth, $hour, $minute, $second, $millisecond, $dayOfWeek, $dayOfYear, $week, $isoWeek, $isoWeekYear, $isoDayOfWeek, $dateToString, $dateFromString, $dateToParts, $dateFromParts, $dateAdd, $dateSubtract, $dateDiff, $dateTrunc, $toString, $toInt, $toLong, $toDouble, $toDecimal, $toBool, $toObjectId, $toDate, $type, $convert, $isNumber, $cond, $ifNull, $size, $literal, $eq, $ne, $gt, $gte, $lt, $lte, $in, $and, $or, $not)"
                     ),
                 )),
             }
@@ -10664,6 +10666,323 @@ fn evaluate_date_operator(
         }
         other => unreachable!("evaluate_date_operator called with {other}"),
     }
+}
+
+/// 转换类算子的目标 BSON 类型。
+///
+/// 只覆盖 `$convert` 手册列出的标量目标；`binData` 需要子类型语义，当前
+/// 直接拒绝，缺口在待真机清单里跟踪。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConversionTarget {
+    Bool,
+    Date,
+    Decimal,
+    Double,
+    Int,
+    Long,
+    ObjectId,
+    String,
+}
+
+impl ConversionTarget {
+    /// 解析 `$convert` 的 `to` 类型别名。
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "bool" => Self::Bool,
+            "date" => Self::Date,
+            "decimal" => Self::Decimal,
+            "double" => Self::Double,
+            "int" => Self::Int,
+            "long" => Self::Long,
+            "objectId" => Self::ObjectId,
+            "string" => Self::String,
+            _ => return None,
+        })
+    }
+
+    /// 解析 `$convert` 的 `to` 数值类型码，沿用 BSON 元素编号。
+    fn from_code(code: i64) -> Option<Self> {
+        Some(match code {
+            1 => Self::Double,
+            2 => Self::String,
+            7 => Self::ObjectId,
+            8 => Self::Bool,
+            9 => Self::Date,
+            16 => Self::Int,
+            18 => Self::Long,
+            19 => Self::Decimal,
+            _ => return None,
+        })
+    }
+
+    /// 错误消息与 `$type` 输出共用的类型名。
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::Date => "date",
+            Self::Decimal => "decimal",
+            Self::Double => "double",
+            Self::Int => "int",
+            Self::Long => "long",
+            Self::ObjectId => "objectId",
+            Self::String => "string",
+        }
+    }
+}
+
+/// 求值转换类聚合算子。
+///
+/// `$toX` 是 `$convert` 的语法糖：`null` 与缺失返回 `null`，转换失败抛
+/// `ConversionFailure`（`241`）。`$convert` 额外支持 `onNull` / `onError`。
+/// `$type` 对缺失字段返回 `"missing"`，而当前表达式求值把缺失折叠成 `null`，
+/// 因此这里单独回查字段路径。精确错误码、错误措辞、`double` 的科学计数写法与
+/// 边界值处理均待真实 `mongod 8.0.9` 录制核对。
+fn evaluate_conversion_operator(
+    document: &BsonDocument,
+    operator: &str,
+    argument: &BsonValue,
+    variables: &ExpressionVariables,
+) -> Result<BsonValue, CommandError> {
+    match operator {
+        "$isNumber" => {
+            let value = evaluate_expression_vars(document, argument, variables)?;
+            Ok(BsonValue::Bool(matches!(value, BsonValue::Int32(_) | BsonValue::Int64(_) | BsonValue::Double(_) | BsonValue::Decimal128(_))))
+        }
+        "$type" => {
+            let value = evaluate_expression_vars(document, argument, variables)?;
+            // 缺失字段与显式 `undefined` 都按 `"missing"` 上报。
+            let missing = matches!(value, BsonValue::Undefined)
+                || matches!(argument, BsonValue::String(path)
+                    if path.starts_with('$') && !path.starts_with("$$") && lookup_field(document, &path[1..]).is_none());
+            Ok(BsonValue::String(if missing { "missing".to_string() } else { bson_type_name(&value).to_string() }))
+        }
+        "$convert" => evaluate_convert(document, argument, variables),
+        _ => {
+            let target = match operator {
+                "$toBool" => ConversionTarget::Bool,
+                "$toDate" => ConversionTarget::Date,
+                "$toDecimal" => ConversionTarget::Decimal,
+                "$toDouble" => ConversionTarget::Double,
+                "$toInt" => ConversionTarget::Int,
+                "$toLong" => ConversionTarget::Long,
+                "$toObjectId" => ConversionTarget::ObjectId,
+                _ => ConversionTarget::String,
+            };
+            let value = evaluate_expression_vars(document, argument, variables)?;
+            if matches!(value, BsonValue::Null | BsonValue::Undefined) {
+                return Ok(BsonValue::Null);
+            }
+            convert_value(&value, target)
+        }
+    }
+}
+
+/// 求值 `$convert: { input, to, onNull, onError }`。
+fn evaluate_convert(document: &BsonDocument, argument: &BsonValue, variables: &ExpressionVariables) -> Result<BsonValue, CommandError> {
+    let BsonValue::Document(options) = argument
+    else {
+        return Err(CommandError::new(2, "$convert requires an object argument"));
+    };
+    let input_expression = options.get("input").ok_or_else(|| CommandError::new(2, "$convert requires an 'input' field"))?;
+    let to_expression = options.get("to").ok_or_else(|| CommandError::new(2, "$convert requires a 'to' field"))?;
+    let target = match evaluate_expression_vars(document, to_expression, variables)? {
+        BsonValue::String(name) => {
+            ConversionTarget::parse(&name).ok_or_else(|| CommandError::new(2, format!("Unknown type name alias: {name}")))?
+        }
+        BsonValue::Document(_) => {
+            return Err(CommandError::new(2, "conversion to binData is not implemented"));
+        }
+        other => match integral_i64(&other) {
+            Some(code) => {
+                ConversionTarget::from_code(code).ok_or_else(|| CommandError::new(2, format!("Invalid numerical type code: {code}")))?
+            }
+            None => {
+                return Err(CommandError::new(
+                    2,
+                    format!("$convert 'to' must be a type name or a numeric type code, found: {}", bson_type_name(&other)),
+                ));
+            }
+        },
+    };
+    let value = evaluate_expression_vars(document, input_expression, variables)?;
+    if matches!(value, BsonValue::Null | BsonValue::Undefined) {
+        return match options.get("onNull") {
+            Some(expression) => evaluate_expression_vars(document, expression, variables),
+            None => Ok(BsonValue::Null),
+        };
+    }
+    match convert_value(&value, target) {
+        Ok(result) => Ok(result),
+        Err(error) => match options.get("onError") {
+            Some(expression) => evaluate_expression_vars(document, expression, variables),
+            None => Err(error),
+        },
+    }
+}
+
+/// 按目标类型转换一个非空值。
+fn convert_value(value: &BsonValue, target: ConversionTarget) -> Result<BsonValue, CommandError> {
+    match target {
+        ConversionTarget::Bool => convert_to_bool(value),
+        ConversionTarget::Date => convert_to_date(value),
+        ConversionTarget::Decimal => convert_to_decimal(value),
+        ConversionTarget::Double => convert_to_double(value),
+        ConversionTarget::Int => convert_to_integer(value, ConversionTarget::Int),
+        ConversionTarget::Long => convert_to_integer(value, ConversionTarget::Long),
+        ConversionTarget::ObjectId => convert_to_object_id(value),
+        ConversionTarget::String => convert_to_string(value),
+    }
+}
+
+fn conversion_failure(value: &BsonValue, target: ConversionTarget) -> CommandError {
+    CommandError::new(
+        241,
+        format!("Unsupported conversion from {} to {} in $convert with no onError value", bson_type_name(value), target.name()),
+    )
+}
+
+fn convert_to_bool(value: &BsonValue) -> Result<BsonValue, CommandError> {
+    let flag = match value {
+        BsonValue::Bool(flag) => *flag,
+        BsonValue::Int32(number) => *number != 0,
+        BsonValue::Int64(number) => *number != 0,
+        BsonValue::Double(number) => *number != 0.0,
+        BsonValue::Decimal128(decimal) => decimal.as_f64() != 0.0,
+        // 任何字符串（含空串）、日期与 ObjectId 都转成 `true`。
+        BsonValue::String(_) | BsonValue::DateTime(_) | BsonValue::ObjectId(_) => true,
+        other => return Err(conversion_failure(other, ConversionTarget::Bool)),
+    };
+    Ok(BsonValue::Bool(flag))
+}
+
+fn convert_to_date(value: &BsonValue) -> Result<BsonValue, CommandError> {
+    let millis = match value {
+        BsonValue::DateTime(millis) => *millis,
+        BsonValue::Timestamp { t, .. } => i64::from(*t) * 1000,
+        BsonValue::ObjectId(bytes) => i64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) * 1000,
+        BsonValue::Int32(number) => i64::from(*number),
+        BsonValue::Int64(number) => *number,
+        BsonValue::Double(number) => truncated_double(*number).ok_or_else(|| conversion_failure(value, ConversionTarget::Date))?,
+        BsonValue::Decimal128(decimal) => decimal.as_i64().ok_or_else(|| conversion_failure(value, ConversionTarget::Date))?,
+        BsonValue::String(text) => {
+            let (local, embedded) = parse_iso_datetime(text).map_err(|_| conversion_failure(value, ConversionTarget::Date))?;
+            local
+                .checked_sub(embedded.unwrap_or(0).checked_mul(1000).ok_or_else(|| conversion_failure(value, ConversionTarget::Date))?)
+                .ok_or_else(|| conversion_failure(value, ConversionTarget::Date))?
+        }
+        other => return Err(conversion_failure(other, ConversionTarget::Date)),
+    };
+    Ok(BsonValue::DateTime(millis))
+}
+
+fn convert_to_decimal(value: &BsonValue) -> Result<BsonValue, CommandError> {
+    let text = match value {
+        BsonValue::Bool(flag) => if *flag { "1" } else { "0" }.to_string(),
+        BsonValue::Int32(number) => number.to_string(),
+        BsonValue::Int64(number) => number.to_string(),
+        BsonValue::Double(number) => display_double(*number),
+        BsonValue::Decimal128(decimal) => return Ok(BsonValue::Decimal128(*decimal)),
+        BsonValue::String(text) => text.clone(),
+        BsonValue::DateTime(millis) => millis.to_string(),
+        other => return Err(conversion_failure(other, ConversionTarget::Decimal)),
+    };
+    Decimal128::from_str(&text).map(BsonValue::Decimal128).ok_or_else(|| conversion_failure(value, ConversionTarget::Decimal))
+}
+
+fn convert_to_double(value: &BsonValue) -> Result<BsonValue, CommandError> {
+    let number = match value {
+        BsonValue::Bool(flag) => {
+            if *flag {
+                1.0
+            }
+            else {
+                0.0
+            }
+        }
+        BsonValue::Int32(number) => f64::from(*number),
+        BsonValue::Int64(number) => *number as f64,
+        BsonValue::Double(number) => *number,
+        BsonValue::Decimal128(decimal) => decimal.as_f64(),
+        BsonValue::String(text) => text.parse::<f64>().map_err(|_| conversion_failure(value, ConversionTarget::Double))?,
+        BsonValue::DateTime(millis) => *millis as f64,
+        other => return Err(conversion_failure(other, ConversionTarget::Double)),
+    };
+    Ok(BsonValue::Double(number))
+}
+
+fn convert_to_integer(value: &BsonValue, target: ConversionTarget) -> Result<BsonValue, CommandError> {
+    let number = match value {
+        BsonValue::Bool(flag) => i64::from(*flag),
+        BsonValue::Int32(number) => i64::from(*number),
+        BsonValue::Int64(number) => *number,
+        BsonValue::Double(number) => truncated_double(*number).ok_or_else(|| conversion_failure(value, target))?,
+        BsonValue::Decimal128(decimal) => {
+            decimal.as_i64().or_else(|| truncated_double(decimal.as_f64())).ok_or_else(|| conversion_failure(value, target))?
+        }
+        BsonValue::String(text) => text.parse::<i64>().map_err(|_| conversion_failure(value, target))?,
+        BsonValue::DateTime(millis) => *millis,
+        other => return Err(conversion_failure(other, target)),
+    };
+    match target {
+        ConversionTarget::Int => i32::try_from(number).map(BsonValue::Int32).map_err(|_| conversion_failure(value, target)),
+        _ => Ok(BsonValue::Int64(number)),
+    }
+}
+
+fn convert_to_object_id(value: &BsonValue) -> Result<BsonValue, CommandError> {
+    match value {
+        BsonValue::ObjectId(bytes) => Ok(BsonValue::ObjectId(*bytes)),
+        BsonValue::String(text) if text.len() == 24 => {
+            let mut bytes = [0_u8; 12];
+            for (index, slot) in bytes.iter_mut().enumerate() {
+                let pair = &text[index * 2..index * 2 + 2];
+                *slot = u8::from_str_radix(pair, 16).map_err(|_| conversion_failure(value, ConversionTarget::ObjectId))?;
+            }
+            Ok(BsonValue::ObjectId(bytes))
+        }
+        other => Err(conversion_failure(other, ConversionTarget::ObjectId)),
+    }
+}
+
+fn convert_to_string(value: &BsonValue) -> Result<BsonValue, CommandError> {
+    let text = match value {
+        BsonValue::String(text) => text.clone(),
+        BsonValue::Bool(flag) => if *flag { "true" } else { "false" }.to_string(),
+        BsonValue::Int32(number) => number.to_string(),
+        BsonValue::Int64(number) => number.to_string(),
+        BsonValue::Double(number) => display_double(*number),
+        BsonValue::Decimal128(decimal) => decimal.as_str(),
+        BsonValue::ObjectId(bytes) => hex_text(bytes),
+        BsonValue::DateTime(millis) => format_date(&CivilDateTime::from_millis(*millis), "%Y-%m-%dT%H:%M:%S.%LZ", FixedOffset::utc())?,
+        other => return Err(conversion_failure(other, ConversionTarget::String)),
+    };
+    Ok(BsonValue::String(text))
+}
+
+/// 按 `mongod` 的 `Double.toString()` 口径渲染双精度值。
+///
+/// 非有限值写成 `"NaN"` / `"Infinity"`；有限值交给 Rust 的最短往返表示，
+/// 其科学计数写法（`1e300` 与 `1E+300`）待真机核对。
+fn display_double(number: f64) -> String {
+    if number.is_nan() {
+        "NaN".to_string()
+    }
+    else if number.is_infinite() {
+        if number.is_sign_negative() { "-Infinity".to_string() } else { "Infinity".to_string() }
+    }
+    else {
+        number.to_string()
+    }
+}
+
+/// 双精度值截断到整数部分，超出 `i64` 或非有限值返回 `None`。
+fn truncated_double(number: f64) -> Option<i64> {
+    if !number.is_finite() {
+        return None;
+    }
+    let truncated = number.trunc();
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    if truncated >= -TWO_POW_63 && truncated < TWO_POW_63 { Some(truncated as i64) } else { None }
 }
 
 /// 按 `$dateToString` 的格式串渲染日期。

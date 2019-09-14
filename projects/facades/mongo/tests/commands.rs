@@ -958,6 +958,120 @@ fn date_expressions_propagate_null_and_reject_bad_operands() {
 }
 
 #[test]
+fn conversion_expressions_follow_the_manual() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![document(&[
+            ("_id", BsonValue::Int32(1)),
+            ("number", BsonValue::Int32(42)),
+            ("fraction", BsonValue::Double(2.9)),
+            ("negative", BsonValue::Double(-2.9)),
+            ("flag", BsonValue::Bool(true)),
+            ("id", BsonValue::ObjectId([0x01; 12])),
+            ("when", BsonValue::DateTime(1_614_834_367_008)),
+            ("digits", text("15")),
+        ])],
+    );
+
+    let row = expression_projection(
+        &store,
+        document(&[
+            ("_id", BsonValue::Int32(0)),
+            ("number_text", operator("$toString", text("$number"))),
+            ("flag_text", operator("$toString", text("$flag"))),
+            ("date_text", operator("$toString", text("$when"))),
+            ("id_text", operator("$toString", text("$id"))),
+            ("int_from_string", operator("$toInt", text("$digits"))),
+            ("int_from_double", operator("$toInt", text("$fraction"))),
+            ("int_from_negative", operator("$toInt", text("$negative"))),
+            ("long_from_bool", operator("$toLong", text("$flag"))),
+            ("double_from_int", operator("$toDouble", text("$number"))),
+            ("bool_from_zero", operator("$toBool", BsonValue::Int32(0))),
+            ("bool_from_string", operator("$toBool", text(""))),
+            ("id_from_string", operator("$toObjectId", text("010101010101010101010101"))),
+            ("date_from_string", operator("$toDate", text("2021-03-04T05:06:07.008Z"))),
+            ("date_from_id", operator("$toDate", text("$id"))),
+            ("decimal_type", operator("$type", operator("$toDecimal", text("$digits")))),
+            ("decimal_is_number", operator("$isNumber", operator("$toDecimal", text("$digits")))),
+            ("int_type", operator("$type", text("$number"))),
+            ("missing_type", operator("$type", text("$absent"))),
+            ("array_type", operator("$type", BsonValue::Array(vec![BsonValue::Int32(1)]))),
+            ("convert_text", operator("$convert", BsonValue::Document(document(&[("input", text("$number")), ("to", text("string"))])))),
+            ("convert_code", operator("$convert", BsonValue::Document(document(&[("input", text("$digits")), ("to", BsonValue::Int32(19))])))),
+            (
+                "convert_null",
+                operator(
+                    "$convert",
+                    BsonValue::Document(document(&[("input", BsonValue::Null), ("to", text("int")), ("onNull", text("none"))])),
+                ),
+            ),
+            (
+                "convert_error",
+                operator(
+                    "$convert",
+                    BsonValue::Document(document(&[("input", text("not-a-number")), ("to", text("int")), ("onError", text("bad"))])),
+                ),
+            ),
+            ("not_a_number", operator("$isNumber", text("$digits"))),
+            ("null_to_int", operator("$toInt", BsonValue::Null)),
+        ]),
+    );
+
+    assert_eq!(row.get("number_text"), Some(&text("42")));
+    assert_eq!(row.get("flag_text"), Some(&text("true")));
+    assert_eq!(row.get("date_text"), Some(&text("2021-03-04T05:06:07.008Z")));
+    assert_eq!(row.get("id_text"), Some(&text("010101010101010101010101")));
+    assert_eq!(row.get("int_from_string"), Some(&BsonValue::Int32(15)));
+    assert_eq!(row.get("int_from_double"), Some(&BsonValue::Int32(2)), "取整必须向零截断");
+    assert_eq!(row.get("int_from_negative"), Some(&BsonValue::Int32(-2)), "负数同样向零截断");
+    assert_eq!(row.get("long_from_bool"), Some(&BsonValue::Int64(1)));
+    assert_eq!(row.get("double_from_int"), Some(&BsonValue::Double(42.0)));
+    assert_eq!(row.get("bool_from_zero"), Some(&BsonValue::Bool(false)));
+    assert_eq!(row.get("bool_from_string"), Some(&BsonValue::Bool(true)), "空串也转成 true");
+    assert_eq!(row.get("id_from_string"), Some(&BsonValue::ObjectId([0x01; 12])));
+    assert_eq!(row.get("date_from_string"), Some(&BsonValue::DateTime(1_614_834_367_008)));
+    assert_eq!(row.get("date_from_id"), Some(&BsonValue::DateTime(16_843_009_000)), "ObjectId 取其时间戳部分");
+    assert_eq!(row.get("decimal_type"), Some(&text("decimal")));
+    assert_eq!(row.get("decimal_is_number"), Some(&BsonValue::Bool(true)));
+    assert_eq!(row.get("int_type"), Some(&text("int")));
+    assert_eq!(row.get("missing_type"), Some(&text("missing")), "缺失字段不能折叠成 null 类型");
+    assert_eq!(row.get("array_type"), Some(&text("array")));
+    assert_eq!(row.get("convert_text"), Some(&text("42")));
+    assert!(matches!(row.get("convert_code"), Some(BsonValue::Decimal128(_))), "数值类型码 19 表示 decimal");
+    assert_eq!(row.get("convert_null"), Some(&text("none")));
+    assert_eq!(row.get("convert_error"), Some(&text("bad")));
+    assert_eq!(row.get("not_a_number"), Some(&BsonValue::Bool(false)));
+    assert_eq!(row.get("null_to_int"), Some(&BsonValue::Null));
+}
+
+#[test]
+fn conversion_expressions_reject_impossible_conversions() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![document(&[("_id", BsonValue::Int32(1)), ("big", BsonValue::Int64(9_007_199_254_740_993)), ("nan", BsonValue::Double(f64::NAN))])],
+    );
+
+    let failure = |projection: BsonDocument| -> CommandError {
+        let aggregate = aggregate_pipeline("items", vec![stage("$project", BsonValue::Document(projection))]);
+        commands::aggregate(&aggregate, &store).expect_err("expression must fail")
+    };
+
+    assert_eq!(failure(document(&[("x", operator("$toInt", text("$big")))])).code, 241, "超出 int32 范围必须失败");
+    assert_eq!(failure(document(&[("x", operator("$toObjectId", text("0123")))])).code, 241);
+    assert_eq!(failure(document(&[("x", operator("$toInt", text("not-a-number")))])).code, 241);
+    assert_eq!(failure(document(&[("x", operator("$toString", BsonValue::Array(vec![BsonValue::Int32(1)])))])).code, 241);
+    assert_eq!(failure(document(&[("x", operator("$toLong", text("$nan")))])).code, 241);
+    assert_eq!(
+        failure(document(&[("x", operator("$convert", BsonValue::Document(document(&[("input", text("$big")), ("to", text("nope"))]))))])).code,
+        2
+    );
+}
+
+#[test]
 fn aggregate_rejects_unsupported_stages_even_after_match() {
     let store = store();
     let search = BsonValue::Document(document(&[("text", text("x"))]));
