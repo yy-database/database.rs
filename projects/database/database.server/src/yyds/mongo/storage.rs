@@ -120,6 +120,26 @@ impl MongoStorage for ExecutorStorage<'_> {
         Ok(documents.len())
     }
 
+    fn scan_reserved(&self, namespace: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        self.executor
+            .execute_scan(None, &Namespace(namespace.to_string()), prefix, None, None, 0)
+            .map_err(|error| StoreError::Shard(error.to_string()))
+    }
+
+    fn put_reserved(&self, namespace: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError> {
+        for (key, value) in entries {
+            self.write(namespace, key.clone(), value.clone())?;
+        }
+        Ok(entries.len())
+    }
+
+    fn reserved_has_entries(&self, namespace: &str) -> Result<bool, StoreError> {
+        self.executor
+            .execute_scan(None, &Namespace(namespace.to_string()), b"", None, None, 1)
+            .map(|records| !records.is_empty())
+            .map_err(|error| StoreError::Shard(error.to_string()))
+    }
+
     fn import(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError> {
         self.replace(namespace, documents)
     }

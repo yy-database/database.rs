@@ -546,9 +546,20 @@ pub fn insert(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
             write_errors.push(id_duplicate_error(&namespace, positions[*duplicate], &identifiers[*duplicate]));
         }
         for (position, (_, stored, _)) in candidates.iter().enumerate() {
-            if !report.duplicates.contains(&position) {
-                accepted_documents.push(stored.clone());
+            if report.duplicates.contains(&position) {
+                if ordered {
+                    break;
+                }
+                continue;
             }
+            accepted_documents.push(stored.clone());
+        }
+        if !index_specs.is_empty() {
+            let pairs: Vec<(BsonDocument, Vec<u8>)> = accepted_documents
+                .iter()
+                .filter_map(|document| document.get("_id").map(|identifier| (document.clone(), value_to_key(identifier))))
+                .collect();
+            write_index_entries(store, session.key(), &pairs, &index_specs)?;
         }
         report.inserted as usize
     }
@@ -829,17 +840,14 @@ enum Hint {
     Index(IndexSpec),
 }
 
-/// One equality/range bound the planner derives for an index key field.
+/// One equality or `$in` bound the executor actually probes on the leading key field.
 enum KeyBound {
     Full,
     Eq(BsonValue),
     In(Vec<BsonValue>),
-    NotEq(BsonValue),
-    Range { start: BsonValue, start_inclusive: bool, end: BsonValue, end_inclusive: bool },
 }
 
-/// `COUNT_SCAN` reports bounds as `startKey` / `endKey` documents instead of
-/// the rendered strings `IXSCAN` uses.
+/// Bounds rendered as `startKey` / `endKey` documents in plan output.
 struct CountRange {
     start: BsonValue,
     start_inclusive: bool,
@@ -851,7 +859,6 @@ struct FieldPlan {
     field: String,
     bound: KeyBound,
     count: CountRange,
-    residual: Option<BsonDocument>,
 }
 
 struct HintedPlan {
@@ -1046,103 +1053,8 @@ fn max_key_value() -> BsonValue {
     BsonValue::Document(document)
 }
 
-fn normalized_clause(field: &str, value: &BsonValue) -> BsonDocument {
-    let mut clause = BsonDocument::new();
-    let normalized = match value {
-        BsonValue::Document(operators) if has_operator(operators) => value.clone(),
-        other => {
-            let mut equality = BsonDocument::new();
-            equality.push("$eq".to_string(), other.clone());
-            BsonValue::Document(equality)
-        }
-    };
-    clause.push(field.to_string(), normalized);
-    clause
-}
-
-fn combine_clauses(clauses: Vec<BsonDocument>) -> BsonDocument {
-    if clauses.len() == 1 {
-        return clauses.into_iter().next().unwrap();
-    }
-    let mut combined = BsonDocument::new();
-    combined.push("$and".to_string(), BsonValue::Array(clauses.into_iter().map(BsonValue::Document).collect()));
-    combined
-}
-
 fn full_count_range() -> CountRange {
     CountRange { start: min_key_value(), start_inclusive: true, end: max_key_value(), end_inclusive: true }
-}
-
-/// Derives bounds for one key field from the top-level filter predicate.
-fn field_plan(field: &str, predicate: Option<&BsonValue>) -> FieldPlan {
-    let Some(predicate) = predicate
-    else {
-        return FieldPlan { field: field.to_string(), bound: KeyBound::Full, count: full_count_range(), residual: None };
-    };
-    let operators = match predicate {
-        BsonValue::Document(operators) if has_operator(operators) => operators,
-        other => {
-            return FieldPlan {
-                field: field.to_string(),
-                bound: KeyBound::Eq(other.clone()),
-                count: CountRange { start: other.clone(), start_inclusive: true, end: other.clone(), end_inclusive: true },
-                residual: None,
-            };
-        }
-    };
-    let residual = normalized_clause(field, predicate);
-    let get = |name: &str| operators.get(name);
-    if let Some(value) = get("$eq") {
-        return FieldPlan {
-            field: field.to_string(),
-            bound: KeyBound::Eq(value.clone()),
-            count: CountRange { start: value.clone(), start_inclusive: true, end: value.clone(), end_inclusive: true },
-            residual: if operators.fields.len() > 1 { Some(residual) } else { None },
-        };
-    }
-    if let Some(BsonValue::Array(values)) = get("$in") {
-        return FieldPlan { field: field.to_string(), bound: KeyBound::In(values.clone()), count: full_count_range(), residual: None };
-    }
-    if let Some(value) = get("$ne") {
-        return FieldPlan { field: field.to_string(), bound: KeyBound::NotEq(value.clone()), count: full_count_range(), residual: None };
-    }
-    if let Some(BsonValue::Bool(_)) = get("$exists") {
-        return FieldPlan { field: field.to_string(), bound: KeyBound::Full, count: full_count_range(), residual: Some(residual) };
-    }
-    if let Some(BsonValue::String(kind)) = get("$type") {
-        if kind == "number" {
-            let mut count = full_count_range();
-            count.start = BsonValue::Double(f64::NAN);
-            count.end = BsonValue::Double(f64::INFINITY);
-            return FieldPlan {
-                field: field.to_string(),
-                bound: KeyBound::Range {
-                    start: BsonValue::Double(f64::NAN),
-                    start_inclusive: true,
-                    end: BsonValue::Double(f64::INFINITY),
-                    end_inclusive: true,
-                },
-                count,
-                residual: None,
-            };
-        }
-        return FieldPlan { field: field.to_string(), bound: KeyBound::Full, count: full_count_range(), residual: Some(residual) };
-    }
-    let lower = get("$gt").map(|value| (value, false)).or_else(|| get("$gte").map(|value| (value, true)));
-    let upper = get("$lt").map(|value| (value, false)).or_else(|| get("$lte").map(|value| (value, true)));
-    if lower.is_some() || upper.is_some() {
-        let (start, start_inclusive) =
-            lower.map(|(value, inclusive)| (value.clone(), inclusive)).unwrap_or((BsonValue::Double(f64::NEG_INFINITY), false));
-        let (end, end_inclusive) =
-            upper.map(|(value, inclusive)| (value.clone(), inclusive)).unwrap_or((BsonValue::Double(f64::INFINITY), true));
-        return FieldPlan {
-            field: field.to_string(),
-            bound: KeyBound::Range { start: start.clone(), start_inclusive, end: end.clone(), end_inclusive },
-            count: CountRange { start, start_inclusive, end, end_inclusive },
-            residual: None,
-        };
-    }
-    FieldPlan { field: field.to_string(), bound: KeyBound::Full, count: full_count_range(), residual: Some(residual) }
 }
 
 fn field_holds_array(documents: &[BsonDocument], field: &str) -> bool {
@@ -1152,64 +1064,164 @@ fn field_holds_array(documents: &[BsonDocument], field: &str) -> bool {
     })
 }
 
-fn build_hinted_plan(documents: &[BsonDocument], spec: &IndexSpec, filter: &BsonDocument, sort: &[(String, i32)]) -> HintedPlan {
-    let mut fields = Vec::with_capacity(spec.key.fields.len());
-    for (field, _) in &spec.key.fields {
-        let predicate = filter.fields.iter().find(|(name, _)| name == field).map(|(_, value)| value);
-        fields.push(field_plan(field, predicate));
-    }
-    // A hinted partial index only keeps its bounds when the query is known to
-    // land inside the index filter; otherwise `mongod 8.0.9` falls back to a
-    // full index scan plus a residual FETCH filter.
-    if let Some(partial) = &spec.partial_filter_expression {
-        for plan in &mut fields {
-            if plan.residual.is_some() {
-                continue;
-            }
-            if let KeyBound::Eq(value) = &plan.bound {
-                let mut probe = BsonDocument::new();
-                probe.push(plan.field.clone(), value.clone());
-                if !document_matches(&probe, partial).unwrap_or(false)
-                    && let Some(predicate) = filter.get(&plan.field)
+/// 可执行的首键字段边界。
+///
+/// 只认等值与 `$in`：范围、`$ne`、`$exists`、正则等需要按 BSON 排序序切范围，
+/// 而索引项键目前按文档键编码拼接、不保证跨类型保序，所以这些条件如实退回
+/// `COLLSCAN`，不伪装成 `IXSCAN`。
+fn executable_field_plan(field: &str, predicate: Option<&BsonValue>) -> FieldPlan {
+    let full = || FieldPlan { field: field.to_string(), bound: KeyBound::Full, count: full_count_range() };
+    let equality = |value: &BsonValue| -> Option<FieldPlan> {
+        if matches!(value, BsonValue::Regex { .. }) || matches!(value, BsonValue::Document(document) if has_operator(document)) {
+            return None;
+        }
+        Some(FieldPlan {
+            field: field.to_string(),
+            bound: KeyBound::Eq(value.clone()),
+            count: CountRange { start: value.clone(), start_inclusive: true, end: value.clone(), end_inclusive: true },
+        })
+    };
+    let Some(predicate) = predicate
+    else {
+        return full();
+    };
+    match predicate {
+        BsonValue::Document(operators) if has_operator(operators) => {
+            if operators.fields.len() == 1 {
+                if let Some(value) = operators.get("$eq")
+                    && let Some(plan) = equality(value)
                 {
-                    plan.bound = KeyBound::Full;
-                    plan.count = full_count_range();
-                    plan.residual = Some(normalized_clause(&plan.field, predicate));
+                    return plan;
+                }
+                if let Some(BsonValue::Array(values)) = operators.get("$in")
+                    && values.iter().all(|value| {
+                        !matches!(value, BsonValue::Regex { .. }) && !matches!(value, BsonValue::Document(document) if has_operator(document))
+                    })
+                {
+                    return FieldPlan { field: field.to_string(), bound: KeyBound::In(values.clone()), count: full_count_range() };
                 }
             }
+            full()
+        }
+        BsonValue::Regex { .. } => full(),
+        other => equality(other).unwrap_or_else(full),
+    }
+}
+
+/// 构建执行器真正会消费的索引计划。
+///
+/// 只有首个键字段可以带探针边界；复合索引的后续字段一律按全范围报告，
+/// 因为执行器不会按第二字段切范围。`residual` 就是回表后实际应用的完整过滤
+/// 条件，`explain` 直接拿它渲染 `FETCH.filter`。
+fn build_hinted_plan(documents: &[BsonDocument], spec: &IndexSpec, filter: &BsonDocument, sort: &[(String, i32)]) -> HintedPlan {
+    let mut fields = Vec::with_capacity(spec.key.fields.len());
+    for (position, (field, _)) in spec.key.fields.iter().enumerate() {
+        if position == 0 {
+            fields.push(executable_field_plan(field, filter.get(field)));
+        }
+        else {
+            fields.push(FieldPlan { field: field.clone(), bound: KeyBound::Full, count: full_count_range() });
         }
     }
-    let mut residuals: Vec<BsonDocument> = fields.iter().filter_map(|plan| plan.residual.clone()).collect();
-    for (field, value) in &filter.fields {
-        if field.starts_with('$') || spec.key.fields.iter().any(|(name, _)| name == field) {
-            continue;
-        }
-        residuals.push(normalized_clause(field, value));
-    }
-    residuals.sort_by(|left, right| left.fields.first().map(|(name, _)| name.clone()).cmp(&right.fields.first().map(|(name, _)| name.clone())));
-    let residual = if residuals.is_empty() { BsonDocument::new() } else { combine_clauses(residuals) };
-    // A sort is served by the index only when it repeats the key pattern in
-    // the same or the exactly reversed direction.
-    let sort_covered = sort.is_empty()
-        || (sort.len() == spec.key.fields.len()
-            && sort.iter().zip(spec.key.fields.iter()).all(|((field, direction), (key_field, key_direction))| {
-                field == key_field
-                    && int_value(key_direction).map(|value| value as i32).is_some_and(|value| value == *direction || value == -*direction)
-            }));
-    let backward = !sort.is_empty()
-        && sort_covered
-        && sort.iter().zip(spec.key.fields.iter()).all(|((_, direction), (_, key_direction))| {
-            int_value(key_direction).map(|value| value as i32).is_some_and(|value| value == -*direction)
-        });
     let multi_paths = spec.key.fields.iter().map(|(field, _)| field_holds_array(documents, field)).collect::<Vec<_>>();
     HintedPlan {
         spec: spec.clone(),
         fields,
-        residual,
-        direction: if backward { "backward" } else { "forward" },
-        sort_covered,
+        residual: filter.clone(),
+        // 执行器没有按索引序反向扫描，也没有把排序交给索引：任何排序都在内存里做。
+        direction: "forward",
+        sort_covered: sort.is_empty(),
         is_multi_key: multi_paths.iter().any(|flag| *flag),
     }
+}
+
+/// `partialFilterExpression` 的每个字段都要求查询里有一条同字段等值条件，
+/// 复杂条件要求查询逐字包含同一条件；不满足就不用这个部分索引。
+fn query_implies_partial(filter: &BsonDocument, partial: &BsonDocument) -> bool {
+    partial.fields.iter().all(|(field, expected)| {
+        let Some(actual) = filter.get(field)
+        else {
+            return false;
+        };
+        match (plain_equality(actual), plain_equality(expected)) {
+            (Some(left), Some(right)) => compare_values(left, right) == Ordering::Equal,
+            _ => actual == expected,
+        }
+    })
+}
+
+fn plain_equality(value: &BsonValue) -> Option<&BsonValue> {
+    match value {
+        BsonValue::Document(operators) if has_operator(operators) => operators.get("$eq"),
+        other => Some(other),
+    }
+}
+
+/// 首个键字段的探针值；全范围扫描返回 `None`。
+fn plan_probes(plan: &HintedPlan) -> Option<Vec<BsonValue>> {
+    match plan.fields.first().map(|field| &field.bound) {
+        Some(KeyBound::Eq(value)) => Some(vec![value.clone()]),
+        Some(KeyBound::In(values)) => Some(values.clone()),
+        _ => None,
+    }
+}
+
+/// 这个索引计划能否被当前执行器如实执行。
+///
+/// 排序规则、稀疏索引的 null 等值、无法被查询蕴含的部分索引都会让索引项与
+/// 匹配语义不再一一对应，遇到这些情况一律退回 `COLLSCAN`。
+fn index_executable(plan: &HintedPlan, filter: &BsonDocument) -> bool {
+    let specification = &plan.spec;
+    if !specification.is_visible() || specification.collation.is_some() {
+        return false;
+    }
+    if specification.is_sparse() {
+        let Some(values) = plan_probes(plan)
+        else {
+            return false;
+        };
+        if values.iter().any(|value| matches!(value, BsonValue::Null | BsonValue::Undefined)) {
+            return false;
+        }
+    }
+    if let Some(partial) = &specification.partial_filter_expression
+        && !query_implies_partial(filter, partial)
+    {
+        return false;
+    }
+    true
+}
+
+/// 索引项是否已经真实落地。
+///
+/// 空索引可能来自旧目录未重建或中断的删除；此时无法区分「没有匹配」与
+/// 「条目缺失」，查询层退回集合扫描，保证结果完整。
+fn index_has_entries(store: &dyn MongoStorage, namespace: &str, specification: &IndexSpec) -> Result<bool, CommandError> {
+    store
+        .reserved_has_entries(&crate::storage::index_namespace(namespace, &specification.name))
+        .map_err(|error| CommandError::new(1, format!("index lookup failed: {error}")))
+}
+
+/// 没有显式 hint 时按过滤条件挑一个可执行索引：只看首个键字段上的等值/`$in`。
+fn automatic_index(store: &dyn MongoStorage, namespace: &str, filter: &BsonDocument) -> Result<Option<IndexSpec>, CommandError> {
+    let candidates: Vec<String> = filter.fields.iter().filter(|(field, _)| !field.starts_with('$')).map(|(field, _)| field.clone()).collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    for specification in store.index_specs(namespace)? {
+        let Some((first, _)) = specification.key.fields.first()
+        else {
+            continue;
+        };
+        if !candidates.iter().any(|field| field == first) {
+            continue;
+        }
+        let plan = build_hinted_plan(&[], &specification, filter, &[]);
+        if plan_probes(&plan).is_some() && index_executable(&plan, filter) && index_has_entries(store, namespace, &specification)? {
+            return Ok(Some(specification));
+        }
+    }
+    Ok(None)
 }
 
 fn bound_text(bound: &KeyBound, backward: bool) -> Vec<String> {
@@ -1217,49 +1229,7 @@ fn bound_text(bound: &KeyBound, backward: bool) -> Vec<String> {
         KeyBound::Full => vec![if backward { "[MaxKey, MinKey]".to_string() } else { "[MinKey, MaxKey]".to_string() }],
         KeyBound::Eq(value) => vec![format!("[{}, {}]", scalar_text(value), scalar_text(value))],
         KeyBound::In(values) => values.iter().map(|value| format!("[{}, {}]", scalar_text(value), scalar_text(value))).collect(),
-        KeyBound::NotEq(value) => {
-            vec![format!("[MinKey, {})", scalar_text(value)), format!("({}, MaxKey]", scalar_text(value))]
-        }
-        KeyBound::Range { start, start_inclusive, end, end_inclusive } => {
-            if backward {
-                vec![format!(
-                    "{}{}, {}{}",
-                    if *end_inclusive { "[" } else { "(" },
-                    scalar_text(end),
-                    scalar_text(start),
-                    if *start_inclusive { "]" } else { ")" }
-                )]
-            }
-            else {
-                vec![format!(
-                    "{}{}, {}{}",
-                    if *start_inclusive { "[" } else { "(" },
-                    scalar_text(start),
-                    scalar_text(end),
-                    if *end_inclusive { "]" } else { ")" }
-                )]
-            }
-        }
     }
-}
-
-fn bound_contains(bound: &KeyBound, value: &BsonValue) -> bool {
-    match bound {
-        KeyBound::Full => true,
-        KeyBound::Eq(expected) => compare_values(value, expected) == Ordering::Equal,
-        KeyBound::In(values) => values.iter().any(|expected| compare_values(value, expected) == Ordering::Equal),
-        KeyBound::NotEq(expected) => compare_values(value, expected) != Ordering::Equal,
-        KeyBound::Range { start, start_inclusive, end, end_inclusive } => {
-            let lower = compare_values(value, start);
-            let upper = compare_values(value, end);
-            (if *start_inclusive { lower != Ordering::Less } else { lower == Ordering::Greater })
-                && (if *end_inclusive { upper != Ordering::Greater } else { upper == Ordering::Less })
-        }
-    }
-}
-
-fn tuple_in_bounds(tuple: &[BsonValue], fields: &[FieldPlan]) -> bool {
-    tuple.iter().zip(fields.iter()).all(|(value, plan)| bound_contains(&plan.bound, value))
 }
 
 fn plan_key_pattern(plan: &HintedPlan) -> BsonDocument {
@@ -1331,15 +1301,7 @@ fn add_fetch_wrapper(stage: BsonDocument, filter: &BsonDocument) -> BsonDocument
 }
 
 fn hinted_find_plan(plan: &HintedPlan, documents: &[BsonDocument], skip: usize, limit: usize, sort: &[(String, i32)]) -> BsonDocument {
-    let mut stage = scan_stage_document(plan, documents, false);
-    if skip > 0 {
-        let mut skipped = BsonDocument::new();
-        skipped.push("stage".to_string(), BsonValue::String("SKIP".to_string()));
-        skipped.push("skipAmount".to_string(), count_value(skip as i64));
-        skipped.push("inputStage".to_string(), BsonValue::Document(stage));
-        stage = skipped;
-    }
-    stage = add_fetch_wrapper(stage, &plan.residual);
+    let mut stage = add_fetch_wrapper(scan_stage_document(plan, documents, false), &plan.residual);
     if !plan.sort_covered {
         let mut pattern = BsonDocument::new();
         for (field, direction) in sort {
@@ -1352,6 +1314,13 @@ fn hinted_find_plan(plan: &HintedPlan, documents: &[BsonDocument], skip: usize, 
         sorted.push("type".to_string(), BsonValue::String("simple".to_string()));
         sorted.push("inputStage".to_string(), BsonValue::Document(stage));
         stage = sorted;
+    }
+    if skip > 0 {
+        let mut skipped = BsonDocument::new();
+        skipped.push("stage".to_string(), BsonValue::String("SKIP".to_string()));
+        skipped.push("skipAmount".to_string(), count_value(skip as i64));
+        skipped.push("inputStage".to_string(), BsonValue::Document(stage));
+        stage = skipped;
     }
     if limit > 0 {
         let mut limited = BsonDocument::new();
@@ -1369,10 +1338,7 @@ fn hinted_find_plan(plan: &HintedPlan, documents: &[BsonDocument], skip: usize, 
 }
 
 fn hinted_count_plan(plan: &HintedPlan, documents: &[BsonDocument]) -> BsonDocument {
-    let mut stage = scan_stage_document(plan, documents, plan.residual.fields.is_empty());
-    if !plan.residual.fields.is_empty() {
-        stage = add_fetch_wrapper(stage, &plan.residual);
-    }
+    let stage = add_fetch_wrapper(scan_stage_document(plan, documents, false), &plan.residual);
     let mut counted = BsonDocument::new();
     counted.push("stage".to_string(), BsonValue::String("COUNT".to_string()));
     counted.push("inputStage".to_string(), BsonValue::Document(stage));
@@ -1399,73 +1365,57 @@ fn execution_base(stage: &str, advanced: i64, works: i64, eof: bool) -> BsonDocu
     document
 }
 
-fn scan_stats(plan: &HintedPlan, documents: &[BsonDocument], count_scan: bool, scanned: i64, works: i64, eof: bool) -> BsonDocument {
-    let mut stage = execution_base(if count_scan { "COUNT_SCAN" } else { "IXSCAN" }, scanned, works, eof);
-    for (field, value) in scan_stage_document(plan, documents, count_scan).fields.into_iter().skip(1) {
+/// 用执行器真实消费的账目渲染 `IXSCAN`。
+///
+/// `keys_examined` 与实际扫描的索引项数一致，`documents_examined` 与实际回表
+/// 次数一致；两者都由执行路径回填，不做按 limit 的提前收尾估算。
+fn index_scan_stage(plan: &HintedPlan, documents: &[BsonDocument], keys_examined: i64, documents_examined: i64) -> BsonDocument {
+    let mut stage = execution_base("IXSCAN", documents_examined, keys_examined + 1, true);
+    for (field, value) in scan_stage_document(plan, documents, false).fields.into_iter().skip(1) {
         stage.push(field, value);
     }
-    stage.push("keysExamined".to_string(), count_value(if count_scan { works } else { scanned }));
-    if !count_scan {
-        stage.push("seeks".to_string(), BsonValue::Int32(if scanned > 0 { 1 } else { 0 }));
-        stage.push("dupsTested".to_string(), BsonValue::Int32(0));
-        stage.push("dupsDropped".to_string(), BsonValue::Int32(0));
-    }
+    stage.push("keysExamined".to_string(), count_value(keys_examined));
+    stage.push("seeks".to_string(), BsonValue::Int32(if keys_examined > 0 { 1 } else { 0 }));
+    stage.push("dupsTested".to_string(), BsonValue::Int32(0));
+    stage.push("dupsDropped".to_string(), BsonValue::Int32(0));
     stage
 }
 
-/// Scans the hinted index conceptually: returns whether each selected key
-/// belongs to a document that passes the full filter, in catalog order.
-fn hinted_entries(documents: &[BsonDocument], plan: &HintedPlan, filter: &BsonDocument) -> Vec<bool> {
-    let mut entries = Vec::new();
-    for document in documents {
-        let matches = document_matches(document, filter).unwrap_or(false);
-        for tuple in index_entries(document, &plan.spec) {
-            if tuple_in_bounds(&tuple, &plan.fields) {
-                entries.push(matches);
-            }
-        }
-    }
-    entries
-}
-
-fn hinted_find_stats(
+fn reported_find_stats(
     plan: &HintedPlan,
     documents: &[BsonDocument],
-    filter: &BsonDocument,
+    keys_examined: i64,
+    documents_examined: i64,
+    matched: usize,
     skip: usize,
     limit: usize,
     all_plans: bool,
 ) -> BsonDocument {
-    let entries = hinted_entries(documents, plan, filter);
-    let keys = entries.len();
-    let scanned = if limit > 0 { (skip + limit).min(keys) } else { keys };
-    let skipped = skip.min(scanned);
-    let fetched = scanned - skipped;
-    let fetch_advanced = entries[skipped..scanned].iter().filter(|matched| **matched).count();
-    let returned = if limit > 0 { fetch_advanced.min(limit) } else { fetch_advanced };
-    // A satisfied LIMIT stops the scan without pulling the EOF key, even when
-    // the last key happened to exhaust the bounds.
-    let limit_satisfied = limit > 0 && fetch_advanced >= limit;
-    let eof = scanned == keys && !limit_satisfied;
-    let works = (scanned + usize::from(eof)) as i64;
-
-    let mut stage = scan_stats(plan, documents, false, scanned as i64, works, eof);
-    if skipped > 0 {
-        let mut skipped_stage = execution_base("SKIP", fetched as i64, works, eof);
-        skipped_stage.push("skipAmount".to_string(), count_value(skip as i64));
-        skipped_stage.push("inputStage".to_string(), BsonValue::Document(stage));
-        stage = skipped_stage;
-    }
-    let mut fetch = execution_base("FETCH", fetch_advanced as i64, works, eof);
+    let works = keys_examined + 1;
+    let mut stage = index_scan_stage(plan, documents, keys_examined, documents_examined);
+    let mut fetch = execution_base("FETCH", matched as i64, works, true);
     if !plan.residual.fields.is_empty() {
         fetch.push("filter".to_string(), BsonValue::Document(plan.residual.clone()));
     }
-    fetch.push("docsExamined".to_string(), count_value(fetched as i64));
+    fetch.push("docsExamined".to_string(), count_value(documents_examined));
     fetch.push("alreadyHasObj".to_string(), BsonValue::Int32(0));
     fetch.push("inputStage".to_string(), BsonValue::Document(stage));
     stage = fetch;
+    if !plan.sort_covered {
+        let mut sorted = execution_base("SORT", matched as i64, works, true);
+        sorted.push("inputStage".to_string(), BsonValue::Document(stage));
+        stage = sorted;
+    }
+    let after_skip = matched.saturating_sub(skip);
+    let returned = if limit > 0 { after_skip.min(limit) } else { after_skip };
+    if skip > 0 {
+        let mut skipped = execution_base("SKIP", after_skip as i64, works, true);
+        skipped.push("skipAmount".to_string(), count_value(skip as i64));
+        skipped.push("inputStage".to_string(), BsonValue::Document(stage));
+        stage = skipped;
+    }
     if limit > 0 {
-        let mut limited = execution_base("LIMIT", returned as i64, returned as i64 + 1, true);
+        let mut limited = execution_base("LIMIT", returned as i64, works, true);
         limited.push("limitAmount".to_string(), count_value(limit as i64));
         limited.push("inputStage".to_string(), BsonValue::Document(stage));
         stage = limited;
@@ -1479,8 +1429,8 @@ fn hinted_find_stats(
     stats.push("executionSuccess".to_string(), BsonValue::Bool(true));
     stats.push("nReturned".to_string(), count_value(returned as i64));
     stats.push("executionTimeMillis".to_string(), BsonValue::Int32(0));
-    stats.push("totalKeysExamined".to_string(), count_value(scanned as i64));
-    stats.push("totalDocsExamined".to_string(), count_value(fetched as i64));
+    stats.push("totalKeysExamined".to_string(), count_value(keys_examined));
+    stats.push("totalDocsExamined".to_string(), count_value(documents_examined));
     stats.push("executionStages".to_string(), BsonValue::Document(cached));
     if all_plans {
         stats.push("allPlansExecution".to_string(), BsonValue::Array(Vec::new()));
@@ -1488,42 +1438,30 @@ fn hinted_find_stats(
     stats
 }
 
-fn hinted_count_stats(
+fn reported_count_stats(
     plan: &HintedPlan,
     documents: &[BsonDocument],
-    filter: &BsonDocument,
+    keys_examined: i64,
+    documents_examined: i64,
+    matched: usize,
     skip: usize,
     limit: usize,
     all_plans: bool,
 ) -> BsonDocument {
-    let entries = hinted_entries(documents, plan, filter);
-    let keys = entries.len();
-    let scanned = if limit > 0 { (skip + limit).min(keys) } else { keys };
-    let works = (scanned + usize::from(scanned == keys)) as i64;
-    let eof = scanned == keys;
-    let count_scan = plan.residual.fields.is_empty();
-    let mut input = scan_stats(plan, documents, count_scan, scanned as i64, works, eof);
-    let fetch_advanced = if count_scan {
-        scanned
-    }
-    else {
-        let advanced = entries[..scanned].iter().filter(|matched| **matched).count();
-        let mut fetch = execution_base("FETCH", advanced as i64, works, eof);
+    let works = keys_examined + 1;
+    let mut input = index_scan_stage(plan, documents, keys_examined, documents_examined);
+    let mut fetch = execution_base("FETCH", matched as i64, works, true);
+    if !plan.residual.fields.is_empty() {
         fetch.push("filter".to_string(), BsonValue::Document(plan.residual.clone()));
-        fetch.push("docsExamined".to_string(), count_value(scanned as i64));
-        fetch.push("alreadyHasObj".to_string(), BsonValue::Int32(0));
-        fetch.push("inputStage".to_string(), BsonValue::Document(input));
-        input = fetch;
-        advanced
-    };
-    let skipped = skip.min(scanned);
-    let skipped_matches = entries[..skipped].iter().filter(|matched| **matched).count();
-    let available = fetch_advanced - skipped_matches;
+    }
+    fetch.push("docsExamined".to_string(), count_value(documents_examined));
+    fetch.push("alreadyHasObj".to_string(), BsonValue::Int32(0));
+    fetch.push("inputStage".to_string(), BsonValue::Document(input));
+    input = fetch;
+    let skipped_matches = matched.min(skip);
+    let available = matched - skipped_matches;
     let counted = if limit > 0 { available.min(limit) } else { available };
-    let input_works = reply_count(&input, "works");
-    let input_eof = input.get("isEOF").and_then(integer_of).unwrap_or(1) != 0;
-    let count_works = input_works + i64::from(!input_eof);
-    let mut counted_stage = execution_base("COUNT", 0, count_works, true);
+    let mut counted_stage = execution_base("COUNT", 0, works + 1, true);
     counted_stage.push("nCounted".to_string(), count_value(counted as i64));
     counted_stage.push("nSkipped".to_string(), count_value(skipped_matches as i64));
     counted_stage.push("inputStage".to_string(), BsonValue::Document(input));
@@ -1536,13 +1474,114 @@ fn hinted_count_stats(
     stats.push("executionSuccess".to_string(), BsonValue::Bool(true));
     stats.push("nReturned".to_string(), BsonValue::Int32(0));
     stats.push("executionTimeMillis".to_string(), BsonValue::Int32(0));
-    stats.push("totalKeysExamined".to_string(), count_value(if count_scan { works } else { scanned as i64 }));
-    stats.push("totalDocsExamined".to_string(), count_value(if count_scan { 0 } else { scanned as i64 }));
+    stats.push("totalKeysExamined".to_string(), count_value(keys_examined));
+    stats.push("totalDocsExamined".to_string(), count_value(documents_examined));
     stats.push("executionStages".to_string(), BsonValue::Document(cached));
     if all_plans {
         stats.push("allPlansExecution".to_string(), BsonValue::Array(Vec::new()));
     }
     stats
+}
+
+/// 执行器真实使用的访问路径。
+///
+/// `find`、`count`、`explain` 都先调用同一个 [`choose_access`]，因此
+/// `explain` 报告的结构就是执行器实际消费的结构，不存在「计划说 IXSCAN、
+/// 实际全表扫描」的第二份判断。
+enum QueryAccess {
+    /// 按编码 `_id` 顺序扫描整个集合，`direction` 为自然序方向。
+    Collection { direction: i32 },
+    /// 按索引项前缀探针读取候选文档，再回表复核完整过滤条件。
+    Index(HintedPlan),
+}
+
+/// 一次扫描的真实账目。
+struct ScanOutcome {
+    documents: Vec<BsonDocument>,
+    keys_examined: i64,
+    documents_examined: i64,
+}
+
+/// 决定一次查询走集合扫描还是索引探针。
+///
+/// 事务内的写入只暂存在文档命名空间，索引项在提交前不对外可见，因此事务内
+/// 一律走集合扫描，保证读到会话自己的未提交写入。
+fn choose_access(
+    store: &dyn MongoStorage,
+    namespace: &str,
+    filter: &BsonDocument,
+    hint: &Hint,
+    sort: &[(String, i32)],
+    documents: &[BsonDocument],
+    session: Option<&str>,
+) -> Result<QueryAccess, CommandError> {
+    if session.is_some() {
+        return Ok(QueryAccess::Collection { direction: 1 });
+    }
+    match hint {
+        Hint::Natural(direction) => Ok(QueryAccess::Collection { direction: *direction }),
+        Hint::Index(specification) => {
+            let plan = build_hinted_plan(documents, specification, filter, sort);
+            if index_executable(&plan, filter) && index_has_entries(store, namespace, specification)? {
+                Ok(QueryAccess::Index(plan))
+            }
+            else {
+                Ok(QueryAccess::Collection { direction: 1 })
+            }
+        }
+        Hint::None => match automatic_index(store, namespace, filter)? {
+            Some(specification) => Ok(QueryAccess::Index(build_hinted_plan(documents, &specification, filter, sort))),
+            None => Ok(QueryAccess::Collection { direction: 1 }),
+        },
+    }
+}
+
+/// 按访问路径执行一次真实扫描。
+fn scan_with_access(
+    store: &dyn MongoStorage,
+    namespace: &str,
+    filter: &BsonDocument,
+    access: &QueryAccess,
+    session: Option<&str>,
+    need_total: bool,
+) -> Result<ScanOutcome, CommandError> {
+    match access {
+        QueryAccess::Collection { .. } => {
+            let documents = collect_matching(store, namespace, filter, session)?;
+            let collection_size = if need_total { namespace_documents(store, namespace, session)?.len() as i64 } else { 0 };
+            Ok(ScanOutcome { documents, keys_examined: 0, documents_examined: collection_size })
+        }
+        QueryAccess::Index(plan) => {
+            let entry_namespace = crate::storage::index_namespace(namespace, &plan.spec.name);
+            let prefixes: Vec<Vec<u8>> = match plan_probes(plan) {
+                Some(values) => values.iter().map(|value| index_tuple(std::slice::from_ref(value))).collect(),
+                None => vec![Vec::new()],
+            };
+            let mut keys_examined = 0i64;
+            let mut documents_examined = 0i64;
+            let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+            let mut documents = Vec::new();
+            for prefix in prefixes {
+                let entries = store
+                    .scan_reserved(&entry_namespace, &prefix)
+                    .map_err(|error| CommandError::new(1, format!("index scan failed: {error}")))?;
+                keys_examined += entries.len() as i64;
+                for (_, document_key) in entries {
+                    if !seen.insert(document_key.clone()) {
+                        continue;
+                    }
+                    documents_examined += 1;
+                    if let Some(payload) = namespace_document(store, namespace, &document_key, session)?
+                        && let Ok(document) = parse_bson(&payload)
+                        && document_matches(&document, filter)?
+                    {
+                        documents.push(document);
+                    }
+                }
+            }
+            Ok(ScanOutcome { documents, keys_examined, documents_examined })
+        }
+    }
 }
 
 /// `find` with filter, sort, skip, limit and cursor batching.
@@ -1567,8 +1606,9 @@ pub fn find(command: &BsonDocument, store: &dyn MongoStorage, cursors: &mut Curs
     };
     let hint = resolve_hint(command, store, &namespace, &filter, command.get("sort"), command.get("projection"))?;
 
-    let mut documents = collect_matching(store, &namespace, &filter, session.key())?;
-    if matches!(hint, Hint::Natural(-1)) {
+    let access = choose_access(store, &namespace, &filter, &hint, &sort, &[], session.key())?;
+    let mut documents = scan_with_access(store, &namespace, &filter, &access, session.key(), false)?.documents;
+    if matches!(access, QueryAccess::Collection { direction: -1 }) {
         documents.reverse();
     }
     sort_documents(&mut documents, &sort);
@@ -1601,7 +1641,7 @@ pub fn count(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDoc
         _ => BsonDocument::new(),
     };
     validate_filter(&filter, "count")?;
-    resolve_hint(command, store, &namespace, &filter, None, None)?;
+    let hint = resolve_hint(command, store, &namespace, &filter, None, None)?;
     let skip = match command.get("skip") {
         Some(value) => match int_value(value) {
             Some(number) if number >= 0 => number as usize,
@@ -1619,7 +1659,10 @@ pub fn count(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDoc
         None => 0,
     };
 
-    let matched = collect_matching(store, &namespace, &filter, session.key())?.len();
+    let matched = {
+        let access = choose_access(store, &namespace, &filter, &hint, &[], &[], session.key())?;
+        scan_with_access(store, &namespace, &filter, &access, session.key(), false)?.documents.len()
+    };
     let start = skip.min(matched);
     let end = if limit > 0 { (start + limit).min(matched) } else { matched };
 
@@ -1680,14 +1723,14 @@ pub fn explain(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonD
 
     let all_documents = collect_matching(store, &namespace, &BsonDocument::new(), None)?;
     let total = all_documents.len();
-    let matched = all_documents.iter().filter(|document| document_matches(document, &filter).unwrap_or(false)).count();
+    // 与 find / count 走同一个访问路径决策函数：explain 不再单独推一份计划。
+    let access = choose_access(store, &namespace, &filter, &hint, &sort, &all_documents, None)?;
+    let outcome = scan_with_access(store, &namespace, &filter, &access, None, true)?;
+    let matched = outcome.documents.len();
     let counted = if limit > 0 { matched.saturating_sub(skip).min(limit) } else { matched.saturating_sub(skip) };
-    let hinted_plan = match &hint {
-        Hint::Index(spec) => Some(build_hinted_plan(&all_documents, spec, &filter, &sort)),
-        _ => None,
-    };
-    let direction = match hint {
-        Hint::Natural(-1) => "backward",
+    let direction = match &access {
+        QueryAccess::Collection { direction: -1 } => "backward",
+        QueryAccess::Index(plan) => plan.direction,
         _ => "forward",
     };
 
@@ -1705,10 +1748,10 @@ pub fn explain(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonD
     query_planner.push("maxIndexedAndSolutionsReached".to_string(), BsonValue::Bool(false));
     query_planner.push("maxScansToExplodeReached".to_string(), BsonValue::Bool(false));
     query_planner.push("prunedSimilarIndexes".to_string(), BsonValue::Bool(false));
-    let plan = match (&hinted_plan, name) {
-        (Some(plan), "find") => hinted_find_plan(plan, &all_documents, skip, limit, &sort),
-        (Some(plan), _) => hinted_count_plan(plan, &all_documents),
-        (None, _) => winning_plan(name, &normalized, skip, limit, direction),
+    let plan = match (&access, name) {
+        (QueryAccess::Index(plan), "find") => hinted_find_plan(plan, &all_documents, skip, limit, &sort),
+        (QueryAccess::Index(plan), _) => hinted_count_plan(plan, &all_documents),
+        (QueryAccess::Collection { .. }, _) => winning_plan(name, &normalized, skip, limit, direction),
     };
     query_planner.push("winningPlan".to_string(), BsonValue::Document(plan));
     query_planner.push("rejectedPlans".to_string(), BsonValue::Array(Vec::new()));
@@ -1721,10 +1764,28 @@ pub fn explain(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonD
         reply.push("queryShapeHash".to_string(), BsonValue::String(stable_shape_hash(&hash_seed)));
     }
     if verbosity != "queryPlanner" {
-        let stats = match (&hinted_plan, name) {
-            (Some(plan), "find") => hinted_find_stats(plan, &all_documents, &filter, skip, limit, verbosity == "allPlansExecution"),
-            (Some(plan), _) => hinted_count_stats(plan, &all_documents, &filter, skip, limit, verbosity == "allPlansExecution"),
-            (None, _) => explain_execution_stats(ExecutionStats {
+        let stats = match (&access, name) {
+            (QueryAccess::Index(plan), "find") => reported_find_stats(
+                plan,
+                &all_documents,
+                outcome.keys_examined,
+                outcome.documents_examined,
+                matched,
+                skip,
+                limit,
+                verbosity == "allPlansExecution",
+            ),
+            (QueryAccess::Index(plan), _) => reported_count_stats(
+                plan,
+                &all_documents,
+                outcome.keys_examined,
+                outcome.documents_examined,
+                matched,
+                skip,
+                limit,
+                verbosity == "allPlansExecution",
+            ),
+            (QueryAccess::Collection { .. }, _) => explain_execution_stats(ExecutionStats {
                 command: name,
                 filter: &normalized,
                 total,
@@ -2319,7 +2380,7 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
             };
             if let Some(info) = update_validation_failure(store, &namespace, &document, &updated)? {
                 if !changes.is_empty() {
-                    store.replace(&namespace, &changes).map_err(|replace| CommandError::new(2, replace.to_string()))?;
+                    stage_replace(store, session.key(), &namespace, &changes)?;
                 }
                 stage_update_oplog(store, session.key(), &namespace, &oplog_pairs);
                 return Ok(write_reply(0, Some(0), &[WriteError::validation(index, info)]));
@@ -2328,7 +2389,7 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
                 // A parallel-array key cannot be indexed at all, so the real
                 // server reports a zeroed counter pair plus `writeErrors`.
                 if !changes.is_empty() {
-                    store.replace(&namespace, &changes).map_err(|replace| CommandError::new(2, replace.to_string()))?;
+                    stage_replace(store, session.key(), &namespace, &changes)?;
                 }
                 stage_update_oplog(store, session.key(), &namespace, &oplog_pairs);
                 return Ok(write_reply(0, Some(0), &[WriteError::plain(index, error.code, error.message)]));
@@ -3931,13 +3992,19 @@ pub fn drop(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDocu
         return Ok(response);
     }
     let records = store.scan(&namespace)?.len() as i32;
-    let user_indexes = store.index_specs(&namespace)?.len() as i32;
+    let specifications = store.index_specs(&namespace)?;
+    let user_indexes = specifications.len() as i32;
     if store.oplog_enabled() {
         let mut object = BsonDocument::new();
         object.push("drop".to_string(), BsonValue::String(collection.clone()));
         let mut old = BsonDocument::new();
         old.push("numRecords".to_string(), BsonValue::Int32(records));
         store.stage_oplog(OplogEntry::command(&command_namespace(&namespace), Some(collection_uuid(&namespace)), object, Some(old)));
+    }
+    for specification in &specifications {
+        store
+            .clear_reserved(&crate::storage::index_namespace(&namespace, &specification.name))
+            .map_err(|error| CommandError::new(2, format!("drop failed: {error}")))?;
     }
     store.drop_namespace(&namespace).map_err(|error| CommandError::new(2, format!("drop failed: {error}")))?;
     let mut response = BsonDocument::new();
@@ -4132,6 +4199,123 @@ fn no_such_transaction_error(txn_number: i64) -> CommandError {
         .with_detail("errorLabels", BsonValue::Array(vec![BsonValue::String("TransientTransactionError".to_string())]))
 }
 
+/// 索引项键：索引键元组后接文档键。
+///
+/// 元组本身带长度前缀，所以「单字段元组」天然是「复合元组」的前缀，等值探针
+/// 可以直接按前缀扫描，不需要再拼分隔符。
+fn index_entry_key(values: &[BsonValue], document_key: &[u8]) -> Vec<u8> {
+    let mut key = index_tuple(values);
+    key.extend_from_slice(document_key);
+    key
+}
+
+/// 一个文档在一组索引下应当存在的全部条目。
+fn document_index_entries(document: &BsonDocument, document_key: &[u8], specifications: &[IndexSpec]) -> BTreeSet<(String, Vec<u8>)> {
+    let mut entries = BTreeSet::new();
+    for specification in specifications {
+        let namespace = crate::storage::index_namespace(&specification.namespace, &specification.name);
+        for values in index_entries(document, specification) {
+            entries.insert((namespace.clone(), index_entry_key(&values, document_key)));
+        }
+    }
+    entries
+}
+
+/// 按命名空间写入索引项；事务内与文档写一样走暂存，提交时一起落地。
+fn put_index_keys(
+    store: &dyn MongoStorage,
+    session: Option<&str>,
+    entries: &BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>>,
+) -> Result<(), CommandError> {
+    for (namespace, entries) in entries {
+        match session {
+            Some(session) => {
+                for (entry_key, value) in entries {
+                    if store.transaction_write(session, namespace, entry_key, Some(value.clone())) == TransactionWrite::Conflict {
+                        return Err(write_conflict_error());
+                    }
+                }
+            }
+            None => {
+                store.put_reserved(namespace, entries).map_err(|error| CommandError::new(2, format!("index write failed: {error}")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 按命名空间删除索引项；事务内暂存删除，提交时一起落地。
+fn delete_index_keys(store: &dyn MongoStorage, session: Option<&str>, keys: &BTreeMap<String, Vec<Vec<u8>>>) -> Result<(), CommandError> {
+    for (namespace, keys) in keys {
+        if keys.is_empty() {
+            continue;
+        }
+        match session {
+            Some(session) => {
+                for key in keys {
+                    if store.transaction_write(session, namespace, key, None) == TransactionWrite::Conflict {
+                        return Err(write_conflict_error());
+                    }
+                }
+            }
+            None => {
+                store.delete(namespace, keys).map_err(|error| CommandError::new(2, format!("index delete failed: {error}")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 为一个文档集合写入索引项；每个条目值是文档键，读取时据此回表。
+fn write_index_entries(
+    store: &dyn MongoStorage,
+    session: Option<&str>,
+    documents: &[(BsonDocument, Vec<u8>)],
+    specifications: &[IndexSpec],
+) -> Result<(), CommandError> {
+    if specifications.is_empty() || documents.is_empty() {
+        return Ok(());
+    }
+    let mut by_namespace: BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>> = BTreeMap::new();
+    for (document, document_key) in documents {
+        for (namespace, entry_key) in document_index_entries(document, document_key, specifications) {
+            by_namespace.entry(namespace).or_default().push((entry_key, document_key.clone()));
+        }
+    }
+    put_index_keys(store, session, &by_namespace)
+}
+
+/// 为 `mongodump` 导入的文档补写索引项；导入走覆盖写，调用方在写完后立即调用。
+pub(crate) fn maintain_imported_indexes(store: &dyn MongoStorage, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
+    let specifications = store.index_specs(namespace).map_err(|error| error.to_string())?;
+    if specifications.is_empty() {
+        return Ok(());
+    }
+    let parsed: Vec<(BsonDocument, Vec<u8>)> =
+        documents.iter().filter_map(|(key, payload)| parse_bson(payload).ok().map(|document| (document, key.clone()))).collect();
+    write_index_entries(store, None, &parsed, &specifications).map_err(|error| error.message)?;
+    Ok(())
+}
+
+/// 删除一个文档集合的全部索引项。
+fn remove_index_entries(
+    store: &dyn MongoStorage,
+    session: Option<&str>,
+    documents: &[(BsonDocument, Vec<u8>)],
+    specifications: &[IndexSpec],
+) -> Result<(), CommandError> {
+    if specifications.is_empty() || documents.is_empty() {
+        return Ok(());
+    }
+    let mut by_namespace: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    for (document, document_key) in documents {
+        for (namespace, entry_key) in document_index_entries(document, document_key, specifications) {
+            by_namespace.entry(namespace).or_default().push(entry_key);
+        }
+    }
+    delete_index_keys(store, session, &by_namespace)
+}
+
 /// Stages a batch of new documents in the session's transaction, or writes it
 /// straight to the shard outside one.
 fn stage_insert(
@@ -4140,6 +4324,14 @@ fn stage_insert(
     namespace: &str,
     documents: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<(), CommandError> {
+    let specifications = store.index_specs(namespace)?;
+    if !specifications.is_empty() {
+        let parsed: Vec<(BsonDocument, Vec<u8>)> =
+            documents.iter().filter_map(|(key, payload)| parse_bson(payload).ok().map(|document| (document, key.clone()))).collect();
+        // 先写索引项再写文档：文档写失败时最多留下指向不存在文档的条目，读取会跳过；
+        // 反序则会静默漏掉文档，查询结果少一条且没有任何报错。
+        write_index_entries(store, session, &parsed, &specifications)?;
+    }
     match session {
         Some(key) => {
             for (document_key, payload) in documents {
@@ -4161,7 +4353,34 @@ fn stage_replace(
     namespace: &str,
     documents: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<usize, CommandError> {
-    match session {
+    let specifications = store.index_specs(namespace)?;
+    let mut removed: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut added: BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>> = BTreeMap::new();
+    if !specifications.is_empty() {
+        for (document_key, payload) in documents {
+            let Ok(replacement) = parse_bson(payload)
+            else {
+                continue;
+            };
+            let current_keys = document_index_entries(&replacement, document_key, &specifications);
+            let previous_keys = match namespace_document(store, namespace, document_key, session)? {
+                Some(previous) => match parse_bson(&previous) {
+                    Ok(previous) => document_index_entries(&previous, document_key, &specifications),
+                    Err(_) => BTreeSet::new(),
+                },
+                None => BTreeSet::new(),
+            };
+            for (entry_namespace, entry_key) in current_keys.difference(&previous_keys) {
+                added.entry(entry_namespace.clone()).or_default().push((entry_key.clone(), document_key.clone()));
+            }
+            for (entry_namespace, entry_key) in previous_keys.difference(&current_keys) {
+                removed.entry(entry_namespace.clone()).or_default().push(entry_key.clone());
+            }
+        }
+        // 新增项先落地、旧项最后删除：中途失败只会多出可被完整过滤条件淘汰的条目。
+        put_index_keys(store, session, &added)?;
+    }
+    let written = match session {
         Some(key) => {
             for (document_key, payload) in documents {
                 if store.transaction_write(key, namespace, document_key, Some(payload.clone())) == TransactionWrite::Conflict {
@@ -4171,13 +4390,28 @@ fn stage_replace(
             Ok(documents.len())
         }
         None => store.replace(namespace, documents).map_err(|error| CommandError::new(2, error.to_string())),
+    };
+    if !specifications.is_empty() {
+        delete_index_keys(store, session, &removed)?;
     }
+    written
 }
 
 /// Stages deletions in the session's transaction, or writes them straight to
 /// the shard outside one.
 fn stage_delete(store: &dyn MongoStorage, session: Option<&str>, namespace: &str, keys: &[Vec<u8>]) -> Result<usize, CommandError> {
-    match session {
+    let specifications = store.index_specs(namespace)?;
+    let mut removed: Vec<(BsonDocument, Vec<u8>)> = Vec::new();
+    if !specifications.is_empty() {
+        for key in keys {
+            if let Some(payload) = namespace_document(store, namespace, key, session)?
+                && let Ok(document) = parse_bson(&payload)
+            {
+                removed.push((document, key.clone()));
+            }
+        }
+    }
+    let written = match session {
         Some(key) => {
             for document_key in keys {
                 if store.transaction_write(key, namespace, document_key, None) == TransactionWrite::Conflict {
@@ -4187,7 +4421,11 @@ fn stage_delete(store: &dyn MongoStorage, session: Option<&str>, namespace: &str
             Ok(keys.len())
         }
         None => store.delete(namespace, keys).map_err(|error| CommandError::new(2, error.to_string())),
+    };
+    if !specifications.is_empty() {
+        remove_index_entries(store, session, &removed, &specifications)?;
     }
+    written
 }
 
 /// The namespace as seen by the session: staged writes layered over committed
@@ -4771,7 +5009,15 @@ pub fn drop_database(command: &BsonDocument, store: &dyn MongoStorage) -> Result
         return Err(CommandError::new(20, "Dropping the 'admin' database is prohibited."));
     }
     let prefix = format!("{database}.");
-    let had_namespaces = store.namespaces()?.iter().any(|namespace| namespace.starts_with(&prefix));
+    let namespaces: Vec<String> = store.namespaces()?.into_iter().filter(|namespace| namespace.starts_with(&prefix)).collect();
+    let had_namespaces = !namespaces.is_empty();
+    for namespace in &namespaces {
+        for specification in store.index_specs(namespace)? {
+            store
+                .clear_reserved(&crate::storage::index_namespace(namespace, &specification.name))
+                .map_err(|error| CommandError::new(2, format!("dropDatabase failed: {error}")))?;
+        }
+    }
     if had_namespaces && store.oplog_enabled() {
         let mut object = BsonDocument::new();
         object.push("dropDatabase".to_string(), BsonValue::Int32(1));
@@ -5648,6 +5894,13 @@ pub fn create_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Resul
 
     if !accepted.is_empty() {
         store.add_indexes(&namespace, &accepted).map_err(|error| CommandError::new(2, format!("createIndexes failed: {error}")))?;
+        // 逐个数：新建索引需要回填，旧目录里缺条目的索引也在这里补齐，避免
+        // 查询把「条目缺失」当成「没有匹配」。
+        for specification in store.index_specs(&namespace)? {
+            if !store.reserved_has_entries(&crate::storage::index_namespace(&namespace, &specification.name))? {
+                backfill_index(store, &namespace, &specification)?;
+            }
+        }
         if let Some(BsonValue::String(collection)) = command.get("createIndexes") {
             stage_create_indexes_oplog(store, &namespace, collection, &accepted);
         }
@@ -5669,6 +5922,26 @@ pub fn create_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Resul
     }
     reply.push("ok".to_string(), BsonValue::Double(1.0));
     Ok(reply)
+}
+
+/// 用集合现有文档重建一个索引的全部条目。
+///
+/// 先清空同名索引项，避免上一次删除中断或崩溃留下的旧条目与新定义混在一起。
+fn backfill_index(store: &dyn MongoStorage, namespace: &str, specification: &IndexSpec) -> Result<(), CommandError> {
+    let entry_namespace = crate::storage::index_namespace(namespace, &specification.name);
+    store.clear_reserved(&entry_namespace)?;
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (document_key, payload) in store.scan(namespace)? {
+        let Ok(document) = parse_bson(&payload)
+        else {
+            continue;
+        };
+        for values in index_entries(&document, specification) {
+            entries.push((index_entry_key(&values, &document_key), document_key.clone()));
+        }
+    }
+    store.put_reserved(&entry_namespace, &entries).map_err(|error| CommandError::new(2, format!("createIndexes backfill failed: {error}")))?;
+    Ok(())
 }
 
 /// Refuses to build a unique index over documents that already collide.
@@ -5845,6 +6118,11 @@ pub fn drop_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Result<
     let dropped: Vec<IndexSpec> =
         if name == "*" { existing.clone() } else { existing.iter().filter(|index| index.name == name).cloned().collect() };
     store.drop_indexes(&namespace, &name).map_err(|error| CommandError::new(2, format!("dropIndexes failed: {error}")))?;
+    for specification in &dropped {
+        store
+            .clear_reserved(&crate::storage::index_namespace(&namespace, &specification.name))
+            .map_err(|error| CommandError::new(2, format!("dropIndexes cleanup failed: {error}")))?;
+    }
     if store.oplog_enabled() {
         let uuid = collection_uuid(&namespace);
         for specification in &dropped {
@@ -5945,7 +6223,7 @@ pub fn ttl_monitor(store: &dyn MongoStorage, now_ms: i64) -> Result<TtlReport, C
             if candidates.is_empty() {
                 continue;
             }
-            deleted += store.delete(&namespace, &candidates).map_err(|error| CommandError::new(2, format!("TTL monitor failed: {error}")))?;
+            deleted += stage_delete(store, None, &namespace, &candidates)?;
         }
         if deleted > 0 {
             report.deleted += deleted;

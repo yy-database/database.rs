@@ -7,7 +7,7 @@ use std::{
 };
 
 use mongo::{
-    bson::{BinaryData, BsonDocument, BsonValue, encode_bson, parse_bson},
+    bson::{BinaryData, BsonDocument, BsonValue, encode_bson, parse_bson, value_to_key},
     commands::{self, CommandError},
     cursor::CursorStore,
     json,
@@ -1767,4 +1767,221 @@ fn wildcard_and_hashed_indexes_follow_the_real_server_rules() {
         59,
         "text indexes are rejected explicitly instead of being served incorrectly"
     );
+}
+
+fn index_namespace(collection: &str, index: &str) -> String {
+    format!("app.{collection}$idx${index}")
+}
+
+fn entries(store: &Store, collection: &str, index: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    store.scan_reserved(&index_namespace(collection, index), b"").expect("scan index entries")
+}
+
+fn explain_find(store: &Store, collection: &str, filter: BsonDocument) -> BsonDocument {
+    let mut find = document(&[("find", text(collection)), ("filter", BsonValue::Document(filter))]);
+    find.push("$db", text("app"));
+    let mut explain = document(&[("explain", BsonValue::Document(find))]);
+    explain.push("verbosity", text("executionStats"));
+    explain.push("$db", text("app"));
+    commands::explain(&explain, store).expect("explain find")
+}
+
+fn explain_count(store: &Store, collection: &str, filter: BsonDocument) -> BsonDocument {
+    let mut count = document(&[("count", text(collection)), ("query", BsonValue::Document(filter))]);
+    count.push("$db", text("app"));
+    let mut explain = document(&[("explain", BsonValue::Document(count))]);
+    explain.push("verbosity", text("executionStats"));
+    explain.push("$db", text("app"));
+    commands::explain(&explain, store).expect("explain count")
+}
+
+fn nested<'a>(document: &'a BsonDocument, path: &[&str]) -> Option<&'a BsonDocument> {
+    let mut current = document;
+    for key in path {
+        match current.get(*key) {
+            Some(BsonValue::Document(next)) => current = next,
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn plan_stage(document: &BsonDocument) -> String {
+    match document.get("stage") {
+        Some(BsonValue::String(stage)) => stage.clone(),
+        _ => String::new(),
+    }
+}
+
+fn update_documents(store: &Store, collection: &str, query: BsonDocument, update: BsonDocument) {
+    let mut specification = BsonDocument::new();
+    specification.push("q", BsonValue::Document(query));
+    specification.push("u", BsonValue::Document(update));
+    let mut update_command = command("update", collection, "app");
+    update_command.push("updates", BsonValue::Array(vec![BsonValue::Document(specification)]));
+    let reply = commands::update(&update_command, store).expect("update");
+    assert_eq!(int(&reply, "nModified"), 1, "the update must change exactly one document");
+}
+
+fn delete_documents(store: &Store, collection: &str, query: BsonDocument) {
+    let mut specification = BsonDocument::new();
+    specification.push("q", BsonValue::Document(query));
+    specification.push("limit", BsonValue::Int32(0));
+    let mut delete_command = command("delete", collection, "app");
+    delete_command.push("deletes", BsonValue::Array(vec![BsonValue::Document(specification)]));
+    commands::delete(&delete_command, store).expect("delete");
+}
+
+#[test]
+fn index_entries_follow_insert_update_and_delete() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![
+            document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Int32(1))]),
+            document(&[("_id", BsonValue::Int32(2)), ("a", BsonValue::Int32(2))]),
+            document(&[("_id", BsonValue::Int32(3)), ("a", BsonValue::Int32(3))]),
+        ],
+    );
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+    assert_eq!(entries(&store, "items", "a_1").len(), 3, "existing documents are backfilled");
+
+    // 索引命名空间不进入目录，因此不会被当成集合列出来。
+    let namespaces = store.namespaces().expect("namespaces");
+    assert!(namespaces.contains(&"app.items".to_string()));
+    assert!(!namespaces.iter().any(|namespace| namespace.contains("$idx$")));
+    let listed = commands::list_collections(&command("listCollections", "items", "app"), &store).expect("listCollections");
+    assert_eq!(batch(&listed, "firstBatch").len(), 1);
+
+    update_documents(
+        &store,
+        "items",
+        document(&[("_id", BsonValue::Int32(2))]),
+        document(&[("$set", BsonValue::Document(document(&[("a", BsonValue::Int32(9))])))]),
+    );
+    assert_eq!(entries(&store, "items", "a_1").len(), 3, "update replaces the entry instead of adding one");
+    let mut cursors = CursorStore::new();
+    let all_filter = command("find", "items", "app");
+    assert_eq!(
+        batch(&commands::find(&all_filter, &store, &mut cursors).expect("find all"), "firstBatch").len(),
+        3,
+        "a find without a filter still sees every document"
+    );
+    let mut old_filter = command("find", "items", "app");
+    old_filter.push("filter", BsonValue::Document(document(&[("a", BsonValue::Int32(2))])));
+    assert_eq!(batch(&commands::find(&old_filter, &store, &mut cursors).expect("find old key"), "firstBatch").len(), 0);
+
+    delete_documents(&store, "items", document(&[("_id", BsonValue::Int32(3))]));
+    let remaining = entries(&store, "items", "a_1");
+    assert_eq!(remaining.len(), 2, "delete removes the index entry with the document");
+    let live: Vec<Vec<u8>> = [1i32, 2].iter().map(|identifier| value_to_key(&BsonValue::Int32(*identifier))).collect();
+    assert!(remaining.iter().all(|(_, document_key)| live.contains(document_key)), "no entry may point at a document that no longer exists");
+}
+
+#[test]
+fn a_dangling_index_entry_never_resurrects_a_deleted_document() {
+    let store = store();
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Int32(7))])]);
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+    let real_entries = entries(&store, "items", "a_1");
+    assert_eq!(real_entries.len(), 1);
+    let (entry_key, _) = real_entries[0].clone();
+
+    delete_documents(&store, "items", document(&[("_id", BsonValue::Int32(1))]));
+    assert!(entries(&store, "items", "a_1").is_empty(), "deleting the document clears its index entry");
+
+    // 模拟删除事务中断：把旧条目手工写回，它此刻指向一个不存在的文档。
+    store.put_reserved(&index_namespace("items", "a_1"), &[(entry_key, value_to_key(&BsonValue::Int32(1)))]).expect("inject dangling entry");
+    assert_eq!(entries(&store, "items", "a_1").len(), 1);
+
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(document(&[("a", BsonValue::Int32(7))])));
+    let mut cursors = CursorStore::new();
+    assert_eq!(
+        batch(&commands::find(&find, &store, &mut cursors).expect("find through index"), "firstBatch").len(),
+        0,
+        "a dangling entry must not become a phantom document"
+    );
+
+    let explained = explain_find(&store, "items", document(&[("a", BsonValue::Int32(7))]));
+    let winning = nested(&explained, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(nested(winning, &["inputStage"]).expect("scan stage")), "IXSCAN");
+    let stats = nested(&explained, &["executionStats"]).expect("execution stats");
+    assert_eq!(int(stats, "totalDocsExamined"), 1, "the dangling entry is fetched once, then skipped");
+    assert_eq!(int(stats, "nReturned"), 0);
+}
+
+#[test]
+fn explain_reports_the_plan_the_executor_actually_runs() {
+    let store = store();
+    let documents: Vec<BsonDocument> =
+        (0..40).map(|identifier| document(&[("_id", BsonValue::Int32(identifier)), ("a", BsonValue::Int32(identifier % 4))])).collect();
+    insert_documents(&store, "items", documents);
+
+    let filter = document(&[("a", BsonValue::Int32(1))]);
+    let before = explain_find(&store, "items", filter.clone());
+    let before_plan = nested(&before, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(before_plan), "COLLSCAN", "without an index the plan must say COLLSCAN");
+    assert_eq!(int(nested(&before, &["executionStats"]).expect("stats"), "totalDocsExamined"), 40);
+
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(filter.clone()));
+    let mut cursors = CursorStore::new();
+    let returned = batch(&commands::find(&find, &store, &mut cursors).expect("find through index"), "firstBatch");
+    assert_eq!(returned.len(), 10, "the indexed result set matches the predicate");
+
+    let after = explain_find(&store, "items", filter.clone());
+    let plan = nested(&after, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(plan), "FETCH");
+    assert_eq!(plan_stage(nested(plan, &["inputStage"]).expect("scan stage")), "IXSCAN");
+    let stats = nested(&after, &["executionStats"]).expect("execution stats");
+    assert_eq!(int(stats, "nReturned"), 10);
+    assert_eq!(int(stats, "totalKeysExamined"), 10);
+    assert_eq!(int(stats, "totalDocsExamined"), 10, "the executor really reads ten documents, not forty");
+
+    let counted = explain_count(&store, "items", filter.clone());
+    assert_eq!(plan_stage(nested(&counted, &["queryPlanner", "winningPlan"]).expect("count plan")), "COUNT");
+    assert_eq!(int(nested(&counted, &["executionStats"]).expect("count stats"), "totalDocsExamined"), 10);
+
+    let mut drop = command("dropIndexes", "items", "app");
+    drop.push("index", text("a_1"));
+    commands::drop_indexes(&drop, &store).expect("dropIndexes");
+    let dropped = explain_find(&store, "items", filter);
+    let dropped_plan = nested(&dropped, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(dropped_plan), "COLLSCAN", "dropping the index puts the plan back to COLLSCAN");
+    assert_eq!(int(nested(&dropped, &["executionStats"]).expect("stats"), "totalDocsExamined"), 40);
+}
+
+#[test]
+fn index_scan_uses_the_leading_field_of_a_compound_index_for_equality() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        (0..6)
+            .map(|identifier| {
+                document(&[("_id", BsonValue::Int32(identifier)), ("a", BsonValue::Int32(identifier % 2)), ("b", BsonValue::Int32(identifier))])
+            })
+            .collect(),
+    );
+    let mut key = BsonDocument::new();
+    key.push("a", BsonValue::Int32(1));
+    key.push("b", BsonValue::Int32(1));
+    let mut specification = BsonDocument::new();
+    specification.push("key", BsonValue::Document(key));
+    specification.push("name", text("a_1_b_1"));
+    let mut create = command("createIndexes", "items", "app");
+    create.push("indexes", BsonValue::Array(vec![BsonValue::Document(specification)]));
+    commands::create_indexes(&create, &store).expect("createIndexes");
+
+    let explained = explain_find(&store, "items", document(&[("a", BsonValue::Int32(1))]));
+    let plan = nested(&explained, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(nested(plan, &["inputStage"]).expect("scan stage")), "IXSCAN");
+    let stats = nested(&explained, &["executionStats"]).expect("stats");
+    assert_eq!(int(stats, "totalKeysExamined"), 3);
+    assert_eq!(int(stats, "totalDocsExamined"), 3);
+    assert_eq!(int(stats, "nReturned"), 3);
 }

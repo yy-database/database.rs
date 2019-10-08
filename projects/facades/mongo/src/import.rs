@@ -37,6 +37,7 @@ pub fn import_bson_documents(storage: &dyn MongoStorage, namespace: &str, bytes:
         entries.push((value_to_key(&identifier), encode_bson(&document)));
         offset = end;
     }
+    crate::commands::maintain_imported_indexes(storage, namespace, &entries)?;
     storage.import(namespace, &entries).map_err(|error| error.to_string())
 }
 

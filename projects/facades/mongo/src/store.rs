@@ -108,6 +108,22 @@ impl Default for TtlMonitorState {
 /// cannot be `!catalog`, so this label never collides with user data.
 const CATALOG_NAMESPACE: &str = "!catalog";
 
+/// 索引项命名空间标记。
+///
+/// 用户可见的库名与集合名都不能包含 `$`，所以 `<collection>$idx$<index>`
+/// 不会与用户集合冲突。索引项与文档共用同一个 shard，只是命名空间不进入目录。
+pub const INDEX_NAMESPACE_MARKER: &str = "$idx$";
+
+/// 该 namespace 是否属于索引项保留命名空间。
+pub fn is_index_namespace(namespace: &str) -> bool {
+    namespace.contains(INDEX_NAMESPACE_MARKER)
+}
+
+/// 由一个集合 namespace 与索引名拼出索引项 namespace。
+pub fn index_namespace(namespace: &str, index: &str) -> String {
+    format!("{namespace}{INDEX_NAMESPACE_MARKER}{index}")
+}
+
 /// Version of the product document stored in the `.yyds` schema slot.
 const CATALOG_DOCUMENT_VERSION: u32 = 1;
 
@@ -1274,14 +1290,16 @@ impl Store {
             }
 
             let catalog_key = Key::new(CATALOG_NAMESPACE, namespace.as_bytes().to_vec());
-            if shard.get(&catalog_key).ok().flatten().is_none() {
+            if !is_index_namespace(namespace) && shard.get(&catalog_key).ok().flatten().is_none() {
                 changes.push(ShardChange::Put { key: catalog_key, value: StoredValue::Inline(InlineValue(Vec::new())), expires_at: None });
             }
 
             shard.commit_changes(changes).map_err(|error| StoreError::Shard(error.to_string()))?;
         }
-        self.note_writes(namespace, &written);
-        self.register_namespace(namespace)?;
+        if !is_index_namespace(namespace) {
+            self.note_writes(namespace, &written);
+            self.register_namespace(namespace)?;
+        }
         Ok(report)
     }
 
@@ -1299,6 +1317,48 @@ impl Store {
                 StoredValue::Object(_) => None,
             })
             .collect())
+    }
+
+    /// 扫描保留命名空间下以 `prefix` 开头的键值对。
+    ///
+    /// 索引项与文档共享同一个 shard，所以这里直接走底层前缀扫描，不经过目录。
+    pub fn scan_reserved(&self, namespace: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        let shard = self.lock();
+        let records =
+            shard.scan(&Namespace(namespace.to_string()), prefix, None, None, 0).map_err(|error| StoreError::Shard(error.to_string()))?;
+        Ok(records
+            .into_iter()
+            .filter_map(|record| match record.value {
+                StoredValue::Inline(InlineValue(bytes)) => Some((record.key.bytes, bytes)),
+                StoredValue::Object(_) => None,
+            })
+            .collect())
+    }
+
+    /// 判断保留命名空间是否至少有一条条目，只读一条就返回。
+    pub fn reserved_has_entries(&self, namespace: &str) -> Result<bool, StoreError> {
+        let shard = self.lock();
+        let records =
+            shard.scan(&Namespace(namespace.to_string()), b"", None, None, 1).map_err(|error| StoreError::Shard(error.to_string()))?;
+        Ok(!records.is_empty())
+    }
+
+    /// 写入保留命名空间，不登记目录、不伪造 `!catalog` 镜像。
+    pub fn put_reserved(&self, namespace: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut shard = self.lock();
+        let changes = entries
+            .iter()
+            .map(|(key, payload)| ShardChange::Put {
+                key: Key::new(namespace, key.clone()),
+                value: StoredValue::Inline(InlineValue(payload.clone())),
+                expires_at: None,
+            })
+            .collect();
+        shard.commit_changes(changes).map_err(|error| StoreError::Shard(error.to_string()))?;
+        Ok(entries.len())
     }
 
     /// Deletes the given encoded `_id` keys and reports how many existed.
@@ -1343,16 +1403,20 @@ impl Store {
                     expires_at: None,
                 });
             }
-            changes.push(ShardChange::Put {
-                key: Key::new(CATALOG_NAMESPACE, namespace.as_bytes().to_vec()),
-                value: StoredValue::Inline(InlineValue(Vec::new())),
-                expires_at: None,
-            });
+            if !is_index_namespace(namespace) {
+                changes.push(ShardChange::Put {
+                    key: Key::new(CATALOG_NAMESPACE, namespace.as_bytes().to_vec()),
+                    value: StoredValue::Inline(InlineValue(Vec::new())),
+                    expires_at: None,
+                });
+            }
             shard.commit_changes(changes).map_err(|error| StoreError::Shard(error.to_string()))?;
         }
-        let keys: Vec<Vec<u8>> = documents.iter().map(|(key, _)| key.clone()).collect();
-        self.note_writes(namespace, &keys);
-        self.register_namespace(namespace)?;
+        if !is_index_namespace(namespace) {
+            let keys: Vec<Vec<u8>> = documents.iter().map(|(key, _)| key.clone()).collect();
+            self.note_writes(namespace, &keys);
+            self.register_namespace(namespace)?;
+        }
         Ok(documents.len())
     }
 
@@ -1553,6 +1617,18 @@ impl crate::storage::MongoStorage for Store {
 
     fn replace(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError> {
         Store::replace(self, namespace, documents)
+    }
+
+    fn scan_reserved(&self, namespace: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        Store::scan_reserved(self, namespace, prefix)
+    }
+
+    fn put_reserved(&self, namespace: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError> {
+        Store::put_reserved(self, namespace, entries)
+    }
+
+    fn reserved_has_entries(&self, namespace: &str) -> Result<bool, StoreError> {
+        Store::reserved_has_entries(self, namespace)
     }
 
     fn import(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError> {

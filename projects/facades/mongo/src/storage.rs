@@ -11,8 +11,8 @@
 //! 淘汰。命令层不得感知后端类型，也不得各自携带一份存储实现。
 
 pub use crate::store::{
-    CollectionOptions, IndexSpec, InsertReport, SessionState, SessionWriteState, StoreError, TransactionAbort, TransactionBegin,
-    TransactionCommit, TransactionWrite, TtlMonitorState,
+    CollectionOptions, INDEX_NAMESPACE_MARKER, IndexSpec, InsertReport, SessionState, SessionWriteState, StoreError, TransactionAbort,
+    TransactionBegin, TransactionCommit, TransactionWrite, TtlMonitorState, index_namespace, is_index_namespace,
 };
 
 use crate::oplog::OplogEntry;
@@ -66,6 +66,35 @@ pub trait MongoStorage: Send + Sync {
 
     /// 覆盖写一批文档，不做重复检查，供 `update` 使用。
     fn replace(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError>;
+
+    /// 扫描保留命名空间下以 `prefix` 开头的键值对。
+    ///
+    /// 索引项与文档共用同一 shard，只是命名空间不进入目录，因此这里既没有
+    /// 第二套存储后端，也不改变 `.yykv` 的字节布局。默认实现整段扫描后按
+    /// 前缀过滤，后端可以覆盖成原生前缀扫描。
+    fn scan_reserved(&self, namespace: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        Ok(self.scan(namespace)?.into_iter().filter(|(key, _)| key.starts_with(prefix)).collect())
+    }
+
+    /// 写入保留命名空间，返回写入条数。
+    ///
+    /// 实现不得把该命名空间登记进目录：索引命名空间只承载键值，不参与
+    /// `listCollections` / `listDatabases`，也不出现在 `drop_namespace` 的目录账目里。
+    fn put_reserved(&self, namespace: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError>;
+
+    /// 判断保留命名空间是否至少有一条条目。
+    ///
+    /// 索引项为空而集合非空只可能来自旧目录未重建或中断的删除，查询层据此
+    /// 退回集合扫描，避免把「索引里没有」误判成「数据不存在」。
+    fn reserved_has_entries(&self, namespace: &str) -> Result<bool, StoreError> {
+        Ok(!self.scan_reserved(namespace, b"")?.is_empty())
+    }
+
+    /// 清空一个保留命名空间，返回删除条数。
+    fn clear_reserved(&self, namespace: &str) -> Result<usize, StoreError> {
+        let keys: Vec<Vec<u8>> = self.scan_reserved(namespace, b"")?.into_iter().map(|(key, _)| key).collect();
+        if keys.is_empty() { Ok(0) } else { self.delete(namespace, &keys) }
+    }
 
     /// 覆盖写一批文档，不做重复检查，供 `mongodump` 导入使用。
     fn import(&self, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError>;
