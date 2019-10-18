@@ -4286,6 +4286,10 @@ fn write_index_entries(
 }
 
 /// 为 `mongodump` 导入的文档补写索引项；导入走覆盖写，调用方在写完后立即调用。
+///
+/// 覆盖写会替换掉同 `_id` 的旧文档，旧文档的索引项必须一并清掉，否则旧索引值
+/// 会留下指向已变更文档的条目。先删旧条目再写新条目，删除期间读到的旧条目只
+/// 会取到旧文档并被完整过滤条件拒绝，不会产生错误命中。
 pub(crate) fn maintain_imported_indexes(store: &dyn MongoStorage, namespace: &str, documents: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
     let specifications = store.index_specs(namespace).map_err(|error| error.to_string())?;
     if specifications.is_empty() {
@@ -4293,6 +4297,19 @@ pub(crate) fn maintain_imported_indexes(store: &dyn MongoStorage, namespace: &st
     }
     let parsed: Vec<(BsonDocument, Vec<u8>)> =
         documents.iter().filter_map(|(key, payload)| parse_bson(payload).ok().map(|document| (document, key.clone()))).collect();
+    let mut overwritten: Vec<(BsonDocument, Vec<u8>)> = Vec::new();
+    for (_, key) in &parsed {
+        match store.get(namespace, key) {
+            Ok(Some(payload)) => {
+                if let Ok(document) = parse_bson(&payload) {
+                    overwritten.push((document, key.clone()));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    remove_index_entries(store, None, &overwritten, &specifications).map_err(|error| error.message)?;
     write_index_entries(store, None, &parsed, &specifications).map_err(|error| error.message)?;
     Ok(())
 }

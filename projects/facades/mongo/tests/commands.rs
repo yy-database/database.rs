@@ -1985,3 +1985,95 @@ fn index_scan_uses_the_leading_field_of_a_compound_index_for_equality() {
     assert_eq!(int(stats, "totalDocsExamined"), 3);
     assert_eq!(int(stats, "nReturned"), 3);
 }
+
+#[test]
+fn dropping_an_index_or_a_collection_leaves_no_index_entries() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![
+            document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Int32(1))]),
+            document(&[("_id", BsonValue::Int32(2)), ("a", BsonValue::Int32(2))]),
+        ],
+    );
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+    assert_eq!(entries(&store, "items", "a_1").len(), 2);
+
+    let mut drop_index = command("dropIndexes", "items", "app");
+    drop_index.push("index", text("a_1"));
+    commands::drop_indexes(&drop_index, &store).expect("dropIndexes");
+    assert!(entries(&store, "items", "a_1").is_empty(), "dropIndexes clears the entries");
+
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("recreate");
+    assert_eq!(entries(&store, "items", "a_1").len(), 2, "recreating rebuilds from the live documents");
+
+    commands::drop(&command("drop", "items", "app"), &store).expect("drop");
+    assert!(entries(&store, "items", "a_1").is_empty(), "dropping the collection clears the entries");
+    assert!(!store.namespace_exists("app.items").expect("namespace lookup"));
+}
+
+#[test]
+fn importing_over_an_existing_document_replaces_its_index_entries() {
+    let store = store();
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let first = document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Int32(1))]);
+    mongo::import::import_bson_documents(&store, "app.items", &encode_bson(&first)).expect("first import");
+    assert_eq!(entries(&store, "items", "a_1").len(), 1);
+
+    let second = document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Int32(2))]);
+    mongo::import::import_bson_documents(&store, "app.items", &encode_bson(&second)).expect("second import");
+    assert_eq!(entries(&store, "items", "a_1").len(), 1, "an overwritten document keeps exactly one entry");
+
+    let mut stale = command("find", "items", "app");
+    stale.push("filter", BsonValue::Document(document(&[("a", BsonValue::Int32(1))])));
+    let mut cursors = CursorStore::new();
+    assert!(batch(&commands::find(&stale, &store, &mut cursors).expect("find stale key"), "firstBatch").is_empty());
+    let stale_explain = explain_find(&store, "items", document(&[("a", BsonValue::Int32(1))]));
+    let stale_stats = nested(&stale_explain, &["executionStats"]).expect("stats");
+    assert_eq!(int(stale_stats, "totalKeysExamined"), 0, "the old value left no entry behind");
+    assert_eq!(int(stale_stats, "totalDocsExamined"), 0);
+
+    let mut fresh = command("find", "items", "app");
+    fresh.push("filter", BsonValue::Document(document(&[("a", BsonValue::Int32(2))])));
+    assert_eq!(batch(&commands::find(&fresh, &store, &mut cursors).expect("find new key"), "firstBatch").len(), 1);
+    let fresh_explain = explain_find(&store, "items", document(&[("a", BsonValue::Int32(2))]));
+    let fresh_stats = nested(&fresh_explain, &["executionStats"]).expect("stats");
+    assert_eq!(int(fresh_stats, "totalKeysExamined"), 1);
+    assert_eq!(int(fresh_stats, "totalDocsExamined"), 1);
+}
+
+#[test]
+fn an_aborted_transaction_leaves_no_index_entries() {
+    let store = store();
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+    let session = session_document();
+
+    let mut aborted = command("insert", "items", "app");
+    aborted.push("lsid", session.clone());
+    aborted.push("txnNumber", BsonValue::Int64(1));
+    aborted.push("startTransaction", BsonValue::Bool(true));
+    aborted.push("autocommit", BsonValue::Bool(false));
+    aborted
+        .push("documents", BsonValue::Array(vec![BsonValue::Document(document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Int32(4))]))]));
+    assert_eq!(int(&commands::insert(&aborted, &store).expect("transactional insert"), "n"), 1);
+    assert!(entries(&store, "items", "a_1").is_empty(), "staged index entries stay inside the transaction");
+
+    assert_eq!(int(&end_transaction(&store, "abortTransaction", &session, 1).expect("abort"), "ok"), 1);
+    assert!(entries(&store, "items", "a_1").is_empty(), "abort discards the staged index entries");
+    let mut cursors = CursorStore::new();
+    assert!(find_all(&store, "items", &mut cursors).is_empty(), "abort discards the staged document too");
+
+    let mut committed = command("insert", "items", "app");
+    committed.push("lsid", session.clone());
+    committed.push("txnNumber", BsonValue::Int64(2));
+    committed.push("startTransaction", BsonValue::Bool(true));
+    committed.push("autocommit", BsonValue::Bool(false));
+    committed
+        .push("documents", BsonValue::Array(vec![BsonValue::Document(document(&[("_id", BsonValue::Int32(2)), ("a", BsonValue::Int32(5))]))]));
+    commands::insert(&committed, &store).expect("second transactional insert");
+    assert_eq!(int(&end_transaction(&store, "commitTransaction", &session, 2).expect("commit"), "ok"), 1);
+    assert_eq!(entries(&store, "items", "a_1").len(), 1, "commit publishes the entry with the document");
+    assert_eq!(find_all(&store, "items", &mut cursors).len(), 1);
+}
