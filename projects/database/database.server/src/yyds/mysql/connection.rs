@@ -9,7 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use database_execution::{
@@ -190,7 +190,11 @@ pub fn serve_cancellable(stream: TcpStream, stopping: Arc<AtomicBool>, runtime: 
     if !stream.peer_addr()?.ip().is_loopback() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "MySQL requires loopback until authentication and TLS are implemented"));
     }
-    stream.set_nonblocking(true)?;
+    // 阻塞模式配合读写超时：等待落在 socket 的可读 / 可写事件上，
+    // 不进入固定时长的轮询。停止时监听线程会关闭本连接的 socket 唤醒阻塞调用。
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     serve_session(CancellableSocket { stream, stopping }, runtime)
 }
 
@@ -1673,18 +1677,23 @@ struct CancellableSocket {
 }
 
 impl CancellableSocket {
+    /// 在可读 / 可写事件上阻塞，不再用固定时长的轮询等待。
+    ///
+    /// socket 由 [`serve_cancellable`] 置为阻塞模式并带 30 秒读写超时，
+    /// 一次 `operation` 会一直等到事件就绪、对端关闭或超时。Windows 的超时
+    /// 报 `TimedOut`，Unix 报 `WouldBlock`，两者走同一条超时路径。
+    /// 停止时监听线程关闭本连接的 socket，阻塞调用会立刻返回而非等满超时。
     fn attempt<T>(&mut self, mut operation: impl FnMut(&mut TcpStream) -> io::Result<T>) -> io::Result<T> {
-        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "MySQL service stopping"));
             }
             match operation(&mut self.stream) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, "MySQL socket I/O timeout"));
+                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    if self.stopping.load(Ordering::Acquire) {
+                        return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "MySQL service stopping"));
                     }
-                    std::thread::sleep(Duration::from_millis(5));
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "MySQL socket I/O timeout"));
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 result => return result,
