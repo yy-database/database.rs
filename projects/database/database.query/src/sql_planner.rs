@@ -170,7 +170,7 @@ pub fn plan_select_for_dialect(
     // 2. 递归解析 predicate 的 AND 树，把 pk 条件提取出来。
     let (pk_equality, pk_prefix, pk_after, pk_before, remaining_predicate) = match select.predicate {
         None => (None, None, None, None, None),
-        Some(expr) => extract_pk_range(expr, source.row_id(pk_field.field_id))?,
+        Some(expr) => extract_pk_range(expr, source.row_id(pk_field.field_id), pk_rowid_is_byte_ordered(&pk_field.field_type))?,
     };
 
     // 3. 分流：有精确 pk 等值 → Read；其他全部 → Scan。
@@ -871,7 +871,8 @@ pub fn plan_update(update: SqlCatalogBoundUpdate, catalog: &SqlCatalog, dialect:
         }));
     };
 
-    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) = extract_pk_range(predicate.clone(), pk_field.field_id)?;
+    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) =
+        extract_pk_range(predicate.clone(), pk_field.field_id, pk_rowid_is_byte_ordered(&pk_field.field_type))?;
     if let Some(rowid_literal) = pk_literal {
         return Ok(SqlExecutionPlan::Update(UpdatePlan {
             namespace,
@@ -914,7 +915,8 @@ pub fn plan_delete(delete: SqlCatalogBoundDelete, catalog: &SqlCatalog) -> Resul
         }));
     };
 
-    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) = extract_pk_range(predicate.clone(), pk_field.field_id)?;
+    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) =
+        extract_pk_range(predicate.clone(), pk_field.field_id, pk_rowid_is_byte_ordered(&pk_field.field_type))?;
     if let Some(rowid_literal) = pk_literal {
         return Ok(SqlExecutionPlan::Delete(DeletePlan {
             namespace,
@@ -1447,12 +1449,13 @@ pub struct DeleteScanPlan {
 fn extract_pk_range(
     predicate: SqlCatalogBoundExpression,
     pk_row_id: u64,
+    pk_rowid_ordered: bool,
 ) -> Result<(Option<SqlBoundLiteral>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<SqlCatalogBoundExpression>), SqlFrontendError> {
     match predicate {
         // AND 拆分 — 两侧分别提取，再合并。
         SqlCatalogBoundExpression::Binary { left, operator: SqlBoundBinaryOperator::And, right } => {
-            let (l_eq, l_pre, l_after, l_before, l_rem) = extract_pk_range(*left, pk_row_id)?;
-            let (r_eq, r_pre, r_after, r_before, r_rem) = extract_pk_range(*right, pk_row_id)?;
+            let (l_eq, l_pre, l_after, l_before, l_rem) = extract_pk_range(*left, pk_row_id, pk_rowid_ordered)?;
+            let (r_eq, r_pre, r_after, r_before, r_rem) = extract_pk_range(*right, pk_row_id, pk_rowid_ordered)?;
             let eq = merge_opt(l_eq, r_eq, "conflicting primary-key equality inside AND")?;
             let prefix = merge_opt(l_pre, r_pre, "conflicting primary-key LIKE prefix inside AND")?;
             let after = merge_opt(l_after, r_after, "conflicting primary-key lower bound inside AND")?;
@@ -1475,7 +1478,7 @@ fn extract_pk_range(
 
                 // pk > literal → after exclusive
                 (SqlBoundBinaryOperator::Greater, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id =>
+                    if col.row_id == pk_row_id && pk_rowid_ordered =>
                 {
                     let rowid = pk_literal_to_rowid(&lit)?;
                     Ok((None, None, Some(rowid), None, None))
@@ -1483,7 +1486,7 @@ fn extract_pk_range(
 
                 // pk >= literal → after exclusive：key > (lit-1) 等价于 key >= lit
                 (SqlBoundBinaryOperator::GreaterEqual, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id =>
+                    if col.row_id == pk_row_id && pk_rowid_ordered =>
                 {
                     let rowid = pk_literal_to_rowid(&lit)?;
                     Ok((None, None, Some(rowid_decrement(&rowid)), None, None))
@@ -1491,7 +1494,7 @@ fn extract_pk_range(
 
                 // pk < literal → before exclusive
                 (SqlBoundBinaryOperator::Less, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id =>
+                    if col.row_id == pk_row_id && pk_rowid_ordered =>
                 {
                     let rowid = pk_literal_to_rowid(&lit)?;
                     Ok((None, None, None, Some(rowid), None))
@@ -1499,7 +1502,7 @@ fn extract_pk_range(
 
                 // pk <= literal → before exclusive：key < (lit+1) 等价于 key <= lit
                 (SqlBoundBinaryOperator::LessEqual, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id =>
+                    if col.row_id == pk_row_id && pk_rowid_ordered =>
                 {
                     let rowid = pk_literal_to_rowid(&lit)?;
                     Ok((None, None, None, Some(rowid_increment(&rowid)), None))
@@ -1566,6 +1569,16 @@ fn combine_remaining(left: Option<SqlCatalogBoundExpression>, right: Option<SqlC
             Some(SqlCatalogBoundExpression::Binary { left: Box::new(l), operator: SqlBoundBinaryOperator::And, right: Box::new(r) })
         }
     }
+}
+
+/// rowid 的字节序是否与主键的数值序一致，决定区间谓词能否下推成 KV 字节区间。
+///
+/// 整数主键的 rowid 是十进制文本（`"6"`、`"10"`、`"100"`），字节序把 `"10"` 排在
+/// `"6"` 之前，与比较语义相反，只能按等值下推。文本与二进制主键的 rowid 就是原始
+/// 字节，字节序与 MySQL 的比较语义一致，区间可以安全下推。
+fn pk_rowid_is_byte_ordered(field_type: &crate::catalog_bind::SqlFieldType) -> bool {
+    use crate::catalog_bind::SqlFieldType;
+    matches!(field_type.inner(), SqlFieldType::String | SqlFieldType::Bytes)
 }
 
 /// Encodes a primary-key literal into the canonical row id bytes.
