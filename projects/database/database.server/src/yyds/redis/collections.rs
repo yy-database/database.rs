@@ -1154,23 +1154,23 @@ const TIMEOUT_MAX_MILLIS: f64 = i64::MAX as f64;
 
 /// 按真机口径给阻塞超时分类。
 ///
-/// 先按浮点秒解析，非数字回「不是浮点」，负值回「负数」，正值换算成毫秒后越过
-/// `i64::MAX` 回「越界」。零与负的亚毫秒值表示无限等待，正的亚毫秒值按最短 1 毫秒
-/// 处理，避免把极小正数误当成永久阻塞。`Ok(None)` 表示无限等待。
+/// 先按浮点秒解析，换算成毫秒后越过 `i64::MAX` 回「越界」，再把毫秒向零截断，
+/// 截断后为负才回「负数」。零与负的亚毫秒值表示无限等待，正的亚毫秒值按最短
+/// 1 毫秒处理，避免把极小正数误当成永久阻塞。`Ok(None)` 表示无限等待。
 fn classify_timeout(raw: &[u8]) -> Result<Option<Duration>, &'static str> {
     let text = std::str::from_utf8(raw).map_err(|_| "timeout is not a float or out of range")?;
     let seconds = text.parse::<f64>().map_err(|_| "timeout is not a float or out of range")?;
     if seconds.is_nan() {
         return Err("timeout is not a float or out of range");
     }
-    if seconds < 0.0 {
-        return Err("timeout is negative");
-    }
     let milliseconds = seconds * 1000.0;
     if milliseconds > TIMEOUT_MAX_MILLIS {
         return Err("timeout is out of range");
     }
     let whole = milliseconds.trunc();
+    if whole < 0.0 {
+        return Err("timeout is negative");
+    }
     if whole == 0.0 {
         return Ok(if seconds > 0.0 { Some(Duration::from_millis(1)) } else { None });
     }
