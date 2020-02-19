@@ -2077,3 +2077,93 @@ fn an_aborted_transaction_leaves_no_index_entries() {
     assert_eq!(entries(&store, "items", "a_1").len(), 1, "commit publishes the entry with the document");
     assert_eq!(find_all(&store, "items", &mut cursors).len(), 1);
 }
+
+fn forty_documents() -> Vec<BsonDocument> {
+    (0..40).map(|identifier| document(&[("_id", BsonValue::Int32(identifier)), ("a", BsonValue::Int32(identifier % 4))])).collect()
+}
+
+#[test]
+fn limit_stops_a_collection_scan_at_the_window_edge() {
+    let store = store();
+    insert_documents(&store, "items", forty_documents());
+
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(BsonDocument::new()));
+    find.push("skip", BsonValue::Int32(5));
+    find.push("limit", BsonValue::Int32(3));
+    let mut cursors = CursorStore::new();
+    let returned = batch(&commands::find(&find, &store, &mut cursors).expect("find"), "firstBatch");
+    assert_eq!(returned.len(), 3);
+    assert_eq!(int(&returned[0], "_id"), 5);
+
+    let mut explained_find = command("find", "items", "app");
+    explained_find.push("filter", BsonValue::Document(BsonDocument::new()));
+    explained_find.push("skip", BsonValue::Int32(5));
+    explained_find.push("limit", BsonValue::Int32(3));
+    let mut explain = document(&[("explain", BsonValue::Document(explained_find))]);
+    explain.push("verbosity", text("executionStats"));
+    explain.push("$db", text("app"));
+    let explained = commands::explain(&explain, &store).expect("explain");
+    let stats = nested(&explained, &["executionStats"]).expect("stats");
+    assert_eq!(int(stats, "nReturned"), 3);
+    assert_eq!(int(stats, "totalDocsExamined"), 8, "扫描在窗口右边界停手，不再读整个集合");
+}
+
+#[test]
+fn limit_stops_the_fetches_of_an_index_scan_at_the_window_edge() {
+    let store = store();
+    insert_documents(&store, "items", forty_documents());
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(document(&[("a", BsonValue::Int32(1))])));
+    find.push("limit", BsonValue::Int32(2));
+    let mut cursors = CursorStore::new();
+    let returned = batch(&commands::find(&find, &store, &mut cursors).expect("find"), "firstBatch");
+    assert_eq!(returned.len(), 2);
+
+    let mut explained_find = command("find", "items", "app");
+    explained_find.push("filter", BsonValue::Document(document(&[("a", BsonValue::Int32(1))])));
+    explained_find.push("limit", BsonValue::Int32(2));
+    let mut explain = document(&[("explain", BsonValue::Document(explained_find))]);
+    explain.push("verbosity", text("executionStats"));
+    explain.push("$db", text("app"));
+    let explained = commands::explain(&explain, &store).expect("explain");
+    let stats = nested(&explained, &["executionStats"]).expect("stats");
+    assert_eq!(int(stats, "nReturned"), 2);
+    // 前缀区间由后端一次读出（10 个键），回表在窗口右边界停手（2 篇）。
+    assert_eq!(int(stats, "totalKeysExamined"), 10);
+    assert_eq!(int(stats, "totalDocsExamined"), 2);
+}
+
+#[test]
+fn aggregate_pushes_a_leading_match_onto_the_find_access_path() {
+    let store = store();
+    insert_documents(&store, "items", forty_documents());
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let ids = |documents: &[BsonDocument]| -> Vec<Vec<u8>> {
+        documents.iter().map(|document| value_to_key(document.get("_id").expect("_id"))).collect()
+    };
+
+    let mut aggregate = command("aggregate", "items", "app");
+    aggregate.push(
+        "pipeline",
+        BsonValue::Array(vec![
+            BsonValue::Document(document(&[("$match", BsonValue::Document(document(&[("a", BsonValue::Int32(1))])))])),
+            BsonValue::Document(document(&[("$skip", BsonValue::Int32(1))])),
+            BsonValue::Document(document(&[("$limit", BsonValue::Int32(3))])),
+        ]),
+    );
+    let pushed = batch(&commands::aggregate(&aggregate, &store).expect("aggregate"), "firstBatch");
+
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(document(&[("a", BsonValue::Int32(1))])));
+    find.push("skip", BsonValue::Int32(1));
+    find.push("limit", BsonValue::Int32(3));
+    let mut cursors = CursorStore::new();
+    let found = batch(&commands::find(&find, &store, &mut cursors).expect("find"), "firstBatch");
+
+    assert_eq!(pushed.len(), 3);
+    assert_eq!(ids(&pushed), ids(&found), "下推之后聚合与 find 走同一条访问路径，顺序一致");
+}

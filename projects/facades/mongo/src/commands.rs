@@ -1537,6 +1537,9 @@ fn choose_access(
 }
 
 /// 按访问路径执行一次真实扫描。
+///
+/// `stop_after` 是命中数边界：达到之后立即停止读取，用于 `limit` 早停。只有
+/// 不受排序约束的查询才能给出这个边界，否则「先停」与「先排」会给出不同结果。
 fn scan_with_access(
     store: &dyn MongoStorage,
     namespace: &str,
@@ -1544,12 +1547,12 @@ fn scan_with_access(
     access: &QueryAccess,
     session: Option<&str>,
     need_total: bool,
+    stop_after: Option<usize>,
 ) -> Result<ScanOutcome, CommandError> {
     match access {
         QueryAccess::Collection { .. } => {
-            let documents = collect_matching(store, namespace, filter, session)?;
-            let collection_size = if need_total { namespace_documents(store, namespace, session)?.len() as i64 } else { 0 };
-            Ok(ScanOutcome { documents, keys_examined: 0, documents_examined: collection_size })
+            let (documents, documents_examined) = collect_matching_bounded(store, namespace, filter, session, need_total, stop_after)?;
+            Ok(ScanOutcome { documents, keys_examined: 0, documents_examined })
         }
         QueryAccess::Index(plan) => {
             let entry_namespace = crate::storage::index_namespace(namespace, &plan.spec.name);
@@ -1561,7 +1564,7 @@ fn scan_with_access(
             let mut documents_examined = 0i64;
             let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
             let mut documents = Vec::new();
-            for prefix in prefixes {
+            'scan: for prefix in prefixes {
                 let entries = store
                     .scan_reserved(&entry_namespace, &prefix)
                     .map_err(|error| CommandError::new(1, format!("index scan failed: {error}")))?;
@@ -1576,11 +1579,49 @@ fn scan_with_access(
                         && document_matches(&document, filter)?
                     {
                         documents.push(document);
+                        if stop_after.is_some_and(|bound| documents.len() >= bound) {
+                            break 'scan;
+                        }
                     }
                 }
             }
             Ok(ScanOutcome { documents, keys_examined, documents_examined })
         }
+    }
+}
+
+/// 只读前 `skip + limit` 篇命中即可结束扫描的边界。
+///
+/// 排序非空时结果顺序由排序决定，不能提前停；`limit` 为 `0` 表示不限量。
+fn scan_stop_after(sort: &[(String, i32)], skip: usize, limit: usize) -> Option<usize> {
+    if sort.is_empty() && limit > 0 { Some(skip.saturating_add(limit)) } else { None }
+}
+
+/// 首段 `$match` 之后紧跟 `$limit`（或 `$skip` + `$limit`）时的扫描边界。
+///
+/// 只看紧邻的这两段：中间还有别的阶段时，`$limit` 前面的文档数无法从访问路径
+/// 直接推出，不能提前停。
+fn aggregate_stop_after(stages: &[BsonValue]) -> Option<usize> {
+    fn pair(stage: Option<&BsonValue>) -> Option<(&str, &BsonValue)> {
+        let BsonValue::Document(document) = stage?
+        else {
+            return None;
+        };
+        if document.fields.len() != 1 {
+            return None;
+        }
+        let (name, body) = document.fields.first()?;
+        Some((name.as_str(), body))
+    }
+    let (name, body) = pair(stages.first())?;
+    match name {
+        "$limit" => positive_stage_integer("$limit", body).ok(),
+        "$skip" => {
+            let skip = usize::try_from(int_value(body)?).ok()?;
+            let (next, next_body) = pair(stages.get(1))?;
+            if next == "$limit" { Some(skip.saturating_add(positive_stage_integer("$limit", next_body).ok()?)) } else { None }
+        }
+        _ => None,
     }
 }
 
@@ -1607,7 +1648,9 @@ pub fn find(command: &BsonDocument, store: &dyn MongoStorage, cursors: &mut Curs
     let hint = resolve_hint(command, store, &namespace, &filter, command.get("sort"), command.get("projection"))?;
 
     let access = choose_access(store, &namespace, &filter, &hint, &sort, &[], session.key())?;
-    let mut documents = scan_with_access(store, &namespace, &filter, &access, session.key(), false)?.documents;
+    // 无排序时结果顺序就是扫描顺序，命中前 `skip + limit` 篇即可停手。
+    let stop_after = scan_stop_after(&sort, skip, limit);
+    let mut documents = scan_with_access(store, &namespace, &filter, &access, session.key(), false, stop_after)?.documents;
     if matches!(access, QueryAccess::Collection { direction: -1 }) {
         documents.reverse();
     }
@@ -1661,7 +1704,8 @@ pub fn count(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDoc
 
     let matched = {
         let access = choose_access(store, &namespace, &filter, &hint, &[], &[], session.key())?;
-        scan_with_access(store, &namespace, &filter, &access, session.key(), false)?.documents.len()
+        let stop_after = scan_stop_after(&[], skip, limit);
+        scan_with_access(store, &namespace, &filter, &access, session.key(), false, stop_after)?.documents.len()
     };
     let start = skip.min(matched);
     let end = if limit > 0 { (start + limit).min(matched) } else { matched };
@@ -1725,7 +1769,9 @@ pub fn explain(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonD
     let total = all_documents.len();
     // 与 find / count 走同一个访问路径决策函数：explain 不再单独推一份计划。
     let access = choose_access(store, &namespace, &filter, &hint, &sort, &all_documents, None)?;
-    let outcome = scan_with_access(store, &namespace, &filter, &access, None, true)?;
+    // 与 find / count 用同一个早停边界，explain 报的扫描量就是执行器真实读到的量。
+    let stop_after = scan_stop_after(&sort, skip, limit);
+    let outcome = scan_with_access(store, &namespace, &filter, &access, None, true, stop_after)?;
     let matched = outcome.documents.len();
     let counted = if limit > 0 { matched.saturating_sub(skip).min(limit) } else { matched.saturating_sub(skip) };
     let direction = match &access {
@@ -1789,6 +1835,7 @@ pub fn explain(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonD
                 command: name,
                 filter: &normalized,
                 total,
+                examined: outcome.documents_examined,
                 matched,
                 skip,
                 limit,
@@ -1909,6 +1956,8 @@ struct ExecutionStats<'a> {
     command: &'a str,
     filter: &'a BsonDocument,
     total: usize,
+    /// 本次扫描实际读到的文档数：`limit` 早停后不再是整个集合。
+    examined: i64,
     matched: usize,
     skip: usize,
     limit: usize,
@@ -1918,13 +1967,13 @@ struct ExecutionStats<'a> {
 }
 
 fn explain_execution_stats(request: ExecutionStats<'_>) -> BsonDocument {
-    let ExecutionStats { command, filter, total, matched, skip, limit, counted, all_plans, direction } = request;
+    let ExecutionStats { command, filter, total, examined, matched, skip, limit, counted, all_plans, direction } = request;
     let works = (total + 1) as i64;
     let returned = if command == "count" { 0 } else { counted };
-    let scan = execution_stage("COLLSCAN", matched as i64, works, total as i64, filter, direction);
+    let scan = execution_stage("COLLSCAN", matched as i64, works, examined, filter, direction);
     let stage = if command == "count" {
         let mut counted_stage = BsonDocument::new();
-        for (field, value) in execution_stage("COUNT", 0, works, total as i64, &BsonDocument::new(), direction).fields {
+        for (field, value) in execution_stage("COUNT", 0, works, examined, &BsonDocument::new(), direction).fields {
             counted_stage.push(field, value);
         }
         counted_stage.push("nCounted".to_string(), count_value(counted as i64));
@@ -1935,14 +1984,14 @@ fn explain_execution_stats(request: ExecutionStats<'_>) -> BsonDocument {
     else {
         let mut stage = scan;
         if skip > 0 {
-            let mut skipped = execution_stage("SKIP", returned as i64, works, total as i64, &BsonDocument::new(), direction);
+            let mut skipped = execution_stage("SKIP", returned as i64, works, examined, &BsonDocument::new(), direction);
             skipped.push("skipAmount".to_string(), count_value(skip as i64));
             skipped.push("inputStage".to_string(), BsonValue::Document(stage));
             stage = skipped;
         }
         if limit > 0 {
             let mut limited = BsonDocument::new();
-            for (field, value) in execution_stage("LIMIT", returned as i64, works, total as i64, &BsonDocument::new(), direction).fields {
+            for (field, value) in execution_stage("LIMIT", returned as i64, works, examined, &BsonDocument::new(), direction).fields {
                 limited.push(field, value);
             }
             limited.push("limitAmount".to_string(), count_value(limit as i64));
@@ -1963,7 +2012,7 @@ fn explain_execution_stats(request: ExecutionStats<'_>) -> BsonDocument {
     stats.push("nReturned".to_string(), count_value(returned as i64));
     stats.push("executionTimeMillis".to_string(), BsonValue::Int32(0));
     stats.push("totalKeysExamined".to_string(), BsonValue::Int32(0));
-    stats.push("totalDocsExamined".to_string(), count_value(total as i64));
+    stats.push("totalDocsExamined".to_string(), count_value(examined));
     stats.push("executionStages".to_string(), BsonValue::Document(stage));
     if all_plans {
         stats.push("allPlansExecution".to_string(), BsonValue::Array(Vec::new()));
@@ -2059,8 +2108,26 @@ pub fn aggregate(command: &BsonDocument, store: &dyn MongoStorage) -> Result<Bso
         _ => return Err(CommandError::new(2, "aggregate requires a pipeline array")),
     };
 
-    let documents = collect_matching(store, &namespace, &BsonDocument::new(), session.key())?;
-    let documents = run_pipeline(documents, stages, store, &namespace, session.key(), &empty_variables())?;
+    // 首个 `$match` 直接下推到访问路径：能走索引就走索引，后接 `$limit` 时还能
+    // 提前停。带 `let` 的 `$match` 依赖变量绑定，留在管道里按原样求值。
+    let documents;
+    let mut remaining: &[BsonValue] = stages;
+    if command.get("let").is_none()
+        && let Some(BsonValue::Document(stage)) = stages.first()
+        && let Some((name, body)) = stage.fields.first()
+        && name == "$match"
+        && let BsonValue::Document(filter) = body
+    {
+        validate_filter(filter, "aggregate $match")?;
+        let stop_after = aggregate_stop_after(&stages[1..]);
+        let access = choose_access(store, &namespace, filter, &Hint::None, &[], &[], session.key())?;
+        documents = scan_with_access(store, &namespace, filter, &access, session.key(), false, stop_after)?.documents;
+        remaining = &stages[1..];
+    }
+    else {
+        documents = collect_matching(store, &namespace, &BsonDocument::new(), session.key())?;
+    }
+    let documents = run_pipeline(documents, remaining, store, &namespace, session.key(), &empty_variables())?;
 
     Ok(cursor_reply(&namespace, "firstBatch", documents.into_iter().map(BsonValue::Document).collect(), 0))
 }
@@ -6326,6 +6393,49 @@ fn collect_matching(
         }
     }
     Ok(documents)
+}
+
+/// 与 [`collect_matching`] 相同，但命中数达到 `stop_after` 后停止读取。
+///
+/// 第二个返回值是实际读到的文档数，供 `explain` 报告 `docsExamined`：提前停
+/// 之后不能再报整个集合的大小。`need_total` 为假时调用方不看这个数字。
+fn collect_matching_bounded(
+    store: &dyn MongoStorage,
+    namespace: &str,
+    filter: &BsonDocument,
+    session: Option<&str>,
+    need_total: bool,
+    stop_after: Option<usize>,
+) -> Result<(Vec<BsonDocument>, i64), CommandError> {
+    if stop_after.is_none() {
+        let documents = collect_matching(store, namespace, filter, session)?;
+        let total = if need_total { namespace_documents(store, namespace, session)?.len() as i64 } else { 0 };
+        return Ok((documents, total));
+    }
+    if let Some(identifier) = single_id_lookup(filter) {
+        let key = value_to_key(identifier);
+        return Ok(match namespace_document(store, namespace, &key, session)? {
+            Some(bytes) => match parse_bson(&bytes) {
+                Ok(document) if document_matches(&document, filter)? => (vec![document], 1),
+                _ => (Vec::new(), 1),
+            },
+            None => (Vec::new(), 0),
+        });
+    }
+    let mut documents = Vec::new();
+    let mut examined = 0i64;
+    for (_key, value) in namespace_documents(store, namespace, session)? {
+        examined += 1;
+        if let Ok(candidate) = parse_bson(&value)
+            && document_matches(&candidate, filter)?
+        {
+            documents.push(candidate);
+            if stop_after.is_some_and(|bound| documents.len() >= bound) {
+                break;
+            }
+        }
+    }
+    Ok((documents, examined))
 }
 
 fn single_id_lookup(filter: &BsonDocument) -> Option<&BsonValue> {
