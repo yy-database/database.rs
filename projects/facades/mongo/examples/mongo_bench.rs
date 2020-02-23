@@ -47,6 +47,8 @@ const DATABASE: &str = "bench";
 const COLLECTION: &str = "items";
 /// 索引名，创建与删除都用它。
 const INDEX_NAME: &str = "bench_score";
+/// 唯一索引名，`insert_unique` 用它测唯一性判定的开销。
+const UNIQUE_INDEX_NAME: &str = "bench_id_kind";
 
 fn main() {
     if let Err(error) = run() {
@@ -69,7 +71,12 @@ fn run() -> Result<(), String> {
     for (name, operation) in OPERATIONS {
         let mut samples = Vec::with_capacity(ROUNDS);
         for round in 0..ROUNDS {
-            reset(&mut backend, &documents, !matches!(*name, "index_create"))?;
+            let index = match *name {
+                "index_create" => ResetIndex::None,
+                "insert_unique" => ResetIndex::Unique,
+                _ => ResetIndex::Score,
+            };
+            reset(&mut backend, &documents, index)?;
             let start = Instant::now();
             operation(&mut backend, round)?;
             samples.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -89,6 +96,7 @@ fn run() -> Result<(), String> {
 const OPERATIONS: &[(&str, fn(&mut Backend, usize) -> Result<(), String>)] = &[
     ("insert_single", insert_single),
     ("insert_bulk", insert_bulk),
+    ("insert_unique", insert_unique),
     ("find_by_id", find_by_id),
     ("find_range", find_range),
     ("update_filter", update_filter),
@@ -121,6 +129,21 @@ fn insert_bulk(backend: &mut Backend, round: usize) -> Result<(), String> {
             ("kind", text(if index % 2 == 0 { "a" } else { "b" })),
             ("score", BsonValue::Int32((index % 1_000) as i32)),
             ("payload", text("bulk-insert-payload")),
+        ])));
+    }
+    let mut insert = command("insert", COLLECTION);
+    insert.push("documents", BsonValue::Array(documents));
+    check_write(&backend.run(&insert)?)
+}
+
+fn insert_unique(backend: &mut Backend, round: usize) -> Result<(), String> {
+    let mut documents = Vec::with_capacity(BATCH_SIZE);
+    for index in 0..BATCH_SIZE {
+        documents.push(BsonValue::Document(document(&[
+            ("_id", BsonValue::Int32(6_000_000 + (round * BATCH_SIZE + index) as i32)),
+            ("kind", text(if index % 2 == 0 { "a" } else { "b" })),
+            ("score", BsonValue::Int32((index % 1_000) as i32)),
+            ("payload", text("unique-insert-payload")),
         ])));
     }
     let mut insert = command("insert", COLLECTION);
@@ -233,8 +256,19 @@ fn cursor_batches(backend: &mut Backend, _round: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// 重置时建哪一个索引。
+#[derive(Clone, Copy)]
+enum ResetIndex {
+    /// 非唯一 `score` 索引，供索引扫描类操作使用。
+    Score,
+    /// 唯一 `{_id, kind}` 索引，供 `insert_unique` 使用。
+    Unique,
+    /// 不建索引，供 `index_create` 自己计时建索引。
+    None,
+}
+
 /// 把集合重置到同一初始状态，重置耗时不计入样本。
-fn reset(backend: &mut Backend, documents: &[BsonDocument], with_index: bool) -> Result<(), String> {
+fn reset(backend: &mut Backend, documents: &[BsonDocument], index: ResetIndex) -> Result<(), String> {
     // 集合不存在时 `drop` 会报错，这里忽略，重置本来就以删掉为准。
     let _ = backend.run(&command("drop", COLLECTION));
     for chunk in documents.chunks(BULK_INSERT_SIZE) {
@@ -242,18 +276,18 @@ fn reset(backend: &mut Backend, documents: &[BsonDocument], with_index: bool) ->
         insert.push("documents", BsonValue::Array(chunk.iter().cloned().map(BsonValue::Document).collect()));
         check_write(&backend.run(&insert)?)?;
     }
-    if with_index {
-        let mut create = command("createIndexes", COLLECTION);
-        create.push(
-            "indexes",
-            BsonValue::Array(vec![BsonValue::Document(document(&[
-                ("key", BsonValue::Document(document(&[("score", BsonValue::Int32(1))]))),
-                ("name", text(INDEX_NAME)),
-            ]))]),
-        );
-        check_reply(&backend.run(&create)?)?;
-    }
-    Ok(())
+    let specification = match index {
+        ResetIndex::None => return Ok(()),
+        ResetIndex::Score => document(&[("key", BsonValue::Document(document(&[("score", BsonValue::Int32(1))]))), ("name", text(INDEX_NAME))]),
+        ResetIndex::Unique => document(&[
+            ("key", BsonValue::Document(document(&[("_id", BsonValue::Int32(1)), ("kind", BsonValue::Int32(1))]))),
+            ("name", text(UNIQUE_INDEX_NAME)),
+            ("unique", BsonValue::Bool(true)),
+        ]),
+    };
+    let mut create = command("createIndexes", COLLECTION);
+    create.push("indexes", BsonValue::Array(vec![BsonValue::Document(specification)]));
+    check_reply(&backend.run(&create)?)
 }
 
 /// 固定 seed 生成同一批文档，两种后端与多次运行都得到相同数据。

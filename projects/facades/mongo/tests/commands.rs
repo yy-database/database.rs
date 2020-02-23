@@ -11,6 +11,7 @@ use mongo::{
     commands::{self, CommandError},
     cursor::CursorStore,
     json,
+    storage::MongoStorage,
     store::Store,
     wire::{decode_op_msg_command, encode_op_msg_body},
 };
@@ -2042,6 +2043,27 @@ fn importing_over_an_existing_document_replaces_its_index_entries() {
     let fresh_stats = nested(&fresh_explain, &["executionStats"]).expect("stats");
     assert_eq!(int(fresh_stats, "totalKeysExamined"), 1);
     assert_eq!(int(fresh_stats, "totalDocsExamined"), 1);
+}
+
+#[test]
+fn a_unique_insert_reads_the_persisted_entry_and_falls_back_when_it_is_missing() {
+    let store = store();
+    commands::create_indexes(&index_command("items", 1, "a_1", true), &store).expect("createIndexes");
+    insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Int32(7))])]);
+
+    let duplicate = insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(2)), ("a", BsonValue::Int32(7))])]);
+    assert_eq!(int(&duplicate, "n"), 0);
+    assert_eq!(int(&array(&duplicate, "writeErrors")[0], "code"), 11000);
+
+    // 旧目录可能还没回填索引项：条目为空时必须退回整表扫描，不能放行重复键。
+    let cleared = store.clear_reserved(&index_namespace("items", "a_1")).expect("clear entries");
+    assert_eq!(cleared, 1);
+    let legacy = insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(3)), ("a", BsonValue::Int32(7))])]);
+    assert_eq!(int(&legacy, "n"), 0);
+    assert_eq!(int(&array(&legacy, "writeErrors")[0], "code"), 11000);
+
+    let fresh = insert_documents(&store, "items", vec![document(&[("_id", BsonValue::Int32(4)), ("a", BsonValue::Int32(8))])]);
+    assert_eq!(int(&fresh, "n"), 1);
 }
 
 #[test]

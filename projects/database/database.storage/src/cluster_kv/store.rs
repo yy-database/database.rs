@@ -442,6 +442,10 @@ fn collect_expired(
 
 /// Shared scan logic: filter by namespace, prefix-match, exclusive cursors (after/before), limit.
 /// Expired records are treated as absent.
+///
+/// 键序是 `(namespace, bytes)`，同一命名空间里带同一前缀的键是连续区间，所以这里
+/// 从区间起点直接 `range` 过去，只走真正可能命中的记录。逐个 `continue` 过滤会让
+/// 每次前缀探针都退化成整 shard 遍历，索引回表与唯一性判定都会因此变慢。
 fn collect_scan(
     records: &BTreeMap<Key, Record>,
     namespace: &Namespace,
@@ -452,14 +456,12 @@ fn collect_scan(
 ) -> Vec<Record> {
     let now = now_unix_ms();
     let mut out = Vec::new();
-    for (key, record) in records {
+    let start = Key::new(namespace.0.clone(), prefix.to_vec());
+    for (key, record) in records.range(start..) {
+        if key.namespace != *namespace || !key.bytes.starts_with(prefix) {
+            break;
+        }
         if record.is_expired_at(now) {
-            continue;
-        }
-        if key.namespace != *namespace {
-            continue;
-        }
-        if !key.bytes.starts_with(prefix) {
             continue;
         }
         if let Some(after_bytes) = after {

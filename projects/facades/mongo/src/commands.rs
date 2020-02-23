@@ -581,6 +581,10 @@ pub fn insert(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
 /// Documents are evaluated in request order. A rejected document never
 /// contributes keys, so an unordered batch may still accept a later document
 /// that reuses a rejected one's key, exactly like `mongod`.
+///
+/// 唯一性判定走已经落盘的索引项：`_id` 用点读，唯一索引按元组前缀探针，不再
+/// 为了查重扫全表。只有索引项为空（旧目录还没回填）时才退回整表扫描，宁可慢
+/// 也不能因为条目缺失放行重复键。
 fn commit_insert(
     store: &dyn MongoStorage,
     session: Option<&str>,
@@ -591,16 +595,24 @@ fn commit_insert(
     write_errors: &mut Vec<WriteError>,
 ) -> Result<(usize, Vec<BsonDocument>), CommandError> {
     let mut indexed: Vec<BTreeSet<Vec<u8>>> = vec![BTreeSet::new(); unique_indexes.len()];
-    let mut existing: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for (key, payload) in namespace_documents(store, namespace, session)? {
-        existing.insert(key);
-        let Ok(document) = parse_bson(&payload)
-        else {
-            continue;
-        };
-        for (position, specification) in unique_indexes.iter().enumerate() {
-            for tuple in index_entries(&document, specification) {
-                indexed[position].insert(index_tuple(&tuple));
+    let mut persistent: Vec<bool> = Vec::with_capacity(unique_indexes.len());
+    for specification in unique_indexes {
+        let entries = store
+            .reserved_has_entries(&crate::storage::index_namespace(namespace, &specification.name))
+            .map_err(|error| CommandError::new(1, format!("index probe failed: {error}")))?;
+        persistent.push(entries);
+    }
+    let fallback: Vec<usize> = persistent.iter().enumerate().filter(|(_, entries)| !**entries).map(|(position, _)| position).collect();
+    if !fallback.is_empty() {
+        for (_, payload) in namespace_documents(store, namespace, session)? {
+            let Ok(document) = parse_bson(&payload)
+            else {
+                continue;
+            };
+            for position in &fallback {
+                for tuple in index_entries(&document, &unique_indexes[*position]) {
+                    indexed[*position].insert(index_tuple(&tuple));
+                }
             }
         }
     }
@@ -610,7 +622,8 @@ fn commit_insert(
     let mut accepted_documents: Vec<BsonDocument> = Vec::new();
     for (index, document, identifier) in candidates {
         let id_key = value_to_key(identifier);
-        if existing.contains(&id_key) || staged.contains(&id_key) {
+        let taken = staged.contains(&id_key) || namespace_document(store, namespace, &id_key, session)?.is_some();
+        if taken {
             write_errors.push(id_duplicate_error(namespace, *index, identifier));
             if ordered {
                 break;
@@ -620,9 +633,19 @@ fn commit_insert(
         let mut conflict: Option<(&IndexSpec, Vec<BsonValue>)> = None;
         'specification: for (position, specification) in unique_indexes.iter().enumerate() {
             for values in index_entries(document, specification) {
-                if indexed[position].contains(&index_tuple(&values)) {
+                let tuple = index_tuple(&values);
+                if indexed[position].contains(&tuple) {
                     conflict = Some((specification, values));
                     break 'specification;
+                }
+                if persistent[position] {
+                    let probe = store
+                        .scan_reserved(&crate::storage::index_namespace(namespace, &specification.name), &tuple)
+                        .map_err(|error| CommandError::new(1, format!("index probe failed: {error}")))?;
+                    if !probe.is_empty() {
+                        conflict = Some((specification, values));
+                        break 'specification;
+                    }
                 }
             }
         }
