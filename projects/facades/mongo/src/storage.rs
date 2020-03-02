@@ -76,6 +76,28 @@ pub trait MongoStorage: Send + Sync {
         Ok(self.scan(namespace)?.into_iter().filter(|(key, _)| key.starts_with(prefix)).collect())
     }
 
+    /// 在保留命名空间下做有界区间扫描。
+    ///
+    /// 语义与 [`Self::scan_reserved`] 相同，但只返回键严格大于 `after`（不含）
+    /// 且严格小于 `before`（不含）的条目，`limit` 为 `0` 表示不设上限。
+    /// 默认实现先整段取出再裁剪，能覆盖的后端应下推到原生游标，避免为了
+    /// 早停而把整段索引前缀读进内存。
+    fn scan_reserved_range(
+        &self,
+        namespace: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        let mut entries = self.scan_reserved(namespace, prefix)?;
+        entries.retain(|(key, _)| after.is_none_or(|after| key.as_slice() > after) && before.is_none_or(|before| key.as_slice() < before));
+        if limit > 0 {
+            entries.truncate(limit);
+        }
+        Ok(entries)
+    }
+
     /// 写入保留命名空间，返回写入条数。
     ///
     /// 实现不得把该命名空间登记进目录：索引命名空间只承载键值，不参与
@@ -125,6 +147,16 @@ pub trait MongoStorage: Send + Sync {
 
     /// 注册 namespace 并追加索引定义。
     fn add_indexes(&self, namespace: &str, indexes: &[IndexSpec]) -> Result<(), StoreError>;
+
+    /// 把一个索引标记为 multikey（索引字段出现过数组值）。
+    ///
+    /// 标记一旦置上就不撤销：数组元素分布决定了两侧范围谓词在 multikey 上
+    /// 不能只按同一元素取值，查询层需要据此退回集合扫描。后端若无法持久化
+    /// 该标记，必须返回 `Err`，不能假装成功。
+    fn mark_index_multikey(&self, namespace: &str, name: &str) -> Result<(), StoreError> {
+        let _ = (namespace, name);
+        Err(StoreError::Catalog("store does not persist index metadata".to_string()))
+    }
 
     /// 删除指定用户索引，`name` 为 `*` 时删除全部用户索引，返回删除条数。
     fn drop_indexes(&self, namespace: &str, name: &str) -> Result<usize, StoreError>;

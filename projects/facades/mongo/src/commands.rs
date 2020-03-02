@@ -863,11 +863,16 @@ enum Hint {
     Index(IndexSpec),
 }
 
-/// One equality or `$in` bound the executor actually probes on the leading key field.
+/// One equality, `$in` or range bound the executor actually probes on the leading key field.
 enum KeyBound {
     Full,
     Eq(BsonValue),
     In(Vec<BsonValue>),
+    /// 首键字段的数值范围；`bool` 表示闭区间，缺省一侧为无界。
+    Range {
+        lower: Option<(BsonValue, bool)>,
+        upper: Option<(BsonValue, bool)>,
+    },
 }
 
 /// Bounds rendered as `startKey` / `endKey` documents in plan output.
@@ -1089,9 +1094,9 @@ fn field_holds_array(documents: &[BsonDocument], field: &str) -> bool {
 
 /// 可执行的首键字段边界。
 ///
-/// 只认等值与 `$in`：范围、`$ne`、`$exists`、正则等需要按 BSON 排序序切范围，
-/// 而索引项键目前按文档键编码拼接、不保证跨类型保序，所以这些条件如实退回
-/// `COLLSCAN`，不伪装成 `IXSCAN`。
+/// 等值、`$in` 与整数边界的范围可以直接切成索引项区间。范围只接受整数边界：
+/// 索引项键把整数值编码成定长保序键，非整数（double 位模式、decimal 系数）在
+/// 现有编码里不保序，硬切区间会漏掉落在区间外的元素，因此如实退回 `COLLSCAN`。
 fn executable_field_plan(field: &str, predicate: Option<&BsonValue>) -> FieldPlan {
     let full = || FieldPlan { field: field.to_string(), bound: KeyBound::Full, count: full_count_range() };
     let equality = |value: &BsonValue| -> Option<FieldPlan> {
@@ -1103,6 +1108,31 @@ fn executable_field_plan(field: &str, predicate: Option<&BsonValue>) -> FieldPla
             bound: KeyBound::Eq(value.clone()),
             count: CountRange { start: value.clone(), start_inclusive: true, end: value.clone(), end_inclusive: true },
         })
+    };
+    let range = |operators: &BsonDocument| -> Option<FieldPlan> {
+        let mut lower: Option<(BsonValue, bool)> = None;
+        let mut upper: Option<(BsonValue, bool)> = None;
+        for (operator, operand) in &operators.fields {
+            let (slot, inclusive) = match operator.as_str() {
+                "$gt" => (&mut lower, false),
+                "$gte" => (&mut lower, true),
+                "$lt" => (&mut upper, false),
+                "$lte" => (&mut upper, true),
+                _ => return None,
+            };
+            numeric_range_bound(operand)?;
+            *slot = Some((operand.clone(), inclusive));
+        }
+        if lower.is_none() && upper.is_none() {
+            return None;
+        }
+        let count = CountRange {
+            start: lower.as_ref().map(|(value, _)| value.clone()).unwrap_or_else(min_key_value),
+            start_inclusive: lower.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+            end: upper.as_ref().map(|(value, _)| value.clone()).unwrap_or_else(max_key_value),
+            end_inclusive: upper.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+        };
+        Some(FieldPlan { field: field.to_string(), bound: KeyBound::Range { lower, upper }, count })
     };
     let Some(predicate) = predicate
     else {
@@ -1124,10 +1154,21 @@ fn executable_field_plan(field: &str, predicate: Option<&BsonValue>) -> FieldPla
                     return FieldPlan { field: field.to_string(), bound: KeyBound::In(values.clone()), count: full_count_range() };
                 }
             }
-            full()
+            range(operators).unwrap_or_else(full)
         }
         BsonValue::Regex { .. } => full(),
         other => equality(other).unwrap_or_else(full),
+    }
+}
+
+/// 范围边界里能精确落到整数键上的值；非整数边界不进索引区间。
+fn numeric_range_bound(value: &BsonValue) -> Option<i64> {
+    match value {
+        BsonValue::Int32(number) => Some(*number as i64),
+        BsonValue::Int64(number) => Some(*number),
+        BsonValue::Double(number) => integral_value(*number),
+        BsonValue::Decimal128(number) => number.as_i64(),
+        _ => None,
     }
 }
 
@@ -1189,6 +1230,96 @@ fn plan_probes(plan: &HintedPlan) -> Option<Vec<BsonValue>> {
     }
 }
 
+/// 一次索引读取的区间：前缀加上排他游标。
+struct IndexSpan {
+    prefix: Vec<u8>,
+    after: Option<Vec<u8>>,
+    before: Option<Vec<u8>>,
+}
+
+/// 首键字段要读的索引区间；`None` 表示整段读取（无谓词的 hint 全索引扫描）。
+fn plan_spans(plan: &HintedPlan) -> Option<Vec<IndexSpan>> {
+    match plan.fields.first().map(|field| &field.bound)? {
+        KeyBound::Full => None,
+        KeyBound::Eq(value) => Some(vec![equality_span(value)]),
+        KeyBound::In(values) => Some(values.iter().map(equality_span).collect()),
+        KeyBound::Range { lower, upper } => Some(range_spans(lower.as_ref(), upper.as_ref())),
+    }
+}
+
+fn equality_span(value: &BsonValue) -> IndexSpan {
+    IndexSpan { prefix: index_tuple(std::slice::from_ref(value)), after: None, before: None }
+}
+
+/// 整数范围切出定长保序区间，非整数 double / decimal 整段读取后由回表过滤收敛。
+///
+/// 索引项键是「键长度（4 字节）+ 键字节 + 文档键」，整数键固定 9 字节，
+/// 因此整数区间可以按长度前缀定位；double 位模式与 decimal 系数在现有编码里
+/// 不保序，硬切会漏数据，只能整段读。
+fn range_spans(lower: Option<&(BsonValue, bool)>, upper: Option<&(BsonValue, bool)>) -> Vec<IndexSpan> {
+    let mut spans = Vec::new();
+    let start = match lower {
+        None => Ok(None),
+        Some((value, inclusive)) => match numeric_range_bound(value) {
+            Some(number) if *inclusive => Ok(Some(number)),
+            Some(number) => number.checked_add(1).map(Some).ok_or(()),
+            None => Err(()),
+        },
+    };
+    let end = match upper {
+        None => Ok(None),
+        Some((value, inclusive)) => match numeric_range_bound(value) {
+            Some(number) if *inclusive => Ok(Some(number)),
+            Some(number) => number.checked_sub(1).map(Some).ok_or(()),
+            None => Err(()),
+        },
+    };
+    if let (Ok(start), Ok(end)) = (start, end)
+        && (start.is_none() || end.is_none() || start <= end)
+    {
+        let entry_length = 9u32;
+        let region = numeric_entry_prefix(b'n', entry_length as usize);
+        let mut span = IndexSpan { prefix: region, after: None, before: None };
+        if let Some(start) = start {
+            let mut key = entry_length.to_be_bytes().to_vec();
+            key.extend_from_slice(&value_to_key(&BsonValue::Int64(start)));
+            span.after = Some(key);
+        }
+        if let Some(end) = end {
+            let mut key = entry_length.to_be_bytes().to_vec();
+            key.extend_from_slice(&value_to_key(&BsonValue::Int64(end)));
+            span.before = prefix_successor(&key);
+        }
+        spans.push(span);
+    }
+    spans.push(IndexSpan { prefix: numeric_entry_prefix(b'd', 9), after: None, before: None });
+    spans.push(IndexSpan { prefix: numeric_entry_prefix(b'D', 22), after: None, before: None });
+    spans
+}
+
+/// 单字段索引项的前缀：键长度（4 字节大端）+ 类型字节。
+fn numeric_entry_prefix(type_byte: u8, key_len: usize) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(5);
+    prefix.extend_from_slice(&(key_len as u32).to_be_bytes());
+    prefix.push(type_byte);
+    prefix
+}
+
+/// 严格大于所有以 `prefix` 开头的键的最小键；全 `0xFF` 时返回 `None`。
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    for position in (0..successor.len()).rev() {
+        if successor[position] == u8::MAX {
+            successor.truncate(position);
+        }
+        else {
+            successor[position] += 1;
+            return Some(successor);
+        }
+    }
+    None
+}
+
 /// 这个索引计划能否被当前执行器如实执行。
 ///
 /// 排序规则、稀疏索引的 null 等值、无法被查询蕴含的部分索引都会让索引项与
@@ -1196,6 +1327,13 @@ fn plan_probes(plan: &HintedPlan) -> Option<Vec<BsonValue>> {
 fn index_executable(plan: &HintedPlan, filter: &BsonDocument) -> bool {
     let specification = &plan.spec;
     if !specification.is_visible() || specification.collation.is_some() {
+        return false;
+    }
+    // 数组字段上两侧范围可以分别由不同元素满足，单元素区间会漏掉
+    // `{a: [3, 12]}` 这类文档。标记为 multikey 后只允许单侧范围。
+    if specification.multikey
+        && matches!(plan.fields.first().map(|field| &field.bound), Some(KeyBound::Range { lower: Some(_), upper: Some(_) }))
+    {
         return false;
     }
     if specification.is_sparse() {
@@ -1240,7 +1378,7 @@ fn automatic_index(store: &dyn MongoStorage, namespace: &str, filter: &BsonDocum
             continue;
         }
         let plan = build_hinted_plan(&[], &specification, filter, &[]);
-        if plan_probes(&plan).is_some() && index_executable(&plan, filter) && index_has_entries(store, namespace, &specification)? {
+        if plan_spans(&plan).is_some() && index_executable(&plan, filter) && index_has_entries(store, namespace, &specification)? {
             return Ok(Some(specification));
         }
     }
@@ -1252,6 +1390,17 @@ fn bound_text(bound: &KeyBound, backward: bool) -> Vec<String> {
         KeyBound::Full => vec![if backward { "[MaxKey, MinKey]".to_string() } else { "[MinKey, MaxKey]".to_string() }],
         KeyBound::Eq(value) => vec![format!("[{}, {}]", scalar_text(value), scalar_text(value))],
         KeyBound::In(values) => values.iter().map(|value| format!("[{}, {}]", scalar_text(value), scalar_text(value))).collect(),
+        KeyBound::Range { lower, upper } => {
+            let start = match lower {
+                Some((value, inclusive)) => format!("{}{}", if *inclusive { "[" } else { "(" }, scalar_text(value)),
+                None => "[MinKey".to_string(),
+            };
+            let end = match upper {
+                Some((value, inclusive)) => format!("{}{}", scalar_text(value), if *inclusive { "]" } else { ")" }),
+                None => "MaxKey]".to_string(),
+            };
+            vec![format!("{start}, {end}")]
+        }
     }
 }
 
@@ -1579,32 +1728,45 @@ fn scan_with_access(
         }
         QueryAccess::Index(plan) => {
             let entry_namespace = crate::storage::index_namespace(namespace, &plan.spec.name);
-            let prefixes: Vec<Vec<u8>> = match plan_probes(plan) {
-                Some(values) => values.iter().map(|value| index_tuple(std::slice::from_ref(value))).collect(),
-                None => vec![Vec::new()],
-            };
+            let spans = plan_spans(plan).unwrap_or_else(|| vec![IndexSpan { prefix: Vec::new(), after: None, before: None }]);
             let mut keys_examined = 0i64;
             let mut documents_examined = 0i64;
             let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
             let mut documents = Vec::new();
-            'scan: for prefix in prefixes {
-                let entries = store
-                    .scan_reserved(&entry_namespace, &prefix)
-                    .map_err(|error| CommandError::new(1, format!("index scan failed: {error}")))?;
-                keys_examined += entries.len() as i64;
-                for (_, document_key) in entries {
-                    if !seen.insert(document_key.clone()) {
-                        continue;
+            'scan: for span in spans {
+                // 区间内部分页：每页只读还差的命中数，避免为了早停把整段前缀取回。
+                let mut cursor = span.after.clone();
+                loop {
+                    let page = match stop_after {
+                        Some(bound) => (bound - documents.len()).max(1),
+                        None => 0,
+                    };
+                    let entries = store
+                        .scan_reserved_range(&entry_namespace, &span.prefix, cursor.as_deref(), span.before.as_deref(), page)
+                        .map_err(|error| CommandError::new(1, format!("index scan failed: {error}")))?;
+                    if entries.is_empty() {
+                        break;
                     }
-                    documents_examined += 1;
-                    if let Some(payload) = namespace_document(store, namespace, &document_key, session)?
-                        && let Ok(document) = parse_bson(&payload)
-                        && document_matches(&document, filter)?
-                    {
-                        documents.push(document);
-                        if stop_after.is_some_and(|bound| documents.len() >= bound) {
-                            break 'scan;
+                    keys_examined += entries.len() as i64;
+                    let fetched = entries.len();
+                    for (entry_key, document_key) in entries {
+                        cursor = Some(entry_key);
+                        if !seen.insert(document_key.clone()) {
+                            continue;
                         }
+                        documents_examined += 1;
+                        if let Some(payload) = namespace_document(store, namespace, &document_key, session)?
+                            && let Ok(document) = parse_bson(&payload)
+                            && document_matches(&document, filter)?
+                        {
+                            documents.push(document);
+                            if stop_after.is_some_and(|bound| documents.len() >= bound) {
+                                break 'scan;
+                            }
+                        }
+                    }
+                    if stop_after.is_none() || fetched < page {
+                        break;
                     }
                 }
             }
@@ -1645,6 +1807,18 @@ fn aggregate_stop_after(stages: &[BsonValue]) -> Option<usize> {
             if next == "$limit" { Some(skip.saturating_add(positive_stage_integer("$limit", next_body).ok()?)) } else { None }
         }
         _ => None,
+    }
+}
+
+/// 值里是否读取了聚合变量（`$$名称`）。
+///
+/// 只做保守判断：任何以 `$$` 开头的字符串都算引用，宁可不下推也不改语义。
+fn references_variables(value: &BsonValue) -> bool {
+    match value {
+        BsonValue::String(text) => text.starts_with("$$"),
+        BsonValue::Array(items) => items.iter().any(references_variables),
+        BsonValue::Document(document) => document.fields.iter().any(|(_, value)| references_variables(value)),
+        _ => false,
     }
 }
 
@@ -2132,14 +2306,15 @@ pub fn aggregate(command: &BsonDocument, store: &dyn MongoStorage) -> Result<Bso
     };
 
     // 首个 `$match` 直接下推到访问路径：能走索引就走索引，后接 `$limit` 时还能
-    // 提前停。带 `let` 的 `$match` 依赖变量绑定，留在管道里按原样求值。
+    // 提前停。`let` 绑定的变量只通过 `$$名称` 读取：`$match` 里没有 `$$` 引用时
+    // 语义与无 `let` 完全一致，仍然下推；有引用就留在管道里按绑定求值。
     let documents;
     let mut remaining: &[BsonValue] = stages;
-    if command.get("let").is_none()
-        && let Some(BsonValue::Document(stage)) = stages.first()
+    if let Some(BsonValue::Document(stage)) = stages.first()
         && let Some((name, body)) = stage.fields.first()
         && name == "$match"
         && let BsonValue::Document(filter) = body
+        && (command.get("let").is_none() || !references_variables(body))
     {
         validate_filter(filter, "aggregate $match")?;
         let stop_after = aggregate_stop_after(&stages[1..]);
@@ -4356,6 +4531,25 @@ fn delete_index_keys(store: &dyn MongoStorage, session: Option<&str>, keys: &BTr
     Ok(())
 }
 
+/// 索引键字段出现数组值时把索引标记为 multikey，供范围计划保守回退。
+///
+/// 标记只会从关变开：数组元素删除后仍按 multikey 处理，宁可少用索引也不漏结果。
+fn note_multikey(store: &dyn MongoStorage, documents: &[(BsonDocument, Vec<u8>)], specifications: &[IndexSpec]) -> Result<(), CommandError> {
+    for specification in specifications {
+        if specification.multikey {
+            continue;
+        }
+        let array_valued =
+            documents.iter().any(|(document, _)| specification.key.fields.iter().any(|(field, _)| field_array_valued(document, field)));
+        if array_valued {
+            store
+                .mark_index_multikey(&specification.namespace, &specification.name)
+                .map_err(|error| CommandError::new(1, format!("index metadata update failed: {error}")))?;
+        }
+    }
+    Ok(())
+}
+
 /// 为一个文档集合写入索引项；每个条目值是文档键，读取时据此回表。
 fn write_index_entries(
     store: &dyn MongoStorage,
@@ -4366,6 +4560,7 @@ fn write_index_entries(
     if specifications.is_empty() || documents.is_empty() {
         return Ok(());
     }
+    note_multikey(store, documents, specifications)?;
     let mut by_namespace: BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>> = BTreeMap::new();
     for (document, document_key) in documents {
         for (namespace, entry_key) in document_index_entries(document, document_key, specifications) {
@@ -4469,6 +4664,12 @@ fn stage_replace(
             else {
                 continue;
             };
+            // 替换出来的文档可能第一次把某个索引字段变成数组，标记后两侧范围退回集合扫描。
+            if specifications.iter().any(|specification| {
+                !specification.multikey && specification.key.fields.iter().any(|(field, _)| field_array_valued(&replacement, field))
+            }) {
+                note_multikey(store, &[(replacement.clone(), document_key.clone())], &specifications)?;
+            }
             let current_keys = document_index_entries(&replacement, document_key, &specifications);
             let previous_keys = match namespace_document(store, namespace, document_key, session)? {
                 Some(previous) => match parse_bson(&previous) {
@@ -5934,6 +6135,7 @@ pub fn create_indexes(command: &BsonDocument, store: &dyn MongoStorage) -> Resul
             collation,
             partial_filter_expression,
             wildcard_projection,
+            multikey: false,
         };
 
         if is_id_key(key) {
@@ -6038,16 +6240,25 @@ fn backfill_index(store: &dyn MongoStorage, namespace: &str, specification: &Ind
     let entry_namespace = crate::storage::index_namespace(namespace, &specification.name);
     store.clear_reserved(&entry_namespace)?;
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut multikey = false;
     for (document_key, payload) in store.scan(namespace)? {
         let Ok(document) = parse_bson(&payload)
         else {
             continue;
         };
+        if !multikey {
+            multikey = specification.key.fields.iter().any(|(field, _)| field_array_valued(&document, field));
+        }
         for values in index_entries(&document, specification) {
             entries.push((index_entry_key(&values, &document_key), document_key.clone()));
         }
     }
     store.put_reserved(&entry_namespace, &entries).map_err(|error| CommandError::new(2, format!("createIndexes backfill failed: {error}")))?;
+    if multikey && !specification.multikey {
+        store
+            .mark_index_multikey(namespace, &specification.name)
+            .map_err(|error| CommandError::new(2, format!("createIndexes multikey marking failed: {error}")))?;
+    }
     Ok(())
 }
 

@@ -126,6 +126,19 @@ impl MongoStorage for ExecutorStorage<'_> {
             .map_err(|error| StoreError::Shard(error.to_string()))
     }
 
+    fn scan_reserved_range(
+        &self,
+        namespace: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        self.executor
+            .execute_scan(None, &Namespace(namespace.to_string()), prefix, after, before, limit)
+            .map_err(|error| StoreError::Shard(error.to_string()))
+    }
+
     fn put_reserved(&self, namespace: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError> {
         for (key, value) in entries {
             self.write(namespace, key.clone(), value.clone())?;
@@ -201,6 +214,22 @@ impl MongoStorage for ExecutorStorage<'_> {
         let options = self.collection_options(namespace)?;
         let mut existing = self.index_specs(namespace)?;
         existing.extend(indexes.iter().cloned());
+        self.write(CATALOG_NAMESPACE, namespace.as_bytes().to_vec(), collection_record(namespace, &options, &existing).into_bytes())
+    }
+
+    fn mark_index_multikey(&self, namespace: &str, name: &str) -> Result<(), StoreError> {
+        let options = self.collection_options(namespace)?;
+        let mut existing = self.index_specs(namespace)?;
+        let mut changed = false;
+        for index in &mut existing {
+            if index.name == name && !index.multikey {
+                index.multikey = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
         self.write(CATALOG_NAMESPACE, namespace.as_bytes().to_vec(), collection_record(namespace, &options, &existing).into_bytes())
     }
 

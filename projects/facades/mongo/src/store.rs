@@ -53,6 +53,8 @@ pub struct IndexSpec {
     pub partial_filter_expression: Option<BsonDocument>,
     /// `wildcardProjection` of a wildcard index, as `listIndexes` reports it.
     pub wildcard_projection: Option<BsonDocument>,
+    /// 索引字段出现过数组值。两侧范围谓词在 multikey 上不能按同一元素取区间。
+    pub multikey: bool,
 }
 
 impl IndexSpec {
@@ -320,6 +322,13 @@ impl IndexSpec {
         if self.hidden {
             text.push_str(",\"hidden\":true");
         }
+        if self.multikey {
+            text.push_str(",\"multikey\":true");
+        }
+        else {
+            // 显式写 false：旧目录没有这个字段，解析时按「可能 multikey」保守处理。
+            text.push_str(",\"multikey\":false");
+        }
         if let Some(seconds) = self.expire_after_seconds {
             text.push_str(&format!(",\"expireAfterSeconds\":{seconds}"));
         }
@@ -369,6 +378,8 @@ fn parse_indexes(document: &str) -> Result<Vec<IndexSpec>, StoreError> {
             .ok_or_else(|| StoreError::Catalog("catalog index entry has no name".to_string()))?;
         let sparse = entry.get("sparse").and_then(serde_json::Value::as_bool);
         let hidden = entry.get("hidden").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        // 旧目录没有该字段时按 multikey 处理：宁可退回集合扫描，也不漏数组文档。
+        let multikey = entry.get("multikey").and_then(serde_json::Value::as_bool).unwrap_or(true);
         let expire_after_seconds = entry.get("expireAfterSeconds").and_then(serde_json::Value::as_i64).map(|seconds| seconds as i32);
         let collation = match entry.get("collation") {
             Some(value) => Some(
@@ -423,6 +434,7 @@ fn parse_indexes(document: &str) -> Result<Vec<IndexSpec>, StoreError> {
             collation,
             partial_filter_expression,
             wildcard_projection,
+            multikey,
         });
     }
     Ok(indexes)
@@ -1335,6 +1347,30 @@ impl Store {
             .collect())
     }
 
+    /// 保留命名空间下的有界区间扫描，直接把游标与条数下推到底层 shard。
+    ///
+    /// `after` / `before` 都是排他游标，`limit` 为 `0` 表示不设上限。
+    pub fn scan_reserved_range(
+        &self,
+        namespace: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        let shard = self.lock();
+        let records = shard
+            .scan(&Namespace(namespace.to_string()), prefix, after, before, limit)
+            .map_err(|error| StoreError::Shard(error.to_string()))?;
+        Ok(records
+            .into_iter()
+            .filter_map(|record| match record.value {
+                StoredValue::Inline(InlineValue(bytes)) => Some((record.key.bytes, bytes)),
+                StoredValue::Object(_) => None,
+            })
+            .collect())
+    }
+
     /// 判断保留命名空间是否至少有一条条目，只读一条就返回。
     pub fn reserved_has_entries(&self, namespace: &str) -> Result<bool, StoreError> {
         let shard = self.lock();
@@ -1444,6 +1480,22 @@ impl Store {
         catalog.namespaces.insert(namespace.to_string());
         catalog.indexes.extend(indexes.iter().cloned());
         catalog.flush()
+    }
+
+    /// 持久化 multikey 标记，已经置上时不重复写目录。
+    pub fn mark_index_multikey(&self, namespace: &str, name: &str) -> Result<(), StoreError> {
+        let mut catalog = self.catalog_lock();
+        let mut changed = false;
+        for index in &mut catalog.indexes {
+            if index.namespace == namespace && index.name == name && !index.multikey {
+                index.multikey = true;
+                changed = true;
+            }
+        }
+        if changed {
+            catalog.flush()?;
+        }
+        Ok(())
     }
 
     /// Drops the named user index, or every user index when `name` is `*`.
@@ -1623,6 +1675,17 @@ impl crate::storage::MongoStorage for Store {
         Store::scan_reserved(self, namespace, prefix)
     }
 
+    fn scan_reserved_range(
+        &self,
+        namespace: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        Store::scan_reserved_range(self, namespace, prefix, after, before, limit)
+    }
+
     fn put_reserved(&self, namespace: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, StoreError> {
         Store::put_reserved(self, namespace, entries)
     }
@@ -1669,6 +1732,10 @@ impl crate::storage::MongoStorage for Store {
 
     fn add_indexes(&self, namespace: &str, indexes: &[IndexSpec]) -> Result<(), StoreError> {
         Store::add_indexes(self, namespace, indexes)
+    }
+
+    fn mark_index_multikey(&self, namespace: &str, name: &str) -> Result<(), StoreError> {
+        Store::mark_index_multikey(self, namespace, name)
     }
 
     fn drop_indexes(&self, namespace: &str, name: &str) -> Result<usize, StoreError> {

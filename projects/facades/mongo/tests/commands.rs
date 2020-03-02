@@ -2153,8 +2153,8 @@ fn limit_stops_the_fetches_of_an_index_scan_at_the_window_edge() {
     let explained = commands::explain(&explain, &store).expect("explain");
     let stats = nested(&explained, &["executionStats"]).expect("stats");
     assert_eq!(int(stats, "nReturned"), 2);
-    // 前缀区间由后端一次读出（10 个键），回表在窗口右边界停手（2 篇）。
-    assert_eq!(int(stats, "totalKeysExamined"), 10);
+    // 前缀区间按窗口分页读取，早停后不再把整段前缀（10 个键）取回。
+    assert_eq!(int(stats, "totalKeysExamined"), 2);
     assert_eq!(int(stats, "totalDocsExamined"), 2);
 }
 
@@ -2188,4 +2188,210 @@ fn aggregate_pushes_a_leading_match_onto_the_find_access_path() {
 
     assert_eq!(pushed.len(), 3);
     assert_eq!(ids(&pushed), ids(&found), "下推之后聚合与 find 走同一条访问路径，顺序一致");
+}
+
+/// 读取 IXSCAN 阶段报告的 `indexBounds.<field>`。
+fn index_bounds(plan: &BsonDocument, field: &str) -> Vec<String> {
+    let Some(BsonValue::Document(bounds)) = plan.get("indexBounds")
+    else {
+        return Vec::new();
+    };
+    match bounds.get(field) {
+        Some(BsonValue::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                BsonValue::String(text) => text.clone(),
+                _ => String::new(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 计划里是否出现指定阶段（`LIMIT` / `FETCH` 会把 `IXSCAN` 包在 `inputStage` 里）。
+fn has_stage(plan: &BsonDocument, wanted: &str) -> bool {
+    if plan_stage(plan) == wanted {
+        return true;
+    }
+    match plan.get("inputStage") {
+        Some(BsonValue::Document(inner)) => has_stage(inner, wanted),
+        _ => false,
+    }
+}
+
+#[test]
+fn a_numeric_range_uses_the_index_interval() {
+    let store = store();
+    insert_documents(&store, "items", forty_documents());
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let filter = document(&[("a", BsonValue::Document(document(&[("$gte", BsonValue::Int32(1)), ("$lt", BsonValue::Int32(3))])))]);
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(filter.clone()));
+    let mut cursors = CursorStore::new();
+    let returned = batch(&commands::find(&find, &store, &mut cursors).expect("find"), "firstBatch");
+    assert_eq!(returned.len(), 20);
+
+    let explained = explain_find(&store, "items", filter);
+    let plan = nested(&explained, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(plan), "FETCH");
+    let scan = nested(plan, &["inputStage"]).expect("scan stage");
+    assert_eq!(plan_stage(scan), "IXSCAN");
+    assert_eq!(index_bounds(scan, "a"), vec!["[1, 3)".to_string()], "计划报的区间就是执行器真的按区间读");
+    let stats = nested(&explained, &["executionStats"]).expect("stats");
+    assert_eq!(int(stats, "nReturned"), 20);
+    assert_eq!(int(stats, "totalKeysExamined"), 20);
+    assert_eq!(int(stats, "totalDocsExamined"), 20, "区间把 40 篇收窄到 20 篇");
+}
+
+#[test]
+fn a_numeric_range_with_a_limit_stops_reading_at_the_window_edge() {
+    let store = store();
+    insert_documents(&store, "items", forty_documents());
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(document(&[("a", BsonValue::Document(document(&[("$gte", BsonValue::Int32(2))])))])));
+    find.push("limit", BsonValue::Int32(5));
+    let mut cursors = CursorStore::new();
+    let returned = batch(&commands::find(&find, &store, &mut cursors).expect("find"), "firstBatch");
+    assert_eq!(returned.len(), 5);
+
+    let mut explained_find = command("find", "items", "app");
+    explained_find.push("filter", BsonValue::Document(document(&[("a", BsonValue::Document(document(&[("$gte", BsonValue::Int32(2))])))])));
+    explained_find.push("limit", BsonValue::Int32(5));
+    let mut explain = document(&[("explain", BsonValue::Document(explained_find))]);
+    explain.push("verbosity", text("executionStats"));
+    explain.push("$db", text("app"));
+    let explained = commands::explain(&explain, &store).expect("explain");
+    let plan = nested(&explained, &["queryPlanner", "winningPlan"]).expect("plan");
+    assert!(has_stage(plan, "IXSCAN"));
+    let stats = nested(&explained, &["executionStats"]).expect("stats");
+    assert_eq!(int(stats, "nReturned"), 5);
+    assert_eq!(int(stats, "totalKeysExamined"), 5, "提前停之后不再读区间里的剩余键");
+    assert_eq!(int(stats, "totalDocsExamined"), 5);
+}
+
+#[test]
+fn a_two_sided_range_on_an_array_field_falls_back_to_a_collection_scan() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![
+            document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Array(vec![BsonValue::Int32(3), BsonValue::Int32(12)]))]),
+            document(&[("_id", BsonValue::Int32(2)), ("a", BsonValue::Array(vec![BsonValue::Int32(7)]))]),
+            document(&[("_id", BsonValue::Int32(3)), ("a", BsonValue::Array(vec![BsonValue::Int32(20)]))]),
+        ],
+    );
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let filter = document(&[("a", BsonValue::Document(document(&[("$gte", BsonValue::Int32(5)), ("$lt", BsonValue::Int32(10))])))]);
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(filter.clone()));
+    let mut cursors = CursorStore::new();
+    let returned = batch(&commands::find(&find, &store, &mut cursors).expect("find"), "firstBatch");
+    // 两个边界由不同元素满足：`[3, 12]` 也必须命中，单元素区间会漏掉它。
+    assert_eq!(returned.len(), 2);
+    assert_eq!(int(&returned[0], "_id"), 1);
+    assert_eq!(int(&returned[1], "_id"), 2);
+
+    let explained = explain_find(&store, "items", filter);
+    let plan = nested(&explained, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(plan), "COLLSCAN", "multikey 上两侧范围不能按单元素区间执行");
+    assert_eq!(int(nested(&explained, &["executionStats"]).expect("stats"), "totalDocsExamined"), 3);
+}
+
+#[test]
+fn a_single_sided_range_on_an_array_field_still_uses_the_index() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![
+            document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Array(vec![BsonValue::Int32(3), BsonValue::Int32(12)]))]),
+            document(&[("_id", BsonValue::Int32(2)), ("a", BsonValue::Array(vec![BsonValue::Int32(7)]))]),
+            document(&[("_id", BsonValue::Int32(3)), ("a", BsonValue::Array(vec![BsonValue::Int32(20)]))]),
+        ],
+    );
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let filter = document(&[("a", BsonValue::Document(document(&[("$gte", BsonValue::Int32(5))])))]);
+    let explained = explain_find(&store, "items", filter);
+    let plan = nested(&explained, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert!(has_stage(plan, "IXSCAN"));
+    let stats = nested(&explained, &["executionStats"]).expect("stats");
+    assert_eq!(int(stats, "nReturned"), 3);
+    assert_eq!(int(stats, "totalKeysExamined"), 3, "只读 >=5 的索引元素，不读 3");
+    assert_eq!(int(stats, "totalDocsExamined"), 3);
+}
+
+#[test]
+fn a_non_integral_range_bound_falls_back_to_a_collection_scan() {
+    let store = store();
+    insert_documents(&store, "items", forty_documents());
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let filter = document(&[("a", BsonValue::Document(document(&[("$gte", BsonValue::Double(1.5))])))]);
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(filter.clone()));
+    let mut cursors = CursorStore::new();
+    let returned = batch(&commands::find(&find, &store, &mut cursors).expect("find"), "firstBatch");
+    assert_eq!(returned.len(), 20);
+
+    let explained = explain_find(&store, "items", filter);
+    let plan = nested(&explained, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(plan), "COLLSCAN", "非整数边界不硬切保序区间");
+    assert_eq!(int(nested(&explained, &["executionStats"]).expect("stats"), "totalDocsExamined"), 40);
+}
+
+#[test]
+fn a_collation_index_is_not_used_for_a_simple_range() {
+    let store = store();
+    insert_documents(&store, "items", forty_documents());
+
+    let specification = document(&[
+        ("key", BsonValue::Document(document(&[("a", BsonValue::Int32(1))]))),
+        ("name", text("a_collation")),
+        ("collation", BsonValue::Document(document(&[("locale", text("en")), ("strength", BsonValue::Int32(2))]))),
+    ]);
+    let mut create = command("createIndexes", "items", "app");
+    create.push("indexes", BsonValue::Array(vec![BsonValue::Document(specification)]));
+    commands::create_indexes(&create, &store).expect("createIndexes");
+
+    let filter = document(&[("a", BsonValue::Document(document(&[("$gte", BsonValue::Int32(1))])))]);
+    let explained = explain_find(&store, "items", filter);
+    let plan = nested(&explained, &["queryPlanner", "winningPlan"]).expect("winning plan");
+    assert_eq!(plan_stage(plan), "COLLSCAN", "查询没有 collation 时不能拿折叠过的大小写键硬撑");
+    assert_eq!(int(nested(&explained, &["executionStats"]).expect("stats"), "totalDocsExamined"), 40);
+}
+
+#[test]
+fn a_let_bound_match_without_variable_references_keeps_find_semantics() {
+    let store = store();
+    insert_documents(&store, "items", forty_documents());
+    commands::create_indexes(&index_command("items", 1, "a_1", false), &store).expect("createIndexes");
+
+    let mut aggregate = command("aggregate", "items", "app");
+    aggregate.push("let", BsonValue::Document(document(&[("floor", BsonValue::Int32(1))])));
+    aggregate.push(
+        "pipeline",
+        BsonValue::Array(vec![
+            BsonValue::Document(document(&[("$match", BsonValue::Document(document(&[("a", BsonValue::Int32(2))])))])),
+            BsonValue::Document(document(&[("$limit", BsonValue::Int32(5))])),
+        ]),
+    );
+    let aggregated = batch(&commands::aggregate(&aggregate, &store).expect("aggregate"), "firstBatch");
+
+    let mut find = command("find", "items", "app");
+    find.push("filter", BsonValue::Document(document(&[("a", BsonValue::Int32(2))])));
+    find.push("limit", BsonValue::Int32(5));
+    let mut cursors = CursorStore::new();
+    let found = batch(&commands::find(&find, &store, &mut cursors).expect("find"), "firstBatch");
+
+    let ids = |documents: &[BsonDocument]| -> Vec<Vec<u8>> {
+        documents.iter().map(|document| value_to_key(document.get("_id").expect("_id"))).collect()
+    };
+    assert_eq!(aggregated.len(), 5);
+    assert_eq!(ids(&aggregated), ids(&found), "不带 $$ 引用的 let 绑定不改变 $match 语义");
 }

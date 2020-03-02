@@ -38,6 +38,28 @@ fn scan_returns_all_records_in_namespace_ordered_by_key() {
 }
 
 #[test]
+fn scan_before_is_exclusive_and_prefix_boundaries_hold_between_namespaces() {
+    let mut shard = MemoryShard::new();
+    for namespace in ["a", "m", "z"] {
+        for &key in &[b"0" as &[u8], b"01", b"1"] {
+            shard.put(Key::new(namespace, key), StoredValue::Inline(InlineValue(key.to_vec()))).unwrap();
+        }
+    }
+    let ns = Namespace("m".into());
+
+    // 前缀 "1" 只命中 "1"，不跨到 "01"，也不越到下一个命名空间 "z"。
+    let only_one: Vec<Vec<u8>> = shard.scan(&ns, b"1", None, None, 0).unwrap().into_iter().map(|record| record.key.bytes).collect();
+    assert_eq!(only_one, vec![b"1".to_vec()]);
+    // before 排他：窗口 (-, "1") 只含 "0" 和 "01"。
+    let before: Vec<Vec<u8>> = shard.scan(&ns, b"", None, Some(b"1"), 0).unwrap().into_iter().map(|record| record.key.bytes).collect();
+    assert_eq!(before, vec![b"0".to_vec(), b"01".to_vec()]);
+    // 空区间：after == before 时不返回任何键。
+    assert!(shard.scan(&ns, b"", Some(b"1"), Some(b"1"), 0).unwrap().is_empty());
+    // 中间命名空间不受前后命名空间影响。
+    assert_eq!(shard.scan(&ns, b"", None, None, 0).unwrap().len(), 3);
+}
+
+#[test]
 fn scan_prefix_filters_to_matching_keys() {
     let mut shard = MemoryShard::new();
     let ns = Namespace("table:7".into());
