@@ -109,56 +109,64 @@ impl Write for SinkRef {
     }
 }
 
-/// Subscription bookkeeping of one connected client.
-struct Entry {
-    sink: Arc<ClientSink>,
+/// One connection's subscription sets. It carries no socket and no protocol.
+#[derive(Default)]
+struct Subscriptions {
     channels: BTreeSet<Vec<u8>>,
     patterns: BTreeSet<Vec<u8>>,
 }
 
-impl Entry {
+impl Subscriptions {
     fn total(&self) -> usize {
         self.channels.len() + self.patterns.len()
     }
 }
 
-struct State {
-    next_client: u64,
-    clients: HashMap<u64, Entry>,
+/// One delivery target of a published message; `pattern` is `Some` for `pmessage`.
+pub struct Delivery {
+    /// Connection id that holds the subscription.
+    pub client: u64,
+    /// Matching pattern when the delivery comes from `PSUBSCRIBE`.
+    pub pattern: Option<Vec<u8>>,
+    /// Channel the message was published to.
+    pub channel: Vec<u8>,
+    /// Message body.
+    pub payload: Vec<u8>,
 }
 
-/// Listener-scoped channel and pattern table shared by every connection.
-pub struct PubSubRegistry {
-    state: Mutex<State>,
+/// Listener-scoped channel table holding only pub/sub semantics.
+///
+/// It answers who subscribed to what and which clients a message reaches, without
+/// holding sockets or encoding protocol frames. The language binding holds this table
+/// directly, while [`PubSubRegistry`] wraps it for the Rust listener's write side.
+pub struct PubSubState {
+    clients: Mutex<HashMap<u64, Subscriptions>>,
 }
 
-impl PubSubRegistry {
+impl Default for PubSubState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PubSubState {
     /// Creates an empty table.
     pub fn new() -> Self {
-        Self { state: Mutex::new(State { next_client: 0, clients: HashMap::new() }) }
+        Self { clients: Mutex::new(HashMap::new()) }
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    /// Registers one connection and returns its client id.
-    pub fn attach(&self, sink: Arc<ClientSink>) -> u64 {
-        let mut state = self.lock();
-        state.next_client += 1;
-        let client = state.next_client;
-        state.clients.insert(client, Entry { sink, channels: BTreeSet::new(), patterns: BTreeSet::new() });
-        client
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Subscriptions>> {
+        self.clients.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Drops every subscription of a disconnected client.
     pub fn detach(&self, client: u64) {
-        self.lock().clients.remove(&client);
+        self.lock().remove(&client);
     }
 
     /// Whether the client holds at least one channel or pattern subscription.
     pub fn is_subscribed(&self, client: u64) -> bool {
-        self.lock().clients.get(&client).is_some_and(|entry| entry.total() > 0)
+        self.lock().get(&client).is_some_and(|entry| entry.total() > 0)
     }
 
     /// Channel and pattern subscription counts of one client.
@@ -166,15 +174,16 @@ impl PubSubRegistry {
     /// `CLIENT LIST` reports them as `sub=` / `psub=`, so they are read from the same
     /// table that owns the subscriptions instead of being mirrored per connection.
     pub fn counts(&self, client: u64) -> (usize, usize) {
-        self.lock().clients.get(&client).map_or((0, 0), |entry| (entry.channels.len(), entry.patterns.len()))
+        self.lock().get(&client).map_or((0, 0), |entry| (entry.channels.len(), entry.patterns.len()))
     }
 
     /// Adds one subscription and answers the total count Redis reports.
+    ///
+    /// The binding passes the host connection id directly, so a first subscription
+    /// creates the record on demand.
     pub fn subscribe(&self, client: u64, name: &[u8], pattern: bool) -> usize {
-        let mut state = self.lock();
-        let Some(entry) = state.clients.get_mut(&client) else {
-            return 0;
-        };
+        let mut clients = self.lock();
+        let entry = clients.entry(client).or_default();
         if pattern {
             entry.patterns.insert(name.to_vec());
         }
@@ -189,8 +198,8 @@ impl PubSubRegistry {
     /// An empty `names` list removes everything of that kind. With nothing to remove
     /// Redis still answers one frame carrying a null name, so it is returned as `None`.
     pub fn unsubscribe(&self, client: u64, names: &[&[u8]], pattern: bool) -> Vec<(Option<Vec<u8>>, usize)> {
-        let mut state = self.lock();
-        let Some(entry) = state.clients.get_mut(&client) else {
+        let mut clients = self.lock();
+        let Some(entry) = clients.get_mut(&client) else {
             return vec![(None, 0)];
         };
         let mut replies = Vec::new();
@@ -224,34 +233,44 @@ impl PubSubRegistry {
         replies
     }
 
-    /// Delivers one message and answers how many subscriptions received it.
+    /// Computes the delivery targets of one message and answers `(receivers, deliveries)`.
     ///
-    /// A client subscribed both directly and through a matching pattern receives two
-    /// frames and counts twice, matching the upstream receiver count.
-    pub fn publish(&self, channel: &[u8], payload: &[u8]) -> usize {
-        let state = self.lock();
+    /// A client subscribed both directly and through a matching pattern gets two
+    /// deliveries and counts twice, matching the real server's receiver count.
+    pub fn publish(&self, channel: &[u8], payload: &[u8]) -> (usize, Vec<Delivery>) {
+        let clients = self.lock();
         let mut delivered = 0;
-        for entry in state.clients.values() {
-            let protocol = entry.sink.protocol();
+        let mut deliveries = Vec::new();
+        for (client, entry) in clients.iter() {
             if entry.channels.contains(channel) {
-                entry.sink.write_frame(&encode_message(protocol, None, channel, payload));
+                deliveries.push(Delivery {
+                    client: *client,
+                    pattern: None,
+                    channel: channel.to_vec(),
+                    payload: payload.to_vec(),
+                });
                 delivered += 1;
             }
             for pattern in &entry.patterns {
                 if glob_match(pattern, channel) {
-                    entry.sink.write_frame(&encode_message(protocol, Some(pattern), channel, payload));
+                    deliveries.push(Delivery {
+                        client: *client,
+                        pattern: Some(pattern.to_vec()),
+                        channel: channel.to_vec(),
+                        payload: payload.to_vec(),
+                    });
                     delivered += 1;
                 }
             }
         }
-        delivered
+        (delivered, deliveries)
     }
 
     /// Active channels, optionally filtered by a glob, in sorted order.
     pub fn channels(&self, pattern: Option<&[u8]>) -> Vec<Vec<u8>> {
-        let state = self.lock();
+        let clients = self.lock();
         let mut names = BTreeSet::new();
-        for entry in state.clients.values() {
+        for entry in clients.values() {
             for channel in &entry.channels {
                 if pattern.is_none_or(|pattern| glob_match(pattern, channel)) {
                     names.insert(channel.clone());
@@ -263,19 +282,127 @@ impl PubSubRegistry {
 
     /// Subscriber count of each requested channel, unknown channels counting zero.
     pub fn numsub(&self, channels: &[&[u8]]) -> Vec<(Vec<u8>, usize)> {
-        let state = self.lock();
+        let clients = self.lock();
         channels
             .iter()
             .map(|channel| {
-                let count = state.clients.values().filter(|entry| entry.channels.contains(*channel)).count();
+                let count = clients.values().filter(|entry| entry.channels.contains(*channel)).count();
                 (channel.to_vec(), count)
             })
             .collect()
     }
 
-    /// Number of distinct pattern subscriptions across all clients.
+    /// Number of distinct patterns subscribed across all clients.
+    ///
+    /// The real server counts unique patterns rather than the sum of per-client
+    /// subscriptions, so `PUBSUB NUMPAT` and `INFO stats` share this answer.
     pub fn numpat(&self) -> usize {
-        self.lock().clients.values().map(|entry| entry.patterns.len()).sum()
+        let clients = self.lock();
+        clients
+            .values()
+            .flat_map(|entry| entry.patterns.iter().map(|pattern| pattern.as_slice()))
+            .collect::<BTreeSet<&[u8]>>()
+            .len()
+    }
+}
+
+struct Writes {
+    next_client: u64,
+    sinks: HashMap<u64, Arc<ClientSink>>,
+}
+
+/// Listener runtime wrapper: the pure table plus each connection's write side.
+pub struct PubSubRegistry {
+    state: Arc<PubSubState>,
+    writes: Mutex<Writes>,
+}
+
+impl PubSubRegistry {
+    /// Creates a registry with a fresh table.
+    pub fn new() -> Self {
+        Self::with_state(Arc::new(PubSubState::new()))
+    }
+
+    /// Wraps the table the language binding also holds.
+    pub fn with_state(state: Arc<PubSubState>) -> Self {
+        Self { state, writes: Mutex::new(Writes { next_client: 0, sinks: HashMap::new() }) }
+    }
+
+    /// Shared handle to the pure table.
+    pub fn state(&self) -> Arc<PubSubState> {
+        Arc::clone(&self.state)
+    }
+
+    fn lock_writes(&self) -> MutexGuard<'_, Writes> {
+        self.writes.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Registers one connection and returns its client id.
+    pub fn attach(&self, sink: Arc<ClientSink>) -> u64 {
+        let mut writes = self.lock_writes();
+        writes.next_client += 1;
+        let client = writes.next_client;
+        writes.sinks.insert(client, sink);
+        client
+    }
+
+    /// Drops every subscription and the write side of a disconnected client.
+    pub fn detach(&self, client: u64) {
+        self.lock_writes().sinks.remove(&client);
+        self.state.detach(client);
+    }
+
+    /// Whether the client holds at least one channel or pattern subscription.
+    pub fn is_subscribed(&self, client: u64) -> bool {
+        self.state.is_subscribed(client)
+    }
+
+    /// Channel and pattern subscription counts of one client.
+    pub fn counts(&self, client: u64) -> (usize, usize) {
+        self.state.counts(client)
+    }
+
+    /// Adds one subscription and answers the total count Redis reports.
+    pub fn subscribe(&self, client: u64, name: &[u8], pattern: bool) -> usize {
+        self.state.subscribe(client, name, pattern)
+    }
+
+    /// Removes subscriptions and answers one `(name, remaining)` pair per reply frame.
+    pub fn unsubscribe(&self, client: u64, names: &[&[u8]], pattern: bool) -> Vec<(Option<Vec<u8>>, usize)> {
+        self.state.unsubscribe(client, names, pattern)
+    }
+
+    /// Delivers one message and answers how many subscriptions received it.
+    pub fn publish(&self, channel: &[u8], payload: &[u8]) -> usize {
+        let (delivered, deliveries) = self.state.publish(channel, payload);
+        let targets = {
+            let writes = self.lock_writes();
+            deliveries
+                .into_iter()
+                .filter_map(|delivery| {
+                    writes.sinks.get(&delivery.client).map(|sink| (sink.protocol(), Arc::clone(sink), delivery))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (protocol, sink, delivery) in targets {
+            sink.write_frame(&encode_message(protocol, delivery.pattern.as_deref(), &delivery.channel, &delivery.payload));
+        }
+        delivered
+    }
+
+    /// Active channels, optionally filtered by a glob, in sorted order.
+    pub fn channels(&self, pattern: Option<&[u8]>) -> Vec<Vec<u8>> {
+        self.state.channels(pattern)
+    }
+
+    /// Subscriber count of each requested channel, unknown channels counting zero.
+    pub fn numsub(&self, channels: &[&[u8]]) -> Vec<(Vec<u8>, usize)> {
+        self.state.numsub(channels)
+    }
+
+    /// Number of distinct patterns subscribed across all clients.
+    pub fn numpat(&self) -> usize {
+        self.state.numpat()
     }
 }
 

@@ -3447,7 +3447,7 @@ fn respond(
         return Ok(false);
     }
     else if command.eq_ignore_ascii_case(b"CLIENT") {
-        if !server_face::handle_client(stream, request, state, clients, pubsub)? {
+        if !server_face::handle_client(stream, request, state, clients, &pubsub.state())? {
             return Ok(false);
         }
     }
@@ -3465,7 +3465,7 @@ fn respond(
         }
     }
     else if command.eq_ignore_ascii_case(b"INFO") {
-        server_face::handle_info(stream, request, clients, pubsub, executor)?;
+        server_face::handle_info(stream, request, clients, &pubsub.state(), executor)?;
     }
     else if command.eq_ignore_ascii_case(b"CONFIG") {
         server_face::handle_config(stream, request, clients)?;

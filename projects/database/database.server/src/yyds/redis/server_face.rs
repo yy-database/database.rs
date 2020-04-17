@@ -26,7 +26,7 @@ use database_types::cluster::Namespace;
 use super::{
     collections::KeyKind,
     connection::{ConnectionState, glob_match, write_bulk, write_error, write_null},
-    pubsub::{ClientSink, PubSubRegistry},
+    pubsub::{ClientSink, PubSubState},
     resp::Request,
 };
 
@@ -204,8 +204,10 @@ impl ClientRecord {
         let name = state.name.as_ref().map(|value| String::from_utf8_lossy(value).into_owned()).unwrap_or_default();
         let lib_name = String::from_utf8_lossy(&state.lib_name).into_owned();
         let lib_ver = String::from_utf8_lossy(&state.lib_ver).into_owned();
+        // 真机把处于订阅态的连接标成 `flags=P`，其余为 `flags=N`。
+        let flags = if sub + psub > 0 { "P" } else { "N" };
         format!(
-            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags=N db={} sub={} psub={} ssub=0 multi={} watch=0 \
+            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={flags} db={} sub={} psub={} ssub=0 multi={} watch=0 \
              qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 \
              tot-mem=0 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 \
              tot-cmds={} read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0",
@@ -366,7 +368,7 @@ pub(crate) fn handle_client(
     request: &Request<'_>,
     state: &ConnectionState,
     registry: &ClientRegistry,
-    pubsub: &PubSubRegistry,
+    pubsub: &PubSubState,
 ) -> io::Result<bool> {
     let count = request.arguments.len();
     let Some(raw) = request.arguments.get(1) else {
@@ -477,7 +479,7 @@ fn handle_client_list(
     stream: &mut dyn Write,
     request: &Request<'_>,
     registry: &ClientRegistry,
-    pubsub: &PubSubRegistry,
+    pubsub: &PubSubState,
 ) -> io::Result<()> {
     let mut filter_type: Option<String> = None;
     let mut filter_id: Option<u64> = None;
@@ -547,7 +549,7 @@ fn handle_client_kill(
     request: &Request<'_>,
     state: &ConnectionState,
     registry: &ClientRegistry,
-    pubsub: &PubSubRegistry,
+    pubsub: &PubSubState,
 ) -> io::Result<bool> {
     let count = request.arguments.len();
     if count == 2 {
@@ -865,7 +867,7 @@ pub(crate) fn handle_info(
     stream: &mut dyn Write,
     request: &Request<'_>,
     registry: &ClientRegistry,
-    pubsub: &PubSubRegistry,
+    pubsub: &PubSubState,
     executor: Option<&dyn KeyValueExecutor>,
 ) -> io::Result<()> {
     let requested: Vec<String> = request.arguments[1..]
@@ -883,7 +885,7 @@ pub(crate) fn handle_info(
             "server" => info_server(registry),
             "clients" => info_clients(registry, pubsub),
             "memory" => info_memory(),
-            "stats" => info_stats(registry),
+            "stats" => info_stats(registry, pubsub),
             _ => info_keyspace(executor),
         });
     }
@@ -943,7 +945,7 @@ fn info_server(registry: &ClientRegistry) -> String {
     .join("\r\n")
 }
 
-fn info_clients(registry: &ClientRegistry, pubsub: &PubSubRegistry) -> String {
+fn info_clients(registry: &ClientRegistry, pubsub: &PubSubState) -> String {
     let clients = registry.count();
     let entries = registry.snapshot();
     let mut subscribers = 0;
@@ -1026,7 +1028,7 @@ fn info_memory() -> String {
     .join("\r\n")
 }
 
-fn info_stats(registry: &ClientRegistry) -> String {
+fn info_stats(registry: &ClientRegistry, pubsub: &PubSubState) -> String {
     [
         "# Stats".to_string(),
         format!("total_connections_received:{}", registry.connections.load(Ordering::Acquire)),
@@ -1048,8 +1050,8 @@ fn info_stats(registry: &ClientRegistry) -> String {
         "evicted_subkeys:0".into(),
         "keyspace_hits:0".into(),
         "keyspace_misses:0".into(),
-        "pubsub_channels:0".into(),
-        "pubsub_patterns:0".into(),
+        format!("pubsub_channels:{}", pubsub.channels(None).len()),
+        format!("pubsub_patterns:{}", pubsub.numpat()),
         "pubsubshard_channels:0".into(),
         "latest_fork_usec:0".into(),
         "total_forks:0".into(),
@@ -1377,7 +1379,7 @@ pub(crate) fn handle_acl(stream: &mut dyn Write, request: &Request<'_>, protocol
 /// `CLIENT KILL` 因此能看到并关闭宿主侧的其它连接。
 pub struct EmbeddedServerFace {
     registry: Arc<ClientRegistry>,
-    pubsub: PubSubRegistry,
+    pubsub: Arc<PubSubState>,
     state: ConnectionState,
 }
 
@@ -1389,7 +1391,14 @@ impl EmbeddedServerFace {
 
     /// 在共享登记表里用宿主连接号创建一条会话。
     pub fn with_id(registry: Arc<ClientRegistry>, id: u64) -> Self {
-        let pubsub = PubSubRegistry::new();
+        Self::with_id_and_pubsub(registry, id, Arc::new(PubSubState::new()))
+    }
+
+    /// 在共享登记表与共享频道表里用宿主连接号创建一条会话。
+    ///
+    /// 绑定层把同一张 [`PubSubState`] 交给同进程的每条会话，`CLIENT LIST` 与
+    /// `INFO` 因此读到宿主侧的订阅计数，而不只是本会话自己的。
+    pub fn with_id_and_pubsub(registry: Arc<ClientRegistry>, id: u64, pubsub: Arc<PubSubState>) -> Self {
         let state = ConnectionState::new(registry.attach_detached_with(id));
         Self { registry, pubsub, state }
     }
