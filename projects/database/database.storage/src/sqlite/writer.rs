@@ -973,10 +973,6 @@ impl SqliteWriter {
                 }
             }
         }
-        if explicit_rowid.is_some() && self.contains_rowid(meta.root_page, rowid)? {
-            return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
-        }
-
         let payload = encode_record(&resolved, self.encoding);
         let root = self.table_insert(meta.root_page, rowid, &payload)?;
         if root != meta.root_page {
@@ -2074,7 +2070,8 @@ impl SqliteWriter {
             PAGE_TABLE_LEAF => {
                 let cells = self.leaf_cells(page)?;
                 if cells.iter().any(|(candidate, _, _)| *candidate == rowid) {
-                    return Err(Error::Unsupported("sqlite duplicate rowid"));
+                    // 重复 rowid 在插入下钻到叶子时就判定，不再先做一次独立查找。
+                    return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
                 }
                 let cell = self.build_cell(PAGE_TABLE_LEAF, Some(rowid), payload)?;
                 let position = cells.partition_point(|(candidate, _, _)| *candidate < rowid);
