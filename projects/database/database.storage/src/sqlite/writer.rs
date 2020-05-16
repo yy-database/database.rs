@@ -103,6 +103,7 @@ pub enum DropIndexOutcome {
     Dropped,
 }
 
+#[derive(Clone)]
 struct TableMeta {
     table_name: String,
     master_rowid: i64,
@@ -141,6 +142,17 @@ struct Snapshot {
     without_rowid_keys: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
 }
 
+/// 表元数据缓存，以 `sqlite_master` 的 schema cookie 为纪元。
+///
+/// 每次解析表结构都要重新遍历 `sqlite_master` 并重解 DDL，批写入里这是
+/// 主要固定开销。缓存只在 cookie 匹配时生效：任何 DDL 都会抬升 cookie，
+/// 于是整表直接失效并在下一次查询时重建。插入引起的根页变化不抬高
+/// cookie，由 [`SqliteWriter::set_master_root`] 就地刷新对应条目。
+struct MetaCache {
+    cookie: u32,
+    tables: std::collections::HashMap<String, TableMeta>,
+}
+
 /// In-memory SQLite format-3 file image with mutation operations.
 ///
 /// Index trees are maintained as ordered in-memory key sets while the image
@@ -165,6 +177,8 @@ pub struct SqliteWriter {
     without_rowid_entries: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
     /// Primary-key prefixes of the live WITHOUT ROWID rows, for uniqueness.
     without_rowid_keys: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
+    /// 按 schema cookie 纪元的表元数据缓存，见 [`MetaCache`]。
+    meta_cache: std::sync::Mutex<MetaCache>,
 }
 
 impl SqliteWriter {
@@ -183,6 +197,7 @@ impl SqliteWriter {
         };
         pages[56..60].copy_from_slice(&marker.to_be_bytes());
         let usable = page_size - usize::from(pages[20]);
+        let cookie = read_schema_cookie(&pages);
         Ok(Self {
             pages,
             page_size,
@@ -192,6 +207,7 @@ impl SqliteWriter {
             index_entries: std::collections::BTreeMap::new(),
             without_rowid_entries: std::collections::BTreeMap::new(),
             without_rowid_keys: std::collections::BTreeMap::new(),
+            meta_cache: std::sync::Mutex::new(MetaCache { cookie, tables: std::collections::HashMap::new() }),
         })
     }
 
@@ -210,6 +226,7 @@ impl SqliteWriter {
             3 => TextEncoding::Utf16Be,
             _ => TextEncoding::Utf8,
         };
+        let cookie = read_schema_cookie(&pages);
         let mut writer = Self {
             pages,
             page_size,
@@ -219,6 +236,7 @@ impl SqliteWriter {
             index_entries: std::collections::BTreeMap::new(),
             without_rowid_entries: std::collections::BTreeMap::new(),
             without_rowid_keys: std::collections::BTreeMap::new(),
+            meta_cache: std::sync::Mutex::new(MetaCache { cookie, tables: std::collections::HashMap::new() }),
         };
         for row in writer.master_rows()? {
             if row.root_page == 0 {
@@ -1213,6 +1231,21 @@ impl SqliteWriter {
         if root != 1 {
             return Err(Error::Corrupt("sqlite master b-tree must not gain height"));
         }
+        // 根页变化不抬升 schema cookie，就地刷新缓存里的对应表与索引。
+        let cookie = read_schema_cookie(&self.pages);
+        let mut cache = self.meta_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.cookie == cookie {
+            for meta in cache.tables.values_mut() {
+                if meta.master_rowid == master_rowid {
+                    meta.root_page = root_page;
+                }
+                for index in &mut meta.indexes {
+                    if index.master_rowid == master_rowid {
+                        index.root_page = root_page;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1543,7 +1576,26 @@ impl SqliteWriter {
         }
     }
 
+    /// Resolves the schema of one table, reusing the parse cached for the
+    /// current schema cookie. Any DDL raises the cookie and invalidates the
+    /// whole cache, so a hit always matches the bytes in `pages`.
     fn table_meta(&self, table: &str) -> Result<TableMeta> {
+        let mut cache = self.meta_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cookie = read_schema_cookie(&self.pages);
+        if cache.cookie != cookie {
+            cache.tables.clear();
+            cache.cookie = cookie;
+        }
+        let key = table.to_ascii_lowercase();
+        if let Some(meta) = cache.tables.get(&key) {
+            return Ok(meta.clone());
+        }
+        let meta = self.load_table_meta(table)?;
+        cache.tables.insert(key, meta.clone());
+        Ok(meta)
+    }
+
+    fn load_table_meta(&self, table: &str) -> Result<TableMeta> {
         let rows = self.master_rows()?;
         let table_row = rows
             .iter()
