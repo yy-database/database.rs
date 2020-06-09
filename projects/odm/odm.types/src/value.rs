@@ -309,7 +309,6 @@ fn is_lower_hex64(text: &str) -> bool {
 
 /// Reference to the immutable manifest object that lists a file's chunks.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct FileManifestRef {
     /// Lowercase hex digest of the manifest payload (64 hex digits).
     pub hash: String,
@@ -323,10 +322,10 @@ pub struct FileManifestRef {
 /// complete octets, while `name` / `media_type` are labelling metadata that
 /// never take part in the identity.
 ///
-/// `Deserialize` is hand-written so that JSON input cannot construct a
-/// descriptor that [`FileDescriptor::new`] would reject.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// 两个方向的 serde 都经由 [`FileDescriptorFields`] 线形态 DTO：`Deserialize`
+/// 是手写的，JSON 输入无法构造出 [`FileDescriptor::new`] 会拒绝的描述符；
+/// `Serialize` 同样委托给该 DTO，camelCase 线名只存在于 DTO，不在核心类型上。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FileDescriptor {
     /// Lowercase hex SHA-256 over the complete file octets (64 hex digits).
     pub digest: String,
@@ -359,8 +358,9 @@ impl FileDescriptor {
 }
 
 /// Wire shape of [`FileDescriptor`]; deserialized only to feed
-/// [`FileDescriptor::new`].
-#[derive(Deserialize)]
+/// [`FileDescriptor::new`], serialized only to emit the canonical
+/// YYDB `file` tagged-scalar field names.
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FileDescriptorFields {
     digest: String,
@@ -368,6 +368,22 @@ struct FileDescriptorFields {
     name: Option<String>,
     media_type: Option<String>,
     manifest: FileManifestRef,
+}
+
+impl Serialize for FileDescriptor {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        FileDescriptorFields {
+            digest: self.digest.clone(),
+            octets: self.octets,
+            name: self.name.clone(),
+            media_type: self.media_type.clone(),
+            manifest: self.manifest.clone(),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for FileDescriptor {

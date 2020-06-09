@@ -99,7 +99,7 @@ pub struct IrisSyntaxSlice {
 // --- span wire ---------------------------------------------------------------
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct SpanWire {
     start: usize,
     end: usize,

@@ -32,6 +32,18 @@ crate。
 - git 依赖钉完整 40 位 `rev`；本地覆盖只 patch **门面** path，写在 gitignore 的 `.cargo/config.toml`。
 - 不要再引入官方 SQLite / `rusqlite` / 第三方 MySQL·PG·Redis 客户端做“对照服务”或顶替 L3。
 
+## 序列化命名边界
+
+- **R1 核心类型只说 Rust 的话**：`*.types`、`database.query` 的 IR/local 类型、集群类型的字段一律 `snake_case`，枚举判别值一律 `snake_case`（`i64`、`null` 这类单词值保持小写）。**禁止**在核心类型上出现面向单一语言的 `serde(rename_all)`。
+- **R2 翻译只在绑定层发生**：napi 优先用 `#[napi(object)]` 自动转 camelCase；需要返回 JSON 字符串或自定义拼写时在绑定 crate 内建专用 DTO，**不得直接序列化核心类型**。
+- **R3 pyo3 只说 Python 的话**：Python 侧参数名与返回键一律 `snake_case`，与 Rust 字段同名；**禁止**向 Python 返回 camelCase 键。协议原语（RESP/BSON/PG 报文）不受此限。
+- **R4 协议优先，可读性让位**：字段拼写以协议/宿主编解码器为准（Mongo Extended JSON、PG/MySQL/Redis 报文、VOS operation artifact、生成客户端 `OperationRequest`、`$database` tagged JSON）。**禁止**为了"好读"改协议字段，包括 `algo`、`mediaType`、`utcMicros`。
+- **R5 落盘契约带版本**：`node.json`、`node.status.json`、SQL schema document 属数据面。改动必须同时升版本号、保留读旧格式、并有迁移测试；不得按语言习惯顺手改。落盘键名由核心内私有 DTO（如 `StoredIdentity`）或绑定层 DTO 冻结，核心类型本身不携带。
+- **R6 wasm 跟随 JS**：wasm 绑定输出 camelCase，转换在 `*-wasm` 适配层完成，不回流核心类型。
+- **R7 枚举值统一**：同一 crate 内判别值统一 `snake_case`；仅协议规定处或影子迁移期与既有台账词汇逐字节对齐处（如 `database.harness` 的 `BaselineProblem`）使用 kebab-case，且必须在代码注释里钉明理由。每个被外部消费的值必须在测试里钉死。
+- **R8 全称优先**：内部标识符能写全称就写全称（`slot_type`、`leader_node_id`、`algorithm`）；已发布配置键（`generate.out`）与协议字段只补文档、不改名。
+- **R9 新增字段的默认答案**：新增 serde 结构体先问"它属于哪一层"。答不上来就不要加 `rename_all`。
+
 ## 兼容档位（实现口径）
 
 | 档 | 名称     | 默认目标                       |

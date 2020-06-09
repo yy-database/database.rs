@@ -15,7 +15,6 @@ pub const REPORT_VERSION: u32 = 1;
 
 /// 语料判定段落。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CorpusReport {
     /// 本次运行的语料参数。
     pub spec: CorpusSpec,
@@ -38,7 +37,6 @@ impl CorpusReport {
 
 /// 统一报告信封。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ReportEnvelope {
     /// 信封版本。
     pub version: u32,

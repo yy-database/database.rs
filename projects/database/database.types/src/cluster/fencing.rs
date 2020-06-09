@@ -23,7 +23,6 @@ pub struct LeaderTerm(pub u64);
 /// A token carried by a write or lease renewal to prove current leadership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase", deny_unknown_fields))]
 pub struct FenceToken {
     /// Routing epoch for the shard placement.
     pub epoch: ShardEpoch,
@@ -39,7 +38,6 @@ pub struct FenceToken {
 /// matches an incoming `FenceToken` against this record to reject stale leaders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase", deny_unknown_fields))]
 pub struct OwnerEntry {
     /// The shard whose owner this record describes.
     pub shard_id: ShardId,

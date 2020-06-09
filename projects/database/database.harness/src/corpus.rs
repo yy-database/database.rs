@@ -18,7 +18,6 @@ use crate::{HarnessError, Result};
 /// `version` 由各产品仓的基线文件声明；`seed` 与 `count` 必须与生成语料时
 /// 使用的值一致。三者任一变化都会让既有摘要失效。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CorpusSpec {
     /// 基线文件版本。
     pub version: u32,
@@ -106,7 +105,6 @@ impl<'de> Deserialize<'de> for Digest {
 
 /// 基线声明的身份：参数加摘要。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BaselineIdentity {
     /// 基线声明的语料参数。
     pub spec: CorpusSpec,
@@ -120,7 +118,6 @@ pub struct BaselineIdentity {
 /// 是调用方观测到的差异信号（例如错误码、结构化字段名）；只有与本次观测
 /// 完全相同时，才算命中已知差异。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct KnownDifference {
     /// 稳定的用例键。
     pub key: String,
@@ -132,7 +129,6 @@ pub struct KnownDifference {
 
 /// 本次运行中实际观测到的一条差异。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DifferenceObservation {
     /// 稳定的用例键。
     pub key: String,
@@ -143,6 +139,10 @@ pub struct DifferenceObservation {
 }
 
 /// 台账判定问题。
+///
+/// 判别值保持 kebab-case：影子迁移要求新旧两路输出逐字节一致，既有 TS 台账
+/// 的问题词汇（`seed-drift` / `signal-changed` 等）就是本枚举的线名，属于
+/// 迁移期契约，不随核心命名规则改写。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum BaselineProblem {
@@ -198,7 +198,6 @@ pub enum BaselineProblem {
 
 /// 台账判定结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BaselineVerdict {
     /// 命中已知差异的条目数。
     pub matched: u64,
@@ -215,7 +214,6 @@ impl BaselineVerdict {
 
 /// 一条完整基线：身份加已知差异登记。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Baseline {
     /// 基线声明的身份。
     pub identity: BaselineIdentity,

@@ -832,7 +832,6 @@ struct FieldDocument {
     field_type: FieldTypeDocument,
     nullable: bool,
     capacity: Option<u32>,
-    #[serde(rename = "sql_type")]
     sql_type: String,
     #[serde(default)]
     default: Option<String>,

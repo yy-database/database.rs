@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 const MAX_IDENTITY_BYTES: u64 = 4096;
 
 /// Persisted cluster and node identities, independent of addresses and shard ids.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+///
+/// 本类型不携带任何面向单一语言的 serde 重命名；`node.json` 的落盘键名由
+/// [`StoredIdentity`] 冻结，对外 JSON 形态由各绑定层 DTO 负责。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeIdentity {
     cluster_id: String,
     node_id: String,
@@ -50,11 +52,28 @@ impl NodeIdentity {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// `node.json` 的落盘身份形态（持久化契约 ③b）。
+///
+/// 键名 `clusterId` / `nodeId` 已被既有节点目录冻结，读旧写旧；
+/// 任何改动都必须升 `version` 并保留读旧格式。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredIdentity {
+    cluster_id: String,
+    node_id: String,
+}
+
+impl From<&NodeIdentity> for StoredIdentity {
+    fn from(identity: &NodeIdentity) -> Self {
+        Self { cluster_id: identity.cluster_id.clone(), node_id: identity.node_id.clone() }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IdentityFile {
     version: u32,
-    identity: NodeIdentity,
+    identity: StoredIdentity,
 }
 
 /// Failure to establish or inspect local node ownership.
@@ -144,8 +163,8 @@ impl NodeLease {
             Ok(stored) if stored == identity => {}
             Ok(_) => return Err(LeaseError::IdentityMismatch),
             Err(LeaseError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                let bytes =
-                    serde_json::to_vec(&IdentityFile { version: 1, identity: identity.clone() }).map_err(|_| LeaseError::CorruptIdentity)?;
+                let bytes = serde_json::to_vec(&IdentityFile { version: 1, identity: StoredIdentity::from(&identity) })
+                    .map_err(|_| LeaseError::CorruptIdentity)?;
                 let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
                 output.write_all(&bytes)?;
                 output.sync_all()?;
@@ -192,8 +211,8 @@ fn read_identity(path: &Path) -> Result<NodeIdentity, LeaseError> {
         return Err(LeaseError::CorruptIdentity);
     }
     let stored: IdentityFile = serde_json::from_slice(&bytes).map_err(|_| LeaseError::CorruptIdentity)?;
-    if stored.version != 1 || stored.identity.validate().is_err() {
+    if stored.version != 1 {
         return Err(LeaseError::CorruptIdentity);
     }
-    Ok(stored.identity)
+    NodeIdentity::new(stored.identity.cluster_id, stored.identity.node_id).map_err(|_| LeaseError::CorruptIdentity)
 }
