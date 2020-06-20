@@ -93,10 +93,10 @@ fn multiple_scans_collected() {
 }
 
 #[test]
-fn slot_ty_can_be_inferred_from_context() {
+fn slot_type_can_be_inferred_from_context() {
     // $limit used as .take($limit) → must be numeric
     let stmt = prepare("User.all().take($limit).collect()").unwrap();
     // Phase-1 lowering still reports Any, but the infrastructure is now
     // in place for context-aware inference.
-    assert_eq!(stmt.parameters[0].slot_ty, SlotTy::Any);
+    assert_eq!(stmt.parameters[0].slot_type, SlotTy::Any);
 }

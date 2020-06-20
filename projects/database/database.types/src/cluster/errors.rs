@@ -110,7 +110,7 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "fencing rejected: fence token (epoch={} term={} leader={}) does not match catalog owner {}",
-                    fence.epoch.0, fence.term.0, fence.leader.0, current
+                    fence.epoch.0, fence.term.0, fence.leader_node_id.0, current
                 )
             }
         }

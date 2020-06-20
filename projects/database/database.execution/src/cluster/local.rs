@@ -66,7 +66,7 @@ where
                 leader_term: database_types::cluster::LeaderTerm(0),
             },
         })?;
-        if fence.leader != owner.node_id || fence.term != owner.leader_term {
+        if fence.leader_node_id != owner.node_id || fence.term != owner.leader_term {
             return Err(Error::FencingRejected { fence: fence.clone(), current: owner.clone() });
         }
         Ok(())

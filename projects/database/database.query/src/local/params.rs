@@ -30,6 +30,7 @@ use vos::syntax::{VosExpr, VosProgram, VosStmt};
 /// Both frontends lower into the same physical operators; the dialect is kept
 /// only for diagnostics and for re-preparing against the right parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[doc(hidden)]
 pub enum Dialect {
     /// VOS pipeline / write program.
@@ -50,13 +51,14 @@ pub struct ParameterDescriptor {
     pub index: u32,
     /// Declared slot type; inferred from surrounding context when possible,
     /// otherwise `Any`.
-    pub slot_ty: SlotTy,
+    pub slot_type: SlotTy,
     /// Number of times this parameter appears in the source.
     pub usage_count: u32,
 }
 
 /// Read / write / session query kind — populated after lowering when ops are inspected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QueryKind {
     /// Read pipeline ending in `.collect()`.
     Read,
@@ -238,7 +240,7 @@ pub fn prepare_sql(source: &str) -> Result<PreparedStatement> {
 ///
 /// * A required parameter is missing from `named`.
 /// * `named` contains a parameter name the statement never references.
-/// * A bound value does not match the declared `slot_ty`.
+/// * A bound value does not match the declared `slot_type`.
 pub fn bind_named(stmt: &PreparedStatement, named: &BTreeMap<String, Value>) -> Result<Vec<Value>> {
     bind_values(&stmt.parameters, named)
 }
@@ -257,7 +259,7 @@ fn bind_values(parameters: &[ParameterDescriptor], named: &BTreeMap<String, Valu
         else {
             return Err(Error::QueryBind { parameter: param.name.clone(), message: format!("missing required parameter `{}`", param.name) });
         };
-        if !param.slot_ty.matches(value) {
+        if !param.slot_type.matches(value) {
             let got = match value {
                 Value::Null => "null",
                 Value::Bool(_) => "bool",
@@ -270,7 +272,7 @@ fn bind_values(parameters: &[ParameterDescriptor], named: &BTreeMap<String, Valu
             };
             return Err(Error::QueryBind {
                 parameter: param.name.clone(),
-                message: format!("parameter `{}` expects `{}`, got `{}`", param.name, param.slot_ty.as_str(), got),
+                message: format!("parameter `{}` expects `{}`, got `{}`", param.name, param.slot_type.as_str(), got),
             });
         }
         values[param.index as usize] = value.clone();
@@ -322,10 +324,10 @@ pub fn bind_ordered(stmt: &PreparedStatement, values: &[Value]) -> Result<Vec<Va
     }
     let mut bound: Vec<Value> = vec![Value::Null; stmt.parameters.len()];
     for (value, param) in values.iter().zip(&stmt.parameters) {
-        if !param.slot_ty.matches(value) {
+        if !param.slot_type.matches(value) {
             return Err(Error::QueryBind {
                 parameter: param.name.clone(),
-                message: format!("parameter `{}` expects `{}`", param.name, param.slot_ty.as_str()),
+                message: format!("parameter `{}` expects `{}`", param.name, param.slot_type.as_str()),
             });
         }
         bound[param.index as usize] = value.clone();
@@ -406,7 +408,7 @@ pub(crate) fn name_to_slot(name: &str, parameters: &[ParameterDescriptor]) -> Re
     };
     let index: u32 = slot.parse().map_err(|_| Error::Schema { message: format!("malformed parameter slot `{name}`") })?;
     let param = parameters.get(index as usize).ok_or_else(|| Error::Schema { message: format!("parameter slot {index} is not declared") })?;
-    Ok(BoundValue::Slot { index: param.index, expected_ty: param.slot_ty })
+    Ok(BoundValue::Slot { index: param.index, expected_ty: param.slot_type })
 }
 
 // ─── internals ────────────────────────────────────────────────────────────
@@ -448,7 +450,7 @@ pub fn scan_and_rewrite(source: &str, dialect: Dialect) -> Result<(Vec<Parameter
                 parameters.push(ParameterDescriptor {
                     name,
                     index,
-                    slot_ty: SlotTy::Any, // narrowing done in lowering
+                    slot_type: SlotTy::Any, // narrowing done in lowering
                     usage_count: 1,
                 });
                 index

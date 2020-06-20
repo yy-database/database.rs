@@ -143,7 +143,7 @@ impl ReplicaSet {
 
     /// Creates the fence token that current writes must carry.
     pub fn fence_token(&self) -> FenceToken {
-        FenceToken { epoch: self.epoch, term: self.term, leader: self.leader.clone() }
+        FenceToken { epoch: self.epoch, term: self.term, leader_node_id: self.leader.clone() }
     }
 
     /// Validates a write caller against the current epoch, term, and leader.
@@ -154,7 +154,7 @@ impl ReplicaSet {
         if token.term != self.term {
             return Err(ReplicaError::StaleTerm { expected: self.term, found: token.term });
         }
-        if caller != &self.leader || token.leader != self.leader {
+        if caller != &self.leader || token.leader_node_id != self.leader {
             return Err(ReplicaError::NotLeader { expected: self.leader.clone(), found: caller.clone() });
         }
         Ok(())

@@ -29,7 +29,7 @@ pub struct FenceToken {
     /// Leader election term.
     pub term: LeaderTerm,
     /// Node that owns the lease.
-    pub leader: ReplicaNodeId,
+    pub leader_node_id: ReplicaNodeId,
 }
 
 /// Catalog-published owner record for one shard.
