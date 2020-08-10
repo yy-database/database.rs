@@ -45,6 +45,8 @@ database-protocol-mongo = { path = "projects/database/database.protocol.mongo" }
 database-client = { path = "projects/database/database.client" }
 database-server = { path = "projects/database/database.server" }
 database-harness = { path = "projects/database/database.harness" }
+plotter-chart = { git = "https://github.com/notedge/document.rs.git", rev = "c0da639639cd0b8618675c791c86487cbf86aa16" }
+plotter-scene = { git = "https://github.com/notedge/document.rs.git", rev = "c0da639639cd0b8618675c791c86487cbf86aa16" }
 sqlite = { path = "projects/facades/sqlite" }
 mongo = { path = "projects/facades/mongo" }
 regex = "1"

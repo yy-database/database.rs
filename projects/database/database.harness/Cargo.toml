@@ -8,9 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# 基准报告图表：经 `plotter-chart` 出 SVG。默认不开启，避免所有产品被
+# 无条件拉入绘图依赖树。
+charts = ["dep:plotter-chart", "dep:plotter-scene"]
+
 [dependencies]
 database-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+plotter-chart = { workspace = true, optional = true }
+plotter-scene = { workspace = true, optional = true }
