@@ -300,4 +300,3 @@ fn open_existing_does_not_create_a_missing_shard() {
     assert!(matches!(FileShard::open_existing(&path), Err(database_types::cluster::Error::NotFound { .. })));
     assert!(!path.exists(), "a read-only open must not install a shard");
 }
-

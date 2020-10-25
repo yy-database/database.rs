@@ -325,10 +325,7 @@ impl KvStore for FileShard {
                 ShardChange::Put { key, value, expires_at } => {
                     let revision = next_revision;
                     next_revision = next_revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
-                    staged_records.insert(
-                        key.clone(),
-                        Record { key: key.clone(), value: value.clone(), revision, expires_at: *expires_at },
-                    );
+                    staged_records.insert(key.clone(), Record { key: key.clone(), value: value.clone(), revision, expires_at: *expires_at });
                 }
                 ShardChange::Delete { key } => {
                     staged_records.remove(key);
@@ -386,12 +383,8 @@ impl KvStore for FileShard {
     }
 
     fn flush(&mut self, namespace: &Namespace) -> Result<usize> {
-        let changes: Vec<ShardChange> = self
-            .records
-            .keys()
-            .filter(|key| key.namespace == *namespace)
-            .map(|key| ShardChange::Delete { key: key.clone() })
-            .collect();
+        let changes: Vec<ShardChange> =
+            self.records.keys().filter(|key| key.namespace == *namespace).map(|key| ShardChange::Delete { key: key.clone() }).collect();
         let removed = changes.len();
         if removed > 0 {
             self.commit_changes(changes)?;

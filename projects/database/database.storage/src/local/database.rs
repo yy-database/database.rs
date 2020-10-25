@@ -158,8 +158,7 @@ impl Database {
                 if key.encoded.starts_with(META_PREFIX) {
                     skipped += 1;
                     if is_last {
-                        last_key =
-                            Some(String::from_utf8(key.encoded).map_err(|_| Error::Corrupt("record key is not UTF-8"))?);
+                        last_key = Some(String::from_utf8(key.encoded).map_err(|_| Error::Corrupt("record key is not UTF-8"))?);
                     }
                     continue;
                 }
