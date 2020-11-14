@@ -66,7 +66,7 @@
 //! `yydb-gateway` lowering can execute them; the shapes above are listed so the
 //! hand-off is mechanical rather than a re-discovery.
 
-use crate::{ColumnSpec, WriteValue};
+use crate::{Collation, ColumnSpec, WriteValue};
 
 use super::error::SqlError;
 
@@ -1232,6 +1232,13 @@ pub enum Expr {
         /// Target type.
         target: CastType,
     },
+    /// `expr COLLATE name`；只改变文本比较规则，不改变表达式的值。
+    Collate {
+        /// 被施加排序规则的表达式。
+        value: Box<Expr>,
+        /// 排序规则名，按书写原样保留，解析时再校验。
+        collation: String,
+    },
     /// `x IS DISTINCT FROM y` or `x IS NOT DISTINCT FROM y`.
     IsDistinct {
         /// Left operand.
@@ -1378,6 +1385,7 @@ impl Expr {
             }
             Self::Alias { name, .. } => name.clone(),
             Self::Cast { value, target } => format!("CAST({} AS {})", value.label(), target.name()),
+            Self::Collate { value, collation } => format!("{} COLLATE {}", value.label(), collation),
             Self::Glob { value, pattern, negated } => {
                 format!("{} {}GLOB {}", value.label(), if *negated { "NOT " } else { "" }, pattern.label())
             }
@@ -3175,7 +3183,21 @@ impl<'a> Parser<'a> {
             self.at += 1;
             return Ok(Expr::Unary { op: UnaryOp::BitNot, value: Box::new(self.unary_expr()?) });
         }
-        self.primary()
+        self.postfix_expr()
+    }
+
+    /// 读取后缀形式的最紧一级表达式，目前只有 `COLLATE`。
+    ///
+    /// SQLite 的优先级表把 `COLLATE` 放在一元运算符之上一档，所以
+    /// `-x COLLATE NOCASE` 是 `-(x COLLATE NOCASE)`；链式书写时最外层的
+    /// `COLLATE` 生效，这里保持同样的嵌套方向。
+    fn postfix_expr(&mut self) -> Result<Expr, SqlError> {
+        let mut value = self.primary()?;
+        while self.eat_word("collate") {
+            let collation = self.name()?;
+            value = Expr::Collate { value: Box::new(value), collation };
+        }
+        Ok(value)
     }
 
     fn primary(&mut self) -> Result<Expr, SqlError> {
@@ -4581,6 +4603,7 @@ impl<'a> Parser<'a> {
             primary_key: false,
             unique: false,
             autoincrement: false,
+            collate: None,
         };
         loop {
             if self.eat_word("primary") {
@@ -4642,9 +4665,10 @@ impl<'a> Parser<'a> {
                 foreign_keys.push(self.references_clause(vec![spec.name.clone()])?);
             }
             else if self.eat_word("collate") {
-                let mut error = self.error("unsupported-column-constraint", format!("unsupported column constraint in `{}`", spec.name));
-                error.clause = Some("COLLATE".to_string());
-                return Err(error);
+                let name = self.name()?;
+                spec.collate = Some(
+                    Collation::parse(&name).ok_or_else(|| self.error("unknown-collation", format!("no such collation sequence: {name}")))?,
+                );
             }
             else if self.eat_word("generated") {
                 let mut error = self.error("unsupported-generated-column", format!("unsupported generated column `{}`", spec.name));
@@ -5747,6 +5771,7 @@ fn expr_references(expr: &Expr, name: &str) -> bool {
         }
         Expr::Alias { value, .. } => expr_references(value, name),
         Expr::Cast { value, .. } => expr_references(value, name),
+        Expr::Collate { value, .. } => expr_references(value, name),
         Expr::Like { value, pattern, escape, .. } => {
             expr_references(value, name)
                 || expr_references(pattern, name)

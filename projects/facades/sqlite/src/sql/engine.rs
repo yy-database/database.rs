@@ -12,8 +12,8 @@ use std::{
 };
 
 use crate::{
-    ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue, decode_library_version,
-    decode_record, read_index_table, read_table, validate_database,
+    Collation, ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue,
+    decode_library_version, decode_record, read_index_table_with, read_table, validate_database,
 };
 
 use super::{
@@ -250,6 +250,8 @@ struct IndexDef {
     terms: Vec<ResolvedExpr>,
     /// Partial-index predicate resolved against the table.
     predicate: Option<ResolvedExpr>,
+    /// 每个键项生效的排序规则，来自索引项显式 `COLLATE` 或列声明。
+    collations: Vec<Collation>,
 }
 
 /// One view in the engine catalog, keyed by its lowercase name.
@@ -741,8 +743,9 @@ fn trigger_event_matches(defined: &TriggerEvent, incoming: &TriggerEvent) -> boo
 enum UniqueKey {
     /// The hidden rowid, reported under `t.rowid` or `t.<alias>`.
     Rowid(String),
-    /// One or more column positions, plus the `t.a, t.b` message fragment.
-    Columns(Vec<usize>, String),
+    /// One or more column positions, plus the `t.a, t.b` message fragment and
+    /// the collation each key position compares with.
+    Columns(Vec<usize>, String, Vec<Collation>),
 }
 
 impl UniqueKey {
@@ -750,13 +753,13 @@ impl UniqueKey {
     fn values(&self, cells: &[Cell], rowid: i64) -> Vec<Cell> {
         match self {
             Self::Rowid(_) => vec![Cell::Integer(rowid)],
-            Self::Columns(positions, _) => positions.iter().map(|position| cells[*position].clone()).collect(),
+            Self::Columns(positions, _, _) => positions.iter().map(|position| cells[*position].clone()).collect(),
         }
     }
 
     fn label(&self) -> &str {
         match self {
-            Self::Rowid(label) | Self::Columns(_, label) => label,
+            Self::Rowid(label) | Self::Columns(_, label, _) => label,
         }
     }
 }
@@ -1226,9 +1229,23 @@ impl Engine {
                         continue;
                     };
                     let outcome = match object.kind {
-                        SchemaObjectKind::Index => read_index_table(pages, root, limits).map(|_| ()),
+                        SchemaObjectKind::Index => {
+                            let collations =
+                                self.indexes.get(&object.name.to_ascii_lowercase()).map(|index| index.collations.clone()).unwrap_or_default();
+                            read_index_table_with(pages, root, limits, &collations).map(|_| ())
+                        }
                         SchemaObjectKind::Table if self.table_is_without_rowid(&object.name) => {
-                            read_index_table(pages, root, limits).map(|_| ())
+                            let collations = match self.tables.iter().find(|def| def.name.eq_ignore_ascii_case(&object.name)) {
+                                Some(def) => {
+                                    let layout = def.without_rowid_layout();
+                                    layout[..def.primary_key_positions().map(|keys| keys.len()).unwrap_or(0)]
+                                        .iter()
+                                        .map(|position| def.columns[*position].collate.unwrap_or_default())
+                                        .collect()
+                                }
+                                None => Vec::new(),
+                            };
+                            read_index_table_with(pages, root, limits, &collations).map(|_| ())
                         }
                         SchemaObjectKind::Table => read_table(pages, root, limits).map(|_| ()),
                         SchemaObjectKind::View | SchemaObjectKind::Trigger => Ok(()),
@@ -1584,6 +1601,19 @@ impl Engine {
                         continue;
                     };
                     let managed = predicate.is_some() || columns.iter().any(|column| column.expr.is_some() || column.collate.is_some());
+                    // 键项显式 `COLLATE` 优先，裸列继承列声明，表达式按 `BINARY`。
+                    let collations: Vec<Collation> = columns
+                        .iter()
+                        .map(|column| match &column.collate {
+                            Some(name) => Collation::parse(name).unwrap_or_default(),
+                            None => {
+                                match (&column.expr, def.columns.iter().find(|existing| existing.name.eq_ignore_ascii_case(&column.name))) {
+                                    (None, Some(existing)) => existing.collate.unwrap_or_default(),
+                                    _ => Collation::Binary,
+                                }
+                            }
+                        })
+                        .collect();
                     let (positions, terms, predicate) = if managed {
                         let shape = TargetShape::new(def, &table, None);
                         let mut terms = Vec::with_capacity(columns.len());
@@ -1645,6 +1675,7 @@ impl Engine {
                             managed,
                             terms,
                             predicate,
+                            collations,
                         },
                     );
                 }
@@ -2745,6 +2776,7 @@ impl Engine {
                 primary_key: false,
                 unique: false,
                 autoincrement: false,
+                collate: None,
             })
             .collect();
         let sql = ctas_schema_sql(&name, &columns);
@@ -3507,23 +3539,14 @@ impl Engine {
                         SqlError::new("index-exists", format!("there is already an object named `{name}`")).in_statement("create-index")
                     );
                 }
-                // `COLLATE` index keys change the b-tree comparison order, which
-                // this writer does not implement yet.
-                if let Some(column) = columns.iter().find(|column| column.collate.is_some()) {
-                    let mut error = SqlError::new(
-                        "unsupported-clause",
-                        format!("`COLLATE` index key `{}` is not supported; this engine compares keys with binary order", column.name),
-                    );
-                    error.clause = Some("COLLATE".to_string());
-                    return Err(error.in_statement("create-index"));
-                }
-                // Expression keys, `COLLATE` terms and a `WHERE` predicate make
-                // the key values row-dependent, so the engine computes them and
-                // hands the exact entries to the writer.
-                let managed = predicate.is_some() || columns.iter().any(|column| column.expr.is_some());
+                // Expression keys and a `WHERE` predicate make the key values
+                // row-dependent, so the engine computes them and hands the exact
+                // entries to the writer.
+                let managed = predicate.is_some() || columns.iter().any(|column| column.expr.is_some() || column.collate.is_some());
                 if managed {
                     let shape = TargetShape::new(def, &table, None);
                     let mut terms = Vec::with_capacity(columns.len());
+                    let mut collations = Vec::with_capacity(columns.len());
                     for column in &columns {
                         let resolved = match &column.expr {
                             Some(expr) => shape.resolve(expr, "create-index")?,
@@ -3538,11 +3561,32 @@ impl Engine {
                                 ResolvedExpr::Column { source: 0, index: position }
                             }
                         };
+                        // 键项显式 `COLLATE` 优先，裸列继承列声明，表达式按 `BINARY`。
+                        collations.push(match &column.collate {
+                            Some(name) => Collation::parse(name).ok_or_else(|| unknown_collation(name).in_statement("create-index"))?,
+                            None => match &column.expr {
+                                Some(_) => Collation::Binary,
+                                None => def
+                                    .columns
+                                    .iter()
+                                    .find(|existing| existing.name.eq_ignore_ascii_case(&column.name))
+                                    .and_then(|existing| existing.collate)
+                                    .unwrap_or_default(),
+                            },
+                        });
                         terms.push(resolved);
                     }
                     let predicate = shape.resolve_optional(predicate.as_ref(), "create-index")?;
                     let rows = self.live_rows(def, "create-index")?;
                     let entries = self.managed_index_entries(def, &terms, predicate.as_ref(), &rows)?;
+                    if unique {
+                        let names = columns.iter().map(|column| format!("{table}.{}", column.name)).collect::<Vec<_>>().join(", ");
+                        if managed_unique_violation(&entries, &collations) {
+                            return Err(
+                                SqlError::new("unique-constraint", format!("UNIQUE constraint failed: {names}")).in_statement("create-index")
+                            );
+                        }
+                    }
                     self.writer
                         .create_managed_index(&name, &table, unique, &sql, &entries)
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-index"))?;
@@ -3550,11 +3594,22 @@ impl Engine {
                     self.index_sequence += 1;
                     self.indexes.insert(
                         key,
-                        IndexDef { name: name.clone(), table: table_key, columns: Vec::new(), unique, order, managed: true, terms, predicate },
+                        IndexDef {
+                            name: name.clone(),
+                            table: table_key,
+                            columns: Vec::new(),
+                            unique,
+                            order,
+                            managed: true,
+                            terms,
+                            predicate,
+                            collations,
+                        },
                     );
                     return Ok(ExecResult { statement: "create-index", columns: Vec::new(), rows: Vec::new(), affected: 1 });
                 }
                 let mut positions = Vec::with_capacity(columns.len());
+                let mut collations = Vec::with_capacity(columns.len());
                 for column in &columns {
                     let position =
                         def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)).ok_or_else(|| {
@@ -3562,6 +3617,10 @@ impl Engine {
                                 .in_statement("create-index")
                         })?;
                     positions.push(position);
+                    collations.push(match &column.collate {
+                        Some(name) => Collation::parse(name).ok_or_else(|| unknown_collation(name).in_statement("create-index"))?,
+                        None => def.columns[position].collate.unwrap_or_default(),
+                    });
                 }
                 if unique {
                     self.ensure_unique_keys(&table, def, &columns)?;
@@ -3583,6 +3642,7 @@ impl Engine {
                         managed: false,
                         terms: Vec::new(),
                         predicate: None,
+                        collations,
                     },
                 );
                 Ok(ExecResult { statement: "create-index", columns: Vec::new(), rows: Vec::new(), affected: 1 })
@@ -4557,11 +4617,17 @@ impl Engine {
     /// which makes `1` and `1.0` collide just like upstream.
     fn ensure_unique_keys(&self, table: &str, def: &TableDef, columns: &[IndexColumn]) -> Result<(), SqlError> {
         let mut positions = Vec::with_capacity(columns.len());
+        let mut collations = Vec::with_capacity(columns.len());
         for column in columns {
             let position = def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)).ok_or_else(|| {
                 SqlError::new("unknown-column", format!("unknown column `{}` in table `{table}`", column.name)).in_statement("create-index")
             })?;
             positions.push(position);
+            // 键项显式 `COLLATE` 优先，否则继承列的声明排序规则。
+            collations.push(match &column.collate {
+                Some(name) => Collation::parse(name).ok_or_else(|| unknown_collation(name).in_statement("create-index"))?,
+                None => def.columns[position].collate.unwrap_or_default(),
+            });
         }
         let mut rows = Vec::new();
         for row in self
@@ -4573,9 +4639,11 @@ impl Engine {
         }
         for right in 1..rows.len() {
             for left in 0..right {
-                let collides = positions.iter().all(|position| {
-                    let (first, second) = (&rows[left][*position], &rows[right][*position]);
-                    !matches!(first, Cell::Null) && !matches!(second, Cell::Null) && compare_cells(first, second) == Ordering::Equal
+                let collides = positions.iter().enumerate().all(|(position, column)| {
+                    let (first, second) = (&rows[left][*column], &rows[right][*column]);
+                    !matches!(first, Cell::Null)
+                        && !matches!(second, Cell::Null)
+                        && compare_cells_with(first, second, collations[position]) == Ordering::Equal
                 });
                 if collides {
                     let names =
@@ -4703,7 +4771,7 @@ impl Engine {
                     .into_iter()
                     .filter(|key| match key {
                         UniqueKey::Rowid(_) => !(positions.len() == 1 && def.rowid_alias == Some(positions[0])),
-                        UniqueKey::Columns(existing, _) => !same_positions(existing, positions),
+                        UniqueKey::Columns(existing, _, _) => !same_positions(existing, positions),
                     })
                     .collect();
                 (keys, others)
@@ -4781,7 +4849,7 @@ impl Engine {
             .into_iter()
             .filter(|key| match key {
                 UniqueKey::Rowid(_) => !def.without_rowid && positions.len() == 1 && def.rowid_alias == Some(positions[0]),
-                UniqueKey::Columns(existing, _) => same_positions(existing, positions),
+                UniqueKey::Columns(existing, _, _) => same_positions(existing, positions),
             })
             .collect()
     }
@@ -4851,7 +4919,7 @@ impl Engine {
                     continue;
                 }
                 if let Some(other) = self.managed_target_key(def, target, cells)? {
-                    if managed_keys_conflict(&wanted, &other) {
+                    if managed_keys_conflict(&wanted, &other, &target.index.collations) {
                         return Ok(Some(target.label.clone()));
                     }
                 }
@@ -4910,7 +4978,7 @@ impl Engine {
                 };
                 for (rowid, cells) in live.iter() {
                     if let Some(other) = self.managed_target_key(def, target, cells)? {
-                        if managed_keys_conflict(&wanted, &other) {
+                        if managed_keys_conflict(&wanted, &other, &target.index.collations) {
                             conflict_rowid = Some(*rowid);
                             break;
                         }
@@ -4955,6 +5023,7 @@ impl Engine {
             left: Box::new(ResolvedExpr::Column { source: 0, index: width }),
             op: CompareOp::Eq,
             right: Box::new(ResolvedExpr::Cell(Cell::Integer(rowid))),
+            collation: Collation::Binary,
         };
         if let Some(filter) = &plan.filter {
             predicate = ResolvedExpr::And(Box::new(predicate), Box::new(filter.clone()));
@@ -5121,7 +5190,7 @@ impl Engine {
             };
             for (rowid, cells) in &live {
                 if let Some(other) = self.managed_target_key(def, &target, cells)? {
-                    if managed_keys_conflict(&wanted, &other) {
+                    if managed_keys_conflict(&wanted, &other, &target.index.collations) {
                         conflicts.insert(*rowid);
                     }
                 }
@@ -5691,32 +5760,47 @@ impl Engine {
         // A WITHOUT ROWID table has no rowid and its primary key is the
         // clustered key, so that key is the first uniqueness rule.
         if def.without_rowid && !def.primary_key.is_empty() {
-            keys.push(UniqueKey::Columns(def.primary_key.clone(), label(&def.primary_key)));
+            keys.push(UniqueKey::Columns(def.primary_key.clone(), label(&def.primary_key), self.key_collations(def, &def.primary_key)));
         }
         else if def.primary_key_index && !def.primary_key.is_empty() {
-            keys.push(UniqueKey::Columns(def.primary_key.clone(), label(&def.primary_key)));
+            keys.push(UniqueKey::Columns(def.primary_key.clone(), label(&def.primary_key), self.key_collations(def, &def.primary_key)));
         }
         for (position, column) in def.columns.iter().enumerate() {
             if Some(position) == def.rowid_alias {
                 continue;
             }
             if column.primary_key || column.unique {
-                keys.push(UniqueKey::Columns(vec![position], label(&[position])));
+                keys.push(UniqueKey::Columns(vec![position], label(&[position]), self.key_collations(def, &[position])));
             }
         }
         for constraint in &def.table_constraints {
             if !constraint.primary {
-                keys.push(UniqueKey::Columns(constraint.columns.clone(), label(&constraint.columns)));
+                keys.push(UniqueKey::Columns(
+                    constraint.columns.clone(),
+                    label(&constraint.columns),
+                    self.key_collations(def, &constraint.columns),
+                ));
             }
         }
         for index in self.indexes.values() {
             // Managed indexes are expression or partial, so their uniqueness is
             // enforced while their keys are rebuilt from the live rows.
             if !def.temp && !index.managed && index.table == table_key && index.unique {
-                keys.push(UniqueKey::Columns(index.columns.clone(), label(&index.columns)));
+                let collations = if index.collations.len() == index.columns.len() {
+                    index.collations.clone()
+                }
+                else {
+                    self.key_collations(def, &index.columns)
+                };
+                keys.push(UniqueKey::Columns(index.columns.clone(), label(&index.columns), collations));
             }
         }
         keys
+    }
+
+    /// 各键位按列声明取得的排序规则，供唯一性与冲突检测使用。
+    fn key_collations(&self, def: &TableDef, positions: &[usize]) -> Vec<Collation> {
+        positions.iter().map(|position| def.columns[*position].collate.unwrap_or_default()).collect()
     }
 
     /// True when the table owns any index whose b-tree has to be rewritten
@@ -5979,6 +6063,17 @@ impl Engine {
             SelectItems::Star => (None, relation.star_columns()),
         };
         let output_width = labels.len();
+        // 输出列各自的排序规则：`DISTINCT`、`GROUP BY` 序数与 `ORDER BY` 序数
+        // 都按它比较文本，与上游对结果列排序规则的继承一致。
+        let output_collations = match items {
+            SelectItems::Named(_) => projection
+                .as_ref()
+                .map(|nodes| nodes.iter().map(|node| resolved_collation(node, &relation)).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            SelectItems::Star => relation.visible_collations(),
+            SelectItems::CountAll => vec![Collation::Binary],
+        };
+        let output_collation = |position: usize| output_collations.get(position).copied().unwrap_or_default();
         // Aggregates are only defined over the whole result, so a predicate or
         // sort key that mixes one in is rejected instead of being evaluated per
         // row. Window functions are likewise limited to projection and `ORDER BY`.
@@ -6003,21 +6098,14 @@ impl Engine {
                     )
                     .in_statement("select"));
                 }
-                group_keys.push(GroupKey::Projected(position as usize - 1));
+                group_keys.push(GroupKey::Projected(position as usize - 1, output_collation(position as usize - 1)));
                 continue;
             }
             let mut scratch_aggregates = Vec::new();
             let mut scratch_windows = Vec::new();
-            group_keys.push(GroupKey::Expression(resolve_expr(
-                expr,
-                &relation,
-                &outer_shapes,
-                &[],
-                &mut scratch_windows,
-                &mut scratch_aggregates,
-                false,
-                false,
-            )?));
+            let resolved = resolve_expr(expr, &relation, &outer_shapes, &[], &mut scratch_windows, &mut scratch_aggregates, false, false)?;
+            let collation = resolved_collation(&resolved, &relation);
+            group_keys.push(GroupKey::Expression(resolved, collation));
         }
         // `HAVING` shares the projection's aggregate list, so it may add an
         // aggregate that the projection does not mention. Window functions are
@@ -6039,7 +6127,10 @@ impl Engine {
                         )
                         .in_statement("select"));
                     }
-                    return Ok((SortKey::Projected(position as usize - 1), SortDirection::of(entry)));
+                    return Ok((
+                        SortKey::Projected(position as usize - 1),
+                        SortDirection::of(entry).with_collation(output_collation(position as usize - 1)),
+                    ));
                 }
                 // An unqualified name that matches a projection alias sorts by
                 // the output column; SQLite prefers the alias over a same-named
@@ -6047,14 +6138,13 @@ impl Engine {
                 if let Expr::Column(column) = &entry.expr {
                     if column.qualifier.is_none() {
                         if let Some(position) = labels.iter().position(|label| label.eq_ignore_ascii_case(&column.name)) {
-                            return Ok((SortKey::Projected(position), SortDirection::of(entry)));
+                            return Ok((SortKey::Projected(position), SortDirection::of(entry).with_collation(output_collation(position))));
                         }
                     }
                 }
-                Ok((
-                    SortKey::Expression(resolve_expr(&entry.expr, &relation, &outer_shapes, named, &mut windows, &mut specs, true, true)?),
-                    SortDirection::of(entry),
-                ))
+                let resolved = resolve_expr(&entry.expr, &relation, &outer_shapes, named, &mut windows, &mut specs, true, true)?;
+                let collation = resolved_collation(&resolved, &relation);
+                Ok((SortKey::Expression(resolved), SortDirection::of(entry).with_collation(collation)))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -6175,7 +6265,7 @@ impl Engine {
             }
             let mut out: Vec<Vec<Cell>> = decorated.into_iter().map(|(_, cells, _)| cells).collect();
             if *distinct {
-                out = retain_first_distinct(out);
+                out = retain_first_distinct(out, &output_collations);
             }
             truncate_rows(&mut out, limit);
             return Ok(ExecResult { statement: "select", columns: labels, rows: out, affected: 0 });
@@ -6250,7 +6340,15 @@ impl Engine {
             let mut seen: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
             let mut kept: Vec<usize> = Vec::with_capacity(rows.len());
             for &index in &order {
-                if !seen.contains(&outputs[index]) {
+                let duplicate = seen.iter().any(|existing| {
+                    existing.len() == outputs[index].len()
+                        && existing
+                            .iter()
+                            .zip(&outputs[index])
+                            .enumerate()
+                            .all(|(position, (left, right))| compare_cells_with(left, right, output_collation(position)) == Ordering::Equal)
+                });
+                if !duplicate {
                     seen.push(outputs[index].clone());
                     kept.push(index);
                 }
@@ -7639,7 +7737,7 @@ fn row_preserving_expr(expr: &Expr) -> bool {
         }
         Expr::In { value, list, .. } => row_preserving_expr(value) && list.iter().all(row_preserving_expr),
         Expr::Function { args, .. } => args.iter().all(row_preserving_expr),
-        Expr::Alias { value, .. } | Expr::Cast { value, .. } => row_preserving_expr(value),
+        Expr::Alias { value, .. } | Expr::Cast { value, .. } | Expr::Collate { value, .. } => row_preserving_expr(value),
         Expr::Like { value, pattern, escape, .. } => {
             row_preserving_expr(value) && row_preserving_expr(pattern) && escape.as_ref().map_or(true, |expr| row_preserving_expr(expr))
         }
@@ -8058,6 +8156,46 @@ impl<'a> Relation<'a> {
         }
         visible
     }
+
+    /// 合并行某一列声明的排序规则。`USING` 合并槽取左侧列的规则，rowid 空槽
+    /// 与派生表、CTE 一律按 `BINARY`。
+    fn column_collation(&self, merged: usize) -> Collation {
+        for source in &self.sources {
+            let end = source.offset + source.width();
+            if merged >= source.offset && merged < end {
+                if merged >= source.offset + source.visible_width() {
+                    return Collation::Binary;
+                }
+                return match &source.columns {
+                    SourceColumns::Table(def) => def.columns[merged - source.offset].collate.unwrap_or_default(),
+                    SourceColumns::Materialized { .. } => Collation::Binary,
+                };
+            }
+        }
+        for join in self.using.iter().flatten() {
+            if join.slot == merged {
+                return self.column_collation(join.left);
+            }
+        }
+        Collation::Binary
+    }
+
+    /// `SELECT *` 输出列各自的排序规则。
+    fn visible_collations(&self) -> Vec<Collation> {
+        let mut collations = Vec::new();
+        for source in &self.sources {
+            for local in 0..source.visible_width() {
+                if source.star_hidden[local] {
+                    continue;
+                }
+                collations.push(match source.star_override[local] {
+                    Some(slot) => self.column_collation(slot),
+                    None => self.column_collation(source.offset + local),
+                });
+            }
+        }
+        collations
+    }
 }
 
 /// A projection / `WHERE` / `ORDER BY` expression with every column resolved
@@ -8093,7 +8231,10 @@ enum ResolvedExpr {
     /// Arithmetic `+`, `-`, `*` or `/`.
     Binary { left: Box<ResolvedExpr>, op: BinaryOp, right: Box<ResolvedExpr> },
     /// Value comparison; yields `1`, `0` or `NULL`.
-    Compare { left: Box<ResolvedExpr>, op: CompareOp, right: Box<ResolvedExpr> },
+    ///
+    /// `collation` 是两个操作数合并后生效的排序规则，解析期确定，求值期只按
+    /// 它比较文本。
+    Compare { left: Box<ResolvedExpr>, op: CompareOp, right: Box<ResolvedExpr>, collation: Collation },
     /// `IS NULL` or `IS NOT NULL`.
     IsNull { value: Box<ResolvedExpr>, negated: bool },
     /// `IS TRUE`, `IS NOT TRUE`, `IS FALSE` or `IS NOT FALSE`.
@@ -8108,21 +8249,30 @@ enum ResolvedExpr {
     Case {
         /// Simple-form operand; absent in the searched form.
         operand: Option<Box<ResolvedExpr>>,
+        /// 简单形式里操作数生效的排序规则；分支自带显式 `COLLATE` 时优先。
+        collation: Option<Collation>,
         /// `WHEN condition THEN result` pairs.
         branches: Vec<(ResolvedExpr, ResolvedExpr)>,
         /// `ELSE result`; absent means `NULL`.
         otherwise: Option<Box<ResolvedExpr>>,
     },
     /// `x IN (...)` or `x NOT IN (...)`.
-    In { value: Box<ResolvedExpr>, list: Vec<ResolvedExpr>, negated: bool },
+    In { value: Box<ResolvedExpr>, list: Vec<ResolvedExpr>, negated: bool, collation: Option<Collation> },
     /// Scalar function call.
     Function { name: ScalarFunction, args: Vec<ResolvedExpr> },
     /// `CAST(expr AS type)`.
     Cast { value: Box<ResolvedExpr>, target: CastType },
+    /// `expr COLLATE name`；只改变文本比较规则，求值结果与内层表达式相同。
+    Collate {
+        /// 被施加排序规则的表达式。
+        value: Box<ResolvedExpr>,
+        /// 解析后的内置排序规则。
+        collation: Collation,
+    },
     /// `x [NOT] LIKE y [ESCAPE z]`.
     Like { value: Box<ResolvedExpr>, pattern: Box<ResolvedExpr>, negated: bool, escape: Option<Box<ResolvedExpr>> },
     /// `x IS DISTINCT FROM y` or `x IS NOT DISTINCT FROM y`.
-    IsDistinct { left: Box<ResolvedExpr>, right: Box<ResolvedExpr>, negated: bool },
+    IsDistinct { left: Box<ResolvedExpr>, right: Box<ResolvedExpr>, negated: bool, collation: Collation },
     /// `x GLOB y` or `x NOT GLOB y`.
     Glob { value: Box<ResolvedExpr>, pattern: Box<ResolvedExpr>, negated: bool },
     /// Scalar subquery `(SELECT ...)`.
@@ -8254,11 +8404,13 @@ impl ResolvedExpr {
                 super::json::arrow(&left.eval(values, ctx)?, &right.eval(values, ctx)?, true)?
             }
             Self::Binary { left, op, right } => arithmetic(*op, &left.eval(values, ctx)?, &right.eval(values, ctx)?),
-            Self::Compare { left, op, right } => match compare_values(&left.eval(values, ctx)?, &right.eval(values, ctx)?, *op) {
-                Some(true) => Cell::Integer(1),
-                Some(false) => Cell::Integer(0),
-                None => Cell::Null,
-            },
+            Self::Compare { left, op, right, collation } => {
+                match compare_values(&left.eval(values, ctx)?, &right.eval(values, ctx)?, *op, *collation) {
+                    Some(true) => Cell::Integer(1),
+                    Some(false) => Cell::Integer(0),
+                    None => Cell::Null,
+                }
+            }
             Self::IsNull { value, negated } => {
                 let is_null = matches!(value.eval(values, ctx)?, Cell::Null);
                 Cell::Integer(i64::from(is_null != *negated))
@@ -8283,7 +8435,7 @@ impl ResolvedExpr {
                 (Some(false), Some(false)) => Cell::Integer(0),
                 _ => Cell::Null,
             },
-            Self::Case { operand, branches, otherwise } => {
+            Self::Case { operand, branches, otherwise, collation } => {
                 match operand {
                     None => {
                         for (condition, result) in branches {
@@ -8295,7 +8447,14 @@ impl ResolvedExpr {
                     Some(operand) => {
                         let base = operand.eval(values, ctx)?;
                         for (candidate, result) in branches {
-                            if compare_values(&base, &candidate.eval(values, ctx)?, CompareOp::Eq) == Some(true) {
+                            // 分支自带的显式 `COLLATE` 优先于 CASE 操作数的列声明。
+                            let branch_collation = collation.or_else(|| match candidate {
+                                Self::Collate { collation, .. } => Some(*collation),
+                                _ => None,
+                            });
+                            if compare_values(&base, &candidate.eval(values, ctx)?, CompareOp::Eq, branch_collation.unwrap_or_default())
+                                == Some(true)
+                            {
                                 return result.eval(values, ctx);
                             }
                         }
@@ -8306,10 +8465,31 @@ impl ResolvedExpr {
                     None => Cell::Null,
                 }
             }
-            Self::In { value, list, negated } => {
+            Self::In { value, list, negated, collation } => {
                 let value = value.eval(values, ctx)?;
-                let list = list.iter().map(|item| item.eval(values, ctx)).collect::<Result<Vec<_>, _>>()?;
-                in_result(&value, &list, *negated)
+                if matches!(value, Cell::Null) {
+                    return Ok(Cell::Null);
+                }
+                let mut saw_null = false;
+                for item in list {
+                    let item_value = item.eval(values, ctx)?;
+                    if matches!(item_value, Cell::Null) {
+                        saw_null = true;
+                        continue;
+                    }
+                    // 左操作数的显式 `COLLATE` 优先；否则取列表项自带的显式规则。
+                    let item_collation = match collation {
+                        Some(collation) => *collation,
+                        None => match item {
+                            Self::Collate { collation, .. } => *collation,
+                            _ => Collation::Binary,
+                        },
+                    };
+                    if compare_values(&value, &item_value, CompareOp::Eq, item_collation) == Some(true) {
+                        return Ok(Cell::Integer(i64::from(!*negated)));
+                    }
+                }
+                if saw_null { Cell::Null } else { Cell::Integer(i64::from(*negated)) }
             }
             Self::Function { name, args } => {
                 let values = args.iter().map(|arg| arg.eval(values, ctx)).collect::<Result<Vec<_>, _>>()?;
@@ -8326,7 +8506,8 @@ impl ResolvedExpr {
                 }
             }
             Self::Cast { value, target } => cast_cell(&value.eval(values, ctx)?, *target),
-            Self::IsDistinct { left, right, negated } => {
+            Self::Collate { value, .. } => value.eval(values, ctx)?,
+            Self::IsDistinct { left, right, negated, collation } => {
                 let left = left.eval(values, ctx)?;
                 let right = right.eval(values, ctx)?;
                 // `NULL` is a value again: two `NULL`s are not distinct, while a
@@ -8335,7 +8516,7 @@ impl ResolvedExpr {
                 let distinct = match (&left, &right) {
                     (Cell::Null, Cell::Null) => false,
                     (Cell::Null, _) | (_, Cell::Null) => true,
-                    _ => compare_cells(&left, &right) != Ordering::Equal,
+                    _ => compare_cells_with(&left, &right, *collation) != Ordering::Equal,
                 };
                 Cell::Integer(i64::from(distinct != *negated))
             }
@@ -8415,9 +8596,12 @@ impl ResolvedExpr {
             // such a conjunct wait for the complete row instead.
             Self::Subquery(_) | Self::Exists(_) => {}
             Self::Column { source, .. } => out.push(*source),
-            Self::Unary { value, .. } | Self::Not(value) | Self::IsNull { value, .. } | Self::IsTruth { value, .. } => {
-                value.collect_sources(out)
-            }
+            Self::Unary { value, .. }
+            | Self::Not(value)
+            | Self::IsNull { value, .. }
+            | Self::IsTruth { value, .. }
+            | Self::Cast { value, .. }
+            | Self::Collate { value, .. } => value.collect_sources(out),
             Self::Binary { left, right, .. } | Self::Compare { left, right, .. } | Self::And(left, right) | Self::Or(left, right) => {
                 left.collect_sources(out);
                 right.collect_sources(out);
@@ -8430,7 +8614,7 @@ impl ResolvedExpr {
                 value.collect_sources(out);
                 pattern.collect_sources(out);
             }
-            Self::Case { operand, branches, otherwise } => {
+            Self::Case { operand, branches, otherwise, .. } => {
                 if let Some(operand) = operand {
                     operand.collect_sources(out);
                 }
@@ -8454,7 +8638,6 @@ impl ResolvedExpr {
                     arg.collect_sources(out);
                 }
             }
-            Self::Cast { value, .. } => value.collect_sources(out),
             // Window values are already materialized for the current row.
             Self::Window(_) => {}
             Self::Parameter(_) => {}
@@ -8473,22 +8656,24 @@ impl ResolvedExpr {
     fn contains_subquery(&self) -> bool {
         match self {
             Self::Subquery(_) | Self::Exists(_) | Self::InSubquery { .. } => true,
-            Self::Unary { value, .. } | Self::Not(value) | Self::IsNull { value, .. } | Self::IsTruth { value, .. } => {
-                value.contains_subquery()
-            }
+            Self::Unary { value, .. }
+            | Self::Not(value)
+            | Self::IsNull { value, .. }
+            | Self::IsTruth { value, .. }
+            | Self::Cast { value, .. }
+            | Self::Collate { value, .. } => value.contains_subquery(),
             Self::Binary { left, right, .. } | Self::Compare { left, right, .. } | Self::And(left, right) | Self::Or(left, right) => {
                 left.contains_subquery() || right.contains_subquery()
             }
             Self::IsDistinct { left, right, .. } => left.contains_subquery() || right.contains_subquery(),
             Self::Glob { value, pattern, .. } => value.contains_subquery() || pattern.contains_subquery(),
-            Self::Case { operand, branches, otherwise } => {
+            Self::Case { operand, branches, otherwise, .. } => {
                 operand.as_ref().is_some_and(|operand| operand.contains_subquery())
                     || branches.iter().any(|(condition, result)| condition.contains_subquery() || result.contains_subquery())
                     || otherwise.as_ref().is_some_and(|otherwise| otherwise.contains_subquery())
             }
             Self::In { value, list, .. } => value.contains_subquery() || list.iter().any(ResolvedExpr::contains_subquery),
             Self::Function { args, .. } => args.iter().any(ResolvedExpr::contains_subquery),
-            Self::Cast { value, .. } => value.contains_subquery(),
             Self::Like { value, pattern, escape, .. } => {
                 value.contains_subquery() || pattern.contains_subquery() || escape.as_ref().is_some_and(|escape| escape.contains_subquery())
             }
@@ -8520,12 +8705,20 @@ struct SortDirection {
     /// `NULLS FIRST` / `NULLS LAST`; `None` keeps the SQLite default, which is
     /// first for `ASC` and last for `DESC`.
     nulls_first: Option<bool>,
+    /// 键表达式的文本排序规则，默认为 `BINARY`。
+    collation: Collation,
 }
 
 impl SortDirection {
     /// Direction of a parsed key.
     fn of(key: &OrderKey) -> Self {
-        Self { descending: key.descending, nulls_first: key.nulls_first }
+        Self { descending: key.descending, nulls_first: key.nulls_first, collation: Collation::Binary }
+    }
+
+    /// 附加键表达式的排序规则。
+    fn with_collation(mut self, collation: Collation) -> Self {
+        self.collation = collation;
+        self
     }
 
     /// Compares two cells, honouring the direction and the `NULL` placement.
@@ -8537,7 +8730,7 @@ impl SortDirection {
                 if matches!(left, Cell::Null) == first { Ordering::Less } else { Ordering::Greater }
             }
             _ => {
-                let ordering = compare_cells(left, right);
+                let ordering = compare_cells_with(left, right, self.collation);
                 if self.descending { ordering.reverse() } else { ordering }
             }
         }
@@ -8547,9 +8740,63 @@ impl SortDirection {
 /// One `GROUP BY` term.
 enum GroupKey {
     /// A one-based projection ordinal.
-    Projected(usize),
+    Projected(usize, Collation),
     /// Expression over the merged source row.
-    Expression(ResolvedExpr),
+    Expression(ResolvedExpr, Collation),
+}
+
+/// 排序规则未知时的统一诊断文案，与上游 SQLite 一致。
+fn unknown_collation(name: &str) -> SqlError {
+    SqlError::new("unknown-collation", format!("no such collation sequence: {name}"))
+}
+
+/// 解析期求一个表达式生效的排序规则：`COLLATE` 用显式声明，裸列用列声明，
+/// 其余表达式按 `BINARY`。
+fn parsed_collation(expr: &Expr, relation: &Relation) -> Result<Collation, SqlError> {
+    match expr {
+        Expr::Collate { collation, .. } => Collation::parse(collation).ok_or_else(|| unknown_collation(collation)),
+        Expr::Column(reference) => Ok(match relation.resolve(reference) {
+            Ok((_, merged)) => relation.column_collation(merged),
+            Err(_) => Collation::Binary,
+        }),
+        Expr::Alias { value, .. } => parsed_collation(value, relation),
+        _ => Ok(Collation::Binary),
+    }
+}
+
+/// 返回带显式 `COLLATE` 的那一层表达式，供二元比较按左侧优先取规则。
+fn explicit_collate(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Collate { .. } => Some(expr),
+        Expr::Alias { value, .. } => match value.as_ref() {
+            Expr::Collate { .. } => Some(value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 二元比较合并后的排序规则：左显式、右显式、左列、右列，最后 `BINARY`。
+fn comparison_collation(left: &Expr, right: &Expr, relation: &Relation) -> Result<Collation, SqlError> {
+    if let Some(expr) = explicit_collate(left) {
+        return parsed_collation(expr, relation);
+    }
+    if let Some(expr) = explicit_collate(right) {
+        return parsed_collation(expr, relation);
+    }
+    match parsed_collation(left, relation)? {
+        Collation::Binary => parsed_collation(right, relation),
+        collation => Ok(collation),
+    }
+}
+
+/// 已解析表达式生效的排序规则，供 `ORDER BY` / `GROUP BY` 使用。
+fn resolved_collation(expr: &ResolvedExpr, relation: &Relation) -> Collation {
+    match expr {
+        ResolvedExpr::Collate { collation, .. } => *collation,
+        ResolvedExpr::Column { index, .. } => relation.column_collation(*index),
+        _ => Collation::Binary,
+    }
 }
 
 /// Resolves one parsed expression against the current core.
@@ -8597,6 +8844,7 @@ fn resolve_expr(
         Expr::Compare { left, op, right } => ResolvedExpr::Compare {
             left: Box::new(resolve_expr(left, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
             op: *op,
+            collation: comparison_collation(left, right, relation)?,
             right: Box::new(resolve_expr(right, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
         },
         Expr::IsNull { value, negated } => ResolvedExpr::IsNull {
@@ -8620,6 +8868,13 @@ fn resolve_expr(
             Box::new(resolve_expr(right, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
         ),
         Expr::Case { operand, branches, otherwise } => ResolvedExpr::Case {
+            collation: match operand {
+                Some(operand) => match parsed_collation(operand, relation)? {
+                    Collation::Binary => None,
+                    collation => Some(collation),
+                },
+                None => None,
+            },
             operand: operand
                 .as_ref()
                 .map(|inner| {
@@ -8661,6 +8916,10 @@ fn resolve_expr(
                 .transpose()?,
         },
         Expr::In { value, list, negated } => ResolvedExpr::In {
+            collation: match parsed_collation(value, relation)? {
+                Collation::Binary => None,
+                collation => Some(collation),
+            },
             value: Box::new(resolve_expr(value, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
             list: list
                 .iter()
@@ -8678,6 +8937,10 @@ fn resolve_expr(
         Expr::Cast { value, target } => ResolvedExpr::Cast {
             value: Box::new(resolve_expr(value, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
             target: *target,
+        },
+        Expr::Collate { value, collation } => ResolvedExpr::Collate {
+            value: Box::new(resolve_expr(value, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
+            collation: Collation::parse(collation).ok_or_else(|| unknown_collation(collation))?,
         },
         Expr::Like { value, pattern, negated, escape } => ResolvedExpr::Like {
             value: Box::new(resolve_expr(value, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
@@ -8699,6 +8962,7 @@ fn resolve_expr(
             left: Box::new(resolve_expr(left, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
             right: Box::new(resolve_expr(right, relation, outer, named, windows, aggregates, allow_aggregate, allow_window)?),
             negated: *negated,
+            collation: comparison_collation(left, right, relation)?,
         },
         Expr::Subquery(query) => ResolvedExpr::Subquery(query.clone()),
         Expr::Exists(query) => ResolvedExpr::Exists(query.clone()),
@@ -8724,7 +8988,11 @@ fn resolve_expr(
                 filter.as_ref().map(|expr| resolve_expr(expr, relation, outer, named, windows, aggregates, false, false)).transpose()?;
             let order = order
                 .iter()
-                .map(|key| Ok((resolve_expr(&key.expr, relation, outer, named, windows, aggregates, false, false)?, SortDirection::of(key))))
+                .map(|key| {
+                    let resolved = resolve_expr(&key.expr, relation, outer, named, windows, aggregates, false, false)?;
+                    let collation = resolved_collation(&resolved, relation);
+                    Ok((resolved, SortDirection::of(key).with_collation(collation)))
+                })
                 .collect::<Result<Vec<_>, SqlError>>()?;
             let index = aggregates.len();
             aggregates.push(AggregateSpec { function: *function, argument, separator, distinct: *distinct, filter, order });
@@ -8781,7 +9049,11 @@ fn resolve_window(
     let order = merged
         .order
         .iter()
-        .map(|key| Ok((resolve_expr(&key.expr, relation, outer, named, windows, aggregates, true, false)?, SortDirection::of(key))))
+        .map(|key| {
+            let resolved = resolve_expr(&key.expr, relation, outer, named, windows, aggregates, true, false)?;
+            let collation = resolved_collation(&resolved, relation);
+            Ok((resolved, SortDirection::of(key).with_collation(collation)))
+        })
         .collect::<Result<Vec<_>, SqlError>>()?;
     let frame = match merged.frame {
         Some(frame) => Some(resolve_frame(frame, relation, outer, named, windows, aggregates)?),
@@ -8925,7 +9197,9 @@ fn resolve_window_function(
         WindowFunction::Aggregate { function, argument: value, separator, distinct, filter, order } => {
             let mut resolved_order = Vec::with_capacity(order.len());
             for key in order {
-                resolved_order.push((argument(&key.expr)?, SortDirection::of(key)));
+                let resolved = argument(&key.expr)?;
+                let collation = resolved_collation(&resolved, relation);
+                resolved_order.push((resolved, SortDirection::of(key).with_collation(collation)));
             }
             ResolvedWindowFunction::Aggregate {
                 function: *function,
@@ -9244,11 +9518,16 @@ fn truncate_rows(rows: &mut Vec<Vec<Cell>>, limit: Option<(usize, Option<usize>)
 ///
 /// Values are compared with `Cell`'s own equality, the same semantics grouping
 /// uses, so integers and reals stay distinct exactly as SQLite keeps them.
-fn retain_first_distinct(rows: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
+fn retain_first_distinct(rows: Vec<Vec<Cell>>, collations: &[Collation]) -> Vec<Vec<Cell>> {
     let mut seen: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if !seen.contains(&row) {
+        if !seen.iter().any(|existing| {
+            existing.len() == row.len()
+                && existing.iter().zip(&row).enumerate().all(|(position, (left, right))| {
+                    compare_cells_with(left, right, collations.get(position).copied().unwrap_or_default()) == Ordering::Equal
+                })
+        }) {
             seen.push(row.clone());
             out.push(row);
         }
@@ -9450,18 +9729,24 @@ fn build_groups(
         let key = group_keys
             .iter()
             .map(|key| match key {
-                GroupKey::Projected(index) => match projection {
+                GroupKey::Projected(index, _) => match projection {
                     Some(nodes) => match nodes.get(*index) {
                         Some(node) => node.eval(&row, ctx),
                         None => Ok(Cell::Null),
                     },
                     None => Ok(row.get(*index).cloned().unwrap_or(Cell::Null)),
                 },
-                GroupKey::Expression(expr) => expr.eval(&row, ctx),
+                GroupKey::Expression(expr, _) => expr.eval(&row, ctx),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let bucket = groups.iter_mut().find(|(existing, _)| {
-            existing.len() == key.len() && existing.iter().zip(&key).all(|(left, right)| compare_cells(left, right) == Ordering::Equal)
+            existing.len() == key.len()
+                && existing.iter().zip(key.iter()).zip(group_keys.iter()).all(|((left, right), key)| {
+                    let collation = match key {
+                        GroupKey::Projected(_, collation) | GroupKey::Expression(_, collation) => *collation,
+                    };
+                    compare_cells_with(left, right, collation) == Ordering::Equal
+                })
         });
         match bucket {
             Some((_, rows)) => {
@@ -9523,7 +9808,10 @@ fn join_rows(
                     merged[source.offset..source.offset + width].clone_from_slice(values);
                     coalesce_using(&mut merged, pairs);
                     let keep = match &ons[index] {
-                        None => pairs.iter().all(|pair| compare_values(&merged[pair.left], &merged[pair.right], CompareOp::Eq) == Some(true)),
+                        None => pairs.iter().all(|pair| {
+                            let collation = relation.column_collation(pair.left);
+                            compare_values(&merged[pair.left], &merged[pair.right], CompareOp::Eq, collation) == Some(true)
+                        }),
                         Some(on) => truthiness(&on.eval(&merged, ctx)?) == Some(true),
                     };
                     if keep {
@@ -9773,8 +10061,13 @@ fn storage_rank(cell: &Cell) -> u8 {
 /// Compares two cells with the SQLite ordering rules.
 ///
 /// Integers and reals compare numerically across the two storage classes, text
-/// compares with the `BINARY` collation, and blobs compare byte by byte.
+/// compares with `BINARY`, and blobs compare byte by byte.
 fn compare_cells(left: &Cell, right: &Cell) -> Ordering {
+    compare_cells_with(left, right, Collation::Binary)
+}
+
+/// 按给定排序规则比较两个单元格，文本以外的比较不受排序规则影响。
+fn compare_cells_with(left: &Cell, right: &Cell, collation: Collation) -> Ordering {
     use Ordering::Equal;
     let (left_rank, right_rank) = (storage_rank(left), storage_rank(right));
     if left_rank != right_rank {
@@ -9786,19 +10079,19 @@ fn compare_cells(left: &Cell, right: &Cell) -> Ordering {
         (Cell::Real(left), Cell::Real(right)) => left.partial_cmp(right).unwrap_or(Equal),
         (Cell::Integer(left), Cell::Real(right)) => (*left as f64).partial_cmp(right).unwrap_or(Equal),
         (Cell::Real(left), Cell::Integer(right)) => left.partial_cmp(&(*right as f64)).unwrap_or(Equal),
-        (Cell::Text(left), Cell::Text(right)) => left.as_bytes().cmp(right.as_bytes()),
+        (Cell::Text(left), Cell::Text(right)) => collation.compare_text(left, right),
         (Cell::Blob(left), Cell::Blob(right)) => left.cmp(right),
         _ => Equal,
     }
 }
 
 /// Applies one comparison operator. `None` means the result is SQL `NULL`.
-fn compare_values(left: &Cell, right: &Cell, operator: CompareOp) -> Option<bool> {
+fn compare_values(left: &Cell, right: &Cell, operator: CompareOp, collation: Collation) -> Option<bool> {
     use Ordering::{Equal, Greater, Less};
     if matches!(left, Cell::Null) || matches!(right, Cell::Null) {
         return None;
     }
-    let ordering = compare_cells(left, right);
+    let ordering = compare_cells_with(left, right, collation);
     Some(match operator {
         CompareOp::Eq => ordering == Equal,
         CompareOp::NotEq => ordering != Equal,
@@ -10368,7 +10661,7 @@ fn in_result(value: &Cell, list: &[Cell], negated: bool) -> Cell {
         if matches!(item, Cell::Null) {
             saw_null = true;
         }
-        else if compare_values(value, item, CompareOp::Eq) == Some(true) {
+        else if compare_values(value, item, CompareOp::Eq, Collation::Binary) == Some(true) {
             return Cell::Integer(i64::from(!negated));
         }
     }
@@ -10437,7 +10730,7 @@ fn eval_function(name: ScalarFunction, args: &[Cell]) -> Cell {
             value => value.clone(),
         },
         // `nullif(x, y)` 与 `x = y` 共用比较语义，比较结果未知时返回 `x`。
-        ScalarFunction::NullIf => match compare_values(&args[0], &args[1], CompareOp::Eq) {
+        ScalarFunction::NullIf => match compare_values(&args[0], &args[1], CompareOp::Eq, Collation::Binary) {
             Some(true) => Cell::Null,
             _ => args[0].clone(),
         },
@@ -10513,10 +10806,10 @@ fn min_max_cell(args: &[Cell], want_max: bool) -> Cell {
     let mut result = &args[0];
     for candidate in &args[1..] {
         let replace = if want_max {
-            compare_values(result, candidate, CompareOp::Lt) == Some(true)
+            compare_values(result, candidate, CompareOp::Lt, Collation::Binary) == Some(true)
         }
         else {
-            compare_values(result, candidate, CompareOp::GtEq) == Some(true)
+            compare_values(result, candidate, CompareOp::GtEq, Collation::Binary) == Some(true)
         };
         if replace {
             result = candidate;
@@ -11721,9 +12014,12 @@ fn expression_mentions_column(expr: &Expr, column: &str, qualifiers: Option<&[&s
         Expr::Glob { value, pattern, .. } => {
             expression_mentions_column(value, column, qualifiers) || expression_mentions_column(pattern, column, qualifiers)
         }
-        Expr::IsNull { value, .. } | Expr::IsTruth { value, .. } | Expr::Not(value) | Expr::Alias { value, .. } | Expr::Cast { value, .. } => {
-            expression_mentions_column(value, column, qualifiers)
-        }
+        Expr::IsNull { value, .. }
+        | Expr::IsTruth { value, .. }
+        | Expr::Not(value)
+        | Expr::Alias { value, .. }
+        | Expr::Cast { value, .. }
+        | Expr::Collate { value, .. } => expression_mentions_column(value, column, qualifiers),
         Expr::Case { operand, branches, otherwise } => {
             operand.as_ref().is_some_and(|value| expression_mentions_column(value, column, qualifiers))
                 || branches.iter().any(|(condition, value)| {
@@ -11999,12 +12295,13 @@ fn managed_index_label(def: &TableDef, index: &IndexDef) -> String {
 
 /// Whether two computed managed-index keys collide, with SQLite's rule that a
 /// `NULL` component never conflicts.
-fn managed_keys_conflict(first: &[Cell], second: &[Cell]) -> bool {
+fn managed_keys_conflict(first: &[Cell], second: &[Cell], collations: &[Collation]) -> bool {
     first.len() == second.len()
-        && first
-            .iter()
-            .zip(second)
-            .all(|(left, right)| !matches!(left, Cell::Null) && !matches!(right, Cell::Null) && compare_cells(left, right) == Ordering::Equal)
+        && first.iter().zip(second).enumerate().all(|(position, (left, right))| {
+            !matches!(left, Cell::Null)
+                && !matches!(right, Cell::Null)
+                && compare_cells_with(left, right, collations.get(position).copied().unwrap_or_default()) == Ordering::Equal
+        })
 }
 
 /// Whether one supplied upsert row collides with one stored row on `key`.
@@ -12013,10 +12310,12 @@ fn managed_keys_conflict(first: &[Cell], second: &[Cell]) -> bool {
 fn upsert_key_conflicts(key: &UniqueKey, candidate: &[Cell], candidate_rowid: i64, existing_rowid: i64, existing: &[Cell]) -> bool {
     match key {
         UniqueKey::Rowid(_) => candidate_rowid == existing_rowid,
-        UniqueKey::Columns(positions, _) => positions.iter().all(|position| {
+        UniqueKey::Columns(positions, _, collations) => positions.iter().enumerate().all(|(index, position)| {
             let first = &candidate[*position];
             let second = &existing[*position];
-            !matches!(first, Cell::Null) && !matches!(second, Cell::Null) && compare_cells(first, second) == Ordering::Equal
+            !matches!(first, Cell::Null)
+                && !matches!(second, Cell::Null)
+                && compare_cells_with(first, second, collations.get(index).copied().unwrap_or_default()) == Ordering::Equal
         }),
     }
 }
@@ -12031,8 +12330,14 @@ fn unique_conflict(keys: &[UniqueKey], candidate: &[Cell], rowid: i64, live: &[(
                 continue;
             }
             let other = key.values(other_cells, *other_rowid);
-            let collides = wanted.iter().zip(&other).all(|(first, second)| {
-                !matches!(first, Cell::Null) && !matches!(second, Cell::Null) && compare_cells(first, second) == Ordering::Equal
+            let collations = match key {
+                UniqueKey::Rowid(_) => &[][..],
+                UniqueKey::Columns(_, _, collations) => collations.as_slice(),
+            };
+            let collides = wanted.iter().zip(&other).enumerate().all(|(index, (first, second))| {
+                !matches!(first, Cell::Null)
+                    && !matches!(second, Cell::Null)
+                    && compare_cells_with(first, second, collations.get(index).copied().unwrap_or_default()) == Ordering::Equal
             });
             if collides {
                 return Some(key.label().to_string());
@@ -12059,6 +12364,28 @@ fn write_failure(error: impl std::fmt::Display, statement: &'static str, def: &T
         SqlError::new("storage", message)
     }
     .in_statement(statement)
+}
+
+/// 管理型索引键里是否存在按排序规则等价的重复项，`NULL` 键不算冲突。
+fn managed_unique_violation(entries: &[(Vec<crate::WriteValue>, i64)], collations: &[Collation]) -> bool {
+    for right in 1..entries.len() {
+        for left in 0..right {
+            let collides = entries[left].0.iter().zip(&entries[right].0).enumerate().all(|(position, (first, second))| {
+                if matches!(first, crate::WriteValue::Null) || matches!(second, crate::WriteValue::Null) {
+                    return false;
+                }
+                let collation = collations.get(position).copied().unwrap_or_default();
+                match (first, second) {
+                    (crate::WriteValue::Text(first), crate::WriteValue::Text(second)) => collation.compare_text(first, second).is_eq(),
+                    _ => first == second,
+                }
+            });
+            if collides {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn write_value_cell(value: &crate::WriteValue) -> Cell {

@@ -18,6 +18,7 @@ fn column(name: &str, declared: &str) -> ColumnSpec {
         primary_key: false,
         unique: false,
         autoincrement: false,
+        collate: None,
     }
 }
 
