@@ -88,7 +88,10 @@ struct MetaColumn {
 impl MetaQuery {
     /// Result shape, usable by a prepared-statement description.
     pub fn describe(&self) -> Vec<SqlColumn> {
-        self.columns.iter().map(|column| SqlColumn { name: column.name.clone(), field_type: column.field_type.clone() }).collect()
+        self.columns
+            .iter()
+            .map(|column| SqlColumn { name: column.name.clone(), field_type: column.field_type.clone(), field_id: None })
+            .collect()
     }
 
     /// Executes the synthesized query against the registry snapshot.

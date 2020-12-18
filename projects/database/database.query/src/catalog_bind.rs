@@ -33,6 +33,10 @@ pub enum SqlFieldType {
     /// The declared length limit is a dialect wire fact, not part of this type:
     /// see [`crate::SqlDialect::bytes_capacity`].
     Bytes,
+    /// Exact decimal result type. MySQL reports `SUM`/`AVG` over exact operands
+    /// as `DECIMAL`, which drivers surface as a string rather than a number.
+    /// Result metadata only: stored columns never project to this type.
+    Decimal,
     /// Optional wrapper — inner type + NULL. Box breaks the recursion
     Optional(Box<SqlFieldType>),
     /// Anything the gateway does not recognise stays opaque.

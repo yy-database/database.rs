@@ -93,6 +93,9 @@ impl SqlValue {
         match inner {
             // 字符串类型保留空串语义：空 bytes 是 `''`，不是 NULL。
             crate::catalog_bind::SqlFieldType::String => SqlValue::String(String::from_utf8_lossy(bytes).into_owned()),
+            // Exact decimals arrive on the wire as text; keep them textual so
+            // drivers observe the same value they would from MySQL.
+            crate::catalog_bind::SqlFieldType::Decimal => SqlValue::String(String::from_utf8_lossy(bytes).into_owned()),
             crate::catalog_bind::SqlFieldType::Int64 | crate::catalog_bind::SqlFieldType::Int32 => {
                 if bytes.is_empty() {
                     return SqlValue::Null;

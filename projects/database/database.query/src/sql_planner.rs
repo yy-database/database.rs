@@ -170,7 +170,7 @@ pub fn plan_select_for_dialect(
     // 2. 递归解析 predicate 的 AND 树，把 pk 条件提取出来。
     let (pk_equality, pk_prefix, pk_after, pk_before, remaining_predicate) = match select.predicate {
         None => (None, None, None, None, None),
-        Some(expr) => extract_pk_range(expr, source.row_id(pk_field.field_id), pk_rowid_is_byte_ordered(&pk_field.field_type))?,
+        Some(expr) => extract_pk_range(expr, source.row_id(pk_field.field_id))?,
     };
 
     // 3. 分流：有精确 pk 等值 → Read；其他全部 → Scan。
@@ -392,7 +392,7 @@ fn resolve_set_operation_order_by(
 /// 计划一个带 JOIN 的 SELECT。
 ///
 /// 基表与每张连接表各自全表扫描，按 JOIN 顺序做嵌套循环合并（INNER / LEFT / RIGHT / FULL），
-/// 再套用 WHERE / 投影 / ORDER BY / LIMIT。主键下推、聚合暂不在网关子集内。
+/// 再套用 WHERE / 聚合 / 投影 / ORDER BY / LIMIT。
 fn plan_join_select(
     select: SqlCatalogBoundSelect,
     limit: Option<usize>,
@@ -402,9 +402,6 @@ fn plan_join_select(
 ) -> Result<SqlExecutionPlan, SqlFrontendError> {
     let SqlCatalogBoundSelect { source, joins, projections, predicate, group_by, having, order_by, distinct, .. } = select;
     let base = source.ok_or_else(|| planner_error("SQL JOIN requires a FROM table"))?;
-    if group_by.is_some() || having.is_some() {
-        return Err(planner_error("SQL JOIN with GROUP BY / HAVING is not in the gateway subset yet"));
-    }
     // 窗口函数需要在单表行集合上分区排序，JOIN 合并后没有对应的 lowering。
     let has_window = projections.iter().any(|projection| match projection {
         SqlCatalogBoundProjection::Expression { expression, .. } => expression_has_window(expression),
@@ -418,9 +415,12 @@ fn plan_join_select(
     // 1. 投影展开：Star 按来源顺序展开整表，Column 直接映射，其余表达式保留。
     let mut projection_fields: Vec<(u64, String)> = Vec::new();
     let mut projection_expressions: Vec<(SqlCatalogBoundExpression, String)> = Vec::new();
+    let mut has_aggregate = false;
+    let mut has_non_aggregate = false;
     for projection in projections {
         match projection {
             SqlCatalogBoundProjection::Star(table) => {
+                has_non_aggregate = true;
                 let catalog_table = find_table(catalog, table.type_id)?;
                 for (index, field) in catalog_table.fields.iter().enumerate() {
                     reject_unknown_field(field)?;
@@ -430,17 +430,26 @@ fn plan_join_select(
             }
             SqlCatalogBoundProjection::Expression { expression, alias } => match expression {
                 SqlCatalogBoundExpression::Column(col) => {
+                    has_non_aggregate = true;
                     projection_fields.push((col.row_id, alias.unwrap_or_else(|| col.visible_name.clone())));
                 }
                 other => {
                     if expression_has_aggregate(&other) {
-                        return Err(planner_error("SQL JOIN with aggregate projections is not in the gateway subset yet"));
+                        has_aggregate = true;
+                    }
+                    else {
+                        has_non_aggregate = true;
                     }
                     let label = alias.unwrap_or_else(|| expression_default_label(&other));
                     projection_expressions.push((other, label));
                 }
             },
         }
+    }
+    // Same rule as the single-table path: mixing aggregate and bare column
+    // projections is only legal under GROUP BY.
+    if has_aggregate && has_non_aggregate && group_by.is_none() {
+        return Err(planner_error("cannot mix aggregate and non-aggregate projections without GROUP BY"));
     }
 
     if distinct {
@@ -468,6 +477,14 @@ fn plan_join_select(
     for join in &joins {
         collect_column_ids(&join.on, &mut needed);
     }
+    if let Some(expressions) = &group_by {
+        for expression in expressions {
+            collect_column_ids(expression, &mut needed);
+        }
+    }
+    if let Some(having) = &having {
+        collect_column_ids(having, &mut needed);
+    }
 
     // 3. 每个来源只解码自己表的字段。
     let mut field_types: std::collections::BTreeMap<u64, crate::catalog_bind::SqlFieldType> = std::collections::BTreeMap::new();
@@ -493,6 +510,9 @@ fn plan_join_select(
         projection_fields,
         projection_expressions,
         remaining_predicate: predicate,
+        group_by,
+        having,
+        has_aggregate,
         order_by,
         limit_after_sort: limit.unwrap_or(0),
         offset_after_sort: offset.unwrap_or(0),
@@ -871,8 +891,7 @@ pub fn plan_update(update: SqlCatalogBoundUpdate, catalog: &SqlCatalog, dialect:
         }));
     };
 
-    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) =
-        extract_pk_range(predicate.clone(), pk_field.field_id, pk_rowid_is_byte_ordered(&pk_field.field_type))?;
+    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) = extract_pk_range(predicate.clone(), pk_field.field_id)?;
     if let Some(rowid_literal) = pk_literal {
         return Ok(SqlExecutionPlan::Update(UpdatePlan {
             namespace,
@@ -915,8 +934,7 @@ pub fn plan_delete(delete: SqlCatalogBoundDelete, catalog: &SqlCatalog) -> Resul
         }));
     };
 
-    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) =
-        extract_pk_range(predicate.clone(), pk_field.field_id, pk_rowid_is_byte_ordered(&pk_field.field_type))?;
+    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) = extract_pk_range(predicate.clone(), pk_field.field_id)?;
     if let Some(rowid_literal) = pk_literal {
         return Ok(SqlExecutionPlan::Delete(DeletePlan {
             namespace,
@@ -948,6 +966,10 @@ pub fn check_write_literal(
     dialect: SqlDialect,
     capacity: Option<u32>,
 ) -> Result<(), SqlFrontendError> {
+    // A declared NOT NULL column accepts no explicit NULL regardless of storage type.
+    if matches!(literal, SqlBoundLiteral::Null) && !field_type.is_nullable() {
+        return Err(SqlFrontendError::new(SqlErrorKind::NotNullViolation, format!("column `{column}` cannot be null")));
+    }
     // `bytes` 列单独处理：容量诊断必须指名 octets 与声明上限，不能与普通类型不匹配混在一起。
     if matches!(field_type.inner(), SqlFieldType::Bytes) {
         // A declared capacity wins: it is the column's own contract, while the
@@ -988,6 +1010,8 @@ pub fn check_write_literal(
             SqlBoundLiteral::String(text) => text.parse::<f64>().is_ok(),
             SqlBoundLiteral::Boolean(_) | SqlBoundLiteral::Bytes(_) => false,
         },
+        // `Decimal` is result metadata only; no column stores it.
+        SqlFieldType::Decimal => false,
         SqlFieldType::Bool => match literal {
             SqlBoundLiteral::Null | SqlBoundLiteral::Boolean(_) => true,
             SqlBoundLiteral::Integer(value) => *value == 0 || *value == 1,
@@ -1035,9 +1059,27 @@ fn literal_from_expression(expr: &SqlCatalogBoundExpression) -> Result<SqlBoundL
             }
             _ => Err(planner_error("binary write values must be a hexadecimal literal")),
         },
+        // A signed literal parses as unary minus/plus around a numeric literal.
+        // Folding it at plan time keeps INSERT values literal-only while
+        // accepting the ordinary `-1` and `-0.5` spellings.
+        SqlCatalogBoundExpression::Unary { operator, expression } => {
+            let inner = literal_from_expression(expression)?;
+            match (operator, inner) {
+                (SqlBoundUnaryOperator::Plus, SqlBoundLiteral::Integer(number)) => Ok(SqlBoundLiteral::Integer(number)),
+                (SqlBoundUnaryOperator::Minus, SqlBoundLiteral::Integer(number)) => number
+                    .checked_neg()
+                    .map(SqlBoundLiteral::Integer)
+                    .ok_or_else(|| planner_error("integer literal is outside the signed 64-bit range")),
+                (SqlBoundUnaryOperator::Plus, SqlBoundLiteral::Number(number)) => Ok(SqlBoundLiteral::Number(number)),
+                (SqlBoundUnaryOperator::Minus, SqlBoundLiteral::Number(number)) => Ok(SqlBoundLiteral::Number(match number.strip_prefix('-') {
+                    Some(rest) => rest.to_string(),
+                    None => format!("-{number}"),
+                })),
+                _ => Err(planner_error("SQL gateway write values must be simple literals")),
+            }
+        }
         SqlCatalogBoundExpression::Function { .. }
         | SqlCatalogBoundExpression::Binary { .. }
-        | SqlCatalogBoundExpression::Unary { .. }
         | SqlCatalogBoundExpression::InSubquery { .. }
         | SqlCatalogBoundExpression::Exists { .. }
         | SqlCatalogBoundExpression::ScalarSubquery { .. }
@@ -1187,6 +1229,13 @@ pub struct JoinPlan {
     pub projection_expressions: Vec<(SqlCatalogBoundExpression, String)>,
     /// 行级过滤表达式；`None` 表示不过滤。
     pub remaining_predicate: Option<SqlCatalogBoundExpression>,
+    /// 可选 GROUP BY 表达式列表；合并出全部行后由 execute 层做 bucket 聚合。
+    pub group_by: Option<Vec<SqlCatalogBoundExpression>>,
+    /// 可选 HAVING 表达式；GROUP BY 聚合完后应用。
+    pub having: Option<SqlCatalogBoundExpression>,
+    /// True when any projection expression is an aggregate function
+    /// (COUNT/SUM/AVG/MAX/MIN). execute_join produces aggregated result rows.
+    pub has_aggregate: bool,
     /// 可选 ORDER BY 字段列表；合并出全部行后由 execute 层内存排序。
     pub order_by: Option<Vec<SqlCatalogBoundOrderByItem>>,
     /// 排序之后才应用的 LIMIT。0 = 无上限。
@@ -1449,13 +1498,12 @@ pub struct DeleteScanPlan {
 fn extract_pk_range(
     predicate: SqlCatalogBoundExpression,
     pk_row_id: u64,
-    pk_rowid_ordered: bool,
 ) -> Result<(Option<SqlBoundLiteral>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<SqlCatalogBoundExpression>), SqlFrontendError> {
     match predicate {
         // AND 拆分 — 两侧分别提取，再合并。
         SqlCatalogBoundExpression::Binary { left, operator: SqlBoundBinaryOperator::And, right } => {
-            let (l_eq, l_pre, l_after, l_before, l_rem) = extract_pk_range(*left, pk_row_id, pk_rowid_ordered)?;
-            let (r_eq, r_pre, r_after, r_before, r_rem) = extract_pk_range(*right, pk_row_id, pk_rowid_ordered)?;
+            let (l_eq, l_pre, l_after, l_before, l_rem) = extract_pk_range(*left, pk_row_id)?;
+            let (r_eq, r_pre, r_after, r_before, r_rem) = extract_pk_range(*right, pk_row_id)?;
             let eq = merge_opt(l_eq, r_eq, "conflicting primary-key equality inside AND")?;
             let prefix = merge_opt(l_pre, r_pre, "conflicting primary-key LIKE prefix inside AND")?;
             let after = merge_opt(l_after, r_after, "conflicting primary-key lower bound inside AND")?;
@@ -1478,7 +1526,7 @@ fn extract_pk_range(
 
                 // pk > literal → after exclusive
                 (SqlBoundBinaryOperator::Greater, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id && pk_rowid_ordered =>
+                    if col.row_id == pk_row_id =>
                 {
                     let rowid = pk_literal_to_rowid(&lit)?;
                     Ok((None, None, Some(rowid), None, None))
@@ -1486,7 +1534,7 @@ fn extract_pk_range(
 
                 // pk >= literal → after exclusive：key > (lit-1) 等价于 key >= lit
                 (SqlBoundBinaryOperator::GreaterEqual, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id && pk_rowid_ordered =>
+                    if col.row_id == pk_row_id =>
                 {
                     let rowid = pk_literal_to_rowid(&lit)?;
                     Ok((None, None, Some(rowid_decrement(&rowid)), None, None))
@@ -1494,7 +1542,7 @@ fn extract_pk_range(
 
                 // pk < literal → before exclusive
                 (SqlBoundBinaryOperator::Less, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id && pk_rowid_ordered =>
+                    if col.row_id == pk_row_id =>
                 {
                     let rowid = pk_literal_to_rowid(&lit)?;
                     Ok((None, None, None, Some(rowid), None))
@@ -1502,7 +1550,7 @@ fn extract_pk_range(
 
                 // pk <= literal → before exclusive：key < (lit+1) 等价于 key <= lit
                 (SqlBoundBinaryOperator::LessEqual, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id && pk_rowid_ordered =>
+                    if col.row_id == pk_row_id =>
                 {
                     let rowid = pk_literal_to_rowid(&lit)?;
                     Ok((None, None, None, Some(rowid_increment(&rowid)), None))
@@ -1569,16 +1617,6 @@ fn combine_remaining(left: Option<SqlCatalogBoundExpression>, right: Option<SqlC
             Some(SqlCatalogBoundExpression::Binary { left: Box::new(l), operator: SqlBoundBinaryOperator::And, right: Box::new(r) })
         }
     }
-}
-
-/// rowid 的字节序是否与主键的数值序一致，决定区间谓词能否下推成 KV 字节区间。
-///
-/// 整数主键的 rowid 是十进制文本（`"6"`、`"10"`、`"100"`），字节序把 `"10"` 排在
-/// `"6"` 之前，与比较语义相反，只能按等值下推。文本与二进制主键的 rowid 就是原始
-/// 字节，字节序与 MySQL 的比较语义一致，区间可以安全下推。
-fn pk_rowid_is_byte_ordered(field_type: &crate::catalog_bind::SqlFieldType) -> bool {
-    use crate::catalog_bind::SqlFieldType;
-    matches!(field_type.inner(), SqlFieldType::String | SqlFieldType::Bytes)
 }
 
 /// Encodes a primary-key literal into the canonical row id bytes.

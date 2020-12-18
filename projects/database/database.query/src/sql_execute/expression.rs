@@ -125,6 +125,12 @@ pub fn eval_cast(value: SqlValue, target: &str, from_literal: bool) -> Result<Sq
         (SqlValue::Boolean(b), "TEXT" | "STRING" | "VARCHAR" | "CHAR" | "CHARACTER") => {
             Ok(SqlValue::String(if b { "TRUE".to_string() } else { "FALSE".to_string() }))
         }
+        // MySQL's `CAST(... AS SIGNED|UNSIGNED)` truncates toward zero and reads a
+        // numeric prefix from text, returning 0 when no prefix exists.
+        (SqlValue::Integer(n), "SIGNED" | "UNSIGNED") => Ok(SqlValue::Integer(n)),
+        (SqlValue::Number(n), "SIGNED" | "UNSIGNED") => Ok(SqlValue::Integer(n as i64)),
+        (SqlValue::Boolean(b), "SIGNED" | "UNSIGNED") => Ok(SqlValue::Integer(if b { 1 } else { 0 })),
+        (SqlValue::String(text), "SIGNED" | "UNSIGNED") => Ok(SqlValue::Integer(mysql_integer_prefix(&text))),
         (SqlValue::Bytes(bytes), target) if crate::sql::is_binary_type_name(target) => Ok(SqlValue::Bytes(bytes)),
         (SqlValue::String(text), target) if crate::sql::is_binary_type_name(target) => {
             if from_literal {
@@ -146,6 +152,23 @@ pub fn eval_cast(value: SqlValue, target: &str, from_literal: bool) -> Result<Sq
             Ok(SqlValue::Null)
         }
     }
+}
+
+/// Reads the leading decimal integer from text the way MySQL does for
+/// `CAST(... AS SIGNED)`: optional sign, digits, then stop. No digits yields 0
+/// and an out-of-range value saturates instead of wrapping.
+fn mysql_integer_prefix(text: &str) -> i64 {
+    let trimmed = text.trim_start();
+    let bytes = trimmed.as_bytes();
+    let mut end = usize::from(bytes.first().is_some_and(|byte| *byte == b'+' || *byte == b'-'));
+    let digits_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digits_start {
+        return 0;
+    }
+    trimmed[..end].parse::<i64>().unwrap_or(if trimmed.starts_with('-') { i64::MIN } else { i64::MAX })
 }
 
 /// Evaluates `expr IN (...)` with SQL three-valued logic.

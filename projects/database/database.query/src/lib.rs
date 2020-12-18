@@ -29,7 +29,7 @@ pub use sql::{
 };
 pub use sql_batch::{SqlBatchStatement, split_sql_batch};
 pub use sql_ddl::{ACCEPTED_COLLATIONS, DdlColumn, SqlDdlStatement, is_accepted_collation, is_ddl_statement, parse_ddl};
-pub use sql_describe::{SqlColumn, describe_bound_insert, describe_plan};
+pub use sql_describe::{SqlColumn, describe_bound_insert, describe_plan, describe_plan_for_dialect};
 pub use sql_execute::{RowFieldValues, SqlResult, SqlValue, decode_row, encode_row};
 pub use sql_meta::{
     MetaQuery, PG_SERVER_VERSION, analyze_meta_query, mysql_data_type, pg_server_version, postgres_type, set_pg_server_version,

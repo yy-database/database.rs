@@ -113,6 +113,71 @@ pub(crate) fn execute_join(
         rows = merged;
     }
 
+    // Aggregates run on the merged join output, so `COUNT(*)` over a join counts
+    // joined rows rather than rows of either side.
+    if plan.has_aggregate || plan.group_by.is_some() {
+        let mut all_rows: Vec<RowFieldValues> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(predicate) = &plan.remaining_predicate {
+                if !truthy(&eval_row_expression(predicate, row, &plan.field_types, dialect, executor, transaction)?) {
+                    continue;
+                }
+            }
+            all_rows.push(row.clone());
+        }
+        if let Some(group_exprs) = &plan.group_by {
+            // Bucket rows by the GROUP BY key, then project and filter each bucket.
+            let mut buckets: std::collections::BTreeMap<String, (Vec<SqlValue>, Vec<RowFieldValues>)> = std::collections::BTreeMap::new();
+            for row in &all_rows {
+                let key_vals: Vec<SqlValue> =
+                    group_exprs.iter().map(|e| eval_expression(e, row, &plan.field_types, dialect)).collect::<Result<Vec<_>, _>>()?;
+                let key_str = serialize_group_key(&key_vals);
+                buckets.entry(key_str).or_insert_with(|| (key_vals, Vec::new())).1.push(row.clone());
+            }
+            let mut staged: Vec<(Vec<Option<SqlValue>>, Vec<SqlValue>)> = Vec::new();
+            for (_key_str, (group_key_vals, bucket_rows)) in &buckets {
+                let mut row_values: Vec<SqlValue> = Vec::new();
+                for (field_id, _display_name) in &plan.projection_fields {
+                    let Some(idx) = group_exprs.iter().position(|ge| matches!(ge, SqlCatalogBoundExpression::Column(col) if col.row_id == *field_id))
+                    else {
+                        return Err(internal_error("grouped projection references a column outside the GROUP BY key"));
+                    };
+                    row_values.push(group_key_vals[idx].clone());
+                }
+                for (expr, _) in &plan.projection_expressions {
+                    row_values.push(eval_having(expr, bucket_rows, group_exprs, &plan.field_types, dialect)?);
+                }
+                if let Some(having) = &plan.having {
+                    let keep = eval_having(having, bucket_rows, group_exprs, &plan.field_types, dialect)?;
+                    if !truthy(&keep) {
+                        continue;
+                    }
+                }
+                let sort_keys: Vec<Option<SqlValue>> = match &plan.order_by {
+                    Some(items) => items
+                        .iter()
+                        .map(|item| Ok(Some(eval_having(&item.expression, bucket_rows, group_exprs, &plan.field_types, dialect)?)))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    None => Vec::new(),
+                };
+                staged.push((sort_keys, row_values));
+            }
+            return Ok(finish_scan_staged(plan, columns, staged));
+        }
+        // Global aggregate: one result row over every joined row.
+        let mut result_row: Vec<SqlValue> = Vec::new();
+        for (expr, _) in &plan.projection_expressions {
+            result_row.push(eval_aggregate(expr, &all_rows, &plan.field_types, dialect)?);
+        }
+        if let Some(having) = &plan.having {
+            let keep = eval_having(having, &all_rows, &[], &plan.field_types, dialect)?;
+            if !truthy(&keep) {
+                return Ok(SqlResult { columns, rows: Vec::new(), affected_rows: 0 });
+            }
+        }
+        return Ok(SqlResult { columns, rows: vec![result_row], affected_rows: 0 });
+    }
+
     let mut staged: Vec<(Vec<Option<SqlValue>>, Vec<SqlValue>)> = Vec::new();
     for row in &rows {
         if let Some(predicate) = &plan.remaining_predicate {
@@ -490,18 +555,67 @@ pub(crate) fn execute_scan(
     Ok(finish_scan_staged(plan, columns, staged))
 }
 
+/// Tail shared by scan and join plans after projection values are produced.
+pub(crate) trait StagedPlan {
+    fn staged_distinct(&self) -> bool;
+    fn staged_order_by(&self) -> Option<&Vec<database_query::catalog_bind::SqlCatalogBoundOrderByItem>>;
+    fn staged_nulls_first(&self) -> bool;
+    fn staged_offset(&self) -> usize;
+    fn staged_limit(&self) -> usize;
+}
+
+impl StagedPlan for ScanPlan {
+    fn staged_distinct(&self) -> bool {
+        self.distinct
+    }
+    fn staged_order_by(&self) -> Option<&Vec<database_query::catalog_bind::SqlCatalogBoundOrderByItem>> {
+        self.order_by.as_ref()
+    }
+    fn staged_nulls_first(&self) -> bool {
+        self.nulls_first
+    }
+    fn staged_offset(&self) -> usize {
+        self.offset_after_sort
+    }
+    fn staged_limit(&self) -> usize {
+        self.limit_after_sort
+    }
+}
+
+impl StagedPlan for JoinPlan {
+    fn staged_distinct(&self) -> bool {
+        self.distinct
+    }
+    fn staged_order_by(&self) -> Option<&Vec<database_query::catalog_bind::SqlCatalogBoundOrderByItem>> {
+        self.order_by.as_ref()
+    }
+    fn staged_nulls_first(&self) -> bool {
+        self.nulls_first
+    }
+    fn staged_offset(&self) -> usize {
+        self.offset_after_sort
+    }
+    fn staged_limit(&self) -> usize {
+        self.limit_after_sort
+    }
+}
+
 /// 对已求值的投影行套用 `DISTINCT`、`ORDER BY` 与 `OFFSET` / `LIMIT`。
 ///
-/// 常规扫描路径与窗口路径共用这一段，保证两条路径的 DISTINCT、NULL 排序和分页
+/// 常规扫描路径、连接路径与窗口路径共用这一段，保证 DISTINCT、NULL 排序和分页
 /// 语义只实现一次。
-pub(crate) fn finish_scan_staged(plan: &ScanPlan, columns: Vec<String>, mut staged: Vec<(Vec<Option<SqlValue>>, Vec<SqlValue>)>) -> SqlResult {
-    if plan.distinct {
+pub(crate) fn finish_scan_staged(
+    plan: &impl StagedPlan,
+    columns: Vec<String>,
+    mut staged: Vec<(Vec<Option<SqlValue>>, Vec<SqlValue>)>,
+) -> SqlResult {
+    if plan.staged_distinct() {
         retain_distinct_projected_rows(&mut staged);
     }
 
     // Sort if ORDER BY present — multi-column, 逐列比较直到分出胜负。
-    let nulls_first = plan.nulls_first;
-    if let Some(order_items) = &plan.order_by {
+    let nulls_first = plan.staged_nulls_first();
+    if let Some(order_items) = plan.staged_order_by() {
         let orderings = order_items
             .iter()
             .map(|item| (item.direction.clone(), order_nulls_first(&item.direction, item.nulls, nulls_first)))
@@ -520,8 +634,8 @@ pub(crate) fn finish_scan_staged(plan: &ScanPlan, columns: Vec<String>, mut stag
         });
     }
 
-    let offset = plan.offset_after_sort;
-    let limit = plan.limit_after_sort;
+    let offset = plan.staged_offset();
+    let limit = plan.staged_limit();
     let rows: Vec<Vec<SqlValue>> = staged.into_iter().skip(offset).take(if limit == 0 { usize::MAX } else { limit }).map(|(_, r)| r).collect();
 
     SqlResult { columns, rows, affected_rows: 0 }

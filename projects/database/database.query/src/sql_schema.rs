@@ -660,6 +660,7 @@ fn canonical_sql_type(field_type: &SqlFieldType) -> &'static str {
         SqlFieldType::String => "TEXT",
         SqlFieldType::Bool => "BOOLEAN",
         SqlFieldType::Bytes => "BYTEA",
+        SqlFieldType::Decimal => "DECIMAL",
         SqlFieldType::Unknown | SqlFieldType::Optional(_) => "TEXT",
     }
 }
@@ -888,6 +889,7 @@ impl FieldTypeDocument {
             SqlFieldType::String => Self::String,
             SqlFieldType::Bool => Self::Bool,
             SqlFieldType::Bytes => Self::Bytes,
+            SqlFieldType::Decimal => Self::Unknown,
             SqlFieldType::Optional(_) | SqlFieldType::Unknown => Self::Unknown,
         }
     }
