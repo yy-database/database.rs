@@ -35,6 +35,7 @@ const OID_TEXT: u32 = 25;
 const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
 const OID_VARCHAR: u32 = 1043;
+const OID_NUMERIC: u32 = 1700;
 
 const PROTOCOL_V3: u32 = 196_608;
 const SSL_REQUEST: u32 = 80_877_103;
@@ -696,11 +697,15 @@ fn handle_single_statement(
                 if needle == "search_path" { Some(session.search_path.clone()) } else { pg_parameter(&name).map(|s| s.to_string()) };
             match value {
                 Some(value) => {
-                    write_row_description(stream, &[SqlColumn { name: name.clone(), field_type: SqlFieldType::String }], &[0])?;
+                    write_row_description(
+                        stream,
+                        &[SqlColumn { name: name.clone(), field_type: SqlFieldType::String, field_id: None }],
+                        &[0],
+                    )?;
                     write_data_row(
                         stream,
                         &[SqlValue::String(value)],
-                        &[SqlColumn { name: name.clone(), field_type: SqlFieldType::String }],
+                        &[SqlColumn { name: name.clone(), field_type: SqlFieldType::String, field_id: None }],
                         &[0],
                     )?;
                     write_command_complete(stream, "SHOW")
@@ -1808,6 +1813,7 @@ fn pg_oid(field_type: &SqlFieldType) -> u32 {
         SqlFieldType::Float64 => OID_FLOAT8,
         SqlFieldType::Bool => OID_BOOL,
         SqlFieldType::Bytes => OID_BYTEA,
+        SqlFieldType::Decimal => OID_NUMERIC,
         SqlFieldType::String | SqlFieldType::Unknown | SqlFieldType::Optional(_) => OID_TEXT,
     }
 }

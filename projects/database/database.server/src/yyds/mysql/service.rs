@@ -2,7 +2,7 @@
 
 use std::{
     io,
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -37,8 +37,7 @@ impl MysqlService {
             ));
         }
         let listener = TcpListener::bind(address)?;
-        // 监听线程阻塞在 accept 上等待新连接，不轮询；停止时用一个回连唤醒它。
-        listener.set_nonblocking(false)?;
+        listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let stopping = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&stopping);
@@ -105,9 +104,6 @@ impl MysqlService {
     fn shutdown(&mut self) -> io::Result<()> {
         self.stopping.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
-            // 监听线程阻塞在 accept 上无法自行观察停止标志，用一次本机回连唤醒它。
-            // 监听器已经退出时连接会被拒绝并立刻返回，不额外等待。
-            let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(500));
             worker.join().map_err(|_| io::Error::other("MySQL accept worker panicked"))??;
         }
         Ok(())
@@ -122,8 +118,7 @@ impl Drop for MysqlService {
 
 #[derive(Debug)]
 struct Clients {
-    /// 每个客户端线程连同它的 socket 句柄：停止时先关闭句柄唤醒阻塞读，再 join。
-    workers: Vec<(JoinHandle<()>, TcpStream)>,
+    workers: Vec<JoinHandle<()>>,
     stopping: Arc<AtomicBool>,
 }
 
@@ -131,10 +126,9 @@ impl Clients {
     fn reap(&mut self) {
         let mut index = 0;
         while index < self.workers.len() {
-            if self.workers[index].0.is_finished() {
-                let (worker, stream) = self.workers.swap_remove(index);
+            if self.workers[index].is_finished() {
+                let worker = self.workers.swap_remove(index);
                 let _ = worker.join();
-                drop(stream);
             }
             else {
                 index += 1;
@@ -146,11 +140,7 @@ impl Clients {
 impl Drop for Clients {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        // 客户端线程阻塞在 socket 读写事件上，关闭句柄让它们立即返回。
-        for (_, stream) in &self.workers {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-        for (worker, _) in self.workers.drain(..) {
+        for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
     }
@@ -171,16 +161,12 @@ fn listen(listener: TcpListener, stopping: Arc<AtomicBool>, runtime: Option<Arc<
                 }
                 let cancellation = Arc::clone(&stopping);
                 let runtime = runtime.clone();
-                // 留一份同源的 socket 句柄，停止时用它关闭连接、唤醒阻塞的客户端线程。
-                let wake = stream.try_clone()?;
                 let worker = thread::Builder::new().name("yyds-mysql-client".into()).spawn(move || {
                     let _ = serve_cancellable(stream, cancellation, runtime);
                 })?;
-                clients.workers.push((worker, wake));
+                clients.workers.push(worker);
             }
-            // 监听器是阻塞模式，不会返回 WouldBlock；保持该分支只为了不把
-            // 平台差异升级成连接失败。
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }

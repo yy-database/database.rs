@@ -9,7 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use database_execution::{
@@ -21,7 +21,8 @@ use database_query::{
     MYSQL_BLOB_CAPACITY, SqlBoundExpression, SqlBoundLiteral, SqlCatalogBoundExpression, SqlCatalogBoundStatement, SqlColumn, SqlDialect,
     SqlErrorKind, SqlExecutionPlan, SqlFieldType, SqlFrontendError, SqlParameterStyle, SqlResult, SqlSchemaCheckpoint, SqlSchemaRegistry,
     SqlSessionCommand, SqlTransactionAction, SqlValue, analyze_meta_query, apply_auto_increment, bind_sql_catalog_with_variables,
-    describe_plan, is_accepted_collation, neutralized_sql_parameters, parse_ddl, parse_session_command, plan_statement_for_dialect,
+    describe_plan_for_dialect, is_accepted_collation, neutralized_sql_parameters, parse_ddl, parse_session_command,
+    plan_statement_for_dialect,
     substitute_sql_parameters,
 };
 
@@ -190,11 +191,7 @@ pub fn serve_cancellable(stream: TcpStream, stopping: Arc<AtomicBool>, runtime: 
     if !stream.peer_addr()?.ip().is_loopback() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "MySQL requires loopback until authentication and TLS are implemented"));
     }
-    // 阻塞模式配合读写超时：等待落在 socket 的可读 / 可写事件上，
-    // 不进入固定时长的轮询。停止时监听线程会关闭本连接的 socket 唤醒阻塞调用。
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_nonblocking(true)?;
     serve_session(CancellableSocket { stream, stopping }, runtime)
 }
 
@@ -1037,7 +1034,7 @@ fn execute_sql(
     }
     // Text protocol (`COM_QUERY`) has no prepare-time description, so derive the
     // declared column types from the plan instead of guessing from row values.
-    let declared_columns = describe_plan(&plan);
+    let declared_columns = describe_plan_for_dialect(&plan, SqlDialect::Mysql);
     let declared_types: Vec<u8> = declared_columns.iter().map(|column| mysql_field_type(&column.field_type)).collect();
     let declared_nullables: Vec<bool> = declared_columns.iter().map(|column| column.field_type.is_nullable()).collect();
     let column_types = if column_types.is_empty() { &declared_types } else { column_types };
@@ -1143,7 +1140,7 @@ fn handle_prepare(
             match bound {
                 SqlCatalogBoundStatement::Select(_) | SqlCatalogBoundStatement::SetOperation(_) => {
                     match plan_statement_for_dialect(bound, &catalog, SqlDialect::Mysql) {
-                        Ok(plan) => describe_plan(&plan),
+                        Ok(plan) => describe_plan_for_dialect(&plan, SqlDialect::Mysql),
                         Err(error) => {
                             session.fail();
                             write_statement_error(stream, sequence, "plan", error)?;
@@ -1417,6 +1414,9 @@ fn mysql_field_type(field_type: &SqlFieldType) -> u8 {
         SqlFieldType::Float64 => MYSQL_TYPE_DOUBLE,
         SqlFieldType::Bool => MYSQL_TYPE_TINY,
         SqlFieldType::Bytes => MYSQL_TYPE_BLOB,
+        // Exact aggregate results (`SUM`/`AVG` over integer operands) are reported
+        // as `DECIMAL` in MySQL, which drivers read back as strings.
+        SqlFieldType::Decimal => MYSQL_TYPE_NEWDECIMAL,
         SqlFieldType::String | SqlFieldType::Unknown | SqlFieldType::Optional(_) => MYSQL_TYPE_VAR_STRING,
     }
 }
@@ -1677,23 +1677,18 @@ struct CancellableSocket {
 }
 
 impl CancellableSocket {
-    /// 在可读 / 可写事件上阻塞，不再用固定时长的轮询等待。
-    ///
-    /// socket 由 [`serve_cancellable`] 置为阻塞模式并带 30 秒读写超时，
-    /// 一次 `operation` 会一直等到事件就绪、对端关闭或超时。Windows 的超时
-    /// 报 `TimedOut`，Unix 报 `WouldBlock`，两者走同一条超时路径。
-    /// 停止时监听线程关闭本连接的 socket，阻塞调用会立刻返回而非等满超时。
     fn attempt<T>(&mut self, mut operation: impl FnMut(&mut TcpStream) -> io::Result<T>) -> io::Result<T> {
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "MySQL service stopping"));
             }
             match operation(&mut self.stream) {
-                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    if self.stopping.load(Ordering::Acquire) {
-                        return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "MySQL service stopping"));
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "MySQL socket I/O timeout"));
                     }
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "MySQL socket I/O timeout"));
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 result => return result,
