@@ -10,7 +10,7 @@
 //! composite PRIMARY KEYs, AUTOINCREMENT, DROP, ALTER, views, triggers, WAL
 //! output and UTF-16 database creation.
 
-use std::{fs, path::Path};
+use std::{fs, io::Write, path::Path};
 
 use database_formats::sqlite::{
     RecordValue, TextEncoding, WriteValue, blank_with_page_size, bump_change_counter, decode_record, decode_varint, encode_record,
@@ -20,6 +20,77 @@ use database_formats::sqlite::{
 use database_types::{Error, Result};
 
 use crate::sqlite::{SchemaObject, TableLimits, TableRow, read_index_table, read_schema, read_schema_with_rowids, read_table};
+
+/// 文本比较所用的排序规则。
+///
+/// 只实现 SQLite 内置的 `BINARY`、`NOCASE`、`RTRIM` 三种：`NOCASE` 仅折叠
+/// ASCII 的 A-Z，`RTRIM` 只去掉尾随的 0x20，其余字节逐字节比较，与上游
+/// 内置排序规则一致。索引 b-tree 的键序和唯一性判定都按这里的分支执行，
+/// facade 的表达式比较复用同一个实现，避免两处语义漂移。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Collation {
+    /// 逐字节比较，SQLite 的默认排序规则。
+    #[default]
+    Binary,
+    /// ASCII 大小写不敏感比较。
+    Nocase,
+    /// 去掉尾随空格后逐字节比较。
+    Rtrim,
+}
+
+impl Collation {
+    /// 按名称解析内置排序规则；未知名称返回 `None`。
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "binary" => Some(Self::Binary),
+            "nocase" => Some(Self::Nocase),
+            "rtrim" => Some(Self::Rtrim),
+            _ => None,
+        }
+    }
+
+    /// 排序规则在 SQL 中的名称。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Binary => "BINARY",
+            Self::Nocase => "NOCASE",
+            Self::Rtrim => "RTRIM",
+        }
+    }
+
+    /// 按本排序规则比较两段文本。
+    pub fn compare_text(self, left: &str, right: &str) -> std::cmp::Ordering {
+        match self {
+            Self::Binary => left.as_bytes().cmp(right.as_bytes()),
+            Self::Nocase => nocase_cmp(left.as_bytes(), right.as_bytes()),
+            Self::Rtrim => left.trim_end_matches(' ').as_bytes().cmp(right.trim_end_matches(' ').as_bytes()),
+        }
+    }
+}
+
+/// ASCII 大小写折叠后的逐字节比较。
+fn nocase_cmp(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut index = 0usize;
+    loop {
+        match (left.get(index), right.get(index)) {
+            (Some(left), Some(right)) => {
+                let ordering = fold_ascii(*left).cmp(&fold_ascii(*right));
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+        }
+        index += 1;
+    }
+}
+
+fn fold_ascii(byte: u8) -> u8 {
+    if byte.is_ascii_uppercase() { byte + 32 } else { byte }
+}
 
 const PAGE_INDEX_INTERIOR: u8 = 2;
 const PAGE_TABLE_INTERIOR: u8 = 5;
@@ -46,6 +117,8 @@ pub struct ColumnSpec {
     pub unique: bool,
     /// `PRIMARY KEY AUTOINCREMENT` on the INTEGER rowid alias.
     pub autoincrement: bool,
+    /// Column-level `COLLATE` declaration; `None` means `BINARY`.
+    pub collate: Option<Collation>,
 }
 
 /// Value slot of an [`SqliteWriter::update`] call.
@@ -108,7 +181,10 @@ struct TableMeta {
     table_name: String,
     master_rowid: i64,
     root_page: u32,
-    columns: Vec<ColumnSpec>,
+    /// 列定义在解析一次后由所有克隆共享；批写入里每条 insert 都取表元数据，
+    /// `Arc` 把列数组的重复分配降为引用计数。需要就地追加的 DDL 路径走
+    /// `Arc::make_mut`。
+    columns: std::sync::Arc<Vec<ColumnSpec>>,
     rowid_alias: Option<usize>,
     without_rowid: bool,
     /// Record layout of a WITHOUT ROWID table: position in the stored record
@@ -119,7 +195,8 @@ struct TableMeta {
     /// The rowid alias is declared `AUTOINCREMENT`.
     autoincrement: bool,
     primary_key_len: usize,
-    indexes: Vec<IndexMeta>,
+    /// 索引元数据与 `columns` 同理按 `Arc` 共享，仅 DDL 路径 `make_mut`。
+    indexes: std::sync::Arc<Vec<IndexMeta>>,
 }
 
 #[derive(Clone)]
@@ -131,12 +208,25 @@ struct IndexMeta {
     /// The key values are computed by the caller (expression and partial
     /// indexes), so this writer never derives entries from column positions.
     managed: bool,
+    /// 每个键项生效的排序规则，来自索引项的显式 `COLLATE` 或索引列声明的
+    /// 列级 `COLLATE`。`columns` 为空的管理型索引按索引 SQL 解析后得到。
+    collations: Vec<Collation>,
 }
 
 struct Snapshot {
     /// Savepoint name, or `None` for a plain `begin` level.
     savepoint: Option<String>,
-    pages: Vec<u8>,
+    /// 本层首次改动某页前捕获的该页完整字节,按页号索引;回滚时逐页还原。
+    /// 旧实现每层克隆整镜像,批写入里事务层数乘以镜像大小;脏页日志只
+    /// 捕获真正被改的页,未触碰的页零开销。
+    dirty: std::collections::HashMap<u32, Vec<u8>>,
+    /// 层建立时镜像的字节长度。回滚先截断回此长度,撤销本层
+    /// [`SqliteWriter::allocate_page`] 的追加,再还原捕获的页。
+    len: usize,
+    /// debug 构建下同时保留整镜像,回滚后与脏页还原结果比对,兜底捕获
+    /// 漏接 `touch_page` 的写点;release 构建零额外成本。
+    #[cfg(debug_assertions)]
+    check: Vec<u8>,
     index_entries: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
     without_rowid_entries: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
     without_rowid_keys: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
@@ -179,6 +269,9 @@ pub struct SqliteWriter {
     without_rowid_keys: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
     /// 按 schema cookie 纪元的表元数据缓存，见 [`MetaCache`]。
     meta_cache: std::sync::Mutex<MetaCache>,
+    /// 持久化开关:`save` 写完文件后是否 `sync_all` 落盘。默认关闭,
+    /// 语义对齐上游 `PRAGMA synchronous` 的 OFF / FULL 两档。
+    synchronous: bool,
 }
 
 impl SqliteWriter {
@@ -208,6 +301,7 @@ impl SqliteWriter {
             without_rowid_entries: std::collections::BTreeMap::new(),
             without_rowid_keys: std::collections::BTreeMap::new(),
             meta_cache: std::sync::Mutex::new(MetaCache { cookie, tables: std::collections::HashMap::new() }),
+            synchronous: false,
         })
     }
 
@@ -237,6 +331,7 @@ impl SqliteWriter {
             without_rowid_entries: std::collections::BTreeMap::new(),
             without_rowid_keys: std::collections::BTreeMap::new(),
             meta_cache: std::sync::Mutex::new(MetaCache { cookie, tables: std::collections::HashMap::new() }),
+            synchronous: false,
         };
         for row in writer.master_rows()? {
             if row.root_page == 0 {
@@ -285,8 +380,24 @@ impl SqliteWriter {
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
         self.materialize_without_rowid()?;
         self.materialize_indexes()?;
+        self.touch_page(1);
         bump_change_counter(&mut self.pages);
-        fs::write(path.as_ref(), &self.pages).map_err(Error::Io)
+        if self.synchronous {
+            let mut file = fs::File::create(path.as_ref()).map_err(Error::Io)?;
+            file.write_all(&self.pages).map_err(Error::Io)?;
+            file.sync_all().map_err(Error::Io)?;
+        }
+        else {
+            fs::write(path.as_ref(), &self.pages).map_err(Error::Io)?;
+        }
+        Ok(())
+    }
+
+    /// 设置 `save` 的持久化强度:`true` 时写完文件后 `sync_all` 落盘
+    /// (对齐上游 `PRAGMA synchronous=FULL`),`false` 时只交给文件系统缓存
+    /// (对齐 `synchronous=OFF`)。默认关闭。
+    pub fn set_synchronous(&mut self, on: bool) {
+        self.synchronous = on;
     }
 
     /// Starts a transaction level. A nested level lets a statement roll itself
@@ -305,10 +416,25 @@ impl SqliteWriter {
 
     /// Commits the innermost open transaction level.
     pub fn commit(&mut self) -> Result<()> {
-        if self.snapshots.pop().is_none() {
+        let Some(level) = self.snapshots.pop()
+        else {
             return Err(Error::Unsupported("sqlite writer has no open transaction"));
-        }
+        };
+        self.promote_dirty(level);
         Ok(())
+    }
+
+    /// 内层提交后把其脏页捕获并入外层。外层若尚无某页的捕获,内层捕获的
+    /// 字节正是外层开始时的状态,外层回滚仍需还原到它们;外层已有捕获时
+    /// 保留外层更旧的版本。
+    fn promote_dirty(&mut self, level: Snapshot) {
+        let Some(parent) = self.snapshots.last_mut()
+        else {
+            return;
+        };
+        for (page, bytes) in level.dirty {
+            parent.dirty.entry(page).or_insert(bytes);
+        }
     }
 
     /// Rolls the image back to the state before the innermost `begin`.
@@ -346,7 +472,11 @@ impl SqliteWriter {
     /// Releasing the outermost savepoint also commits the open transaction.
     pub fn release(&mut self, name: &str) -> Result<()> {
         let index = self.find_savepoint(name)?;
-        self.snapshots.truncate(index);
+        let popped: Vec<Snapshot> = self.snapshots.drain(index..).collect();
+        // 由外向内并入捕获:先插入外层(更旧)的捕获,内层同名页不覆盖它。
+        for level in popped {
+            self.promote_dirty(level);
+        }
         Ok(())
     }
 
@@ -362,19 +492,57 @@ impl SqliteWriter {
     fn push_level(&mut self, savepoint: Option<String>) {
         self.snapshots.push(Snapshot {
             savepoint,
-            pages: self.pages.clone(),
+            dirty: std::collections::HashMap::new(),
+            len: self.pages.len(),
+            #[cfg(debug_assertions)]
+            check: self.pages.clone(),
             index_entries: self.index_entries.clone(),
             without_rowid_entries: self.without_rowid_entries.clone(),
             without_rowid_keys: self.without_rowid_keys.clone(),
         });
     }
 
+    /// 在首次改动 `page` 之前捕获其当前字节。无打开的事务、本层已捕获过
+    /// 该页、或页超出当前镜像长度(本层新分配,回滚按 `len` 截断即可)时
+    /// 不做任何事。所有页写入函数都必须在写前调用本方法。
+    fn touch_page(&mut self, page: u32) {
+        if self.snapshots.is_empty() {
+            return;
+        }
+        let offset = (page as usize - 1) * self.page_size;
+        let Some(end) = offset.checked_add(self.page_size)
+        else {
+            return;
+        };
+        if end > self.pages.len() {
+            return;
+        }
+        let level = self.snapshots.last_mut().expect("checked non-empty");
+        if level.dirty.contains_key(&page) {
+            return;
+        }
+        level.dirty.insert(page, self.pages[offset..end].to_vec());
+    }
+
     fn restore_level(&mut self, index: usize) {
         let snapshot = &self.snapshots[index];
-        self.pages = snapshot.pages.clone();
+        self.pages.truncate(snapshot.len);
+        for (page, bytes) in &snapshot.dirty {
+            let offset = (*page as usize - 1) * self.page_size;
+            if offset + self.page_size <= self.pages.len() {
+                self.pages[offset..offset + self.page_size].copy_from_slice(bytes);
+            }
+        }
         self.index_entries = snapshot.index_entries.clone();
         self.without_rowid_entries = snapshot.without_rowid_entries.clone();
         self.without_rowid_keys = snapshot.without_rowid_keys.clone();
+        #[cfg(debug_assertions)]
+        if self.pages != snapshot.check {
+            let page = (0..std::cmp::max(self.pages.len(), snapshot.check.len()))
+                .find(|byte| self.pages.get(*byte) != snapshot.check.get(*byte))
+                .map_or(0, |byte| (byte / self.page_size) as u32 + 1);
+            panic!("脏页日志漏捕获了页写入:首个差异在第 {page} 页");
+        }
     }
 
     /// Finds the innermost savepoint with this name. Names are case insensitive,
@@ -506,13 +674,13 @@ impl SqliteWriter {
             table_name: name.to_string(),
             master_rowid,
             root_page,
-            columns: columns.to_vec(),
+            columns: std::sync::Arc::new(columns.to_vec()),
             rowid_alias,
             without_rowid: false,
             without_rowid_layout: Vec::new(),
             autoincrement: columns.iter().any(|column| column.autoincrement),
             primary_key_len: 0,
-            indexes: Vec::new(),
+            indexes: std::sync::Arc::new(Vec::new()),
         };
         let mut auto_number = 0usize;
         for (index, column) in columns.iter().enumerate() {
@@ -813,6 +981,17 @@ impl SqliteWriter {
     ) -> Result<()> {
         let root_page = self.allocate_page()?;
         self.init_leaf_page(root_page, PAGE_INDEX_LEAF);
+        // Automatic constraint indexes inherit the collation of their key
+        // columns; an explicit index takes it from its own `CREATE` text and
+        // falls back to the column declaration for bare keys.
+        let collations = if automatic {
+            columns.iter().map(|position| meta.columns[*position].collate.unwrap_or_default()).collect()
+        }
+        else {
+            let column_names: Vec<String> = columns.iter().map(|index| meta.columns[*index].name.clone()).collect();
+            let rendered = render_create_index(name, &table_name_of(meta), &column_names, unique);
+            index_collations(sql.unwrap_or(&rendered), &meta.columns)?
+        };
         // Automatic constraint indexes carry no CREATE text in sqlite_master;
         // upstream SQLite re-derives them from the table definition and would
         // reject a duplicate if the text were present.
@@ -825,7 +1004,7 @@ impl SqliteWriter {
             let sql = sql.unwrap_or(&rendered);
             self.insert_master_row("index", name, &table_name_of(meta), root_page, Some(sql))?
         };
-        let mut index = IndexMeta { master_rowid, root_page, columns, unique, managed: false };
+        let mut index = IndexMeta { master_rowid, root_page, columns, unique, managed: false, collations };
 
         // Backfill existing rows into the live key set, then materialize the
         // fresh root. Splits may regrow the root; the master row must follow.
@@ -839,13 +1018,13 @@ impl SqliteWriter {
         }
         let initial_root = root_page;
         for key in &entries {
-            index.root_page = self.index_insert(index.root_page, key)?;
+            index.root_page = self.index_insert(index.root_page, key, &index.collations)?;
         }
         if index.root_page != initial_root {
             self.set_master_root(master_rowid, index.root_page)?;
         }
         self.index_entries.insert(master_rowid, entries);
-        meta.indexes.push(index);
+        std::sync::Arc::make_mut(&mut meta.indexes).push(index);
         Ok(())
     }
 
@@ -865,20 +1044,21 @@ impl SqliteWriter {
         }
         let root_page = self.allocate_page()?;
         self.init_leaf_page(root_page, PAGE_INDEX_LEAF);
+        let collations = index_collations(sql, &meta.columns)?;
         let master_rowid = self.insert_master_row("index", name, table, root_page, Some(sql))?;
         if unique {
             let mut signatures = std::collections::BTreeSet::new();
             for (values, _) in entries {
-                if !signatures.insert(encode_record(values, self.encoding)) {
+                if !signatures.insert(encode_record(&normalized_index_values(values, &collations), self.encoding)) {
                     return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
                 }
             }
         }
         let keys: std::collections::BTreeSet<Vec<u8>> =
             entries.iter().map(|(values, rowid)| managed_index_key(values, *rowid, self.encoding)).collect();
-        let mut index = IndexMeta { master_rowid, root_page, columns: Vec::new(), unique, managed: true };
+        let mut index = IndexMeta { master_rowid, root_page, columns: Vec::new(), unique, managed: true, collations };
         for key in &keys {
-            index.root_page = self.index_insert(index.root_page, key)?;
+            index.root_page = self.index_insert(index.root_page, key, &index.collations)?;
         }
         if index.root_page != root_page {
             self.set_master_root(master_rowid, index.root_page)?;
@@ -899,10 +1079,12 @@ impl SqliteWriter {
         if !index_sql_is_managed(sql)? {
             return Err(Error::Unsupported("sqlite index is not managed"));
         }
+        let meta = self.table_meta(&row.table_name)?;
+        let collations = index_collations(sql, &meta.columns)?;
         if sql.to_ascii_uppercase().starts_with("CREATE UNIQUE INDEX") {
             let mut signatures = std::collections::BTreeSet::new();
             for (values, _) in entries {
-                if !signatures.insert(encode_record(values, self.encoding)) {
+                if !signatures.insert(encode_record(&normalized_index_values(values, &collations), self.encoding)) {
                     return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
                 }
             }
@@ -980,13 +1162,13 @@ impl SqliteWriter {
         if let Some(index) = alias_index {
             resolved[index] = WriteValue::Null;
         }
-        for index_meta in &meta.indexes {
+        for index_meta in meta.indexes.iter() {
             if index_meta.managed {
                 continue;
             }
             if index_meta.unique && index_key_has_no_null(&resolved, &index_meta.columns) {
                 let key = encode_index_key(&meta, index_meta, rowid, &resolved, self.encoding)?;
-                if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), None)? {
+                if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), None, &index_meta.collations)? {
                     return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
                 }
             }
@@ -997,7 +1179,7 @@ impl SqliteWriter {
             self.set_master_root(meta.master_rowid, root)?;
             meta.root_page = root;
         }
-        for index_meta in &meta.indexes {
+        for index_meta in meta.indexes.iter() {
             if index_meta.managed {
                 continue;
             }
@@ -1024,7 +1206,7 @@ impl SqliteWriter {
         };
         let values = decode_record(&payload, self.encoding, Default::default()).map_err(|_| Error::Corrupt("sqlite record decode failed"))?;
         let owned = expand_alias(&meta, rowid, &values);
-        for index_meta in &meta.indexes {
+        for index_meta in meta.indexes.iter() {
             if index_meta.managed {
                 continue;
             }
@@ -1082,13 +1264,13 @@ impl SqliteWriter {
         if next_rowid != rowid && self.contains_rowid(meta.root_page, next_rowid)? {
             return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
         }
-        for index_meta in &meta.indexes {
+        for index_meta in meta.indexes.iter() {
             if index_meta.managed {
                 continue;
             }
             if index_meta.unique && index_key_has_no_null(&owned, &index_meta.columns) {
                 let key = encode_index_key(&meta, index_meta, next_rowid, &owned, self.encoding)?;
-                if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), Some(rowid))? {
+                if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), Some(rowid), &index_meta.collations)? {
                     return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
                 }
             }
@@ -1107,7 +1289,7 @@ impl SqliteWriter {
             self.set_master_root(meta.master_rowid, root)?;
         }
         let meta = self.table_meta(table)?;
-        for index_meta in &meta.indexes {
+        for index_meta in meta.indexes.iter() {
             if index_meta.managed {
                 continue;
             }
@@ -1239,7 +1421,7 @@ impl SqliteWriter {
                 if meta.master_rowid == master_rowid {
                     meta.root_page = root_page;
                 }
-                for index in &mut meta.indexes {
+                for index in std::sync::Arc::make_mut(&mut meta.indexes) {
                     if index.master_rowid == master_rowid {
                         index.root_page = root_page;
                     }
@@ -1436,6 +1618,7 @@ impl SqliteWriter {
 
     /// Writes the `user_version` field at byte 60 of the database header.
     pub fn set_user_version(&mut self, value: i64) {
+        self.touch_page(1);
         self.pages[60..64].copy_from_slice(&(value as i32).to_be_bytes());
     }
 
@@ -1446,6 +1629,7 @@ impl SqliteWriter {
 
     /// Writes the `application_id` field at byte 68 of the database header.
     pub fn set_application_id(&mut self, value: i64) {
+        self.touch_page(1);
         self.pages[68..72].copy_from_slice(&(value as i32).to_be_bytes());
     }
 
@@ -1659,12 +1843,12 @@ impl SqliteWriter {
             master_rowid: table_row.rowid,
             root_page: table_row.root_page,
             autoincrement: columns.iter().any(|column| column.autoincrement),
-            columns,
+            columns: std::sync::Arc::new(columns),
             rowid_alias,
             without_rowid,
             without_rowid_layout,
             primary_key_len: if without_rowid { without_rowid_key_positions.len() } else { 0 },
-            indexes: Vec::new(),
+            indexes: std::sync::Arc::new(Vec::new()),
         };
         // Automatic constraint indexes are numbered in declaration order:
         // each column-level PRIMARY KEY / UNIQUE first, then a table-level key.
@@ -1721,13 +1905,25 @@ impl SqliteWriter {
                     (positions, true, false)
                 }
             };
-            meta.indexes.push(IndexMeta { master_rowid: row.rowid, root_page: row.root_page, columns: positions, unique, managed });
+            let collations = match row.sql.as_deref() {
+                Some(sql) => index_collations(sql, &meta.columns)?,
+                None => positions.iter().map(|position| meta.columns[*position].collate.unwrap_or_default()).collect(),
+            };
+            std::sync::Arc::make_mut(&mut meta.indexes).push(IndexMeta {
+                master_rowid: row.rowid,
+                root_page: row.root_page,
+                columns: positions,
+                unique,
+                managed,
+                collations,
+            });
         }
         Ok(meta)
     }
 
     fn bump_cookie(&mut self) {
         let cookie = read_schema_cookie(&self.pages).wrapping_add(1);
+        self.touch_page(1);
         set_schema_cookie(&mut self.pages, cookie);
     }
 
@@ -1751,6 +1947,7 @@ impl SqliteWriter {
     }
 
     fn init_leaf_page(&mut self, page: u32, kind: u8) {
+        self.touch_page(page);
         let offset = self.page_offset(page);
         self.pages[offset..offset + self.page_size].fill(0);
         let header = offset + Self::header_offset(page);
@@ -1762,6 +1959,8 @@ impl SqliteWriter {
     fn allocate_page(&mut self) -> Result<u32> {
         let trunk = read_freelist_trunk(&self.pages);
         if trunk != 0 {
+            self.touch_page(trunk);
+            self.touch_page(1);
             let offset = self.page_offset(trunk);
             let leaf_count = u32::from_be_bytes(self.pages[offset + 4..offset + 8].try_into().unwrap());
             if leaf_count > 0 {
@@ -1777,6 +1976,7 @@ impl SqliteWriter {
             return Ok(trunk);
         }
         let page = (self.pages.len() / self.page_size) as u32 + 1;
+        self.touch_page(1);
         self.pages.extend(std::iter::repeat_n(0u8, self.page_size));
         set_page_count(&mut self.pages, page);
         Ok(page)
@@ -1784,12 +1984,15 @@ impl SqliteWriter {
 
     fn decrement_freelist(&mut self) {
         let count = read_freelist_count(&self.pages);
+        self.touch_page(1);
         set_freelist_count(&mut self.pages, count.saturating_sub(1));
     }
 
     fn free_page(&mut self, page: u32) {
         let trunk = read_freelist_trunk(&self.pages);
         if trunk != 0 {
+            self.touch_page(trunk);
+            self.touch_page(1);
             let offset = self.page_offset(trunk);
             let leaf_count = u32::from_be_bytes(self.pages[offset + 4..offset + 8].try_into().unwrap());
             let capacity = (self.usable - 8) / 4;
@@ -1802,6 +2005,8 @@ impl SqliteWriter {
                 return;
             }
         }
+        self.touch_page(page);
+        self.touch_page(1);
         let offset = self.page_offset(page);
         self.pages[offset..offset + self.page_size].fill(0);
         self.pages[offset..offset + 4].copy_from_slice(&trunk.to_be_bytes());
@@ -1818,6 +2023,29 @@ impl SqliteWriter {
             let (rowid, rowid_size) = decode_varint(&cell[length_size..])?;
             Ok(CellInfo { rowid: rowid as i64, prefix: length_size + rowid_size, length })
         })
+    }
+
+    /// 只解析表叶页各 cell 的 rowid 序列，不物化任何 cell 字节。
+    /// 插入下钻的重复判定与插入位置只需要有序键序列；cell 字节只在
+    /// 分裂路径才需要，由调用方另行走 [`Self::leaf_cells`]。
+    /// 页内 cell 指针数组按 rowid 升序排列，返回的序列同样升序。
+    fn leaf_rowids(&self, page: u32) -> Result<Vec<i64>> {
+        let offset = self.page_offset(page);
+        let page_bytes = &self.pages[offset..offset + self.page_size];
+        let header_relative = Self::header_offset(page);
+        if page_bytes[header_relative] != PAGE_TABLE_LEAF {
+            return Err(Error::Corrupt("sqlite page type invalid"));
+        }
+        let count = u16::from_be_bytes(page_bytes[header_relative + 3..header_relative + 5].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            let pointer = header_relative + 8 + index * 2;
+            let cell_offset = u16::from_be_bytes(page_bytes[pointer..pointer + 2].try_into().unwrap()) as usize;
+            let (_, length_size) = decode_varint(&page_bytes[cell_offset..])?;
+            let (rowid, _) = decode_varint(&page_bytes[cell_offset + length_size..])?;
+            out.push(rowid as i64);
+        }
+        Ok(out)
     }
 
     fn cells_common<F>(&self, page: u32, mut parse: F) -> Result<Vec<(i64, usize, Vec<u8>)>>
@@ -1864,6 +2092,7 @@ impl SqliteWriter {
         let mut current = head;
         loop {
             let chunk = remaining.len().min(per_page);
+            self.touch_page(current);
             let offset = self.page_offset(current);
             self.pages[offset..offset + self.page_size].fill(0);
             self.pages[offset + 4..offset + 4 + chunk].copy_from_slice(&remaining[..chunk]);
@@ -1919,6 +2148,7 @@ impl SqliteWriter {
 
     /// Writes sorted cells into a leaf page from scratch (no freeblocks).
     fn rebuild_leaf(&mut self, page: u32, kind: u8, cells: &[Vec<u8>]) {
+        self.touch_page(page);
         let offset = self.page_offset(page);
         // Page 1 owns the 100-byte database header (magic, page size, text
         // encoding, reserved bytes), so a rebuild may only clear the b-tree
@@ -1943,6 +2173,7 @@ impl SqliteWriter {
 
     /// Inserts one cell into a leaf without splitting; caller checked space.
     fn place_leaf_cell(&mut self, page: u32, position: usize, cell: &[u8]) {
+        self.touch_page(page);
         let offset = self.page_offset(page);
         let header_relative = Self::header_offset(page);
         let kind = self.pages[offset + header_relative];
@@ -1953,17 +2184,12 @@ impl SqliteWriter {
         let target = content_start - cell.len();
         self.pages[offset + target..offset + target + cell.len()].copy_from_slice(cell);
         let pointer_base = offset + header_relative + header_size;
-        // Shift pointers [position..count] right by one slot, then insert.
-        let mut pointers = Vec::with_capacity(count + 1);
-        for index in 0..count {
-            let pointer = pointer_base + index * 2;
-            pointers.push(u16::from_be_bytes(self.pages[pointer..pointer + 2].try_into().unwrap()));
-        }
-        pointers.insert(position, target as u16);
-        for (index, pointer) in pointers.iter().enumerate() {
-            let slot = pointer_base + index * 2;
-            self.pages[slot..slot + 2].copy_from_slice(&pointer.to_be_bytes());
-        }
+        // Shift pointers [position..count] right by one slot in place (no
+        // per-insert Vec), then write the new pointer into the freed slot.
+        let shift_start = pointer_base + position * 2;
+        let shift_end = pointer_base + count * 2;
+        self.pages.copy_within(shift_start..shift_end, shift_start + 2);
+        self.pages[shift_start..shift_start + 2].copy_from_slice(&(target as u16).to_be_bytes());
         self.pages[offset + header_relative + 3..offset + header_relative + 5].copy_from_slice(&((count + 1) as u16).to_be_bytes());
         let content_field = if target == 65_536 { 0u16 } else { target as u16 };
         self.pages[offset + header_relative + 5..offset + header_relative + 7].copy_from_slice(&content_field.to_be_bytes());
@@ -1973,9 +2199,35 @@ impl SqliteWriter {
     // Rowid b-tree
     // ------------------------------------------------------------------
 
+    /// 表中最大 rowid；空表为 0。沿内部节点最右孩子下降到最右叶，只读
+    /// 最后一个 cell 的 rowid（叶内按 rowid 升序），复杂度 O(log n)。
+    /// 最右叶恰为空（删除后尚未回收的罕见形态）时回退全表扫描，
+    /// 与旧实现语义完全一致。
     fn max_rowid(&self, root: u32) -> Result<i64> {
-        let rows = read_table(&self.pages, root, TableLimits::default())?;
-        Ok(rows.last().map(|row| row.rowid).unwrap_or(0))
+        let mut page = root;
+        loop {
+            let offset = self.page_offset(page);
+            let header_relative = Self::header_offset(page);
+            match self.pages[offset + header_relative] {
+                PAGE_TABLE_LEAF => {
+                    let count =
+                        u16::from_be_bytes(self.pages[offset + header_relative + 3..offset + header_relative + 5].try_into().unwrap()) as usize;
+                    if count == 0 {
+                        let rows = read_table(&self.pages, root, TableLimits::default())?;
+                        return Ok(rows.last().map(|row| row.rowid).unwrap_or(0));
+                    }
+                    let pointer = header_relative + 8 + (count - 1) * 2;
+                    let cell_offset = u16::from_be_bytes(self.pages[offset + pointer..offset + pointer + 2].try_into().unwrap()) as usize;
+                    let (_, length_size) = decode_varint(&self.pages[offset + cell_offset..])?;
+                    let (rowid, _) = decode_varint(&self.pages[offset + cell_offset + length_size..])?;
+                    return Ok(rowid as i64);
+                }
+                PAGE_TABLE_INTERIOR => {
+                    page = u32::from_be_bytes(self.pages[offset + header_relative + 8..offset + header_relative + 12].try_into().unwrap());
+                }
+                _ => return Err(Error::Corrupt("sqlite table b-tree page type invalid")),
+            }
+        }
     }
 
     fn contains_rowid(&self, root: u32, rowid: i64) -> Result<bool> {
@@ -2104,6 +2356,7 @@ impl SqliteWriter {
             _ => return Err(Error::Corrupt("sqlite master b-tree page type invalid")),
         };
         let page = self.allocate_page()?;
+        self.touch_page(page);
         let dest = self.page_offset(page);
         self.pages[dest..dest + self.page_size].fill(0);
         self.rebuild_leaf(page, kind, &cells);
@@ -2120,20 +2373,22 @@ impl SqliteWriter {
         let kind = self.pages[offset + header_relative];
         match kind {
             PAGE_TABLE_LEAF => {
-                let cells = self.leaf_cells(page)?;
-                if cells.iter().any(|(candidate, _, _)| *candidate == rowid) {
+                let rowids = self.leaf_rowids(page)?;
+                let position = rowids.partition_point(|candidate| *candidate < rowid);
+                if rowids.get(position).is_some_and(|candidate| *candidate == rowid) {
                     // 重复 rowid 在插入下钻到叶子时就判定，不再先做一次独立查找。
                     return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
                 }
                 let cell = self.build_cell(PAGE_TABLE_LEAF, Some(rowid), payload)?;
-                let position = cells.partition_point(|(candidate, _, _)| *candidate < rowid);
                 if cell.len() + 2 <= self.free_space(page) {
                     self.place_leaf_cell(page, position, &cell);
                     return Ok(None);
                 }
                 // Split: pack the sorted cells into as many pages as the
                 // payload sizes demand (one oversized overflow cell can make a
-                // count-based half-page overflow its page).
+                // count-based half-page overflow its page). 只有分裂才物化
+                // 既有 cell 字节；快路径完全不触碰它们。
+                let cells = self.leaf_cells(page)?;
                 let mut all: Vec<(i64, Vec<u8>)> = cells.into_iter().map(|(key, _, bytes)| (key, bytes)).collect();
                 all.insert(position, (rowid, cell));
                 let capacity = self.page_capacity(page);
@@ -2262,9 +2517,9 @@ impl SqliteWriter {
         let kind = self.pages[offset + header_relative];
         match kind {
             PAGE_TABLE_LEAF => {
-                let cells = self.leaf_cells(page)?;
-                let Some(position) = cells.iter().position(|(candidate, _, _)| *candidate == rowid)
-                else {
+                let rowids = self.leaf_rowids(page)?;
+                let position = rowids.partition_point(|candidate| *candidate < rowid);
+                if !rowids.get(position).is_some_and(|candidate| *candidate == rowid) {
                     return Err(Error::Unsupported("sqlite rowid not found"));
                 };
                 self.remove_cell(page, position)?;
@@ -2364,6 +2619,7 @@ impl SqliteWriter {
     }
 
     fn repoint_child(&mut self, page: u32, child_index: Option<usize>, old_child: u32, new_child: u32) -> Result<()> {
+        self.touch_page(page);
         let offset = self.page_offset(page);
         let header_relative = Self::header_offset(page);
         match child_index {
@@ -2385,6 +2641,7 @@ impl SqliteWriter {
 
     /// Removes cell `position` from a leaf page, maintaining the freeblock chain.
     fn remove_cell(&mut self, page: u32, position: usize) -> Result<()> {
+        self.touch_page(page);
         let offset = self.page_offset(page);
         let header_relative = Self::header_offset(page);
         let kind = self.pages[offset + header_relative];
@@ -2499,8 +2756,8 @@ impl SqliteWriter {
     /// cell's child, keys at or above continue right. The divider of a split
     /// is a real entry that MOVES up to the parent and leaves both halves,
     /// exactly like upstream SQLite.
-    fn index_insert(&mut self, root: u32, key: &[u8]) -> Result<u32> {
-        match self.index_insert_inner(root, key)? {
+    fn index_insert(&mut self, root: u32, key: &[u8], collations: &[Collation]) -> Result<u32> {
+        match self.index_insert_inner(root, key, collations)? {
             Some(split) => {
                 let new_root = self.allocate_page()?;
                 self.init_leaf_page(new_root, PAGE_INDEX_INTERIOR);
@@ -2520,14 +2777,14 @@ impl SqliteWriter {
         }
     }
 
-    fn index_insert_inner(&mut self, page: u32, key: &[u8]) -> Result<Option<IndexSplit>> {
+    fn index_insert_inner(&mut self, page: u32, key: &[u8], collations: &[Collation]) -> Result<Option<IndexSplit>> {
         let offset = self.page_offset(page);
         let header_relative = Self::header_offset(page);
         let kind = self.pages[offset + header_relative];
         match kind {
             PAGE_INDEX_LEAF => {
                 let entries = self.index_leaf_entries(page)?;
-                let position = entries.partition_point(|(payload, _)| compare_index_payloads(payload, key, self.encoding).is_lt());
+                let position = entries.partition_point(|(payload, _)| compare_index_payloads(payload, key, self.encoding, collations).is_lt());
                 if entries.get(position).is_some_and(|(payload, _)| payload.as_slice() == key) {
                     return Err(Error::Unsupported("sqlite duplicate index key"));
                 }
@@ -2578,7 +2835,7 @@ impl SqliteWriter {
                 let mut child_index = None;
                 let mut child = entries.rightmost;
                 for (index, (payload, child_page)) in entries.cells.iter().enumerate() {
-                    match compare_index_payloads(key, payload, self.encoding) {
+                    match compare_index_payloads(key, payload, self.encoding, collations) {
                         std::cmp::Ordering::Less => {
                             child = *child_page;
                             child_index = Some(index);
@@ -2590,7 +2847,7 @@ impl SqliteWriter {
                         std::cmp::Ordering::Greater => continue,
                     }
                 }
-                let Some(split) = self.index_insert_inner(child, key)?
+                let Some(split) = self.index_insert_inner(child, key, collations)?
                 else {
                     return Ok(None);
                 };
@@ -2713,14 +2970,21 @@ impl SqliteWriter {
     }
 
     /// UNIQUE constraint probe against the live key set of one index.
-    fn set_prefix_match(&self, master_rowid: i64, key: &[u8], prefix_columns: usize, excluded_rowid: Option<i64>) -> Result<bool> {
+    fn set_prefix_match(
+        &self,
+        master_rowid: i64,
+        key: &[u8],
+        prefix_columns: usize,
+        excluded_rowid: Option<i64>,
+        collations: &[Collation],
+    ) -> Result<bool> {
         let wanted = decode_record(key, self.encoding, Default::default()).map_err(|_| Error::Corrupt("sqlite index record decode failed"))?;
         let Some(entries) = self.index_entries.get(&master_rowid)
         else {
             return Ok(false);
         };
         for payload in entries {
-            if self.prefix_matches(payload, &wanted, prefix_columns, excluded_rowid)? {
+            if self.prefix_matches(payload, &wanted, prefix_columns, excluded_rowid, collations)? {
                 return Ok(true);
             }
         }
@@ -2797,13 +3061,18 @@ impl SqliteWriter {
         let rows = self.master_rows()?;
         for row in rows.iter().filter(|row| row.kind == "table" && row.sql.as_deref().is_some_and(is_without_rowid)) {
             let entries = self.without_rowid_entries.get(&row.rowid).cloned().unwrap_or_default();
+            let meta = self.load_table_meta(&row.table_name)?;
+            let collations: Vec<Collation> = meta.without_rowid_layout[..meta.primary_key_len]
+                .iter()
+                .map(|position| meta.columns[*position].collate.unwrap_or_default())
+                .collect();
             if row.root_page != 0 {
                 self.free_subtree(row.root_page)?;
             }
             let mut root = self.allocate_page()?;
             self.init_leaf_page(root, PAGE_INDEX_LEAF);
             for key in &entries {
-                root = self.index_insert(root, key)?;
+                root = self.index_insert(root, key, &collations)?;
             }
             if root != row.root_page {
                 self.set_master_root(row.rowid, root)?;
@@ -2821,13 +3090,16 @@ impl SqliteWriter {
         let rows = self.master_rows()?;
         for row in rows.iter().filter(|row| row.kind == "index") {
             let entries = self.index_entries.get(&row.rowid).cloned().unwrap_or_default();
+            let meta = self.load_table_meta(&row.table_name)?;
+            let collations =
+                meta.indexes.iter().find(|index| index.master_rowid == row.rowid).map(|index| index.collations.clone()).unwrap_or_default();
             if row.root_page != 0 {
                 self.free_subtree(row.root_page)?;
             }
             let mut root = self.allocate_page()?;
             self.init_leaf_page(root, PAGE_INDEX_LEAF);
             for key in &entries {
-                root = self.index_insert(root, key)?;
+                root = self.index_insert(root, key, &collations)?;
             }
             if root != row.root_page {
                 self.set_master_root(row.rowid, root)?;
@@ -2842,10 +3114,11 @@ impl SqliteWriter {
         wanted: &[database_formats::sqlite::RecordValue<'_>],
         prefix_columns: usize,
         excluded_rowid: Option<i64>,
+        collations: &[Collation],
     ) -> Result<bool> {
         let candidate =
             decode_record(payload, self.encoding, Default::default()).map_err(|_| Error::Corrupt("sqlite index record decode failed"))?;
-        if !prefix_equal(&candidate, wanted, prefix_columns) {
+        if !prefix_equal(&candidate, wanted, prefix_columns, collations) {
             return Ok(false);
         }
         if let Some(excluded) = excluded_rowid {
@@ -2903,19 +3176,15 @@ fn decode_cell_payload(cell: &[u8]) -> Result<Vec<u8>> {
     Ok(cell[length_size..length_size + length].to_vec())
 }
 
-fn compare_index_payloads(left: &[u8], right: &[u8], encoding: TextEncoding) -> std::cmp::Ordering {
-    let left_values = decode_record(left, encoding, Default::default()).unwrap_or_default();
-    let right_values = decode_record(right, encoding, Default::default()).unwrap_or_default();
-    for (a, b) in left_values.iter().zip(right_values.iter()) {
-        match compare_record_values(a, b) {
-            std::cmp::Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-    left_values.len().cmp(&right_values.len())
+fn compare_index_payloads(left: &[u8], right: &[u8], encoding: TextEncoding, collations: &[Collation]) -> std::cmp::Ordering {
+    crate::sqlite::table::compare_records_with(left, right, encoding, collations).unwrap_or(std::cmp::Ordering::Equal)
 }
 
-fn compare_record_values(a: &database_formats::sqlite::RecordValue<'_>, b: &database_formats::sqlite::RecordValue<'_>) -> std::cmp::Ordering {
+fn compare_record_values(
+    a: &database_formats::sqlite::RecordValue<'_>,
+    b: &database_formats::sqlite::RecordValue<'_>,
+    collation: Collation,
+) -> std::cmp::Ordering {
     use database_formats::sqlite::RecordValue as V;
     let class = |value: &V| match value {
         V::Null => 0,
@@ -2931,7 +3200,7 @@ fn compare_record_values(a: &database_formats::sqlite::RecordValue<'_>, b: &data
             else {
                 unreachable!()
             };
-            left.as_bytes().cmp(right.as_bytes())
+            collation.compare_text(left, right)
         }
         (3, 3) => {
             let (V::Blob(left), V::Blob(right)) = (a, b)
@@ -2977,11 +3246,16 @@ fn prefix_equal(
     candidate: &[database_formats::sqlite::RecordValue<'_>],
     wanted: &[database_formats::sqlite::RecordValue<'_>],
     prefix_columns: usize,
+    collations: &[Collation],
 ) -> bool {
     if candidate.len() < prefix_columns || wanted.len() < prefix_columns {
         return false;
     }
-    candidate[..prefix_columns].iter().zip(wanted[..prefix_columns].iter()).all(|(left, right)| compare_record_values(left, right).is_eq())
+    candidate[..prefix_columns]
+        .iter()
+        .zip(wanted[..prefix_columns].iter())
+        .enumerate()
+        .all(|(position, (left, right))| compare_record_values(left, right, collations.get(position).copied().unwrap_or_default()).is_eq())
 }
 
 fn is_rowid_alias(column: &ColumnSpec) -> bool {
@@ -3174,6 +3448,9 @@ fn render_create_table(name: &str, columns: &[ColumnSpec], primary_key: &[String
     let mut parts = Vec::with_capacity(columns.len() + 1);
     for column in columns {
         let mut fragment = render_column_head(&column.name, &column.declared_type);
+        if let Some(collate) = column.collate {
+            fragment.push_str(&format!(" COLLATE {}", collate.name()));
+        }
         if column.primary_key {
             fragment.push_str(" PRIMARY KEY");
             if column.autoincrement {
@@ -3202,6 +3479,9 @@ fn render_create_table_without_rowid(name: &str, columns: &[ColumnSpec], primary
     let mut parts = Vec::with_capacity(columns.len() + 1);
     for column in columns {
         let mut fragment = render_column_head(&column.name, &column.declared_type);
+        if let Some(collate) = column.collate {
+            fragment.push_str(&format!(" COLLATE {}", collate.name()));
+        }
         if column.not_null {
             fragment.push_str(" NOT NULL");
         }
@@ -3345,7 +3625,8 @@ fn create_table_body(sql: &str) -> Result<&str> {
 
 /// True when `text` begins with `keyword` as a whole word.
 fn starts_with_keyword(text: &str, keyword: &str) -> bool {
-    let Some(prefix) = text.get(..keyword.len()) else {
+    let Some(prefix) = text.get(..keyword.len())
+    else {
         return false;
     };
     if !prefix.eq_ignore_ascii_case(keyword) {
@@ -3427,7 +3708,7 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
     let mut index = 1usize;
     while index < tokens.len() {
         let upper = tokens[index].to_ascii_uppercase();
-        if matches!(upper.as_str(), "NOT" | "DEFAULT" | "PRIMARY" | "UNIQUE" | "NULL" | "REFERENCES") {
+        if matches!(upper.as_str(), "NOT" | "DEFAULT" | "PRIMARY" | "UNIQUE" | "NULL" | "REFERENCES" | "COLLATE") {
             break;
         }
         if !declared_type.is_empty() {
@@ -3440,6 +3721,7 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
     let mut primary_key = false;
     let mut unique = false;
     let mut autoincrement = false;
+    let mut collate = None;
     let mut default_value = None;
     let mut default_text = None;
     while index < tokens.len() {
@@ -3474,6 +3756,12 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
             }
             "NULL" => {
                 index += 1;
+            }
+            "COLLATE" => {
+                let name = tokens.get(index + 1).ok_or(Error::Unsupported("sqlite COLLATE name missing"))?;
+                let name = unquote_identifier(name)?;
+                collate = Some(Collation::parse(&name).ok_or(Error::Unsupported("sqlite no such collation sequence"))?);
+                index += 2;
             }
             "CONSTRAINT" => {
                 // Skip the name; the clause that follows is parsed next.
@@ -3551,7 +3839,7 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
             _ => return Err(Error::Unsupported("sqlite column constraint unrecognized")),
         }
     }
-    Ok(ColumnSpec { name, declared_type, not_null, default_value, default_text, primary_key, unique, autoincrement })
+    Ok(ColumnSpec { name, declared_type, not_null, default_value, default_text, primary_key, unique, autoincrement, collate })
 }
 
 fn require_keyword(tokens: &[String], index: usize, keyword: &str) -> Result<()> {
@@ -3842,4 +4130,60 @@ fn parse_create_index(sql: &str) -> Result<(Vec<String>, bool)> {
         columns.push(unquote_identifier(name)?);
     }
     Ok((columns, unique))
+}
+
+/// 解析索引每个键项生效的排序规则：键项显式写了 `COLLATE` 就用它，裸列
+/// 键则取该列的声明排序规则，表达式键没有列可依，按 `BINARY` 处理。
+fn index_collations(sql: &str, columns: &[ColumnSpec]) -> Result<Vec<Collation>> {
+    let upper = sql.to_ascii_uppercase();
+    let Some(on) = upper.find(" ON ")
+    else {
+        return Err(Error::Unsupported("sqlite CREATE INDEX text unrecognized"));
+    };
+    let rest = &sql[on + 4..];
+    let Some(open) = rest.find('(')
+    else {
+        return Err(Error::Unsupported("sqlite CREATE INDEX text lacks columns"));
+    };
+    let Some(close) = rest.rfind(')')
+    else {
+        return Err(Error::Unsupported("sqlite CREATE INDEX text lacks closing paren"));
+    };
+    let mut collations = Vec::new();
+    for fragment in split_index_fragments(&rest[open + 1..close]) {
+        let fragment = fragment.trim();
+        let core = match fragment.rsplit_once(char::is_whitespace) {
+            Some((head, tail)) if tail.eq_ignore_ascii_case("asc") || tail.eq_ignore_ascii_case("desc") => head.trim_end(),
+            _ => fragment,
+        };
+        let words: Vec<&str> = core.split_whitespace().collect();
+        let explicit =
+            words.windows(2).find(|pair| pair[0].eq_ignore_ascii_case("collate")).map(|pair| unquote_identifier(pair[1])).transpose()?;
+        let collation = match explicit {
+            Some(name) => Collation::parse(&name).ok_or(Error::Unsupported("sqlite no such collation sequence"))?,
+            None if is_plain_index_identifier(core) => {
+                let name = unquote_identifier(core)?;
+                columns.iter().find(|column| eq_ignore_ascii_case(&column.name, &name)).and_then(|column| column.collate).unwrap_or_default()
+            }
+            None => Collation::Binary,
+        };
+        collations.push(collation);
+    }
+    Ok(collations)
+}
+
+/// 按排序规则归一化一个索引键，使 `NOCASE` / `RTRIM` 下等价的值得到同一个
+/// 编码，唯一性判定因而与 b-tree 比较顺序保持一致。
+fn normalized_index_values(values: &[WriteValue], collations: &[Collation]) -> Vec<WriteValue> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(position, value)| match (collations.get(position).copied().unwrap_or_default(), value) {
+            (Collation::Nocase, WriteValue::Text(text)) => {
+                WriteValue::Text(text.chars().map(|character| character.to_ascii_lowercase()).collect())
+            }
+            (Collation::Rtrim, WriteValue::Text(text)) => WriteValue::Text(text.trim_end_matches(' ').to_string()),
+            (_, value) => value.clone(),
+        })
+        .collect()
 }
