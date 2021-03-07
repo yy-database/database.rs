@@ -17,10 +17,9 @@ pub mod sql;
 pub use sql::{Cell, ColumnRef, Engine, ExecResult, IndexColumn, Literal, SelectItems, SqlError, Statement, TableRef, parse, results_json};
 
 pub use database_storage::sqlite::{
-    ColumnSpec, DropIndexOutcome, SchemaObject, SchemaObjectKind, SqliteDatabase, SqliteWriter, TableLimits, TableRow, TextEncoding, UpdateValue, WriteValue,
-    apply_write_affinity,
-    decode_record, decode_varint, read_existing, read_index_table, read_named_index, read_named_table, read_named_without_rowid, read_schema,
-    read_table, sqlite_library_version,
+    Collation, ColumnSpec, DropIndexOutcome, SchemaObject, SchemaObjectKind, SqliteDatabase, SqliteWriter, TableLimits, TableRow, TextEncoding,
+    UpdateValue, WriteValue, apply_write_affinity, decode_record, decode_varint, read_existing, read_index_table, read_index_table_with,
+    read_named_index, read_named_table, read_named_without_rowid, read_schema, read_table, read_table_range, sqlite_library_version,
 };
 
 pub use database_formats::sqlite::{

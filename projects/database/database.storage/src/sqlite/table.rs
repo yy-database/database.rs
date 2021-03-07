@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashSet};
+use std::cmp::Ordering;
 
 use database_types::{Error, Result};
 
@@ -37,7 +37,12 @@ struct Scan<'snapshot> {
     page_size: usize,
     usable: usize,
     page_count: usize,
-    visited: HashSet<u32>,
+    /// 页号→是否已访问的位图。`page_count` 由文件长度或经校验的 header
+    /// 声明界定,不超实际字节数,位图预分配有界;替代 `HashSet` 消除每页
+    /// 一次哈希插入的扫描开销。
+    visited: Vec<bool>,
+    /// 已访问页数,对应旧实现 `visited.len()` 的限额语义。
+    visited_count: usize,
     limits: TableLimits,
 }
 
@@ -47,30 +52,35 @@ impl<'snapshot> Scan<'snapshot> {
         if index == 0 || index > self.page_count {
             return Err(Error::Corrupt("sqlite page reference out of bounds"));
         }
-        if self.visited.len() >= self.limits.max_pages {
+        if self.visited_count >= self.limits.max_pages {
             return Err(Error::Unsupported("sqlite table page limit exceeded"));
         }
-        if !self.visited.insert(number) {
+        if self.visited[index] {
             return Err(Error::Corrupt("sqlite repeated b-tree or overflow page"));
         }
+        self.visited[index] = true;
+        self.visited_count += 1;
         let start = (index - 1) * self.page_size;
         Ok(&self.bytes[start..start + self.usable])
     }
 
-    fn payload(&mut self, page: &[u8], offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
+    /// 载荷在本页存放的本地字节数,按上游 SQLite 的 U 值公式。
+    fn local(&self, length: usize) -> usize {
         let maximum = self.usable - 35;
         let minimum = ((self.usable - 12) * 32 / 255) - 23;
-        let local = if length <= maximum {
-            length
+        if length <= maximum {
+            return length;
         }
-        else {
-            let candidate = minimum + (length - minimum) % (self.usable - 4);
-            if candidate <= maximum { candidate } else { minimum }
-        };
+        let candidate = minimum + (length - minimum) % (self.usable - 4);
+        if candidate <= maximum { candidate } else { minimum }
+    }
+
+    fn payload(&mut self, page: &[u8], offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
+        let local = self.local(length);
         let end = offset.checked_add(local).ok_or(Error::Corrupt("sqlite cell length overflow"))?;
         let initial = page.get(offset..end).ok_or(Error::Corrupt("sqlite cell payload truncated"))?;
         let overflow_pages = (length - local).div_ceil(self.usable - 4);
-        if overflow_pages > self.limits.max_pages.saturating_sub(self.visited.len()) {
+        if overflow_pages > self.limits.max_pages.saturating_sub(self.visited_count) {
             return Err(Error::Unsupported("sqlite table page limit exceeded"));
         }
         let mut payload = Vec::new();
@@ -100,6 +110,20 @@ impl<'snapshot> Scan<'snapshot> {
 /// trailing rowid column. Interior cells hold real keys, so the walk emits
 /// them between child subtrees and rejects any out-of-order pair.
 pub fn read_index_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Result<Vec<Vec<u8>>> {
+    read_index_table_with(bytes, root_page, limits, &[])
+}
+
+/// Reads an index b-tree whose key positions use the given collations.
+///
+/// 不传排序规则时（`&[]`）键序按“任意内置排序规则下都合法”判定：只有三种
+/// 规则下都逆序才算损坏，这样无需拿到 schema 也能读 `NOCASE` / `RTRIM`
+/// 索引。
+pub fn read_index_table_with(
+    bytes: &[u8],
+    root_page: u32,
+    limits: TableLimits,
+    collations: &[crate::sqlite::writer::Collation],
+) -> Result<Vec<Vec<u8>>> {
     let page_size = validate_database(bytes)?;
     if bytes.is_empty() {
         return Err(Error::Corrupt("sqlite index root in empty database"));
@@ -111,7 +135,15 @@ pub fn read_index_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Re
     };
     let declared = read_u32(bytes, 28)? as usize;
     let page_count = if declared != 0 && read_u32(bytes, 24)? == read_u32(bytes, 92)? { declared } else { bytes.len() / page_size };
-    let mut scan = Scan { bytes, page_size, usable: page_size - usize::from(bytes[20]), page_count, visited: HashSet::new(), limits };
+    let mut scan = Scan {
+        bytes,
+        page_size,
+        usable: page_size - usize::from(bytes[20]),
+        page_count,
+        visited: vec![false; page_count + 1],
+        visited_count: 0,
+        limits,
+    };
     let mut pending = vec![IndexTask::Page(root_page)];
     let mut payloads = Vec::new();
     let mut previous: Option<Vec<u8>> = None;
@@ -123,7 +155,16 @@ pub fn read_index_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Re
                     return Err(Error::Unsupported("sqlite index row limit exceeded"));
                 }
                 if let Some(left) = &previous {
-                    if compare_records(left, &payload, encoding)? != Ordering::Less {
+                    let ordering = compare_records_with(left, &payload, encoding, collations)?;
+                    let violated = if collations.is_empty() {
+                        ordering != Ordering::Less
+                            && compare_records_with(left, &payload, encoding, &[crate::sqlite::writer::Collation::Nocase])? != Ordering::Less
+                            && compare_records_with(left, &payload, encoding, &[crate::sqlite::writer::Collation::Rtrim])? != Ordering::Less
+                    }
+                    else {
+                        ordering != Ordering::Less
+                    };
+                    if violated {
                         return Err(Error::Corrupt("sqlite index key order violated"));
                     }
                 }
@@ -176,7 +217,7 @@ pub fn read_index_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Re
         if kind == 2 {
             tasks.push(IndexTask::Page(read_u32(page, header + 8)?));
         }
-        if pending.len().saturating_add(tasks.len()).saturating_add(scan.visited.len()) > limits.max_pages {
+        if pending.len().saturating_add(tasks.len()).saturating_add(scan.visited_count) > limits.max_pages {
             return Err(Error::Unsupported("sqlite index page limit exceeded"));
         }
         pending.extend(tasks.into_iter().rev());
@@ -191,11 +232,26 @@ enum IndexTask {
 
 /// SQLite BINARY order: NULL, numbers, text, then blob, with byte-wise ties.
 fn compare_records(left: &[u8], right: &[u8], encoding: TextEncoding) -> Result<Ordering> {
+    compare_records_with(left, right, encoding, &[])
+}
+
+/// 按每个键位的排序规则比较两条索引记录，缺省位置按 `BINARY`。
+pub(crate) fn compare_records_with(
+    left: &[u8],
+    right: &[u8],
+    encoding: TextEncoding,
+    collations: &[crate::sqlite::writer::Collation],
+) -> Result<Ordering> {
     let limits = |payload: &[u8]| RecordLimits { max_payload_bytes: payload.len(), max_columns: 4096 };
     let left_values = decode_record(left, encoding, limits(left))?;
     let right_values = decode_record(right, encoding, limits(right))?;
-    for (left, right) in left_values.iter().zip(right_values.iter()) {
-        let ordering = compare_values(left, right);
+    for (position, (left, right)) in left_values.iter().zip(right_values.iter()).enumerate() {
+        let ordering = match (left, right) {
+            (RecordValue::Text(left), RecordValue::Text(right)) => {
+                collations.get(position).copied().unwrap_or_default().compare_text(left, right)
+            }
+            _ => compare_values(left, right),
+        };
         if ordering != Ordering::Equal {
             return Ok(ordering);
         }
@@ -228,16 +284,42 @@ fn compare_values(left: &RecordValue<'_>, right: &RecordValue<'_>) -> Ordering {
 /// Index b-trees (including WITHOUT ROWID tables) are explicitly unsupported.
 /// This does not recover WAL/journals or perform a full integrity check.
 pub fn read_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Result<Vec<TableRow>> {
+    read_table_inner(bytes, root_page, limits, None, None)
+}
+
+/// 读取 rowid 落在闭区间 `[lower, upper]` 内的记录,按 rowid 升序返回。
+/// 与 [`read_table`] 共用同一套损坏检测与限额,但只物化区间内的载荷,
+/// 并按查询界剪枝内部节点:与区间不相交的子树不再下探。点查即
+/// `lower == upper`。
+pub fn read_table_range(bytes: &[u8], root_page: u32, lower: i64, upper: i64, limits: TableLimits) -> Result<Vec<TableRow>> {
+    if lower > upper {
+        return Ok(Vec::new());
+    }
+    read_table_inner(bytes, root_page, limits, Some(lower), Some(upper))
+}
+
+fn read_table_inner(bytes: &[u8], root_page: u32, limits: TableLimits, floor: Option<i64>, ceil: Option<i64>) -> Result<Vec<TableRow>> {
     let page_size = validate_database(bytes)?;
     if bytes.is_empty() {
         return Err(Error::Corrupt("sqlite table root in empty database"));
     }
     let declared = read_u32(bytes, 28)? as usize;
     let page_count = if declared != 0 && read_u32(bytes, 24)? == read_u32(bytes, 92)? { declared } else { bytes.len() / page_size };
-    let mut scan = Scan { bytes, page_size, usable: page_size - usize::from(bytes[20]), page_count, visited: HashSet::new(), limits };
+    let mut scan = Scan {
+        bytes,
+        page_size,
+        usable: page_size - usize::from(bytes[20]),
+        page_count,
+        visited: vec![false; page_count + 1],
+        visited_count: 0,
+        limits,
+    };
     let mut pending = vec![(root_page, None::<i64>, None::<i64>)];
     let mut rows: Vec<TableRow> = Vec::new();
     let mut total_payload = 0usize;
+    // 每页的 cell 跨度与子页任务复用同一缓冲,避免逐页堆分配。
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut children: Vec<(u32, Option<i64>, Option<i64>)> = Vec::new();
     while let Some((number, lower, upper)) = pending.pop() {
         let page = scan.page(number)?;
         let header = if number == 1 { 100 } else { 0 };
@@ -259,8 +341,9 @@ pub fn read_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Result<V
             return Err(Error::Corrupt("sqlite b-tree content boundary invalid"));
         }
         let mut previous = lower;
-        let mut spans = Vec::with_capacity(count);
-        let mut children = Vec::new();
+        spans.clear();
+        children.clear();
+        spans.reserve(count);
         for index in 0..count {
             let cell = read_u16(page, header + header_size + index * 2)?;
             if cell < content_start || cell >= page.len() {
@@ -295,9 +378,18 @@ pub fn read_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Result<V
                     return Err(Error::Corrupt("sqlite table rows out of order"));
                 }
                 previous = Some(rowid);
-                let (payload, end) = scan.payload(page, cell + length_size + rowid_size, length)?;
+                let prefix = length_size + rowid_size;
+                let local = scan.local(length);
+                let span_end = cell + prefix + local + if length > local { 4 } else { 0 };
+                if span_end > page.len() {
+                    return Err(Error::Corrupt("sqlite cell payload truncated"));
+                }
+                spans.push((cell, span_end));
+                if floor.is_some_and(|bound| rowid < bound) || ceil.is_some_and(|bound| rowid > bound) {
+                    continue;
+                }
+                let (payload, _end) = scan.payload(page, cell + prefix, length)?;
                 rows.push(TableRow { rowid, payload });
-                spans.push((cell, end));
             }
         }
         spans.sort_unstable();
@@ -306,13 +398,19 @@ pub fn read_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Result<V
         }
         if kind == 5 {
             children.push((read_u32(page, header + 8)?, previous, upper));
-            if pending.len().saturating_add(children.len()).saturating_add(scan.visited.len()) > limits.max_pages {
+            if pending.len().saturating_add(children.len()).saturating_add(scan.visited_count) > limits.max_pages {
                 return Err(Error::Unsupported("sqlite table page limit exceeded"));
             }
-            pending.extend(children.into_iter().rev());
+            pending.extend(children.iter().rev().copied().filter(|(_, lo, hi)| range_intersects(*lo, *hi, floor, ceil)));
         }
     }
     Ok(rows)
+}
+
+/// 子树校验界 `(lo, hi]`(`lo` 不含、`hi` 含)与查询闭区间 `[floor, ceil]`
+/// 是否可能相交;`None` 界表示无界。区间读取据此剪枝不相交的子树。
+fn range_intersects(lo: Option<i64>, hi: Option<i64>, floor: Option<i64>, ceil: Option<i64>) -> bool {
+    hi.is_none_or(|bound| floor.is_none_or(|lower| bound >= lower)) && lo.is_none_or(|bound| ceil.is_none_or(|upper| bound < upper))
 }
 
 fn check_key(key: i64, lower: Option<i64>, upper: Option<i64>) -> Result<()> {

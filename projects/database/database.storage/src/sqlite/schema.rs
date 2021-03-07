@@ -2,7 +2,7 @@ use database_types::{Error, Result};
 
 use database_formats::sqlite::{RecordLimits, RecordValue, TextEncoding, WriteValue, decode_record, encode_record, validate_database};
 
-use crate::sqlite::table::{TableLimits, TableRow, read_index_table, read_table};
+use crate::sqlite::table::{TableLimits, TableRow, read_index_table, read_table, read_table_range};
 
 /// Reads a secondary index b-tree in key order.
 ///
@@ -11,6 +11,12 @@ use crate::sqlite::table::{TableLimits, TableRow, read_index_table, read_table};
 pub fn read_named_index(bytes: &[u8], name: &str, limits: TableLimits) -> Result<Vec<Vec<u8>>> {
     validate_database(bytes)?;
     let objects = read_schema(bytes, limits)?;
+    index_rows_from_objects(bytes, &objects, name, limits)
+}
+
+/// 在已解析的 schema 对象里按名读取二级索引,不再重读 `sqlite_master`。
+/// 供 [`crate::sqlite::database::SqliteDatabase`] 的缓存路径复用。
+pub(crate) fn index_rows_from_objects(bytes: &[u8], objects: &[SchemaObject], name: &str, limits: TableLimits) -> Result<Vec<Vec<u8>>> {
     let object = objects
         .iter()
         .find(|object| object.kind == SchemaObjectKind::Index && object.name.eq_ignore_ascii_case(name))
@@ -79,12 +85,23 @@ pub fn read_schema_with_rowids(bytes: &[u8], limits: TableLimits) -> Result<Vec<
 /// views are resolved when their definition is a plain column projection onto
 /// a single rowid table, and rejected with a distinguishable error otherwise.
 pub fn read_named_table(bytes: &[u8], name: &str, limits: TableLimits) -> Result<Vec<TableRow>> {
-    read_named_table_at_depth(bytes, name, limits, 0)
+    validate_database(bytes)?;
+    let objects = read_schema(bytes, limits)?;
+    named_table_from_objects(bytes, &objects, name, limits, 0)
 }
 
 const MAX_VIEW_DEPTH: usize = 8;
 
-fn read_named_table_at_depth(bytes: &[u8], name: &str, limits: TableLimits, depth: usize) -> Result<Vec<TableRow>> {
+/// 在已解析的 schema 对象里按名解析表或简单视图并读出记录,不再重读
+/// `sqlite_master`。供 [`crate::sqlite::database::SqliteDatabase`] 的缓存
+/// 路径与 [`read_named_table`] 共用;视图链的递归也走同一份对象表。
+pub(crate) fn named_table_from_objects(
+    bytes: &[u8],
+    objects: &[SchemaObject],
+    name: &str,
+    limits: TableLimits,
+    depth: usize,
+) -> Result<Vec<TableRow>> {
     if depth > MAX_VIEW_DEPTH {
         return Err(Error::Unsupported("sqlite view nesting depth exceeded"));
     }
@@ -92,7 +109,6 @@ fn read_named_table_at_depth(bytes: &[u8], name: &str, limits: TableLimits, dept
         validate_database(bytes)?;
         return if bytes.is_empty() { Ok(Vec::new()) } else { read_table(bytes, 1, limits) };
     }
-    let objects = read_schema(bytes, limits)?;
     let mut matching = objects
         .iter()
         .filter(|object| matches!(object.kind, SchemaObjectKind::Table | SchemaObjectKind::View) && object.name.eq_ignore_ascii_case(name));
@@ -102,8 +118,50 @@ fn read_named_table_at_depth(bytes: &[u8], name: &str, limits: TableLimits, dept
     }
     match object.kind {
         SchemaObjectKind::Table => read_table_object(bytes, object, limits),
-        SchemaObjectKind::View => read_view_rows(bytes, object, limits, depth),
+        SchemaObjectKind::View => read_view_rows(bytes, objects, object, limits, depth),
         _ => Err(Error::Corrupt("sqlite named object is not a table or view")),
+    }
+}
+
+/// 在已解析的 schema 对象里按名做 rowid 闭区间读取,不再重读
+/// `sqlite_master`。视图不支持区间访问(其行不是存储记录)。
+/// 点查即 `lower == upper`,配合 [`read_table_range`] 的下降剪枝,
+/// 代价为 O(log n) 页访问。
+pub(crate) fn named_table_range_from_objects(
+    bytes: &[u8],
+    objects: &[SchemaObject],
+    name: &str,
+    lower: i64,
+    upper: i64,
+    limits: TableLimits,
+) -> Result<Vec<TableRow>> {
+    if name.eq_ignore_ascii_case("sqlite_schema") || name.eq_ignore_ascii_case("sqlite_master") {
+        validate_database(bytes)?;
+        return if bytes.is_empty() { Ok(Vec::new()) } else { read_table_range(bytes, 1, lower, upper, limits) };
+    }
+    let mut matching = objects
+        .iter()
+        .filter(|object| matches!(object.kind, SchemaObjectKind::Table | SchemaObjectKind::View) && object.name.eq_ignore_ascii_case(name));
+    let object = matching.next().ok_or_else(|| Error::Corrupt("sqlite named table not found"))?;
+    if matching.next().is_some() {
+        return Err(Error::Corrupt("sqlite ambiguous table name"));
+    }
+    match object.kind {
+        SchemaObjectKind::Table => {
+            let root = object.root_page.filter(|root| *root != 0).ok_or(Error::Unsupported("sqlite virtual table access"))?;
+            if root == 1 {
+                return Err(Error::Corrupt("sqlite user table aliases schema root"));
+            }
+            let rows = read_table_range(bytes, root, lower, upper, limits)?;
+            if let Some(sql) = object.sql.as_deref() {
+                if is_strict(sql) {
+                    validate_strict_rows(&rows, sql, database_encoding(bytes)?, limits)?;
+                }
+            }
+            Ok(rows)
+        }
+        SchemaObjectKind::View => Err(Error::Unsupported("sqlite range access over a view is not supported")),
+        _ => Err(Error::Corrupt("sqlite named object is not a table")),
     }
 }
 
@@ -126,12 +184,12 @@ fn read_table_object(bytes: &[u8], object: &SchemaObject, limits: TableLimits) -
 /// Resolves `CREATE VIEW <name> AS SELECT <columns> FROM <table>` onto the base
 /// table. Expressions, joins, filters, aliases, subqueries and view-on-view
 /// chains are rejected instead of being half evaluated.
-fn read_view_rows(bytes: &[u8], object: &SchemaObject, limits: TableLimits, depth: usize) -> Result<Vec<TableRow>> {
+fn read_view_rows(bytes: &[u8], objects: &[SchemaObject], object: &SchemaObject, limits: TableLimits, depth: usize) -> Result<Vec<TableRow>> {
     let sql = object.sql.as_deref().ok_or(Error::Unsupported("sqlite view has no CREATE source"))?;
     let projection = parse_view(sql)?;
-    let base = read_named_table_at_depth(bytes, &projection.base, limits, depth + 1)?;
+    let base = named_table_from_objects(bytes, objects, &projection.base, limits, depth + 1)?;
     let encoding = database_encoding(bytes)?;
-    let definitions = base_table_columns(bytes, &projection.base, limits)?;
+    let definitions = base_table_columns(objects, &projection.base)?;
     let alias_index = definitions.iter().position(|column| column.rowid_alias);
     let positions = match &projection.columns {
         Some(columns) => {
@@ -293,8 +351,7 @@ fn database_encoding(bytes: &[u8]) -> Result<TextEncoding> {
     }
 }
 
-fn base_table_columns(bytes: &[u8], name: &str, limits: TableLimits) -> Result<Vec<ColumnDefinition>> {
-    let objects = read_schema(bytes, limits)?;
+fn base_table_columns(objects: &[SchemaObject], name: &str) -> Result<Vec<ColumnDefinition>> {
     let object = objects
         .iter()
         .find(|object| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case(name))
@@ -405,6 +462,12 @@ pub fn validate_strict_rows(rows: &[TableRow], sql: &str, encoding: TextEncoding
 pub fn read_named_without_rowid(bytes: &[u8], name: &str, limits: TableLimits) -> Result<Vec<Vec<u8>>> {
     validate_database(bytes)?;
     let objects = read_schema(bytes, limits)?;
+    without_rowid_rows_from_objects(bytes, &objects, name, limits)
+}
+
+/// 在已解析的 schema 对象里按名读取 WITHOUT ROWID 表,不再重读
+/// `sqlite_master`。供缓存路径复用。
+pub(crate) fn without_rowid_rows_from_objects(bytes: &[u8], objects: &[SchemaObject], name: &str, limits: TableLimits) -> Result<Vec<Vec<u8>>> {
     let object = objects
         .iter()
         .find(|object| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case(name))
