@@ -1975,6 +1975,29 @@ impl Statement {
             },
         }
     }
+
+    /// 语句是否可能改变存储的数据库镜像。
+    ///
+    /// 只有 DDL 与 DML 会弄脏镜像；`SELECT`、`PRAGMA`、`ATTACH`、`DETACH`
+    /// 和 `EXPLAIN` 单独都不写文件。事务控制语句本身不写,它们移动提交边界,
+    /// 由连接层在 `COMMIT` 成功后统一落盘。宿主不得再用关键词猜这件事。
+    pub fn writes(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateTable { .. }
+                | Self::CreateView { .. }
+                | Self::CreateTrigger { .. }
+                | Self::CreateIndex { .. }
+                | Self::Insert { .. }
+                | Self::Update { .. }
+                | Self::Delete { .. }
+                | Self::DropTable { .. }
+                | Self::DropIndex { .. }
+                | Self::DropView { .. }
+                | Self::DropTrigger { .. }
+                | Self::AlterTable { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5878,6 +5901,291 @@ fn is_aggregate_name(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "count" | "avg" | "sum" | "total" | "min" | "max")
 }
 
+/// 语句的权威参数槽位:解析器为每个 `?`、`?NNN` 与 `:name` 分配的零基索引,
+/// 连同书写原文,按索引升序去重。
+///
+/// 槽位来自已解析的 AST,而不是对 SQL 文本的第二次词法扫描,因此宿主层
+/// 看到的槽位与执行时绑定的槽位永远一致。宿主不得自行数占位符。
+pub fn parameter_slots(statement: &Statement) -> Vec<(usize, String)> {
+    let mut slots = Vec::new();
+    collect_statement_slots(statement, &mut slots);
+    slots.sort_by_key(|(index, _)| *index);
+    slots.dedup_by_key(|(index, _)| *index);
+    slots
+}
+
+fn collect_statement_slots(statement: &Statement, slots: &mut Vec<(usize, String)>) {
+    match statement {
+        Statement::CreateTable { checks, query, .. } => {
+            for check in checks {
+                collect_expr_slots(&check.expr, slots);
+            }
+            if let Some(query) = query {
+                collect_statement_slots(query, slots);
+            }
+        }
+        Statement::CreateView { query, .. } => collect_statement_slots(query, slots),
+        Statement::Explain { statement, .. } => collect_statement_slots(statement, slots),
+        Statement::CreateTrigger { when, body, .. } => {
+            if let Some(when) = when {
+                collect_expr_slots(when, slots);
+            }
+            for statement in body {
+                collect_statement_slots(statement, slots);
+            }
+        }
+        Statement::CreateIndex { columns, predicate, .. } => {
+            for column in columns {
+                if let Some(expr) = &column.expr {
+                    collect_expr_slots(expr, slots);
+                }
+            }
+            if let Some(predicate) = predicate {
+                collect_expr_slots(predicate, slots);
+            }
+        }
+        Statement::Insert { rows, query, conflict, returning, .. } => {
+            for row in rows {
+                for value in row {
+                    match value {
+                        InsertValue::Parameter { index, text } => slots.push((*index, text.clone())),
+                        InsertValue::Expression(expr) => collect_expr_slots(expr, slots),
+                        InsertValue::Literal(_) => {}
+                    }
+                }
+            }
+            if let Some(query) = query {
+                collect_statement_slots(query, slots);
+            }
+            if let Some(clause) = conflict {
+                if let Some(predicate) = &clause.predicate {
+                    collect_expr_slots(predicate, slots);
+                }
+                if let ConflictAction::Update { assignments, predicate } = &clause.action {
+                    for assignment in assignments {
+                        collect_expr_slots(&assignment.value, slots);
+                    }
+                    if let Some(predicate) = predicate {
+                        collect_expr_slots(predicate, slots);
+                    }
+                }
+            }
+            collect_items_slots(returning, slots);
+        }
+        Statement::Update { assignments, from, filter, returning, .. } => {
+            for assignment in assignments {
+                collect_expr_slots(&assignment.value, slots);
+            }
+            for table in from {
+                collect_table_slots(table, slots);
+            }
+            if let Some(filter) = filter {
+                collect_expr_slots(filter, slots);
+            }
+            collect_items_slots(returning, slots);
+        }
+        Statement::Delete { filter, returning, .. } => {
+            if let Some(filter) = filter {
+                collect_expr_slots(filter, slots);
+            }
+            collect_items_slots(returning, slots);
+        }
+        Statement::Select { with, first, compounds, order, limit, .. } => {
+            for table in with {
+                collect_statement_slots(&table.query, slots);
+            }
+            collect_core_slots(first, slots);
+            for term in compounds {
+                collect_core_slots(&term.core, slots);
+            }
+            for key in order {
+                collect_expr_slots(&key.expr, slots);
+            }
+            if let Some(limit) = limit {
+                collect_expr_slots(&limit.count, slots);
+                if let Some(offset) = &limit.offset {
+                    collect_expr_slots(offset, slots);
+                }
+            }
+        }
+        Statement::Pragma { .. }
+        | Statement::Attach { .. }
+        | Statement::Detach { .. }
+        | Statement::Transaction { .. }
+        | Statement::DropTable { .. }
+        | Statement::DropIndex { .. }
+        | Statement::DropView { .. }
+        | Statement::DropTrigger { .. }
+        | Statement::AlterTable { .. } => {}
+    }
+}
+
+fn collect_core_slots(core: &SelectCore, slots: &mut Vec<(usize, String)>) {
+    if let SelectItems::Named(items) = &core.items {
+        for item in items {
+            collect_expr_slots(item, slots);
+        }
+    }
+    for table in &core.from {
+        collect_table_slots(table, slots);
+    }
+    if let Some(filter) = &core.filter {
+        collect_expr_slots(filter, slots);
+    }
+    for expr in &core.group {
+        collect_expr_slots(expr, slots);
+    }
+    if let Some(having) = &core.having {
+        collect_expr_slots(having, slots);
+    }
+    for window in &core.windows {
+        collect_spec_slots(&window.spec, slots);
+    }
+}
+
+fn collect_table_slots(table: &TableRef, slots: &mut Vec<(usize, String)>) {
+    if let Some(query) = &table.query {
+        collect_statement_slots(query, slots);
+    }
+    if let Some(on) = &table.on {
+        collect_expr_slots(on, slots);
+    }
+}
+
+fn collect_items_slots(items: &Option<SelectItems>, slots: &mut Vec<(usize, String)>) {
+    if let Some(SelectItems::Named(items)) = items {
+        for item in items {
+            collect_expr_slots(item, slots);
+        }
+    }
+}
+
+fn collect_spec_slots(spec: &WindowSpec, slots: &mut Vec<(usize, String)>) {
+    for expr in &spec.partition {
+        collect_expr_slots(expr, slots);
+    }
+    for key in &spec.order {
+        collect_expr_slots(&key.expr, slots);
+    }
+    if let Some(frame) = &spec.frame {
+        for bound in [&frame.start, &frame.end] {
+            if let Some(offset) = &bound.offset {
+                collect_expr_slots(offset, slots);
+            }
+        }
+    }
+}
+
+fn collect_expr_slots(expr: &Expr, slots: &mut Vec<(usize, String)>) {
+    match expr {
+        Expr::Column(_) | Expr::Literal(_) => {}
+        Expr::Parameter { index, text } => slots.push((*index, text.clone())),
+        Expr::Unary { value, .. }
+        | Expr::IsNull { value, .. }
+        | Expr::IsTruth { value, .. }
+        | Expr::Alias { value, .. }
+        | Expr::Cast { value, .. }
+        | Expr::Collate { value, .. } => collect_expr_slots(value, slots),
+        Expr::Not(inner) => collect_expr_slots(inner, slots),
+        Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } | Expr::IsDistinct { left, right, .. } => {
+            collect_expr_slots(left, slots);
+            collect_expr_slots(right, slots);
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            collect_expr_slots(left, slots);
+            collect_expr_slots(right, slots);
+        }
+        Expr::Glob { value, pattern, .. } => {
+            collect_expr_slots(value, slots);
+            collect_expr_slots(pattern, slots);
+        }
+        Expr::Case { operand, branches, otherwise } => {
+            if let Some(operand) = operand {
+                collect_expr_slots(operand, slots);
+            }
+            for (condition, result) in branches {
+                collect_expr_slots(condition, slots);
+                collect_expr_slots(result, slots);
+            }
+            if let Some(otherwise) = otherwise {
+                collect_expr_slots(otherwise, slots);
+            }
+        }
+        Expr::In { value, list, .. } => {
+            collect_expr_slots(value, slots);
+            for item in list {
+                collect_expr_slots(item, slots);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                collect_expr_slots(arg, slots);
+            }
+        }
+        Expr::Subquery(statement) | Expr::Exists(statement) => collect_statement_slots(statement, slots),
+        Expr::InSubquery { value, query, .. } => {
+            collect_expr_slots(value, slots);
+            collect_statement_slots(query, slots);
+        }
+        Expr::Aggregate { argument, separator, filter, order, .. } => {
+            for part in [argument.as_ref(), separator.as_ref(), filter.as_ref()] {
+                if let Some(expr) = part {
+                    collect_expr_slots(expr, slots);
+                }
+            }
+            for key in order {
+                collect_expr_slots(&key.expr, slots);
+            }
+        }
+        Expr::Like { value, pattern, escape, .. } => {
+            collect_expr_slots(value, slots);
+            collect_expr_slots(pattern, slots);
+            if let Some(escape) = escape {
+                collect_expr_slots(escape, slots);
+            }
+        }
+        Expr::Window { function, spec } => collect_window_slots(function, spec, slots),
+    }
+}
+
+fn collect_window_slots(function: &WindowFunction, spec: &WindowSpec, slots: &mut Vec<(usize, String)>) {
+    let arguments: Vec<&Expr> = match function {
+        WindowFunction::Ntile(value) | WindowFunction::FirstValue(value) | WindowFunction::LastValue(value) => vec![value.as_ref()],
+        WindowFunction::Lag { value, offset, default } | WindowFunction::Lead { value, offset, default } => {
+            let mut arguments = vec![value.as_ref()];
+            if let Some(offset) = offset {
+                arguments.push(offset.as_ref());
+            }
+            if let Some(default) = default {
+                arguments.push(default.as_ref());
+            }
+            arguments
+        }
+        WindowFunction::NthValue { value, position } => vec![value.as_ref(), position.as_ref()],
+        WindowFunction::Aggregate { argument, separator, filter, order, .. } => {
+            let mut arguments = Vec::new();
+            if let Some(argument) = argument {
+                arguments.push(argument.as_ref());
+            }
+            if let Some(separator) = separator {
+                arguments.push(separator.as_ref());
+            }
+            if let Some(filter) = filter {
+                arguments.push(filter.as_ref());
+            }
+            for key in order {
+                arguments.push(&key.expr);
+            }
+            arguments
+        }
+        _ => Vec::new(),
+    };
+    for argument in arguments {
+        collect_expr_slots(argument, slots);
+    }
+    collect_spec_slots(spec, slots);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5964,6 +6272,62 @@ mod tests {
         match expr {
             Expr::Not(inner) => assert!(matches!(*inner, Expr::Or(..))),
             other => panic!("expected NOT around a group, found {other:?}"),
+        }
+    }
+
+    fn slots_of(sql: &str) -> Vec<(usize, String)> {
+        let statements = parse(sql).expect("statement parses");
+        let statement = statements.into_iter().next().expect("one statement");
+        parameter_slots(&statement)
+    }
+
+    #[test]
+    fn bare_question_marks_take_consecutive_indexes() {
+        assert_eq!(slots_of("SELECT ?, ?, ?"), vec![(0, "?".to_string()), (1, "?".to_string()), (2, "?".to_string())]);
+    }
+
+    #[test]
+    fn numbered_placeholders_fix_their_slot_and_later_bare_marks_follow() {
+        assert_eq!(slots_of("SELECT ?2, ?"), vec![(1, "?2".to_string()), (2, "?".to_string())]);
+    }
+
+    #[test]
+    fn repeated_named_placeholder_shares_one_slot() {
+        assert_eq!(slots_of("SELECT :a + :a"), vec![(0, ":a".to_string())]);
+    }
+
+    #[test]
+    fn insert_values_mix_literals_and_placeholders() {
+        assert_eq!(slots_of("INSERT INTO t VALUES (?, :name, 'x')"), vec![(0, "?".to_string()), (1, ":name".to_string())]);
+    }
+
+    #[test]
+    fn slots_are_collected_from_subqueries_and_predicates() {
+        assert_eq!(
+            slots_of("SELECT a FROM t WHERE b IN (SELECT c FROM u WHERE d = ?) AND e > ?"),
+            vec![(0, "?".to_string()), (1, "?".to_string())]
+        );
+    }
+
+    #[test]
+    fn writes_classifies_statements_by_ast_kind() {
+        let cases = [
+            ("SELECT 1", false),
+            ("PRAGMA foreign_keys = ON", false),
+            ("EXPLAIN SELECT 1", false),
+            ("BEGIN", false),
+            ("COMMIT", false),
+            ("CREATE TABLE t (a INTEGER)", true),
+            ("INSERT INTO t VALUES (1)", true),
+            ("UPDATE t SET a = 1", true),
+            ("DELETE FROM t", true),
+            ("DROP TABLE t", true),
+            ("ALTER TABLE t ADD COLUMN b TEXT", true),
+            ("CREATE INDEX i ON t (a)", true),
+        ];
+        for (sql, expected) in cases {
+            let statement = parse(sql).expect("statement parses").into_iter().next().expect("one statement");
+            assert_eq!(statement.writes(), expected, "writes() for {sql}");
         }
     }
 }

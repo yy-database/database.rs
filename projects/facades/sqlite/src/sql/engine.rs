@@ -1863,6 +1863,23 @@ impl Engine {
         result
     }
 
+    /// 执行一条已经解析好的语句,并绑定零基位置参数。
+    ///
+    /// 已解析的 AST 就是本引擎的"预编译"形态:宿主解析一次、反复执行同一
+    /// 语句时不再重新词法或重新解析 SQL 文本。触发器体照常经过
+    /// [`Engine::run_triggered`],与文本入口的执行路径一致。
+    pub fn execute_statement(&mut self, statement: &Statement, parameters: &[Cell]) -> Result<ExecResult, SqlError> {
+        self.parameters = parameters.to_vec();
+        let result = self.run_triggered(statement.clone());
+        self.parameters.clear();
+        result
+    }
+
+    /// `PRAGMA synchronous` 的透传:`false` 时落盘跳过持久化刷新。
+    pub fn set_synchronous(&mut self, on: bool) {
+        self.writer.set_synchronous(on);
+    }
+
     /// Current database image, suitable for writing to a `.sqlite3` file.
     ///
     /// Index b-trees are rebuilt after every insert that touches an indexed

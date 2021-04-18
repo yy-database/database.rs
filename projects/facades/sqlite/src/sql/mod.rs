@@ -19,7 +19,7 @@ pub mod sql;
 
 pub use engine::{Cell, Engine, ExecResult, results_json};
 pub use error::SqlError;
-pub use sql::{ColumnRef, IndexColumn, Literal, SelectItems, Statement, TableRef, parse};
+pub use sql::{ColumnRef, IndexColumn, Literal, SelectItems, Statement, TableRef, TransactionAction, parameter_slots, parse};
 
 pub(crate) fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
