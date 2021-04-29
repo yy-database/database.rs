@@ -12,9 +12,13 @@
 
 #![deny(missing_docs)]
 
+pub mod connection;
 pub mod sql;
 
-pub use sql::{Cell, ColumnRef, Engine, ExecResult, IndexColumn, Literal, SelectItems, SqlError, Statement, TableRef, parse, results_json};
+pub use connection::{Connection, ConnectionOptions, Prepared};
+pub use sql::{
+    Cell, ColumnRef, Engine, ExecResult, IndexColumn, Literal, SelectItems, SqlError, Statement, TableRef, parameter_slots, parse, results_json,
+};
 
 pub use database_storage::sqlite::{
     Collation, ColumnSpec, DropIndexOutcome, SchemaObject, SchemaObjectKind, SqliteDatabase, SqliteWriter, TableLimits, TableRow, TextEncoding,
