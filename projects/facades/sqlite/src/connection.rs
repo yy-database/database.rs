@@ -111,7 +111,11 @@ pub struct Connection {
 
 impl Connection {
     /// 按选项打开连接:读已有文件、从字节镜像打开、创建新文件或纯内存。
+    ///
+    /// 新建的文件库在打开成功后立即落一份一致镜像,与 SQLite 创建即有文件的
+    /// 行为一致;缺失文件以 `not-found` 拒绝。
     pub fn open(options: ConnectionOptions) -> Result<Self, SqlError> {
+        let mut created = false;
         let writer = if let Some(pages) = &options.data {
             SqliteWriter::from_pages(pages.clone()).map_err(storage_error)?
         }
@@ -120,10 +124,11 @@ impl Connection {
                 SqliteWriter::open(path).map_err(storage_error)?
             }
             else if options.create && !options.read_only {
+                created = true;
                 SqliteWriter::create(options.page_size.unwrap_or(4096) as usize).map_err(storage_error)?
             }
             else {
-                return Err(SqlError::new("open", format!("database file `{}` does not exist", path.display())));
+                return Err(SqlError::new("not-found", format!("database file `{}` does not exist", path.display())));
             }
         }
         else {
@@ -131,7 +136,16 @@ impl Connection {
         };
         let mut engine = Engine::from_writer(writer)?;
         engine.set_synchronous(options.synchronous);
-        Ok(Self { engine, filename: options.filename, read_only: options.read_only, dirty: false })
+        let mut connection = Self { engine, filename: options.filename, read_only: options.read_only, dirty: false };
+        if created {
+            connection.publish()?;
+        }
+        Ok(connection)
+    }
+
+    /// 当前数据库镜像,可直接写成 `.sqlite3` 文件。
+    pub fn snapshot(&self) -> &[u8] {
+        self.engine.snapshot()
     }
 
     /// 解析一次 SQL,得到可反复执行的预编译语句。
@@ -269,6 +283,17 @@ impl Connection {
     }
 }
 
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Connection")
+            .field("filename", &self.filename)
+            .field("read_only", &self.read_only)
+            .field("dirty", &self.dirty)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +318,26 @@ mod tests {
             .expect("reopen file");
         let results = reader.execute(sql, &[]).expect("read committed image");
         results.last().expect("at least one result").rows.clone()
+    }
+
+    #[test]
+    fn opening_a_missing_file_creates_and_publishes_it() {
+        let path = temp_path("create");
+        assert!(!path.exists());
+        let mut connection = Connection::open(ConnectionOptions { filename: Some(path.clone()), ..Default::default() }).expect("create opens");
+        assert!(path.exists(), "a created file database carries its initial image");
+        connection.execute("CREATE TABLE t (a INTEGER)", &[]).expect("create publishes");
+        assert_eq!(rows_on_disk(&path, "SELECT a FROM t").len(), 0);
+        fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
+    }
+
+    #[test]
+    fn missing_file_without_create_is_not_found() {
+        let path = temp_path("missing");
+        let error = Connection::open(ConnectionOptions { filename: Some(path.join("absent.sqlite")), create: false, ..Default::default() })
+            .expect_err("file is absent");
+        assert_eq!(error.code, "not-found");
+        fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
     }
 
     #[test]
