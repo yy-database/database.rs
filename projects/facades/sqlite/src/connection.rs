@@ -148,6 +148,11 @@ impl Connection {
         self.engine.snapshot()
     }
 
+    /// 镜像头里的 format-3 库版本。
+    pub fn sqlite_version(&self) -> Result<String, SqlError> {
+        self.engine.sqlite_version()
+    }
+
     /// 解析一次 SQL,得到可反复执行的预编译语句。
     ///
     /// 恰好一条语句:空输入与多语句分别以 `empty-statement` 和
@@ -442,5 +447,11 @@ mod tests {
         connection.backup(&target).expect("backup");
         assert_eq!(rows_on_disk(&target, "SELECT a FROM t"), vec![vec![Cell::Integer(9)]]);
         fs::remove_dir_all(directory.parent().expect("parent directory")).expect("cleanup");
+    }
+
+    #[test]
+    fn sqlite_version_reports_the_format_three_library_stamp() {
+        let connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        assert_eq!(connection.sqlite_version().expect("header carries a version"), crate::ENGINE_LIBRARY_VERSION);
     }
 }
