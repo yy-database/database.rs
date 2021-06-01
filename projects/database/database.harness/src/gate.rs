@@ -1,47 +1,52 @@
-//! 门禁判定：套件计数汇总与 floor 判定。
+//! 门禁判定：消费执行状态、oracle 资格、证据完整性、基线变化与 floors，
+//! 逐项给出问题，不用单个 `ok` 掩盖未验证项。
 //!
-//! 本模块只做判定：接收调用方已经解析好的计数（TAP、pytest、unittest、
-//! `node:test` 的输出解析全部留在产品仓），给出 floor 达标与 skipped 即红
-//! 的判定。它不运行测试命令、不解析任何测试输出、不持有 floor 数值；
-//! floor 数值与各仓指标选择是产品仓配置。
+//! 本模块只做判定：接收调用方已经解析好的计数与证据（TAP、pytest、unittest、
+//! `node:test` 的输出解析全部留在产品仓），给出失败关闭的门禁结论。它不运行
+//! 测试命令、不解析任何测试输出、不持有 floor 数值；floor 数值与各仓指标选择
+//! 是产品仓配置，判定算法在此上游统一维护。
 //!
-//! 判定语义固化三处既有实现：SQLite `test.ts` 的
-//! `fail === 0 && skip === 0 && cases >= floor`、MongoDB
-//! `gate-test-count.mjs` 的 cases + assertions 双指标、yyds
-//! `assert-test-count.mjs` 的 passed floor。
+//! 失败关闭规则：执行状态至少区分 passed、failed、skipped、unavailable、
+//! unverified、timed_out、cancelled、crashed、not_run，各状态分别统计，禁止靠
+//! 重试膨胀覆盖量；必需 oracle 不可用、证据缺来源、基线陈旧/未登记/变化、必需
+//! suite 缺失、部分 suite 未执行（策略未放行时）一律记问题，任一问题即 `ok = false`。
 
 use serde::{Deserialize, Serialize};
 
-/// 一次运行的计数汇总。
+/// 单个 suite 的执行状态计数。
 ///
-/// `cases` 与 `assertions` 是不同指标，迁移时不得静默互换；各仓按自己的
-/// 口径填对应字段，未使用的指标留 0。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SuiteSummary {
-    /// 执行用例数。
+/// 各计数互不重叠：`cases` 是声明的用例总数，状态计数之和应等于 `cases`；
+/// `attempts` 是执行尝试数（重试会大于 `cases`，但通过量仍以 `passed` 计），
+/// `assertions` 是断言数。产品按自己的口径填，未用的状态留 0。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SuiteTally {
+    /// 声明的用例总数。
     pub cases: u64,
     /// 断言数。
     pub assertions: u64,
+    /// 执行尝试数；与 `cases` 分开统计，禁止靠重试膨胀覆盖量。
+    pub attempts: u64,
     /// 通过数。
     pub passed: u64,
-    /// 失败数。
+    /// 失败数（命令返回非零或断言不成立）。
     pub failed: u64,
     /// 跳过数。
     pub skipped: u64,
+    /// 未验证数：跑到了但没有可信对照（oracle 缺失时不得计通过）。
+    pub unverified: u64,
+    /// 不可用数：被测或依赖不可达。
+    pub unavailable: u64,
+    /// 超时数。
+    pub timed_out: u64,
+    /// 取消数。
+    pub cancelled: u64,
+    /// 崩溃数。
+    pub crashed: u64,
+    /// 未执行数：声明了 suite 但一条都没跑。
+    pub not_run: u64,
 }
 
-impl SuiteSummary {
-    /// 按指标取计数。
-    pub fn value(&self, metric: Metric) -> u64 {
-        match metric {
-            Metric::Cases => self.cases,
-            Metric::Assertions => self.assertions,
-            Metric::Passed => self.passed,
-        }
-    }
-}
-
-/// floor 使用的指标。
+/// floor 使用的指标。判别值 snake_case（R1 核心类型口径）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
@@ -62,29 +67,187 @@ pub struct Floor {
     pub min: u64,
 }
 
-/// 门禁问题。判别值 kebab-case，与台账问题词汇（`unlisted`、
-/// `signal-changed` 等）同一口径。
+impl SuiteTally {
+    /// 按指标取计数。
+    pub fn value(&self, metric: Metric) -> u64 {
+        match metric {
+            Metric::Cases => self.cases,
+            Metric::Assertions => self.assertions,
+            Metric::Passed => self.passed,
+        }
+    }
+}
+
+/// oracle 资格。
+///
+/// `required` 为真时，`available` 为假记 oracle 不可用，`provenance` 为空记
+/// 证据缺来源——两者都失败关闭，不得回退被测实现或上次结果计通过。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OracleQualification {
+    /// 本 suite 是否必须有真机 / 官方语料 / 冻结基线对照。
+    pub required: bool,
+    /// 对照是否实际可用。
+    pub available: bool,
+    /// 来源标识（引擎版本、语料 revision、采集证据引用）；`required` 且为空即证据缺失。
+    pub provenance: Option<String>,
+}
+
+impl OracleQualification {
+    /// 无对照需求的纯计数 suite。
+    pub fn not_required() -> Self {
+        Self { required: false, available: false, provenance: None }
+    }
+}
+
+/// 基线信号。判别值 snake_case；与台账问题词汇（`stale`、`unlisted`）同一口径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineSignal {
+    /// 本 suite 不依赖冻结基线。
+    None,
+    /// 与基线一致。
+    Matched,
+    /// 基线条目陈旧（被测已变化但台账未更新）。
+    Stale,
+    /// 出现未登记差异。
+    Unlisted,
+    /// 真实合同变化，需显式重采基线，不得用旧算法绕过。
+    Changed,
+}
+
+/// 一个 suite 进门禁所需的全部证据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuiteReport {
+    /// suite 稳定命名；`missing_suites` 比对与问题归属都靠它。
+    pub name: String,
+    /// 执行状态计数。
+    pub tally: SuiteTally,
+    /// 本 suite 的 floor 列表，按输入顺序比较。
+    pub floors: Vec<Floor>,
+    /// oracle 资格。
+    pub oracle: OracleQualification,
+    /// 基线信号。
+    pub baseline: BaselineSignal,
+}
+
+/// 门禁策略。缺省全部失败关闭。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatePolicy {
+    /// 是否允许部分 suite 未执行（`not_run > 0`）。缺省 false。
+    pub allow_partial: bool,
+    /// 是否允许跳过用例。缺省 false。
+    pub allow_skipped: bool,
+    /// 必须出现的 suite 名单；缺失即记 `missing-suite`。
+    pub required_suites: Vec<String>,
+}
+
+impl Default for GatePolicy {
+    fn default() -> Self {
+        Self { allow_partial: false, allow_skipped: false, required_suites: Vec::new() }
+    }
+}
+
+/// 门禁问题。判别值 kebab-case，与台账问题词汇（`unlisted`、`signal-changed` 等）
+/// 同一口径（R7 影子迁移期逐字节对齐，故此处用 kebab-case）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum GateProblem {
-    /// 存在跳过用例；skipped 即红，不计通过。
-    Skipped {
-        /// 跳过数量。
-        count: u64,
-    },
     /// 存在失败用例。
     Failed {
+        /// 归属 suite。
+        suite: String,
         /// 失败数量。
         count: u64,
     },
+    /// 存在跳过用例（策略未放行时）。
+    Skipped {
+        /// 归属 suite。
+        suite: String,
+        /// 跳过数量。
+        count: u64,
+    },
+    /// 存在未验证用例（跑到了但无可信对照）。
+    Unverified {
+        /// 归属 suite。
+        suite: String,
+        /// 未验证数量。
+        count: u64,
+    },
+    /// 存在不可用用例。
+    Unavailable {
+        /// 归属 suite。
+        suite: String,
+        /// 不可用数量。
+        count: u64,
+    },
+    /// 存在超时用例。
+    TimedOut {
+        /// 归属 suite。
+        suite: String,
+        /// 超时数量。
+        count: u64,
+    },
+    /// 存在取消用例。
+    Cancelled {
+        /// 归属 suite。
+        suite: String,
+        /// 取消数量。
+        count: u64,
+    },
+    /// 存在崩溃用例。
+    Crashed {
+        /// 归属 suite。
+        suite: String,
+        /// 崩溃数量。
+        count: u64,
+    },
+    /// 存在未执行用例（策略未放行部分执行时）。
+    NotRun {
+        /// 归属 suite。
+        suite: String,
+        /// 未执行数量。
+        count: u64,
+    },
+    /// 必需 oracle 不可用。
+    OracleUnavailable {
+        /// 归属 suite。
+        suite: String,
+    },
+    /// 必需 oracle 缺来源标识，证据不完整。
+    MissingEvidence {
+        /// 归属 suite。
+        suite: String,
+    },
+    /// 基线条目陈旧。
+    BaselineStale {
+        /// 归属 suite。
+        suite: String,
+    },
+    /// 出现未登记差异。
+    BaselineUnlisted {
+        /// 归属 suite。
+        suite: String,
+    },
+    /// 真实合同变化，需显式重采基线。
+    BaselineChanged {
+        /// 归属 suite。
+        suite: String,
+    },
     /// 某指标低于 floor。
     FloorUnmet {
+        /// 归属 suite。
+        suite: String,
         /// 比较的指标。
         metric: Metric,
         /// 声明的最小值。
         min: u64,
         /// 实际计数。
         actual: u64,
+    },
+    /// 策略要求的 suite 未出现。
+    MissingSuite {
+        /// 缺失的 suite 名。
+        suite: String,
     },
 }
 
@@ -93,24 +256,64 @@ pub enum GateProblem {
 pub struct GateVerdict {
     /// 无任何问题才算通过。
     pub ok: bool,
-    /// 问题列表，顺序固定为 skipped、failed、然后按 floors 输入顺序。
+    /// 问题列表：先按 suite 输入顺序，suite 内固定为 failed、skipped、unverified、
+    /// unavailable、timed_out、cancelled、crashed、not_run、oracle-unavailable、
+    /// missing-evidence、baseline-*、然后按 floors 输入顺序；末尾追加 missing-suite。
     pub problems: Vec<GateProblem>,
 }
 
-/// 按固定规则判定一次运行：`skipped > 0` 记 `skipped`，`failed > 0`
-/// 记 `failed`，每条 floor 按对应指标比较，`value < min` 记 `floor-unmet`。
-pub fn verdict(summary: &SuiteSummary, floors: &[Floor]) -> GateVerdict {
+/// 按失败关闭规则判定一组 suite。
+pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
     let mut problems = Vec::new();
-    if summary.skipped > 0 {
-        problems.push(GateProblem::Skipped { count: summary.skipped });
+    for suite in suites {
+        let name = suite.name.clone();
+        let tally = &suite.tally;
+        if tally.failed > 0 {
+            problems.push(GateProblem::Failed { suite: name.clone(), count: tally.failed });
+        }
+        if tally.skipped > 0 && !policy.allow_skipped {
+            problems.push(GateProblem::Skipped { suite: name.clone(), count: tally.skipped });
+        }
+        if tally.unverified > 0 {
+            problems.push(GateProblem::Unverified { suite: name.clone(), count: tally.unverified });
+        }
+        if tally.unavailable > 0 {
+            problems.push(GateProblem::Unavailable { suite: name.clone(), count: tally.unavailable });
+        }
+        if tally.timed_out > 0 {
+            problems.push(GateProblem::TimedOut { suite: name.clone(), count: tally.timed_out });
+        }
+        if tally.cancelled > 0 {
+            problems.push(GateProblem::Cancelled { suite: name.clone(), count: tally.cancelled });
+        }
+        if tally.crashed > 0 {
+            problems.push(GateProblem::Crashed { suite: name.clone(), count: tally.crashed });
+        }
+        if tally.not_run > 0 && !policy.allow_partial {
+            problems.push(GateProblem::NotRun { suite: name.clone(), count: tally.not_run });
+        }
+        if suite.oracle.required && !suite.oracle.available {
+            problems.push(GateProblem::OracleUnavailable { suite: name.clone() });
+        }
+        if suite.oracle.required && suite.oracle.provenance.as_deref().unwrap_or("").is_empty() {
+            problems.push(GateProblem::MissingEvidence { suite: name.clone() });
+        }
+        match suite.baseline {
+            BaselineSignal::Stale => problems.push(GateProblem::BaselineStale { suite: name.clone() }),
+            BaselineSignal::Unlisted => problems.push(GateProblem::BaselineUnlisted { suite: name.clone() }),
+            BaselineSignal::Changed => problems.push(GateProblem::BaselineChanged { suite: name.clone() }),
+            BaselineSignal::None | BaselineSignal::Matched => {}
+        }
+        for floor in &suite.floors {
+            let actual = tally.value(floor.metric);
+            if actual < floor.min {
+                problems.push(GateProblem::FloorUnmet { suite: name.clone(), metric: floor.metric, min: floor.min, actual });
+            }
+        }
     }
-    if summary.failed > 0 {
-        problems.push(GateProblem::Failed { count: summary.failed });
-    }
-    for floor in floors {
-        let actual = summary.value(floor.metric);
-        if actual < floor.min {
-            problems.push(GateProblem::FloorUnmet { metric: floor.metric, min: floor.min, actual });
+    for required in &policy.required_suites {
+        if !suites.iter().any(|suite| &suite.name == required) {
+            problems.push(GateProblem::MissingSuite { suite: required.clone() });
         }
     }
     GateVerdict { ok: problems.is_empty(), problems }
@@ -120,74 +323,128 @@ pub fn verdict(summary: &SuiteSummary, floors: &[Floor]) -> GateVerdict {
 mod tests {
     use super::*;
 
-    fn summary(cases: u64, assertions: u64, passed: u64, failed: u64, skipped: u64) -> SuiteSummary {
-        SuiteSummary { cases, assertions, passed, failed, skipped }
+    fn tally(cases: u64, assertions: u64, passed: u64, failed: u64, skipped: u64) -> SuiteTally {
+        SuiteTally { cases, assertions, attempts: cases, passed, failed, skipped, ..SuiteTally::default() }
     }
 
     fn floor(metric: Metric, min: u64) -> Floor {
         Floor { metric, min }
     }
 
+    fn suite(name: &str, t: SuiteTally, floors: Vec<Floor>) -> SuiteReport {
+        SuiteReport { name: name.to_string(), tally: t, floors, oracle: OracleQualification::not_required(), baseline: BaselineSignal::None }
+    }
+
     #[test]
     fn clean_run_passes() {
-        let verdict = verdict(&summary(100, 0, 100, 0, 0), &[floor(Metric::Cases, 90)]);
+        let verdict = evaluate(&[suite("sql", tally(100, 0, 100, 0, 0), vec![floor(Metric::Cases, 90)])], &GatePolicy::default());
         assert!(verdict.ok);
         assert!(verdict.problems.is_empty());
     }
 
     #[test]
-    fn skipped_is_red() {
-        let verdict = verdict(&summary(100, 0, 99, 0, 1), &[floor(Metric::Cases, 90)]);
-        assert!(!verdict.ok);
-        assert_eq!(verdict.problems, vec![GateProblem::Skipped { count: 1 }]);
+    fn skipped_is_red_unless_allowed() {
+        let blocked = evaluate(&[suite("sql", tally(100, 0, 99, 0, 1), vec![floor(Metric::Cases, 90)])], &GatePolicy::default());
+        assert_eq!(blocked.problems, vec![GateProblem::Skipped { suite: "sql".into(), count: 1 }]);
+        let allowed = evaluate(
+            &[suite("sql", tally(100, 0, 99, 0, 1), vec![floor(Metric::Cases, 90)])],
+            &GatePolicy { allow_skipped: true, ..GatePolicy::default() },
+        );
+        assert!(allowed.ok);
     }
 
     #[test]
-    fn failed_is_red() {
-        let verdict = verdict(&summary(100, 0, 98, 2, 0), &[]);
-        assert!(!verdict.ok);
-        assert_eq!(verdict.problems, vec![GateProblem::Failed { count: 2 }]);
+    fn unverified_and_unavailable_are_red() {
+        let t = SuiteTally {
+            cases: 10,
+            assertions: 0,
+            attempts: 10,
+            passed: 6,
+            failed: 0,
+            skipped: 0,
+            unverified: 2,
+            unavailable: 1,
+            ..SuiteTally::default()
+        };
+        let verdict = evaluate(&[suite("ext", t, vec![])], &GatePolicy::default());
+        assert_eq!(
+            verdict.problems,
+            vec![GateProblem::Unverified { suite: "ext".into(), count: 2 }, GateProblem::Unavailable { suite: "ext".into(), count: 1 },]
+        );
     }
 
     #[test]
-    fn floors_report_in_input_order() {
-        // MongoDB 双指标口径：assertions 与 cases 同时比较，两条 floor 都未达标。
-        let verdict = verdict(&summary(10, 20, 10, 0, 0), &[floor(Metric::Assertions, 30), floor(Metric::Cases, 15)]);
-        assert!(!verdict.ok);
-        assert_eq!(verdict.problems.len(), 2);
-        assert_eq!(verdict.problems[0], GateProblem::FloorUnmet { metric: Metric::Assertions, min: 30, actual: 20 });
-        assert_eq!(verdict.problems[1], GateProblem::FloorUnmet { metric: Metric::Cases, min: 15, actual: 10 });
+    fn required_oracle_unavailable_and_missing_evidence_fail_closed() {
+        let s = SuiteReport {
+            name: "ext".into(),
+            tally: tally(10, 0, 10, 0, 0),
+            floors: vec![],
+            oracle: OracleQualification { required: true, available: false, provenance: None },
+            baseline: BaselineSignal::None,
+        };
+        let verdict = evaluate(&[s], &GatePolicy::default());
+        assert_eq!(
+            verdict.problems,
+            vec![GateProblem::OracleUnavailable { suite: "ext".into() }, GateProblem::MissingEvidence { suite: "ext".into() },]
+        );
     }
 
     #[test]
-    fn passed_metric_floor_matches_yyds_semantics() {
-        // yyds 口径：按 passed 计数比较 floor。
-        let first = verdict(&summary(84, 0, 80, 4, 0), &[floor(Metric::Passed, 80)]);
-        assert!(!first.ok);
-        assert_eq!(first.problems[0], GateProblem::Failed { count: 4 });
-        let second = verdict(&summary(84, 0, 80, 0, 0), &[floor(Metric::Passed, 81)]);
-        assert_eq!(second.problems, vec![GateProblem::FloorUnmet { metric: Metric::Passed, min: 81, actual: 80 }]);
-    }
-
-    #[test]
-    fn verdict_matches_sqlite_layer_rule() {
-        // SQLite 层规则 golden：ok 当且仅当 failed == 0 && skipped == 0 && cases >= floor。
-        for (cases, failed, skipped) in [(1660u64, 0u64, 0u64), (1659, 0, 0), (1660, 1, 0), (1660, 0, 1), (0, 0, 0)] {
-            let expected_ok = failed == 0 && skipped == 0 && cases >= 1660;
-            let verdict = verdict(&summary(cases, 0, cases - failed - skipped, failed, skipped), &[floor(Metric::Cases, 1660)]);
-            assert_eq!(verdict.ok, expected_ok, "cases {cases} failed {failed} skipped {skipped}");
+    fn baseline_signals_are_problems() {
+        for (signal, expected) in [
+            (BaselineSignal::Stale, GateProblem::BaselineStale { suite: "s".into() }),
+            (BaselineSignal::Unlisted, GateProblem::BaselineUnlisted { suite: "s".into() }),
+            (BaselineSignal::Changed, GateProblem::BaselineChanged { suite: "s".into() }),
+        ] {
+            let mut s = suite("s", tally(5, 0, 5, 0, 0), vec![]);
+            s.baseline = signal;
+            let verdict = evaluate(&[s], &GatePolicy::default());
+            assert_eq!(verdict.problems, vec![expected]);
         }
     }
 
     #[test]
+    fn floors_report_in_input_order_per_suite() {
+        let verdict = evaluate(
+            &[suite("m", tally(10, 20, 10, 0, 0), vec![floor(Metric::Assertions, 30), floor(Metric::Cases, 15)])],
+            &GatePolicy::default(),
+        );
+        assert_eq!(
+            verdict.problems,
+            vec![
+                GateProblem::FloorUnmet { suite: "m".into(), metric: Metric::Assertions, min: 30, actual: 20 },
+                GateProblem::FloorUnmet { suite: "m".into(), metric: Metric::Cases, min: 15, actual: 10 },
+            ]
+        );
+    }
+
+    #[test]
+    fn not_run_red_unless_partial_allowed() {
+        let t = SuiteTally { cases: 0, not_run: 50, ..SuiteTally::default() };
+        let blocked = evaluate(&[suite("p", t, vec![floor(Metric::Cases, 1)])], &GatePolicy::default());
+        assert!(blocked.problems.iter().any(|problem| matches!(problem, GateProblem::NotRun { .. })));
+        let allowed = evaluate(&[suite("p", t, vec![])], &GatePolicy { allow_partial: true, ..GatePolicy::default() });
+        assert!(allowed.ok);
+    }
+
+    #[test]
+    fn missing_required_suite_is_red() {
+        let verdict = evaluate(
+            &[suite("present", tally(5, 0, 5, 0, 0), vec![])],
+            &GatePolicy { required_suites: vec!["present".into(), "absent".into()], ..GatePolicy::default() },
+        );
+        assert_eq!(verdict.problems, vec![GateProblem::MissingSuite { suite: "absent".into() }]);
+    }
+
+    #[test]
     fn serde_shape_is_kebab_kind_and_snake_metric() {
-        let verdict = verdict(&summary(5, 0, 5, 0, 0), &[floor(Metric::Cases, 10)]);
+        let verdict = evaluate(&[suite("s", tally(5, 0, 5, 0, 0), vec![floor(Metric::Cases, 10)])], &GatePolicy::default());
         let json = serde_json::to_string(&verdict).unwrap();
         assert!(json.contains("\"kind\":\"floor-unmet\""), "{json}");
         assert!(json.contains("\"metric\":\"cases\""), "{json}");
-        let problem: GateProblem = serde_json::from_str("{\"kind\":\"skipped\",\"count\":2}").unwrap();
-        assert_eq!(problem, GateProblem::Skipped { count: 2 });
-        let summary: SuiteSummary = serde_json::from_str("{\"cases\":1,\"assertions\":2,\"passed\":3,\"failed\":4,\"skipped\":5}").unwrap();
-        assert_eq!(summary.value(Metric::Assertions), 2);
+        let problem: GateProblem = serde_json::from_str("{\"kind\":\"oracle-unavailable\",\"suite\":\"s\"}").unwrap();
+        assert_eq!(problem, GateProblem::OracleUnavailable { suite: "s".into() });
+        let signal: BaselineSignal = serde_json::from_str("\"unlisted\"").unwrap();
+        assert_eq!(signal, BaselineSignal::Unlisted);
     }
 }

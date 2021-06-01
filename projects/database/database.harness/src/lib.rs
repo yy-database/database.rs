@@ -28,15 +28,15 @@ pub mod chart;
 
 pub use bench::{BenchPlan, BenchRow, DeltaRegistry, IntentionalDelta, Stats, per_op_ms, summarize};
 pub use compare::{CompareMode, Comparison, Diff, DifferenceClass, classify, compare};
-pub use fuzz::{
-    FuzzInput, FuzzPlan, Grammar, Rule, ShrinkMove, ShrinkMoveKind, ShrinkSession, SlotPool, SplitMix64, Symbol, TraceEntry, generate, render,
-    shrink, shrink_next, shrink_report, shrink_start,
-};
 pub use corpus::{
     Baseline, BaselineIdentity, BaselineProblem, BaselineVerdict, CorpusSpec, DifferenceObservation, Digest, KnownDifference, check_baseline,
     check_identity,
 };
-pub use gate::{Floor, GateProblem, GateVerdict, Metric, SuiteSummary, verdict};
+pub use fuzz::{
+    FuzzInput, FuzzPlan, Grammar, Rule, ShrinkMove, ShrinkMoveKind, ShrinkSession, SlotPool, SplitMix64, Symbol, TraceEntry, generate, render,
+    shrink, shrink_next, shrink_report, shrink_start,
+};
+pub use gate::{BaselineSignal, Floor, GatePolicy, GateProblem, GateVerdict, Metric, OracleQualification, SuiteReport, SuiteTally, evaluate};
 pub use observe::{Cell, ErrorShape, Observed, ObservedBody, TruthProvenance};
 pub use report::{CorpusReport, REPORT_VERSION, ReportEnvelope, render_json};
 
