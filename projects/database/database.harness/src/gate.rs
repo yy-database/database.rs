@@ -8,16 +8,19 @@
 //!
 //! 失败关闭规则：执行状态至少区分 passed、failed、skipped、unavailable、
 //! unverified、timed_out、cancelled、crashed、not_run，各状态分别统计，禁止靠
-//! 重试膨胀覆盖量；必需 oracle 不可用、证据缺来源、基线陈旧/未登记/变化、必需
+//! 重试膨胀覆盖量；状态计数之和与声明的 `cases` 不一致（用例下落不明或被重复
+//! 计入）记 `tally-inconsistent`；必需 oracle 不可用、证据缺来源、基线陈旧/未登记/变化、必需
 //! suite 缺失、部分 suite 未执行（策略未放行时）一律记问题，任一问题即 `ok = false`。
 
 use serde::{Deserialize, Serialize};
 
 /// 单个 suite 的执行状态计数。
 ///
-/// 各计数互不重叠：`cases` 是声明的用例总数，状态计数之和应等于 `cases`；
-/// `attempts` 是执行尝试数（重试会大于 `cases`，但通过量仍以 `passed` 计），
-/// `assertions` 是断言数。产品按自己的口径填，未用的状态留 0。
+/// 各计数互不重叠：`cases` 是声明的用例总数，状态计数之和必须等于 `cases`，
+/// 不一致即 `tally-inconsistent` 并失败关闭——用例下落不明或被重复计入时，
+/// 其余计数不可信，不得凭 floor 达标判通过；`attempts` 是执行尝试数（重试会
+/// 大于 `cases`，但通过量仍以 `passed` 计），`assertions` 是断言数。产品按
+/// 自己的口径填，未用的状态留 0。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SuiteTally {
     /// 声明的用例总数。
@@ -152,6 +155,16 @@ impl Default for GatePolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum GateProblem {
+    /// 状态计数之和与声明的 `cases` 不一致：用例下落不明（和偏小）或被重复
+    /// 计入（和偏大），报告本身不可信。
+    TallyInconsistent {
+        /// 归属 suite。
+        suite: String,
+        /// 声明的用例总数。
+        cases: u64,
+        /// 状态计数实际总和。
+        counted: u64,
+    },
     /// 存在失败用例。
     Failed {
         /// 归属 suite。
@@ -256,9 +269,10 @@ pub enum GateProblem {
 pub struct GateVerdict {
     /// 无任何问题才算通过。
     pub ok: bool,
-    /// 问题列表：先按 suite 输入顺序，suite 内固定为 failed、skipped、unverified、
-    /// unavailable、timed_out、cancelled、crashed、not_run、oracle-unavailable、
-    /// missing-evidence、baseline-*、然后按 floors 输入顺序；末尾追加 missing-suite。
+    /// 问题列表：先按 suite 输入顺序，suite 内固定为 tally-inconsistent、failed、
+    /// skipped、unverified、unavailable、timed_out、cancelled、crashed、not_run、
+    /// oracle-unavailable、missing-evidence、baseline-*、然后按 floors 输入顺序；
+    /// 末尾追加 missing-suite。
     pub problems: Vec<GateProblem>,
 }
 
@@ -268,6 +282,19 @@ pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
     for suite in suites {
         let name = suite.name.clone();
         let tally = &suite.tally;
+        let counted = tally
+            .passed
+            .saturating_add(tally.failed)
+            .saturating_add(tally.skipped)
+            .saturating_add(tally.unverified)
+            .saturating_add(tally.unavailable)
+            .saturating_add(tally.timed_out)
+            .saturating_add(tally.cancelled)
+            .saturating_add(tally.crashed)
+            .saturating_add(tally.not_run);
+        if counted != tally.cases {
+            problems.push(GateProblem::TallyInconsistent { suite: name.clone(), cases: tally.cases, counted });
+        }
         if tally.failed > 0 {
             problems.push(GateProblem::Failed { suite: name.clone(), count: tally.failed });
         }
@@ -359,7 +386,7 @@ mod tests {
             cases: 10,
             assertions: 0,
             attempts: 10,
-            passed: 6,
+            passed: 7,
             failed: 0,
             skipped: 0,
             unverified: 2,
@@ -420,7 +447,7 @@ mod tests {
 
     #[test]
     fn not_run_red_unless_partial_allowed() {
-        let t = SuiteTally { cases: 0, not_run: 50, ..SuiteTally::default() };
+        let t = SuiteTally { cases: 50, not_run: 50, ..SuiteTally::default() };
         let blocked = evaluate(&[suite("p", t, vec![floor(Metric::Cases, 1)])], &GatePolicy::default());
         assert!(blocked.problems.iter().any(|problem| matches!(problem, GateProblem::NotRun { .. })));
         let allowed = evaluate(&[suite("p", t, vec![])], &GatePolicy { allow_partial: true, ..GatePolicy::default() });
@@ -434,6 +461,57 @@ mod tests {
             &GatePolicy { required_suites: vec!["present".into(), "absent".into()], ..GatePolicy::default() },
         );
         assert_eq!(verdict.problems, vec![GateProblem::MissingSuite { suite: "absent".into() }]);
+    }
+
+    #[test]
+    fn undercounted_cases_fail_closed() {
+        // 声明 100 例，状态计数只覆盖 90 例：10 例下落不明。floor 只看 `cases`
+        // 声明值，旧实现在此判 `ok = true`，属失败打开。
+        let t = SuiteTally { cases: 100, assertions: 0, attempts: 100, passed: 90, ..SuiteTally::default() };
+        let verdict = evaluate(&[suite("leak", t, vec![floor(Metric::Cases, 90)])], &GatePolicy::default());
+        assert!(!verdict.ok, "cases 与状态计数不一致必须失败关闭");
+        assert_eq!(verdict.problems, vec![GateProblem::TallyInconsistent { suite: "leak".into(), cases: 100, counted: 90 }]);
+    }
+
+    #[test]
+    fn overcounted_cases_fail_closed() {
+        // 状态计数之和（13）大于声明的 `cases`（10）：同一用例被重复计入。
+        let t = SuiteTally { cases: 10, assertions: 0, attempts: 10, passed: 10, unverified: 3, ..SuiteTally::default() };
+        let verdict = evaluate(&[suite("dup", t, vec![])], &GatePolicy::default());
+        assert!(!verdict.ok);
+        assert_eq!(
+            verdict.problems,
+            vec![
+                GateProblem::TallyInconsistent { suite: "dup".into(), cases: 10, counted: 13 },
+                GateProblem::Unverified { suite: "dup".into(), count: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn tally_consistency_golden_order_and_serde() {
+        // golden：多 suite 混合问题，钉死 `tally-inconsistent` 在 suite 内最前、
+        // 整体顺序与 kebab-case 判别值形态。
+        let ok_tally = SuiteTally { cases: 2, assertions: 0, attempts: 2, passed: 2, ..SuiteTally::default() };
+        let bad_tally = SuiteTally { cases: 4, assertions: 0, attempts: 4, passed: 3, failed: 2, ..SuiteTally::default() };
+        let verdict = evaluate(
+            &[suite("a", ok_tally, vec![]), suite("b", bad_tally, vec![floor(Metric::Passed, 4)])],
+            &GatePolicy { required_suites: vec!["a".into(), "c".into()], ..GatePolicy::default() },
+        );
+        assert!(!verdict.ok);
+        assert_eq!(
+            verdict.problems,
+            vec![
+                GateProblem::TallyInconsistent { suite: "b".into(), cases: 4, counted: 5 },
+                GateProblem::Failed { suite: "b".into(), count: 2 },
+                GateProblem::FloorUnmet { suite: "b".into(), metric: Metric::Passed, min: 4, actual: 3 },
+                GateProblem::MissingSuite { suite: "c".into() },
+            ]
+        );
+        let json = serde_json::to_string(&verdict.problems[0]).unwrap();
+        assert!(json.contains("\"kind\":\"tally-inconsistent\""), "{json}");
+        let problem: GateProblem = serde_json::from_str("{\"kind\":\"tally-inconsistent\",\"suite\":\"b\",\"cases\":4,\"counted\":5}").unwrap();
+        assert_eq!(problem, GateProblem::TallyInconsistent { suite: "b".into(), cases: 4, counted: 5 });
     }
 
     #[test]
