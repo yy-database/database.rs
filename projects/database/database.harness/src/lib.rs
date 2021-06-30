@@ -26,7 +26,7 @@ pub mod report;
 #[cfg(feature = "charts")]
 pub mod chart;
 
-pub use bench::{BenchPlan, BenchRow, DeltaRegistry, IntentionalDelta, Stats, per_op_ms, summarize};
+pub use bench::{BenchPlan, BenchProvenance, BenchReport, BenchRow, DeltaRegistry, IntentionalDelta, Stats, per_op_ms, summarize};
 pub use compare::{CompareMode, Comparison, Diff, DifferenceClass, classify, compare};
 pub use corpus::{
     Baseline, BaselineIdentity, BaselineProblem, BaselineVerdict, CorpusSpec, DifferenceObservation, Digest, KnownDifference, check_baseline,

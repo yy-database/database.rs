@@ -1,12 +1,19 @@
 //! 基准统计与报告行。
 //!
-//! 只做数学：轮次计划、median/p95/极值、按操作数归一与 intentional-delta
-//! 台账。它不运行 workload、不选择对照组、不定义被测操作——那些留在各产品
-//! 仓的 bench 脚本里。
+//! 只做数学：轮次计划、median/p95/极值、按操作数归一、intentional-delta
+//! 台账，以及跨运行对比所需的最小 provenance（工具链、目标三元组、数据规模、
+//! 场景参数、轮数口径）。它不运行 workload、不选择对照组、不定义被测操作，
+//! 也不探测宿主环境——provenance 的取值由产品仓的 bench 脚本采集后填入。
 //!
 //! p95 固化为 nearest-rank：`sorted[min(len-1, ceil(len*0.95)-1)]`，与
 //! SQLite / yydb 既有 TS 实现逐字节一致；median 在偶数长度取中间两值平均。
 //! 两条公式都有 golden vector 钉死，改动口径必须单独提交并说明理由。
+//!
+//! provenance 的线格式是 additive 的：全部字段 `serde(default)` 且缺省不
+//! 序列化，旧 JSON 照旧可解，既有 N-API JSON 直通绑定（`harnessBenchSummary` /
+//! `harnessBenchPerOp` 及其 `Stats` DTO）不需要任何改动。
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +24,78 @@ pub struct BenchPlan {
     pub rounds: u32,
     /// 预热轮数，允许 0。
     pub warmup: u32,
+}
+
+/// 一次基准运行的 provenance：跨运行对比所需的最小信息。
+///
+/// 全部字段可选，缺省不序列化、缺失按默认值反序列化，线格式 additive。
+/// 本 crate 不采集也不校验这些值：版本号拼写、三元组格式由调用方（产品仓
+/// bench 脚本）负责，这里只冻结字段名与合并语义。空 provenance 与未记录
+/// （`None`）在线上等价，调用方应优先用 [`BenchProvenance::is_empty`] 判断
+/// 后整体省略。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BenchProvenance {
+    /// 场景标识，例如 `redis-point-get`。同一场景矩阵格在不同运行里必须
+    /// 取同一值，它是跨运行对比的连接键；与 [`BenchRow::workload`] 的关系
+    /// 是「场景 → 该场景内的 workload」。
+    pub scenario: Option<String>,
+    /// 场景参数，稳定键值对。`BTreeMap` 保证序列化顺序确定，同一组参数
+    /// 序列化出的字节逐字节一致。参数值不同即视为不同场景实例，对比侧
+    /// 不得把它们合并；键名由场景矩阵定义方冻结。
+    pub scenario_params: BTreeMap<String, String>,
+    /// 数据规模描述，例如 `keys=10000,value_bytes=1024`。单位拼写在值里，
+    /// 本 crate 不解析；缺失时该行不可与带规模的另一运行直接对比。
+    pub data_scale: Option<String>,
+    /// Rust 工具链版本（`rustc --version` 原文），区分原生绑定的代码生成。
+    pub rustc_version: Option<String>,
+    /// JS 运行时版本（`node --version` 原文），区分验收层的宿主。纯 Rust
+    /// workload 没有宿主时省略。
+    pub node_version: Option<String>,
+    /// 目标三元组，例如 `x86_64-pc-windows-msvc`。解释执行或 wasm 宿主
+    /// 可能没有原生三元组，允许省略。
+    pub target_triple: Option<String>,
+    /// 源码修订（git rev），用于把一行数字钉回产生它的产物。短哈希与完整
+    /// 40 位十六进制都允许，但跨运行对比前必须归一。
+    pub rev: Option<String>,
+    /// 轮数口径：本次运行实际使用的测量轮数与预热轮数。[`Stats::rounds`]
+    /// 是进入统计的样本数，两者不一致说明报告自相矛盾，对比侧应视为异常。
+    pub plan: Option<BenchPlan>,
+}
+
+impl BenchProvenance {
+    /// 是否所有字段都未记录。为空时序列化结果只剩 `{}`，调用方应改传
+    /// `None` 让整个字段从线上消失。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.scenario.is_none()
+            && self.scenario_params.is_empty()
+            && self.data_scale.is_none()
+            && self.rustc_version.is_none()
+            && self.node_version.is_none()
+            && self.target_triple.is_none()
+            && self.rev.is_none()
+            && self.plan.is_none()
+    }
+
+    /// 逐字段补全：`self` 已有的值保持，未记录的字段取 `fallback` 的；
+    /// `scenario_params` 按键合并，同名键以 `self` 为准。用于行级
+    /// provenance 覆盖运行级 provenance。
+    #[must_use]
+    pub fn filled_with(&self, fallback: &Self) -> Self {
+        let mut scenario_params = fallback.scenario_params.clone();
+        scenario_params.extend(self.scenario_params.clone());
+        Self {
+            scenario: self.scenario.clone().or_else(|| fallback.scenario.clone()),
+            scenario_params,
+            data_scale: self.data_scale.clone().or_else(|| fallback.data_scale.clone()),
+            rustc_version: self.rustc_version.clone().or_else(|| fallback.rustc_version.clone()),
+            node_version: self.node_version.clone().or_else(|| fallback.node_version.clone()),
+            target_triple: self.target_triple.clone().or_else(|| fallback.target_triple.clone()),
+            rev: self.rev.clone().or_else(|| fallback.rev.clone()),
+            plan: self.plan.or(fallback.plan),
+        }
+    }
 }
 
 /// 一组样本的统计结果。
@@ -78,6 +157,44 @@ pub struct BenchRow {
     pub reference: Option<Stats>,
     /// 对照引擎名，例如 `better-sqlite3`。
     pub reference_engine: Option<String>,
+    /// 本行测量的 provenance。`None` 表示继承 [`BenchReport`] 的运行级
+    /// provenance；行级字段逐字段覆盖运行级（见 [`BenchReport::row_provenance`]），
+    /// 用于同一报告里个别行换了数据规模或参数的情况。缺省不序列化，
+    /// 旧 JSON 无此字段照旧可解。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<BenchProvenance>,
+}
+
+/// 一次基准运行的汇总输出：报告行加运行级 provenance。
+///
+/// 这是跨运行对比的顶层信封：`provenance` 记录一次运行的工具链、目标三元组、
+/// 轮数口径等共享事实，行级 [`BenchRow::provenance`] 只登记与运行级不同的
+/// 字段。序列化 additive：旧读取方忽略新增字段即可，新读取方可以解析没有
+/// `provenance` 的旧文档；`{}` 与只有 `rows` 的文档都能解出空 provenance。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BenchReport {
+    /// 运行级 provenance，适用于所有行。`None` 或空 provenance 表示未记录。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<BenchProvenance>,
+    /// 报告行，每个 workload 一行；同一报告内 `workload` 唯一。
+    pub rows: Vec<BenchRow>,
+}
+
+impl BenchReport {
+    /// 某一行生效的 provenance：行级已有的字段保持，未记录的字段取运行级
+    /// 补全。两侧都没有时返回空 provenance（[`BenchProvenance::is_empty`]
+    /// 为真），调用方据此决定省略还是报警。
+    ///
+    /// 只读取传入的 `row`，不校验它是否属于 [`BenchReport::rows`]。
+    #[must_use]
+    pub fn row_provenance(&self, row: &BenchRow) -> BenchProvenance {
+        match (&self.provenance, &row.provenance) {
+            (None, None) => BenchProvenance::default(),
+            (None, Some(own)) | (Some(own), None) => own.clone(),
+            (Some(base), Some(own)) => own.filled_with(base),
+        }
+    }
 }
 
 /// 一条 intentional delta：某个 workload 有意不配对照组或口径不同。
@@ -173,9 +290,112 @@ mod tests {
 
     #[test]
     fn delta_registry_explains_reference_free_rows() {
-        let row = BenchRow { workload: "point-pk".into(), unit: "ms".into(), ours: summarize(&[1.0]), reference: None, reference_engine: None };
+        let row = BenchRow { workload: "point-pk".into(), unit: "ms".into(), ours: summarize(&[1.0]), reference: None, reference_engine: None, provenance: None };
         let registry = DeltaRegistry::new(vec![IntentionalDelta { workload: "point-pk".into(), reason: "no comparable index path".into() }]);
         assert!(registry.explains(&row));
         assert!(!registry.explains(&BenchRow { workload: "scan".into(), ..row }));
+    }
+
+    /// 构造一份填满全部字段的 provenance，供线格式测试复用。
+    fn full_provenance() -> BenchProvenance {
+        let mut params = BTreeMap::new();
+        params.insert("batch".to_owned(), "500".to_owned());
+        params.insert("value_bytes".to_owned(), "1024".to_owned());
+        BenchProvenance {
+            scenario: Some("redis-pipeline-set".to_owned()),
+            scenario_params: params,
+            data_scale: Some("keys=500".to_owned()),
+            rustc_version: Some("rustc 1.99.1 (58cf8f9c3)".to_owned()),
+            node_version: Some("v22.11.0".to_owned()),
+            target_triple: Some("x86_64-pc-windows-msvc".to_owned()),
+            rev: Some("269d874".to_owned()),
+            plan: Some(BenchPlan { rounds: 5, warmup: 1 }),
+        }
+    }
+
+    #[test]
+    fn provenance_stays_off_the_wire_when_unset() {
+        let row = BenchRow { workload: "get-seq".into(), unit: "ms".into(), ours: summarize(&[1.0]), reference: None, reference_engine: None, provenance: None };
+        let row_json = serde_json::to_string(&row).expect("row serializes");
+        assert!(!row_json.contains("provenance"), "unset row provenance must not appear on the wire: {row_json}");
+
+        let report = BenchReport { provenance: None, rows: vec![row] };
+        let report_json = serde_json::to_string(&report).expect("report serializes");
+        assert!(!report_json.contains("provenance"), "unset report provenance must not appear on the wire: {report_json}");
+    }
+
+    #[test]
+    fn provenance_wire_keys_are_frozen_snake_case() {
+        let json = serde_json::to_string(&full_provenance()).expect("provenance serializes");
+        for key in ["\"scenario\"", "\"scenario_params\"", "\"data_scale\"", "\"rustc_version\"", "\"node_version\"", "\"target_triple\"", "\"rev\"", "\"plan\"", "\"rounds\":5", "\"warmup\":1"] {
+            assert!(json.contains(key), "missing frozen wire key {key} in {json}");
+        }
+    }
+
+    #[test]
+    fn old_wire_shapes_still_deserialize_without_provenance() {
+        // 既有 N-API 直通绑定产出的旧行格式：五个字段、无 provenance。
+        let old_row = r#"{"workload":"get-seq","unit":"ms","ours":{"median_ms":1.0,"p95_ms":1.0,"min_ms":1.0,"max_ms":1.0,"rounds":1},"reference":null,"reference_engine":null}"#;
+        let row: BenchRow = serde_json::from_str(old_row).expect("old row json must still parse");
+        assert!(row.provenance.is_none());
+
+        let old_report = format!(r#"{{"rows":[{old_row}]}}"#);
+        let report: BenchReport = serde_json::from_str(&old_report).expect("rows-only report must parse");
+        assert!(report.provenance.is_none());
+        assert_eq!(report.rows.len(), 1);
+
+        let empty: BenchReport = serde_json::from_str("{}").expect("empty object must parse");
+        assert!(empty.rows.is_empty() && empty.provenance.is_none());
+    }
+
+    #[test]
+    fn unknown_future_fields_are_ignored() {
+        let row_json = r#"{"workload":"get-seq","unit":"ms","ours":{"median_ms":1.0,"p95_ms":1.0,"min_ms":1.0,"max_ms":1.0,"rounds":1},"reference":null,"reference_engine":null,"provenance":{"scenario":"s","machine_id":"host-7"}}"#;
+        let row: BenchRow = serde_json::from_str(row_json).expect("unknown provenance key must not break parsing");
+        assert_eq!(row.provenance.expect("provenance recorded").scenario.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn provenance_roundtrips_with_stable_param_order() {
+        let wanted = full_provenance();
+        let json = serde_json::to_string(&wanted).expect("serializes");
+        assert_eq!(json, serde_json::to_string(&wanted).expect("serializes again"), "serialization must be byte-stable");
+        assert!(json.find("\"batch\"").expect("batch key") < json.find("\"value_bytes\"").expect("value_bytes key"), "params serialize sorted");
+        assert_eq!(serde_json::from_str::<BenchProvenance>(&json).expect("roundtrip"), wanted);
+    }
+
+    #[test]
+    fn row_provenance_overrides_report_level_field_by_field() {
+        let mut row_level = BenchProvenance::default();
+        row_level.scenario = Some("redis-big-value-set".to_owned());
+        row_level.rev = Some("row-rev".to_owned());
+        row_level.scenario_params.insert("value_bytes".to_owned(), "65536".to_owned());
+
+        let mut run_level = full_provenance();
+        run_level.scenario = Some("run-scenario".to_owned());
+        run_level.rev = Some("run-rev".to_owned());
+
+        let report = BenchReport {
+            provenance: Some(run_level),
+            rows: vec![BenchRow { workload: "set-big".into(), unit: "ms".into(), ours: summarize(&[1.0]), reference: None, reference_engine: None, provenance: Some(row_level) }],
+        };
+        let effective = report.row_provenance(&report.rows[0]);
+        assert_eq!(effective.scenario.as_deref(), Some("redis-big-value-set"), "row wins on overlap");
+        assert_eq!(effective.rev.as_deref(), Some("row-rev"));
+        assert_eq!(effective.rustc_version.as_deref(), Some("rustc 1.99.1 (58cf8f9c3)"), "unset fields fall back to the run");
+        assert_eq!(effective.target_triple.as_deref(), Some("x86_64-pc-windows-msvc"));
+        assert_eq!(effective.plan, Some(BenchPlan { rounds: 5, warmup: 1 }));
+        assert_eq!(effective.scenario_params.get("batch").map(String::as_str), Some("500"), "params merge by key");
+        assert_eq!(effective.scenario_params.get("value_bytes").map(String::as_str), Some("65536"), "row param wins");
+    }
+
+    #[test]
+    fn empty_provenance_is_marked_empty() {
+        assert!(BenchProvenance::default().is_empty());
+        assert!(!BenchProvenance { rev: Some("x".to_owned()), ..BenchProvenance::default() }.is_empty());
+        let mut params_only = BenchProvenance::default();
+        params_only.scenario_params.insert("k".to_owned(), "v".to_owned());
+        assert!(!params_only.is_empty(), "params alone are a recorded field");
+        assert!(!full_provenance().is_empty());
     }
 }

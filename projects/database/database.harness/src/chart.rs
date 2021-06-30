@@ -97,6 +97,7 @@ mod tests {
             ours: summarize(ours),
             reference: reference.map(summarize),
             reference_engine: reference.map(|_| "better-sqlite3".to_owned()),
+            provenance: None,
         }
     }
 
