@@ -2573,14 +2573,27 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
     let mut modified: i64 = 0;
     let index_specs: Vec<IndexSpec> = store.index_specs(&namespace)?;
     let unique_indexes: Vec<IndexSpec> = index_specs.iter().filter(|index| index.unique).cloned().collect();
-    let mut indexed: BTreeMap<Vec<u8>, Vec<BTreeSet<Vec<u8>>>> = BTreeMap::new();
-    if !unique_indexes.is_empty() {
-        for (key, value) in namespace_documents(store, &namespace, session.key())? {
-            if let Ok(document) = parse_bson(&value) {
-                indexed.insert(key, unique_indexes.iter().map(|spec| tuples_of(&document, spec)).collect());
+    // 唯一索引项全部已落盘且不在事务里时，冲突检查走前缀探针，不再为每条更新命令整表建 map。
+    // 条目缺失（旧目录还没回填）或事务内暂存对探针不可见时，退回整表 map，宁可慢也不放行重复键。
+    let probe_namespaces: Option<Vec<String>> = if session.key().is_some() {
+        None
+    } else {
+        let mut namespaces = Vec::with_capacity(unique_indexes.len());
+        let mut ready = true;
+        for specification in &unique_indexes {
+            let entries_namespace = crate::storage::index_namespace(&namespace, &specification.name);
+            let entries = store
+                .reserved_has_entries(&entries_namespace)
+                .map_err(|error| CommandError::new(1, format!("index probe failed: {error}")))?;
+            if !entries {
+                ready = false;
+                break;
             }
+            namespaces.push(entries_namespace);
         }
-    }
+        ready.then_some(namespaces)
+    };
+    let mut indexed: Option<BTreeMap<Vec<u8>, Vec<BTreeSet<Vec<u8>>>>> = None;
     for (index, specification) in specifications.iter().enumerate() {
         let BsonValue::Document(specification) = specification
         else {
@@ -2613,7 +2626,29 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
 
         let mut changes = Vec::new();
         let mut oplog_pairs: Vec<(BsonDocument, BsonDocument)> = Vec::new();
-        for (key, value) in namespace_documents(store, &namespace, session.key())? {
+        // `_id` 等值过滤最多命中一篇，点读定位，不再整命名空间扫描匹配；探针不可用时退回扫描，
+        // 扫描路径需要唯一 map 时惰性建一次，后续规格复用并就地刷新。
+        let point_read = probe_namespaces.is_some() && single_id_lookup(filter).is_some();
+        let candidates: Vec<(Vec<u8>, Vec<u8>)> = if let Some(identifier) = single_id_lookup(filter).filter(|_| point_read) {
+            let key = value_to_key(identifier);
+            match namespace_document(store, &namespace, &key, session.key())? {
+                Some(payload) => vec![(key, payload)],
+                None => Vec::new(),
+            }
+        }
+        else {
+            if !unique_indexes.is_empty() && indexed.is_none() {
+                let mut map = BTreeMap::new();
+                for (key, value) in namespace_documents(store, &namespace, session.key())? {
+                    if let Ok(document) = parse_bson(&value) {
+                        map.insert(key, unique_indexes.iter().map(|spec| tuples_of(&document, spec)).collect());
+                    }
+                }
+                indexed = Some(map);
+            }
+            namespace_documents(store, &namespace, session.key())?
+        };
+        for (key, value) in candidates {
             let Ok(document) = parse_bson(&value)
             else {
                 continue;
@@ -2660,7 +2695,12 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
                 return Ok(write_reply(0, Some(0), &[WriteError::plain(index, error.code, error.message)]));
             }
             if !unique_indexes.is_empty() {
-                if let Some((specification, values)) = find_unique_conflict(&unique_indexes, &updated, &key, &indexed) {
+                let conflict = match (point_read, &probe_namespaces, &indexed) {
+                    (true, Some(probes), _) => unique_conflict_by_probe(store, probes, &unique_indexes, &updated, &key)?,
+                    (false, _, Some(map)) => find_unique_conflict(&unique_indexes, &updated, &key, map),
+                    _ => None,
+                };
+                if let Some((specification, values)) = conflict {
                     // Same shape as a failing multi-update: already applied writes
                     // stay, counters report zero, and the command stops here.
                     if !changes.is_empty() {
@@ -2669,7 +2709,7 @@ pub fn update(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDo
                     stage_update_oplog(store, session.key(), &namespace, &oplog_pairs);
                     return Ok(write_reply(0, Some(0), &[duplicate_index_error(index, &namespace, specification, &values)]));
                 }
-                if let Some(entry) = indexed.get_mut(&key) {
+                if let Some(entry) = indexed.as_mut().and_then(|map| map.get_mut(&key)) {
                     *entry = unique_indexes.iter().map(|spec| tuples_of(&updated, spec)).collect();
                 }
             }
@@ -2819,6 +2859,33 @@ fn find_unique_conflict<'a>(
         }
     }
     None
+}
+
+/// 按已落盘索引项探针检查 `document` 更新后的唯一键是否与**其它**文档冲突。
+///
+/// 每个唯一索引项的键是 `index_tuple(values) + 文档键`，条目按索引命名空间隔离，
+/// 定长元组自定界，所以前缀 `tuple` 命中的条目尾部就是持有该元组的文档键；只要存在
+/// 一条不等于本篇自身条目，即为冲突。探针只读，不整表扫描。
+fn unique_conflict_by_probe<'a>(
+    store: &dyn MongoStorage,
+    namespaces: &[String],
+    indexes: &'a [IndexSpec],
+    document: &BsonDocument,
+    key: &[u8],
+) -> Result<Option<(&'a IndexSpec, Vec<BsonValue>)>, CommandError> {
+    for (specification, entries_namespace) in indexes.iter().zip(namespaces) {
+        for values in index_entries(document, specification) {
+            let tuple = index_tuple(&values);
+            let own = index_entry_key(&values, key);
+            let probe = store
+                .scan_reserved(&entries_namespace, &tuple)
+                .map_err(|error| CommandError::new(1, format!("index probe failed: {error}")))?;
+            if probe.iter().any(|(entry_key, _)| entry_key.as_slice() != own.as_slice()) {
+                return Ok(Some((specification, values)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Reply shape shared by `insert` / `update` / `delete` / `count`, matching

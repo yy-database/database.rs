@@ -1382,6 +1382,69 @@ fn unique_index_rejects_duplicate_keys_on_insert_and_update() {
     assert_eq!(int(&errors[0], "code"), 11000);
 }
 
+/// 单 `_id` 等值更新走点读 + 已落盘索引项探针：改回自身唯一值不自撞，
+/// 同一命令里前一条更新的新值对后一条可见（逐条落地后探针能看到），
+/// 未命中的 `_id` 更新不产生任何写入。
+#[test]
+fn update_by_id_reads_points_and_probes_persisted_index_entries() {
+    let store = store();
+    insert_documents(
+        &store,
+        "items",
+        vec![
+            document(&[("_id", BsonValue::Int32(1)), ("a", BsonValue::Int32(7))]),
+            document(&[("_id", BsonValue::Int32(2)), ("a", BsonValue::Int32(8))]),
+            document(&[("_id", BsonValue::Int32(3)), ("a", BsonValue::Int32(9))]),
+        ],
+    );
+    commands::create_indexes(&index_command("items", 1, "a_1", true), &store).expect("createIndexes");
+
+    let mut single = command("update", "items", "app");
+    let mut specification = BsonDocument::new();
+    specification.push("q", BsonValue::Document(document(&[("_id", BsonValue::Int32(1))])));
+    specification.push(
+        "u",
+        BsonValue::Document(document(&[("$set", BsonValue::Document(document(&[("a", BsonValue::Int32(7)), ("seen", BsonValue::Bool(true))])))])),
+    );
+    single.push("updates", BsonValue::Array(vec![BsonValue::Document(specification)]));
+    let reply = commands::update(&single, &store).expect("update");
+    assert_eq!(int(&reply, "n"), 1);
+    assert_eq!(int(&reply, "nModified"), 1);
+
+    let mut chained = command("update", "items", "app");
+    let mut first = BsonDocument::new();
+    first.push("q", BsonValue::Document(document(&[("_id", BsonValue::Int32(2))])));
+    first.push("u", BsonValue::Document(document(&[("$set", BsonValue::Document(document(&[("a", BsonValue::Int32(42))])))])));
+    let mut second = BsonDocument::new();
+    second.push("q", BsonValue::Document(document(&[("_id", BsonValue::Int32(3))])));
+    second.push("u", BsonValue::Document(document(&[("$set", BsonValue::Document(document(&[("a", BsonValue::Int32(42))])))])));
+    chained.push("updates", BsonValue::Array(vec![BsonValue::Document(first), BsonValue::Document(second)]));
+    let reply = commands::update(&chained, &store).expect("chained update");
+    assert_eq!(int(&reply, "n"), 0);
+    let errors = array(&reply, "writeErrors");
+    assert_eq!(int(&errors[0], "code"), 11000);
+    assert_eq!(int(&errors[0], "index"), 1);
+
+    let mut missing = command("update", "items", "app");
+    let mut specification = BsonDocument::new();
+    specification.push("q", BsonValue::Document(document(&[("_id", BsonValue::Int32(99))])));
+    specification.push("u", BsonValue::Document(document(&[("$set", BsonValue::Document(document(&[("a", BsonValue::Int32(1))])))])));
+    missing.push("updates", BsonValue::Array(vec![BsonValue::Document(specification)]));
+    let reply = commands::update(&missing, &store).expect("missing update");
+    assert_eq!(int(&reply, "n"), 0);
+    assert_eq!(int(&reply, "nModified"), 0);
+
+    let mut cursors = CursorStore::new();
+    let found = find_all(&store, "items", &mut cursors);
+    assert_eq!(found.len(), 3);
+    let first = found.iter().find(|entry| entry.get("_id") == Some(&BsonValue::Int32(1))).expect("doc 1");
+    assert_eq!(first.get("seen"), Some(&BsonValue::Bool(true)));
+    let second = found.iter().find(|entry| entry.get("_id") == Some(&BsonValue::Int32(2))).expect("doc 2");
+    assert_eq!(second.get("a"), Some(&BsonValue::Int32(42)));
+    let third = found.iter().find(|entry| entry.get("_id") == Some(&BsonValue::Int32(3))).expect("doc 3");
+    assert_eq!(third.get("a"), Some(&BsonValue::Int32(9)));
+}
+
 #[test]
 fn create_indexes_rejects_conflicting_definitions() {
     let store = store();
