@@ -7,7 +7,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -3712,7 +3712,7 @@ impl Engine {
                     let mut offset = width + usize::from(!def.without_rowid);
                     let mut from_tables: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(from.len());
                     for entry in &from {
-                        let (columns, rows) = self.select_source(entry, &budget, None)?;
+                        let (columns, rows) = self.select_source(entry, &budget, None, None)?;
                         let visible = columns.width();
                         let width = visible + usize::from(columns.hidden_rowid());
                         sources.push(Source {
@@ -6006,11 +6006,15 @@ impl Engine {
         // a base table is decoded from storage, a CTE comes from the `WITH`
         // environment, and a derived table is evaluated once through this same
         // `select` (as a plain subquery, never correlated).
+        // A single base rowid table with a `WHERE <rowid> = <integer literal>`
+        // conjunct is bounded to its one candidate row before decoding; the
+        // full predicate still runs downstream so the result is unchanged.
+        let pin = self.rowid_pin(from, filter);
         let mut sources = Vec::with_capacity(from.len());
         let mut tables: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(from.len());
         let mut offset = 0;
         for table in from {
-            let (columns, rows) = self.select_source(table, budget, ctes)?;
+            let (columns, rows) = self.select_source(table, budget, ctes, pin)?;
             let width = columns.width();
             let source = Source {
                 label: table.label().to_string(),
@@ -7319,6 +7323,73 @@ impl Engine {
         Ok(Some((source.name.to_ascii_lowercase(), offset.saturating_add(count))))
     }
 
+    /// Detects a `WHERE <rowid> = <integer literal>` conjunct that bounds a
+    /// single base rowid table to one candidate row.
+    ///
+    /// Only the plain main-schema rowid-table branch of [`Engine::select_source`]
+    /// honors the pin; every other source shape (join, derived table, view, temp
+    /// table, `WITHOUT ROWID`, attached schema, non-integer literal, or an
+    /// equality sitting under `OR` / `NOT`) yields `None` so the scan stays a
+    /// full read. The predicate is still evaluated in full downstream, so a pin
+    /// never changes the emitted row set or order — it only narrows the
+    /// candidate rows the scan decodes.
+    fn rowid_pin(&self, from: &[TableRef], filter: &Option<Expr>) -> Option<i64> {
+        if from.len() != 1 {
+            return None;
+        }
+        let table = &from[0];
+        if table.query.is_some() {
+            return None;
+        }
+        // An unqualified name reaches the bounded branch only when no temp
+        // object shadows it; `temp.` never does. A view re-evaluates its query
+        // and is not bounded here.
+        let key = table.name.to_ascii_lowercase();
+        let reaches_main = match table.schema.as_deref() {
+            None => !self.temp_lookup.contains_key(&key) && !self.temp_views.contains_key(&key),
+            Some(qualifier) => {
+                let lower = qualifier.to_ascii_lowercase();
+                lower == "main" || self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(&lower))
+            }
+        };
+        if !reaches_main || self.views.contains_key(&key) {
+            return None;
+        }
+        let position = *self.table_lookup.get(&key)?;
+        let def = &self.tables[position];
+        if def.without_rowid {
+            return None;
+        }
+        let alias_name = def.rowid_alias.map(|index| def.columns[index].name.clone());
+        Self::rowid_eq_conjunct(filter.as_ref()?, alias_name.as_deref(), table.label())
+    }
+
+    /// Walks the top-level `AND` chain of a predicate for a `rowid = <int>` (or
+    /// `<int> = rowid`) comparison on the rowid-alias column or an implicit
+    /// `rowid` / `_rowid_` / `oid` name. Anything outside a plain `AND` of
+    /// `=` comparisons yields `None`.
+    fn rowid_eq_conjunct(expr: &Expr, alias_name: Option<&str>, label: &str) -> Option<i64> {
+        match expr {
+            Expr::And(left, right) => {
+                Self::rowid_eq_conjunct(left, alias_name, label).or_else(|| Self::rowid_eq_conjunct(right, alias_name, label))
+            }
+            Expr::Compare { left, op, right } if *op == CompareOp::Eq => {
+                let (column, value) = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(column), Expr::Literal(Literal::Integer(value))) => (column, *value),
+                    (Expr::Literal(Literal::Integer(value)), Expr::Column(column)) => (column, *value),
+                    _ => return None,
+                };
+                if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(label)) {
+                    return None;
+                }
+                let rowid_named = is_rowid_alias(&column.name);
+                let alias_named = alias_name.is_some_and(|name| name.eq_ignore_ascii_case(&column.name));
+                if rowid_named || alias_named { Some(value) } else { None }
+            }
+            _ => None,
+        }
+    }
+
     /// Runs a nested `SELECT` statement through the same entry point as a
     /// top-level one, so its own `WITH` entries work as well.
     /// Resolves one `FROM` entry against the schema it names, if any. An
@@ -7329,6 +7400,7 @@ impl Engine {
         table: &TableRef,
         budget: &Budget,
         ctes: Option<&CteEnv>,
+        rowid_pin: Option<i64>,
     ) -> Result<(SourceColumns<'b>, Vec<Vec<Cell>>), SqlError> {
         if let Some(query) = &table.query {
             let result = self.select_statement(query, &[], budget, ctes)?;
@@ -7417,10 +7489,21 @@ impl Engine {
                 let decoded = stored.iter().map(|payload| def.decode_without_rowid(payload)).collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
                 return Ok((SourceColumns::Table(def), decoded));
             }
-            let stored = self
-                .writer
-                .table_rows(&def.name, TableLimits::default())
-                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+            let stored = match rowid_pin {
+                // A `WHERE <rowid alias> = <integer literal>` on this very base
+                // rowid table: bound the scan to the one candidate row instead
+                // of decoding the whole table. The full predicate still runs in
+                // `cross_product`, so the emitted row set and order are exactly
+                // the unpushed path's; a miss yields no rows.
+                Some(rowid) => self
+                    .writer
+                    .table_range(&def.name, rowid, rowid, TableLimits::default())
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+                None => self
+                    .writer
+                    .table_rows(&def.name, TableLimits::default())
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+            };
             let decoded = stored
                 .iter()
                 .map(|row| {
@@ -9806,6 +9889,14 @@ fn join_rows(
         let unconditional = ons[index].is_none() && pairs.is_empty();
         let kind = source.join.unwrap_or(JoinKind::Inner);
         let mut next = Vec::new();
+        // Fast path for the common `INNER JOIN ... ON <right>.<rowid> = <expr
+        // over the left>` shape: index the right side by rowid once and probe
+        // per left row instead of rescanning every right row for every left
+        // row. The full `ON` still decides each candidate and any non-integer
+        // probe falls back to the nested scan, so the emitted rows and their
+        // left-major order are identical to the generic path below.
+        let fast =
+            if unconditional || !pairs.is_empty() || !matches!(kind, JoinKind::Inner) { None } else { rowid_join_probe(source, &ons[index], index) };
         if unconditional {
             for left in &rows {
                 for values in &tables[index] {
@@ -9813,6 +9904,45 @@ fn join_rows(
                     merged[source.offset..source.offset + width].clone_from_slice(values);
                     ctx.budget.charge(1)?;
                     next.push(merged);
+                }
+            }
+        }
+        else if let Some((right_slot, probe)) = fast {
+            let within = right_slot - source.offset;
+            let mut by_rowid: HashMap<i64, Vec<usize>> = HashMap::new();
+            for (position, row) in tables[index].iter().enumerate() {
+                if let Cell::Integer(key) = &row[within] {
+                    by_rowid.entry(*key).or_default().push(position);
+                }
+            }
+            let on = ons[index].as_ref().expect("the probe only returns for a present ON");
+            for left in &rows {
+                match probe.eval(left, ctx)? {
+                    Cell::Integer(key) => {
+                        if let Some(positions) = by_rowid.get(&key) {
+                            for &position in positions {
+                                let mut merged = left.clone();
+                                merged[source.offset..source.offset + width].clone_from_slice(&tables[index][position]);
+                                if truthiness(&on.eval(&merged, ctx)?) == Some(true) {
+                                    ctx.budget.charge(1)?;
+                                    next.push(merged);
+                                }
+                            }
+                        }
+                    }
+                    // A non-integer probe could still equal an integer rowid
+                    // under SQLite's affinity rules, so keep the nested scan for
+                    // this left row to guarantee an identical result.
+                    _ => {
+                        for values in tables[index].iter() {
+                            let mut merged = left.clone();
+                            merged[source.offset..source.offset + width].clone_from_slice(values);
+                            if truthiness(&on.eval(&merged, ctx)?) == Some(true) {
+                                ctx.budget.charge(1)?;
+                                next.push(merged);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -9889,6 +10019,48 @@ fn coalesce_using(row: &mut [Cell], pairs: &[UsingJoin]) {
         let left = row[pair.left].clone();
         row[pair.slot] = if matches!(left, Cell::Null) { row[pair.right].clone() } else { left };
     }
+}
+
+/// Detects an inner-join `ON` that is a single equality between one base
+/// rowid table's rowid (its rowid-alias column or the implicit `rowid`) and an
+/// expression over strictly earlier sources. Returns the merged-row slot that
+/// holds that rowid and the probe expression, or `None` for any shape the hash
+/// fast path cannot prove equivalent to the nested scan.
+fn rowid_join_probe<'a>(source: &Source, on: &'a Option<ResolvedExpr>, index: usize) -> Option<(usize, &'a ResolvedExpr)> {
+    if !source.columns.hidden_rowid() {
+        return None;
+    }
+    let def = match &source.columns {
+        SourceColumns::Table(def) => *def,
+        SourceColumns::Materialized { .. } => return None,
+    };
+    if def.without_rowid {
+        return None;
+    }
+    let alias_slot = def.rowid_alias.map(|alias| source.offset + alias);
+    let hidden_slot = source.offset + def.columns.len();
+    let on = on.as_ref()?;
+    let (slot, probe) = match on {
+        ResolvedExpr::Compare { left, op: CompareOp::Eq, right, .. } => match (left.as_ref(), right.as_ref()) {
+            (ResolvedExpr::Column { source: owner, index: slot }, other) if *owner == index && (*slot == hidden_slot || alias_slot == Some(*slot)) => {
+                (*slot, other)
+            }
+            (other, ResolvedExpr::Column { source: owner, index: slot }) if *owner == index && (*slot == hidden_slot || alias_slot == Some(*slot)) => {
+                (*slot, other)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if probe.contains_subquery() {
+        return None;
+    }
+    let mut refs = Vec::new();
+    probe.collect_sources(&mut refs);
+    if refs.iter().any(|owner| *owner >= index) {
+        return None;
+    }
+    Some((slot, probe))
 }
 
 /// Materializes the Cartesian product of the `UPDATE ... FROM` sources.
@@ -13458,6 +13630,61 @@ mod tests {
         let qualified = engine.execute_one("SELECT l.id, r.id FROM l RIGHT JOIN r USING(id)").expect("qualified");
         assert_eq!(qualified.columns, vec!["id", "id"]);
         assert_eq!(qualified.rows, vec![vec![Cell::Integer(2), Cell::Integer(2)], vec![Cell::Null, Cell::Integer(3)]]);
+    }
+
+    #[test]
+    fn inner_join_on_right_rowid_alias_keeps_left_major_order() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE l(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO l VALUES (1,'a'),(2,'b'),(3,'c')",
+            "CREATE TABLE r(id INTEGER PRIMARY KEY, w TEXT)",
+            "INSERT INTO r VALUES (1,'X'),(2,'Y')",
+        ]);
+        // `r.id` is the right source's rowid alias, so the hash fast path
+        // probes by rowid. The emitted pairs and their left-major order match
+        // what the nested scan produces; the unmatched left row (id 3) drops.
+        let joined = engine.execute_one("SELECT l.v, r.w FROM l JOIN r ON r.id = l.id").expect("rowid join");
+        assert_eq!(joined.rows, vec![vec![text("a"), text("X")], vec![text("b"), text("Y")]]);
+        // The implicit `rowid` name hits the same fast path.
+        assert_eq!(
+            engine.execute_one("SELECT l.v, r.w FROM l JOIN r ON r.rowid = l.id").expect("implicit rowid join").rows,
+            vec![vec![text("a"), text("X")], vec![text("b"), text("Y")]]
+        );
+        // A non-integer probe (real via arithmetic) falls back to the nested
+        // scan but still yields the identical result.
+        assert_eq!(
+            engine.execute_one("SELECT l.v, r.w FROM l JOIN r ON r.id = l.id * 1.0").expect("real probe join").rows,
+            vec![vec![text("a"), text("X")], vec![text("b"), text("Y")]]
+        );
+        // A compound `ON` is not a single equality, so the generic path runs.
+        assert_eq!(
+            engine.execute_one("SELECT l.v, r.w FROM l JOIN r ON r.id = l.id AND r.w <> 'Y'").expect("compound on join").rows,
+            vec![vec![text("a"), text("X")]]
+        );
+    }
+
+    #[test]
+    fn select_rowid_alias_equality_fetches_the_single_row() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)",
+            "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')",
+        ]);
+        // A hit on the rowid alias is bounded to the one candidate row.
+        assert_eq!(engine.execute_one("SELECT label FROM t WHERE id = 2").expect("point hit").rows, vec![vec![text("b")]]);
+        // A miss yields no rows, exactly like the full scan.
+        assert!(engine.execute_one("SELECT label FROM t WHERE id = 99").expect("point miss").rows.is_empty());
+        // The implicit `rowid` name is pinned too.
+        assert_eq!(engine.execute_one("SELECT label FROM t WHERE rowid = 3").expect("rowid hit").rows, vec![vec![text("c")]]);
+        // Reversed operand order pins as well.
+        assert_eq!(engine.execute_one("SELECT label FROM t WHERE 1 = id").expect("reversed pin").rows, vec![vec![text("a")]]);
+        // An `OR` of two rowid equalities is not a top-level conjunct, so both
+        // rows come back through the full scan.
+        assert_eq!(
+            engine.execute_one("SELECT label FROM t WHERE id = 1 OR id = 3").expect("or scan").rows,
+            vec![vec![text("a")], vec![text("c")]]
+        );
+        // A pinned equality combined with another conjunct keeps the filter.
+        assert!(engine.execute_one("SELECT label FROM t WHERE id = 2 AND label = 'zzz'").expect("pin plus filter").rows.is_empty());
     }
 
     #[test]

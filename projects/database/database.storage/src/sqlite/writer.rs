@@ -19,7 +19,9 @@ use database_formats::sqlite::{
 };
 use database_types::{Error, Result};
 
-use crate::sqlite::{SchemaObject, TableLimits, TableRow, read_index_table, read_schema, read_schema_with_rowids, read_table};
+use crate::sqlite::{
+    SchemaObject, TableLimits, TableRow, read_index_table, read_schema, read_schema_with_rowids, read_table, read_table_range,
+};
 
 /// 文本比较所用的排序规则。
 ///
@@ -568,6 +570,17 @@ impl SqliteWriter {
     pub fn table_rows(&self, table: &str, limits: TableLimits) -> Result<Vec<TableRow>> {
         let meta = self.table_meta(table)?;
         read_table(&self.pages, meta.root_page, limits)
+    }
+
+    /// Reads one table's rows whose rowid falls in the closed range
+    /// `[lower, upper]`, ascending, through the crate's own bounded reader.
+    /// Mirrors [`SqliteWriter::table_rows`] (same name resolution and damage
+    /// checks) but only materializes the in-range payloads, so a
+    /// `WHERE <rowid alias> = <literal>` point read never decodes the whole
+    /// table. An empty range yields an empty result.
+    pub fn table_range(&self, table: &str, lower: i64, upper: i64, limits: TableLimits) -> Result<Vec<TableRow>> {
+        let meta = self.table_meta(table)?;
+        read_table_range(&self.pages, meta.root_page, lower, upper, limits)
     }
 
     /// Reads one WITHOUT ROWID table's records in primary-key order.
