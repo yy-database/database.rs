@@ -931,7 +931,9 @@ fn write_error(stream: &mut impl Write, sequence: u8, code: u16, state: &str, me
 }
 
 /// 把一条 SQL 走完整的 bind → plan → execute → wire 路径。
-/// 根据 plan variant 分发：SELECT → ResultSet；INSERT/UPDATE/DELETE → OK(AffectedRows=1)。
+/// 根据 plan variant 分发：SELECT → ResultSet；INSERT/UPDATE/DELETE → OK，
+/// `affected_rows` 直接取执行器返回的真实行数（多行 INSERT 计 N、UPDATE/DELETE 计命中行数），
+/// 不再回固定值。
 /// `column_types` 为空时按行值推断列类型，否则使用调用方已经声明的类型。
 /// `binary_rows` 为真时按 MySQL binary protocol 编码结果行（prepared statement 路径）。
 fn execute_sql(
