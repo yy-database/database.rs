@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     ops::Bound,
@@ -7,8 +7,19 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use database_formats::yy::yykv::{Key, Record, StoredValue, decode_snapshot, encode_snapshot};
+use database_formats::yy::yykv::{KV_MAGIC, Key, Record, StoredValue, decode_snapshot, encode_snapshot, kv_format::checksum as yykv_checksum};
 use database_types::cluster::{Error, Namespace, Result, SweepReport};
+
+/// Offset of the snapshot body inside the file: magic + body checksum. The checksum covers
+/// the whole body, including the `next_revision` and record-count header fields.
+const BODY_OFFSET: usize = KV_MAGIC.len() + 8;
+
+/// Byte length of a snapshot header: magic + body checksum + `next_revision` + record count.
+///
+/// Everything after this prefix is a concatenation of per-record segments in key order, and
+/// each segment depends only on its own record, so a clean record's bytes can be reused
+/// verbatim across commits. `file_shard` tests pin this against a full `encode_snapshot`.
+const RECORD_AREA_OFFSET: usize = BODY_OFFSET + 8 + 4;
 
 /// Current wall clock as Unix epoch milliseconds, used for record expiry deadlines.
 pub fn now_unix_ms() -> i64 {
@@ -212,6 +223,13 @@ impl KvStore for MemoryShard {
 pub struct FileShard {
     path: PathBuf,
     records: BTreeMap<Key, Record>,
+    /// Snapshot bytes of every record as of the last durable publish, keyed and ordered
+    /// exactly like `records`. A commit re-encodes only the records its changes touch and
+    /// reuses these segments verbatim for the rest, so the assembled snapshot stays
+    /// byte-identical to a full `encode_snapshot` of the same state.
+    encoded: BTreeMap<Key, Vec<u8>>,
+    /// Total byte length of the `encoded` segments; sizes the assembled snapshot.
+    encoded_len: usize,
     next_revision: u64,
     /// Resume point for a budgeted expiry pass; process-local and not persisted.
     sweep_cursor: Option<Key>,
@@ -231,7 +249,14 @@ impl FileShard {
                     fs::create_dir_all(parent)?;
                 }
             }
-            let shard = Self { path, records: BTreeMap::new(), next_revision: 1, sweep_cursor: None };
+            let shard = Self {
+                path,
+                records: BTreeMap::new(),
+                encoded: BTreeMap::new(),
+                encoded_len: 0,
+                next_revision: 1,
+                sweep_cursor: None,
+            };
             shard.persist()?;
             Ok(shard)
         }
@@ -261,30 +286,185 @@ impl FileShard {
         self.persist()
     }
 
+    /// Full re-encode of the shard through the durable commit boundary.
+    ///
+    /// This is the byte-for-byte oracle for the incremental path below: it calls the format
+    /// encoder directly and is the only persist that does not consult the `encoded` cache.
     fn persist(&self) -> Result<()> {
         let bytes = encode_snapshot(&self.records, self.next_revision)?;
         write_snapshot_durable(&self.path, &bytes)
     }
 
+    /// Encodes the snapshot segment of one record.
+    ///
+    /// The `.yykv` body is a fixed header followed by per-record segments in key order, and a
+    /// segment depends only on its own record, so running the full encoder over a one-entry
+    /// map reproduces exactly the bytes the whole-shard encoder would write for this record.
+    /// Reusing the format encoder (instead of a second copy of its record writer) keeps the
+    /// cache byte-identical to a full re-encode by construction.
+    fn encode_record(record: &Record) -> Result<Vec<u8>> {
+        let next_revision = record.revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
+        let mut single = BTreeMap::new();
+        single.insert(record.key.clone(), record.clone());
+        let bytes = encode_snapshot(&single, next_revision)?;
+        bytes.get(RECORD_AREA_OFFSET..).map(<[u8]>::to_vec).ok_or(Error::Corrupt("yykv single-record encoding missing body"))
+    }
+
+    /// Rebuilds the per-record byte cache from `records`; done once when a shard is opened.
+    fn rebuild_encoded(&mut self) -> Result<()> {
+        let mut encoded = BTreeMap::new();
+        let mut encoded_len = 0;
+        for record in self.records.values() {
+            let bytes = Self::encode_record(record)?;
+            encoded_len += bytes.len();
+            encoded.insert(record.key.clone(), bytes);
+        }
+        self.encoded = encoded;
+        self.encoded_len = encoded_len;
+        Ok(())
+    }
+
+    fn put_encoded(&mut self, key: Key, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        self.encoded_len += bytes.len();
+        let previous = self.encoded.insert(key, bytes);
+        if let Some(previous) = &previous {
+            self.encoded_len -= previous.len();
+        }
+        previous
+    }
+
+    fn remove_encoded(&mut self, key: &Key) -> Option<Vec<u8>> {
+        let previous = self.encoded.remove(key);
+        if let Some(previous) = &previous {
+            self.encoded_len -= previous.len();
+        }
+        previous
+    }
+
+    /// Assembles the snapshot from the per-record byte cache: only the segments the caller
+    /// just re-encoded are new; every clean record is copied verbatim. The header, the
+    /// record validation and the body checksum reproduce `encode_snapshot` exactly, so the
+    /// output is byte-identical to a full re-encode of the same state.
+    fn assemble_snapshot(&self, next_revision: u64) -> Result<Vec<u8>> {
+        if next_revision == 0 {
+            return Err(Error::Unsupported("yykv next_revision must be at least 1"));
+        }
+        let count = u32::try_from(self.records.len()).map_err(|_| Error::Unsupported("too many shard records"))?;
+        if self.records.len() != self.encoded.len() {
+            return Err(Error::Corrupt("shard record encoding cache out of sync"));
+        }
+        let mut bytes = Vec::with_capacity(RECORD_AREA_OFFSET + self.encoded_len);
+        bytes.extend_from_slice(KV_MAGIC);
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&next_revision.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for ((key, record), (cached_key, segment)) in self.records.iter().zip(self.encoded.iter()) {
+            if key != cached_key {
+                return Err(Error::Corrupt("shard record encoding cache out of sync"));
+            }
+            if record.revision == 0 || record.revision >= next_revision {
+                return Err(Error::Unsupported("yykv revision must be below next_revision"));
+            }
+            bytes.extend_from_slice(segment);
+        }
+        let body_checksum = yykv_checksum(&bytes[BODY_OFFSET..]);
+        bytes[KV_MAGIC.len()..BODY_OFFSET].copy_from_slice(&body_checksum.to_le_bytes());
+        Ok(bytes)
+    }
+
+    /// Incremental counterpart of [`Self::persist`]: assemble from the byte cache and write
+    /// through the same durable commit boundary.
+    fn persist_incremental(&mut self, next_revision: u64) -> Result<()> {
+        let bytes = self.assemble_snapshot(next_revision)?;
+        // Durable commit point: the full post-commit snapshot is fsynced to a temp file and
+        // atomically replaces the shard. Memory is only published after this returns `Ok`,
+        // so a crash or storage failure here leaves the previous snapshot both visible and
+        // durable — never a half-applied batch.
+        //
+        // The one exception is a directory-sync failure after the rename already happened:
+        // that error means durability is unproven, not that nothing was committed. The on-disk
+        // snapshot may already be the post-commit one, so the in-memory state is deliberately
+        // not published and the caller must reopen the shard instead of assuming a clean
+        // rollback to the previous snapshot.
+        write_snapshot_durable(&self.path, &bytes)
+    }
+
+    fn apply_put(&mut self, record: Record) -> Result<()> {
+        let encoded = Self::encode_record(&record)?;
+        let key = record.key.clone();
+        self.records.insert(key.clone(), record);
+        self.put_encoded(key, encoded);
+        Ok(())
+    }
+
+    fn apply_delete(&mut self, key: &Key) {
+        self.records.remove(key);
+        self.remove_encoded(key);
+    }
+
     fn insert(&mut self, key: Key, value: StoredValue, expires_at: Option<i64>) -> Result<u64> {
         let revision = self.next_revision;
         let next_revision = revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
-        let record = Record { key: key.clone(), value, revision, expires_at };
-        let previous = self.records.insert(key.clone(), record);
-        self.next_revision = next_revision;
-        if let Err(error) = self.persist() {
-            self.next_revision = revision;
-            match previous {
-                Some(record) => {
-                    self.records.insert(key, record);
-                }
-                None => {
-                    self.records.remove(&key);
-                }
-            }
+        let mut journal = CommitJournal::new();
+        journal.capture(self, &key);
+        if let Err(error) = self.apply_put(Record { key, value, revision, expires_at }) {
+            journal.restore(self);
             return Err(error);
         }
+        if let Err(error) = self.persist_incremental(next_revision) {
+            journal.restore(self);
+            return Err(error);
+        }
+        self.next_revision = next_revision;
         Ok(revision)
+    }
+}
+
+/// Pre-images of the keys one commit touches, so a failed durable write restores the exact
+/// pre-commit memory state instead of leaving a half-applied batch visible to readers.
+struct CommitJournal {
+    seen: BTreeSet<Key>,
+    entries: Vec<(Key, Option<Record>, Option<Vec<u8>>)>,
+}
+
+impl CommitJournal {
+    fn new() -> Self {
+        Self { seen: BTreeSet::new(), entries: Vec::new() }
+    }
+
+    /// Records the pre-image of `key` once; repeated touches in the same batch are no-ops.
+    fn capture(&mut self, shard: &FileShard, key: &Key) {
+        if self.seen.insert(key.clone()) {
+            self.entries.push((key.clone(), shard.records.get(key).cloned(), shard.encoded.get(key).cloned()));
+        }
+    }
+
+    fn restore(self, shard: &mut FileShard) {
+        for (key, record, segment) in self.entries.into_iter().rev() {
+            match record {
+                Some(record) => {
+                    shard.records.insert(key.clone(), record);
+                }
+                None => {
+                    shard.records.remove(&key);
+                }
+            }
+            match segment {
+                Some(segment) => {
+                    shard.put_encoded(key, segment);
+                }
+                None => {
+                    shard.remove_encoded(&key);
+                }
+            }
+        }
+    }
+}
+
+fn change_key(change: &ShardChange) -> &Key {
+    match change {
+        ShardChange::Put { key, .. } => key,
+        ShardChange::Delete { key } => key,
     }
 }
 
@@ -303,12 +483,14 @@ impl KvStore for FileShard {
     }
 
     fn delete(&mut self, key: &Key) -> Result<bool> {
-        let Some(record) = self.records.remove(key)
-        else {
+        if !self.records.contains_key(key) {
             return Ok(false);
-        };
-        if let Err(error) = self.persist() {
-            self.records.insert(key.clone(), record);
+        }
+        let mut journal = CommitJournal::new();
+        journal.capture(self, key);
+        self.apply_delete(key);
+        if let Err(error) = self.persist_incremental(self.next_revision) {
+            journal.restore(self);
             return Err(error);
         }
         Ok(true)
@@ -318,33 +500,40 @@ impl KvStore for FileShard {
         if changes.is_empty() {
             return Ok(());
         }
-        let mut staged_records = self.records.clone();
-        let mut next_revision = self.next_revision;
+        // The revision budget is checked before any memory is touched, so an exhausted
+        // counter leaves the shard exactly as it was, matching the pre-staging contract.
+        let puts = changes.iter().filter(|change| matches!(change, ShardChange::Put { .. })).count() as u64;
+        let next_revision = self.next_revision.checked_add(puts).ok_or(Error::Corrupt("shard revision exhausted"))?;
+        let mut journal = CommitJournal::new();
         for change in &changes {
-            match change {
+            journal.capture(self, change_key(change));
+        }
+        // Stage in place: only the touched records are re-encoded; every clean record keeps
+        // its cached snapshot bytes. A failure at any step restores the journaled pre-images,
+        // so the visible state is either the whole batch or nothing.
+        let mut revision = self.next_revision;
+        for change in &changes {
+            let applied = match change {
                 ShardChange::Put { key, value, expires_at } => {
-                    let revision = next_revision;
-                    next_revision = next_revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
-                    staged_records.insert(key.clone(), Record { key: key.clone(), value: value.clone(), revision, expires_at: *expires_at });
+                    self.apply_put(Record { key: key.clone(), value: value.clone(), revision, expires_at: *expires_at })
                 }
                 ShardChange::Delete { key } => {
-                    staged_records.remove(key);
+                    self.apply_delete(key);
+                    Ok(())
                 }
+            };
+            if let Err(error) = applied {
+                journal.restore(self);
+                return Err(error);
+            }
+            if matches!(change, ShardChange::Put { .. }) {
+                revision += 1;
             }
         }
-        let bytes = encode_snapshot(&staged_records, next_revision)?;
-        // Durable commit point: the full post-commit snapshot is fsynced to a temp file and
-        // atomically replaces the shard. Memory is only published after this returns `Ok`,
-        // so a crash or storage failure here leaves the previous snapshot both visible and
-        // durable — never a half-applied batch.
-        //
-        // The one exception is a directory-sync failure after the rename already happened:
-        // that error means durability is unproven, not that nothing was committed. The on-disk
-        // snapshot may already be the post-commit one, so the in-memory state is deliberately
-        // not published and the caller must reopen the shard instead of assuming a clean
-        // rollback to the previous snapshot.
-        write_snapshot_durable(&self.path, &bytes)?;
-        self.records = staged_records;
+        if let Err(error) = self.persist_incremental(next_revision) {
+            journal.restore(self);
+            return Err(error);
+        }
         self.next_revision = next_revision;
         Ok(())
     }
@@ -493,7 +682,10 @@ fn write_snapshot_durable(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn decode(path: &Path, bytes: &[u8]) -> Result<FileShard> {
     let snapshot = decode_snapshot(bytes)?;
-    Ok(FileShard { path: path.to_path_buf(), records: snapshot.records, next_revision: snapshot.next_revision, sweep_cursor: None })
+    let mut shard =
+        FileShard { path: path.to_path_buf(), records: snapshot.records, encoded: BTreeMap::new(), encoded_len: 0, next_revision: snapshot.next_revision, sweep_cursor: None };
+    shard.rebuild_encoded()?;
+    Ok(shard)
 }
 
 #[cfg(not(windows))]

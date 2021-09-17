@@ -1,10 +1,10 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use database_storage::cluster_kv::{FileShard, InlineValue, Key, KvStore, ObjectRef, StoredValue};
+use database_storage::cluster_kv::{FileShard, InlineValue, Key, KvStore, ObjectRef, ShardChange, StoredValue};
 use database_types::cluster::Namespace;
 
 fn temp_path(label: &str) -> PathBuf {
@@ -14,6 +14,121 @@ fn temp_path(label: &str) -> PathBuf {
 
 fn cleanup(path: &PathBuf) {
     let _ = fs::remove_file(path);
+}
+
+/// The incremental commit path must produce byte-identical snapshots to a fresh full
+/// re-encode (`FileShard::flush` goes through `encode_snapshot` directly, bypassing the
+/// per-record byte cache).
+fn assert_matches_full_reencode(shard: &FileShard, path: &Path) {
+    let incremental = fs::read(path).expect("read incremental snapshot");
+    shard.flush().expect("full re-encode");
+    let full = fs::read(path).expect("read full re-encode snapshot");
+    assert_eq!(incremental, full, "incremental snapshot bytes must equal a fresh full re-encode");
+}
+
+#[test]
+fn record_area_offset_matches_the_format_header() {
+    let empty = database_formats::yy::yykv::encode_snapshot(&std::collections::BTreeMap::new(), 1).expect("encode");
+    assert_eq!(empty.len(), 25, "the incremental assembler assumes a 25-byte header (magic + checksum + next_revision + count)");
+}
+
+#[test]
+fn file_shard_incremental_commits_match_full_reencode_bytes() {
+    let path = temp_path("incremental-bytes");
+    let mut shard = FileShard::open(&path).expect("open");
+    let now = database_storage::cluster_kv::now_unix_ms();
+    let a = Key::new("ns", b"a");
+    let b = Key::new("ns", b"b");
+    let c = Key::new("ns", b"c");
+    let d = Key::new("other", b"d");
+
+    assert_matches_full_reencode(&shard, &path);
+
+    shard.put(a.clone(), StoredValue::Inline(InlineValue(b"1".to_vec()))).unwrap();
+    assert_matches_full_reencode(&shard, &path);
+
+    // Overwriting the same key must replace its cached segment, never append a second one.
+    shard.put(a.clone(), StoredValue::Inline(InlineValue(b"22".to_vec()))).unwrap();
+    assert_matches_full_reencode(&shard, &path);
+
+    shard.put_expiring(b.clone(), StoredValue::Inline(InlineValue(b"expiring".to_vec())), now + 60_000).unwrap();
+    assert_matches_full_reencode(&shard, &path);
+
+    shard.put(d.clone(), StoredValue::Object(ObjectRef { hash_hex: "ff00".into() })).unwrap();
+    assert_matches_full_reencode(&shard, &path);
+
+    // One batch touching a key twice, deleting another and adding an expiry.
+    shard
+        .commit_changes(vec![
+            ShardChange::Put { key: c.clone(), value: StoredValue::Inline(InlineValue(b"c1".to_vec())), expires_at: None },
+            ShardChange::Put { key: a.clone(), value: StoredValue::Inline(InlineValue(b"a3".to_vec())), expires_at: Some(now + 30_000) },
+            ShardChange::Delete { key: b.clone() },
+            ShardChange::Put { key: c.clone(), value: StoredValue::Inline(InlineValue(b"c2".to_vec())), expires_at: None },
+        ])
+        .expect("batch commit");
+    assert_matches_full_reencode(&shard, &path);
+
+    // A delete of an absent key must not rewrite the snapshot at all.
+    let before = fs::read(&path).unwrap();
+    assert!(!shard.delete(&b).unwrap());
+    assert_eq!(fs::read(&path).unwrap(), before, "an absent-key delete must leave the file untouched");
+    assert_matches_full_reencode(&shard, &path);
+
+    // Expiry reclamation goes through the same commit boundary.
+    shard.put_expiring(Key::new("ns", b"gone"), StoredValue::Inline(InlineValue(b"x".to_vec())), now - 1).unwrap();
+    assert_eq!(shard.sweep_expired(now, None).unwrap().reclaimed, 1);
+    assert_matches_full_reencode(&shard, &path);
+
+    // A namespace flush removes every key of one namespace in a single commit.
+    assert_eq!(KvStore::flush(&mut shard, &Namespace("ns".into())).unwrap(), 2);
+    assert_matches_full_reencode(&shard, &path);
+
+    drop(shard);
+
+    // A reopened shard rebuilds the byte cache from the snapshot and keeps committing identically.
+    let mut reopened = FileShard::open(&path).expect("reopen");
+    assert_matches_full_reencode(&reopened, &path);
+    reopened.put(a, StoredValue::Inline(InlineValue(b"after-reopen".to_vec()))).unwrap();
+    assert_matches_full_reencode(&reopened, &path);
+    cleanup(&path);
+}
+
+#[test]
+fn failed_commit_restores_records_and_the_next_commit_is_byte_correct() {
+    let path = temp_path("failed-commit");
+    let backup = path.with_extension("saved");
+    let mut shard = FileShard::open(&path).expect("open");
+    let a = Key::new("ns", b"a");
+    let b = Key::new("ns", b"b");
+    shard.put(a.clone(), StoredValue::Inline(InlineValue(b"original".to_vec()))).unwrap();
+    let published = fs::read(&path).unwrap();
+    fs::rename(&path, &backup).unwrap();
+    fs::create_dir(&path).unwrap();
+
+    shard
+        .commit_changes(vec![
+            ShardChange::Put { key: b.clone(), value: StoredValue::Inline(InlineValue(b"new".to_vec())), expires_at: None },
+            ShardChange::Put { key: a.clone(), value: StoredValue::Inline(InlineValue(b"replaced".to_vec())), expires_at: None },
+        ])
+        .expect_err("the durable boundary is blocked");
+    assert!(shard.get(&b).unwrap().is_none(), "a failed batch must not leak the new key");
+    assert_eq!(shard.get(&a).unwrap().unwrap().value, StoredValue::Inline(InlineValue(b"original".to_vec())), "the touched key keeps its pre-image");
+    assert_eq!(fs::read(&backup).unwrap(), published, "the durable snapshot keeps the pre-commit bytes");
+
+    fs::remove_dir(&path).unwrap();
+    fs::rename(&backup, &path).unwrap();
+
+    // A failed commit must not consume revisions: the retry starts where the shard did.
+    shard.commit_changes(vec![ShardChange::Put { key: b.clone(), value: StoredValue::Inline(InlineValue(b"new".to_vec())), expires_at: None }]).expect("retry");
+    assert_eq!(shard.get(&b).unwrap().unwrap().revision, 2);
+    assert_eq!(shard.get(&a).unwrap().unwrap().revision, 1);
+    assert_matches_full_reencode(&shard, &path);
+
+    drop(shard);
+    let reopened = FileShard::open(&path).expect("reopen after recovery");
+    assert_eq!(reopened.get(&b).unwrap().unwrap().revision, 2);
+    assert_eq!(reopened.get(&a).unwrap().unwrap().revision, 1);
+    cleanup(&path);
 }
 
 #[test]
