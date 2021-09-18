@@ -21,9 +21,10 @@ pub use sql::{
 };
 
 pub use database_storage::sqlite::{
-    Collation, ColumnSpec, DropIndexOutcome, SchemaObject, SchemaObjectKind, SqliteDatabase, SqliteWriter, TableLimits, TableRow, TextEncoding,
-    UpdateValue, WriteValue, apply_write_affinity, decode_record, decode_varint, read_existing, read_index_table, read_index_table_with,
-    read_named_index, read_named_table, read_named_without_rowid, read_schema, read_table, read_table_range, sqlite_library_version,
+    Affinity, Collation, ColumnSpec, DropIndexOutcome, SchemaObject, SchemaObjectKind, SqliteDatabase, SqliteWriter, TableLimits, TableRow,
+    TextEncoding, UpdateValue, WriteValue, affinity_of, apply_write_affinity, decode_record, decode_varint, read_existing, read_index_table,
+    read_index_table_with, read_named_index, read_named_table, read_named_without_rowid, read_schema, read_table, read_table_head, read_table_range,
+    sqlite_library_version,
 };
 
 pub use database_formats::sqlite::{

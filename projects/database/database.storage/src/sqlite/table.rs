@@ -284,7 +284,7 @@ fn compare_values(left: &RecordValue<'_>, right: &RecordValue<'_>) -> Ordering {
 /// Index b-trees (including WITHOUT ROWID tables) are explicitly unsupported.
 /// This does not recover WAL/journals or perform a full integrity check.
 pub fn read_table(bytes: &[u8], root_page: u32, limits: TableLimits) -> Result<Vec<TableRow>> {
-    read_table_inner(bytes, root_page, limits, None, None)
+    read_table_inner(bytes, root_page, limits, None, None, None)
 }
 
 /// 读取 rowid 落在闭区间 `[lower, upper]` 内的记录,按 rowid 升序返回。
@@ -295,10 +295,28 @@ pub fn read_table_range(bytes: &[u8], root_page: u32, lower: i64, upper: i64, li
     if lower > upper {
         return Ok(Vec::new());
     }
-    read_table_inner(bytes, root_page, limits, Some(lower), Some(upper))
+    read_table_inner(bytes, root_page, limits, Some(lower), Some(upper), None)
 }
 
-fn read_table_inner(bytes: &[u8], root_page: u32, limits: TableLimits, floor: Option<i64>, ceil: Option<i64>) -> Result<Vec<TableRow>> {
+/// 按 rowid 升序读取一张 rowid 表的前 `max_rows` 行,读满即停。
+/// 与 [`read_table`] 共用同一套损坏检测,但不再遍历整棵 b-tree:
+/// 满足 `ORDER BY <rowid 序> LIMIT n` 的有界扫描只访问覆盖前 n 行
+/// 所需的页。`max_rows == 0` 直接返回空。
+pub fn read_table_head(bytes: &[u8], root_page: u32, max_rows: usize, limits: TableLimits) -> Result<Vec<TableRow>> {
+    if max_rows == 0 {
+        return Ok(Vec::new());
+    }
+    read_table_inner(bytes, root_page, limits, None, None, Some(max_rows))
+}
+
+fn read_table_inner(
+    bytes: &[u8],
+    root_page: u32,
+    limits: TableLimits,
+    floor: Option<i64>,
+    ceil: Option<i64>,
+    stop_after: Option<usize>,
+) -> Result<Vec<TableRow>> {
     let page_size = validate_database(bytes)?;
     if bytes.is_empty() {
         return Err(Error::Corrupt("sqlite table root in empty database"));
@@ -390,6 +408,9 @@ fn read_table_inner(bytes: &[u8], root_page: u32, limits: TableLimits, floor: Op
                 }
                 let (payload, _end) = scan.payload(page, cell + prefix, length)?;
                 rows.push(TableRow { rowid, payload });
+                if stop_after.is_some_and(|bound| rows.len() >= bound) {
+                    return Ok(rows);
+                }
             }
         }
         spans.sort_unstable();

@@ -18,8 +18,8 @@ pub use crate::sqlite::{
         SchemaObject, SchemaObjectKind, ViewProjection, parse_view, read_named_index, read_named_table, read_named_without_rowid, read_schema,
         read_schema_with_rowids, validate_strict_rows,
     },
-    table::{TableLimits, TableRow, read_index_table, read_index_table_with, read_table, read_table_range},
-    writer::{Collation, ColumnSpec, DropIndexOutcome, SqliteWriter, UpdateValue, apply_write_affinity},
+    table::{TableLimits, TableRow, read_index_table, read_index_table_with, read_table, read_table_head, read_table_range},
+    writer::{Affinity, Collation, ColumnSpec, DropIndexOutcome, SqliteWriter, UpdateValue, affinity_of, apply_write_affinity},
 };
 
 // Re-exported from sqlite-formats for convenient one-crate consumption.

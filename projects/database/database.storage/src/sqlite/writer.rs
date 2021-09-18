@@ -20,7 +20,7 @@ use database_formats::sqlite::{
 use database_types::{Error, Result};
 
 use crate::sqlite::{
-    SchemaObject, TableLimits, TableRow, read_index_table, read_schema, read_schema_with_rowids, read_table, read_table_range,
+    SchemaObject, TableLimits, TableRow, read_index_table, read_schema, read_schema_with_rowids, read_table, read_table_head, read_table_range,
 };
 
 /// 文本比较所用的排序规则。
@@ -581,6 +581,55 @@ impl SqliteWriter {
     pub fn table_range(&self, table: &str, lower: i64, upper: i64, limits: TableLimits) -> Result<Vec<TableRow>> {
         let meta = self.table_meta(table)?;
         read_table_range(&self.pages, meta.root_page, lower, upper, limits)
+    }
+
+    /// Reads one table's first `max_rows` rows in ascending rowid order through
+    /// the crate's bounded reader. Mirrors [`SqliteWriter::table_rows`] (same
+    /// name resolution and damage checks) but stops the b-tree walk as soon as
+    /// the bound is satisfied, so `ORDER BY <rowid order> LIMIT n` never
+    /// materializes the tail of the table.
+    pub fn table_head(&self, table: &str, max_rows: usize, limits: TableLimits) -> Result<Vec<TableRow>> {
+        let meta = self.table_meta(table)?;
+        read_table_head(&self.pages, meta.root_page, max_rows, limits)
+    }
+
+    /// Reads one index's live key set, decoded into `(key values, rowid)` pairs
+    /// in the index's own column order. The key set is the writer's in-memory
+    /// source of truth while the image is being mutated, so this reflects every
+    /// row written since the file was opened, not just the materialized pages.
+    /// Returns an error when no index with that name exists.
+    pub fn index_entries_decoded(&self, index: &str) -> Result<Vec<(Vec<WriteValue>, i64)>> {
+        let row = self
+            .master_rows()?
+            .into_iter()
+            .find(|row| row.kind == "index" && eq_ignore_ascii_case(&row.name, index))
+            .ok_or(Error::Unsupported("sqlite index does not exist"))?;
+        let Some(entries) = self.index_entries.get(&row.rowid) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for payload in entries {
+            let values = decode_record(payload, self.encoding, Default::default())
+                .map_err(|_| Error::Corrupt("sqlite index record decode failed"))?;
+            let Some(last) = values.last() else {
+                continue;
+            };
+            let database_formats::sqlite::RecordValue::Integer(rowid) = last else {
+                return Err(Error::Corrupt("sqlite index record has no rowid column"));
+            };
+            let key = values[..values.len() - 1]
+                .iter()
+                .map(|value| match value {
+                    database_formats::sqlite::RecordValue::Null => WriteValue::Null,
+                    database_formats::sqlite::RecordValue::Integer(number) => WriteValue::Integer(*number),
+                    database_formats::sqlite::RecordValue::Real(real) => WriteValue::Real(*real),
+                    database_formats::sqlite::RecordValue::Text(text) => WriteValue::Text(text.clone()),
+                    database_formats::sqlite::RecordValue::Blob(blob) => WriteValue::Blob(blob.to_vec()),
+                })
+                .collect();
+            out.push((key, *rowid));
+        }
+        Ok(out)
     }
 
     /// Reads one WITHOUT ROWID table's records in primary-key order.
@@ -3276,16 +3325,22 @@ fn is_rowid_alias(column: &ColumnSpec) -> bool {
 }
 
 /// SQLite column affinity derived from the declared type (fileformat2 §3.1).
-#[derive(Clone, Copy, PartialEq)]
-enum Affinity {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Affinity {
+    /// `INT`-shaped declared types.
     Integer,
+    /// `CHAR` / `CLOB` / `TEXT` declared types.
     Text,
+    /// `BLOB` or an empty declared type.
     Blob,
+    /// `REAL` / `FLOA` / `DOUB` declared types.
     Real,
+    /// Everything else.
     Numeric,
 }
 
-fn affinity_of(declared: &str) -> Affinity {
+/// Affinity a column with this declared type text takes for stored values.
+pub fn affinity_of(declared: &str) -> Affinity {
     let upper = declared.to_ascii_uppercase();
     if upper.contains("INT") {
         Affinity::Integer

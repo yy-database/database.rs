@@ -12,8 +12,8 @@ use std::{
 };
 
 use crate::{
-    Collation, ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue,
-    decode_library_version, decode_record, read_index_table_with, read_table, validate_database,
+    Affinity, Collation, ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue,
+    affinity_of, decode_library_version, decode_record, read_index_table_with, read_table, validate_database,
 };
 
 use super::{
@@ -252,6 +252,97 @@ struct IndexDef {
     predicate: Option<ResolvedExpr>,
     /// 每个键项生效的排序规则，来自索引项显式 `COLLATE` 或列声明。
     collations: Vec<Collation>,
+}
+
+/// How one base-table scan is bounded before any row is decoded.
+///
+/// Every variant keeps the emitted row set and row order identical to the
+/// unbounded read: the full predicate still runs downstream, and a bounded
+/// read only narrows the candidate rows the scan materializes.
+enum ScanHint {
+    /// `WHERE <rowid alias> = <integer literal>`: one candidate rowid.
+    Pin(i64),
+    /// `WHERE <indexed column> = <literal>` covering every key column of a
+    /// plain column index: the rowids the index probe found, ascending.
+    Rowids(Vec<i64>),
+    /// `ORDER BY <rowid order> LIMIT n` with no other row-reducing clause:
+    /// only the first `n` rows in rowid order can reach the output.
+    Head(usize),
+}
+
+/// Canonical equality signature of one index or group key value.
+///
+/// Two cells share a signature exactly when `compare_cells_with` reports them
+/// equal, so a hash bucket built from signatures never splits rows the linear
+/// scan would have grouped, and never merges rows it would have kept apart.
+/// Values whose equality the canonical form cannot reproduce (a binary64 NaN,
+/// which the engine compares equal to every numeric, or an integer outside the
+/// exact binary64 range) yield `None` and push the caller back to the linear
+/// path.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ProbeKey {
+    /// SQL `NULL`.
+    Null,
+    /// A numeric value canonicalized to its binary64 bits, with every signed
+    /// zero folded onto positive zero (the engine compares them equal).
+    Number(u64),
+    /// An integer binary64 cannot represent exactly.
+    Wide(i64),
+    /// Text folded for its collation, so collation equality is byte equality.
+    Text(Box<[u8]>),
+    /// Blob bytes.
+    Blob(Box<[u8]>),
+}
+
+/// One key position's canonical signature, or `None` when the value is a NaN.
+fn probe_key(cell: &Cell, collation: Collation) -> Option<ProbeKey> {
+    match cell {
+        Cell::Null => Some(ProbeKey::Null),
+        Cell::Integer(value) => Some(integer_probe_key(*value)),
+        Cell::Real(value) => real_probe_key(*value),
+        Cell::Text(text) => Some(ProbeKey::Text(fold_text(text, collation).into_boxed_slice())),
+        Cell::Blob(bytes) => Some(ProbeKey::Blob(bytes.clone().into_boxed_slice())),
+    }
+}
+
+/// Signature of an integer: exact binary64 values fold onto the numeric bits,
+/// everything else keeps the full `i64`.
+fn integer_probe_key(value: i64) -> ProbeKey {
+    let real = value as f64;
+    if real.abs() < 9_223_372_036_854_775_808.0 && (real as i64) == value {
+        ProbeKey::Number(real.to_bits())
+    }
+    else {
+        ProbeKey::Wide(value)
+    }
+}
+
+/// Signature of a real; `None` for a NaN, which the engine compares equal to
+/// every numeric value and therefore has no hashable class.
+fn real_probe_key(value: f64) -> Option<ProbeKey> {
+    if value.is_nan() { None } else if value == 0.0 { Some(ProbeKey::Number(0.0f64.to_bits())) } else { Some(ProbeKey::Number(value.to_bits())) }
+}
+
+/// Text folded for its collation: `NOCASE` lowercases ASCII bytes and `RTRIM`
+/// drops trailing spaces, which is exactly what their comparisons ignore.
+fn fold_text(text: &str, collation: Collation) -> Vec<u8> {
+    match collation {
+        Collation::Binary => text.as_bytes().to_vec(),
+        Collation::Nocase => text.as_bytes().iter().map(u8::to_ascii_lowercase).collect(),
+        Collation::Rtrim => text.trim_end_matches(' ').as_bytes().to_vec(),
+    }
+}
+
+/// Cached live key set of one plain column index, valid while `epoch` matches
+/// the engine's write epoch.
+struct IndexProbe {
+    /// Write epoch the key set was read under.
+    epoch: u64,
+    /// Rowids sharing a canonical key, ascending.
+    map: HashMap<Vec<ProbeKey>, Vec<i64>>,
+    /// A stored key the canonical form cannot reproduce; the probe is then
+    /// never used and every query falls back to the full scan.
+    poisoned: bool,
 }
 
 /// One view in the engine catalog, keyed by its lowercase name.
@@ -1014,6 +1105,12 @@ pub struct Engine {
     /// Open explicit transaction, or `None` in autocommit. Savepoint names are
     /// stored outermost first.
     transaction: Option<TransactionState>,
+    /// Statement counter bumped by every statement that could change rows or
+    /// schema, so cached index probes rebuild after any mutation.
+    write_epoch: std::cell::Cell<u64>,
+    /// Live key sets of plain column indexes, keyed by lowercase index name,
+    /// valid only while the stored epoch matches [`Engine::write_epoch`].
+    index_probes: std::cell::RefCell<HashMap<String, IndexProbe>>,
 }
 
 /// Explicit transaction bookkeeping, mirroring the writer's snapshot levels.
@@ -1065,6 +1162,8 @@ impl Engine {
             recursive_triggers: false,
             last_insert_rowid: 0,
             transaction: None,
+            write_epoch: std::cell::Cell::new(0),
+            index_probes: std::cell::RefCell::new(HashMap::new()),
         };
         engine.load_catalog()?;
         Ok(engine)
@@ -2550,6 +2649,11 @@ impl Engine {
     }
 
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
+        // Any statement other than a plain read can change rows or schema, so
+        // the cached index probes stop being valid from this statement on.
+        if !matches!(statement, Statement::Select { .. } | Statement::Explain { .. }) {
+            self.write_epoch.set(self.write_epoch.get() + 1);
+        }
         let Some(schema) = leading_schema(&statement).map(str::to_owned)
         else {
             if let Some(index) = self.attached_target(&statement) {
@@ -6007,14 +6111,23 @@ impl Engine {
         // environment, and a derived table is evaluated once through this same
         // `select` (as a plain subquery, never correlated).
         // A single base rowid table with a `WHERE <rowid> = <integer literal>`
-        // conjunct is bounded to its one candidate row before decoding; the
-        // full predicate still runs downstream so the result is unchanged.
-        let pin = self.rowid_pin(from, filter);
+        // conjunct is bounded to its one candidate row before decoding; failing
+        // that, a `WHERE` conjunction covering every key column of a plain
+        // column index probes the index instead of decoding the whole table.
+        // Both keep the full predicate running downstream, so the emitted row
+        // set and order are unchanged.
+        let scan = match self.rowid_pin(from, filter) {
+            Some(rowid) => Some(ScanHint::Pin(rowid)),
+            None => self.index_pin(from, filter).map(ScanHint::Rowids),
+        };
+        // `ORDER BY <rowid order> LIMIT n` reads only the leading rows, because
+        // the scan order already satisfies that sort.
+        let scan = scan.or_else(|| self.rowid_head_bound(first, &order, limit).map(ScanHint::Head));
         let mut sources = Vec::with_capacity(from.len());
         let mut tables: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(from.len());
         let mut offset = 0;
         for table in from {
-            let (columns, rows) = self.select_source(table, budget, ctes, pin)?;
+            let (columns, rows) = self.select_source(table, budget, ctes, scan.as_ref())?;
             let width = columns.width();
             let source = Source {
                 label: table.label().to_string(),
@@ -7390,6 +7503,204 @@ impl Engine {
         }
     }
 
+    /// Single base rowid table of the main schema that a bounded scan may
+    /// target: one `FROM` item, no derived table, no temp object or view
+    /// shadowing the name, not `WITHOUT ROWID`. This is the shape gate shared
+    /// by the point-pin and index-pin paths; anything else keeps the full read.
+    fn bounded_scan_target<'a>(&'a self, from: &'a [TableRef]) -> Option<(&'a TableDef, &'a TableRef)> {
+        if from.len() != 1 {
+            return None;
+        }
+        let table = &from[0];
+        if table.query.is_some() {
+            return None;
+        }
+        let key = table.name.to_ascii_lowercase();
+        let reaches_main = match table.schema.as_deref() {
+            None => !self.temp_lookup.contains_key(&key) && !self.temp_views.contains_key(&key),
+            Some(qualifier) => {
+                let lower = qualifier.to_ascii_lowercase();
+                lower == "main" || self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(&lower))
+            }
+        };
+        if !reaches_main || self.views.contains_key(&key) {
+            return None;
+        }
+        let position = *self.table_lookup.get(&key)?;
+        let def = &self.tables[position];
+        if def.without_rowid {
+            return None;
+        }
+        Some((def, table))
+    }
+
+    /// Detects a `WHERE` conjunction that pins every key column of one plain
+    /// column index to a literal with `=`, and returns the matching rowids in
+    /// ascending order.
+    ///
+    /// The gate is deliberately narrow so the probe can never miss a row the
+    /// full predicate would keep. Only non-managed indexes over declared
+    /// columns qualify, each key column's literal must match the column's
+    /// affinity class exactly (a `TEXT` column with a text literal, an
+    /// `INTEGER` column with an integer literal, a `REAL` column with a real
+    /// literal), and a stored key the canonical signature cannot reproduce
+    /// poisons the whole probe. The full predicate still runs downstream, so
+    /// over-fetching is harmless. Within one full-key equality the index
+    /// entries are ordered by rowid, which is also the order of the full
+    /// table scan, so the emitted rows keep their position.
+    fn index_pin(&self, from: &[TableRef], filter: &Option<Expr>) -> Option<Vec<i64>> {
+        let (def, table) = self.bounded_scan_target(from)?;
+        let filter = filter.as_ref()?;
+        let table_key = def.name.to_ascii_lowercase();
+        for index in self.indexes.values() {
+            if index.managed || index.table != table_key || index.columns.is_empty() {
+                continue;
+            }
+            if let Some(rowids) = self.index_probe_rows(index, def, filter, table.label()) {
+                return Some(rowids);
+            }
+        }
+        None
+    }
+
+    /// Builds the probe key from the equality literals and looks it up in the
+    /// index's cached key set. `None` means the shape is not pushdown-safe and
+    /// the caller must fall back to the full scan.
+    fn index_probe_rows(&self, index: &IndexDef, def: &TableDef, filter: &Expr, label: &str) -> Option<Vec<i64>> {
+        let mut equalities: Vec<(usize, Cell)> = Vec::new();
+        collect_index_equalities(filter, def, label, &mut equalities);
+        if equalities.is_empty() {
+            return None;
+        }
+        let mut key = Vec::with_capacity(index.columns.len());
+        for (slot, position) in index.columns.iter().enumerate() {
+            let (_, cell) = equalities.iter().find(|(column, _)| column == position)?;
+            match (affinity_of(&def.columns[*position].declared_type), cell) {
+                (Affinity::Text, Cell::Text(_)) | (Affinity::Real, Cell::Real(_)) | (Affinity::Integer, Cell::Integer(_)) => {}
+                _ => return None,
+            }
+            let collation = index.collations.get(slot).copied().unwrap_or_default();
+            key.push(probe_key(cell, collation)?);
+        }
+        if key.iter().any(|part| matches!(part, ProbeKey::Wide(_))) {
+            return None;
+        }
+        self.index_probe_rowids(index, &key)
+    }
+
+    /// Returns the rowids stored under one probe key, rebuilding the cached
+    /// key set first when the write epoch moved on.
+    fn index_probe_rowids(&self, index: &IndexDef, key: &[ProbeKey]) -> Option<Vec<i64>> {
+        let epoch = self.write_epoch.get();
+        let name = index.name.to_ascii_lowercase();
+        {
+            let cache = self.index_probes.borrow();
+            if let Some(probe) = cache.get(&name) {
+                if probe.epoch == epoch {
+                    return if probe.poisoned { None } else { probe.map.get(key).cloned() };
+                }
+            }
+        }
+        let probe = self.build_index_probe(index, epoch);
+        let rowids = if probe.poisoned { None } else { probe.map.get(key).cloned() };
+        self.index_probes.borrow_mut().insert(name, probe);
+        rowids
+    }
+
+    /// Decodes one index's live key set into canonical signatures. A stored
+    /// key outside the canonical form (a NaN or a wide integer) poisons the
+    /// probe so every later query keeps the full scan.
+    fn build_index_probe(&self, index: &IndexDef, epoch: u64) -> IndexProbe {
+        let mut probe = IndexProbe { epoch, map: HashMap::new(), poisoned: false };
+        let entries = match self.writer.index_entries_decoded(&index.name) {
+            Ok(entries) => entries,
+            Err(_) => {
+                probe.poisoned = true;
+                return probe;
+            }
+        };
+        for (values, rowid) in entries {
+            if values.len() != index.columns.len() {
+                probe.poisoned = true;
+                break;
+            }
+            let mut key = Vec::with_capacity(values.len());
+            let mut canonical = true;
+            for (value, collation) in values.iter().zip(&index.collations) {
+                match probe_key(&write_value_cell(value), *collation) {
+                    Some(part) if !matches!(part, ProbeKey::Wide(_)) => key.push(part),
+                    _ => {
+                        canonical = false;
+                        break;
+                    }
+                }
+            }
+            if !canonical {
+                probe.poisoned = true;
+                break;
+            }
+            probe.map.entry(key).or_default().push(rowid);
+        }
+        if !probe.poisoned {
+            for rowids in probe.map.values_mut() {
+                rowids.sort_unstable();
+            }
+        }
+        probe
+    }
+
+    /// Detects `ORDER BY <rowid order> LIMIT n` over a single base rowid table
+    /// with nothing else that could reorder or drop rows: no `WHERE`, no
+    /// `DISTINCT`, no aggregate, group or window, no `count(*)`, no `DESC` and
+    /// no `NULLS` override. Returns the number of leading rows the scan has to
+    /// read (`offset + count`).
+    ///
+    /// A table scan already emits rowid order, which is exactly what an
+    /// ascending rowid sort produces, so reading only the prefix and letting
+    /// the generic sort run over it keeps the rows and their order identical.
+    /// Projection items must stay bare column references (or `*`): an aliased
+    /// projection could make an `ORDER BY` name resolve to a different
+    /// expression than the rowid column the scan order is based on.
+    fn rowid_head_bound(&self, first: &SelectCore, order: &[OrderKey], limit: Option<(usize, Option<usize>)>) -> Option<usize> {
+        if order.is_empty()
+            || first.filter.is_some()
+            || first.distinct
+            || !first.group.is_empty()
+            || first.having.is_some()
+            || !first.windows.is_empty()
+            || matches!(first.items, SelectItems::CountAll)
+        {
+            return None;
+        }
+        if !matches!(first.items, SelectItems::Star)
+            && !matches!(&first.items, SelectItems::Named(exprs) if exprs.iter().all(|expr| matches!(expr, Expr::Column(_))))
+        {
+            return None;
+        }
+        let Some((offset, Some(count))) = limit else {
+            return None;
+        };
+        let (def, table) = self.bounded_scan_target(&first.from)?;
+        let alias_name = def.rowid_alias.map(|index| def.columns[index].name.clone());
+        for entry in order {
+            if entry.descending || entry.nulls_first.is_some() {
+                return None;
+            }
+            let Expr::Column(column) = &entry.expr else {
+                return None;
+            };
+            if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(table.label())) {
+                return None;
+            }
+            let rowid_named = is_rowid_alias(&column.name);
+            let alias_named = alias_name.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(&column.name));
+            if !rowid_named && !alias_named {
+                return None;
+            }
+        }
+        Some(offset.saturating_add(count))
+    }
+
     /// Runs a nested `SELECT` statement through the same entry point as a
     /// top-level one, so its own `WITH` entries work as well.
     /// Resolves one `FROM` entry against the schema it names, if any. An
@@ -7400,7 +7711,7 @@ impl Engine {
         table: &TableRef,
         budget: &Budget,
         ctes: Option<&CteEnv>,
-        rowid_pin: Option<i64>,
+        scan: Option<&ScanHint>,
     ) -> Result<(SourceColumns<'b>, Vec<Vec<Cell>>), SqlError> {
         if let Some(query) = &table.query {
             let result = self.select_statement(query, &[], budget, ctes)?;
@@ -7489,15 +7800,38 @@ impl Engine {
                 let decoded = stored.iter().map(|payload| def.decode_without_rowid(payload)).collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
                 return Ok((SourceColumns::Table(def), decoded));
             }
-            let stored = match rowid_pin {
+            let stored = match scan {
                 // A `WHERE <rowid alias> = <integer literal>` on this very base
                 // rowid table: bound the scan to the one candidate row instead
                 // of decoding the whole table. The full predicate still runs in
                 // `cross_product`, so the emitted row set and order are exactly
                 // the unpushed path's; a miss yields no rows.
-                Some(rowid) => self
+                Some(ScanHint::Pin(rowid)) => self
                     .writer
-                    .table_range(&def.name, rowid, rowid, TableLimits::default())
+                    .table_range(&def.name, *rowid, *rowid, TableLimits::default())
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+                // A `WHERE <indexed column> = <literal>` covering every key
+                // column of a plain index: fetch just the probe's rowids, each
+                // by its own point read. They arrive ascending, which is both
+                // the index order under one full-key equality and the order of
+                // the full scan, so the emitted rows keep their position.
+                Some(ScanHint::Rowids(rowids)) => {
+                    let mut stored = Vec::with_capacity(rowids.len());
+                    for rowid in rowids.iter() {
+                        stored.extend(
+                            self.writer
+                                .table_range(&def.name, *rowid, *rowid, TableLimits::default())
+                                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+                        );
+                    }
+                    stored
+                }
+                // `ORDER BY <rowid order> LIMIT n`: read only the leading rows;
+                // the scan order already satisfies the sort, and the generic
+                // sort downstream just confirms it over this small prefix.
+                Some(ScanHint::Head(max_rows)) => self
+                    .writer
+                    .table_head(&def.name, *max_rows, TableLimits::default())
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
                 None => self
                     .writer
@@ -9825,6 +10159,17 @@ fn build_groups(
         return Ok(vec![rows]);
     }
     let mut groups: Vec<(Vec<Cell>, Vec<Vec<Cell>>)> = Vec::new();
+    // Hash buckets over the canonical key signatures, so a row finds its
+    // group in one probe instead of a linear scan over every group built so
+    // far. Two keys land in one bucket exactly when they compare equal, and
+    // within a bucket the first match in group-creation order is the same
+    // first match the linear scan would have taken, so the groups and their
+    // output order are unchanged.
+    let mut buckets: HashMap<Vec<ProbeKey>, Vec<usize>> = HashMap::new();
+    // A key the canonical form cannot hash (a NaN, which compares equal to
+    // every numeric, or a wide integer) switches the rest of the build to the
+    // linear scan, which reproduces the engine's comparison exactly.
+    let mut linear = false;
     for row in rows {
         let key = group_keys
             .iter()
@@ -9839,27 +10184,67 @@ fn build_groups(
                 GroupKey::Expression(expr, _) => expr.eval(&row, ctx),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let bucket = groups.iter_mut().find(|(existing, _)| {
-            existing.len() == key.len()
-                && existing.iter().zip(key.iter()).zip(group_keys.iter()).all(|((left, right), key)| {
-                    let collation = match key {
-                        GroupKey::Projected(_, collation) | GroupKey::Expression(_, collation) => *collation,
-                    };
-                    compare_cells_with(left, right, collation) == Ordering::Equal
-                })
-        });
-        match bucket {
-            Some((_, rows)) => {
+        let signature = if linear { None } else { group_signature(&key, group_keys) };
+        let matched = match &signature {
+            Some(signature) => buckets
+                .get(signature)
+                .and_then(|candidates| candidates.iter().find(|index| group_keys_equal(&groups[**index].0, &key, group_keys)))
+                .copied(),
+            None => {
+                linear = true;
+                groups.iter().position(|(existing, _)| group_keys_equal(existing, &key, group_keys))
+            }
+        };
+        match matched {
+            Some(index) => {
                 budget.charge(1)?;
-                rows.push(row);
+                groups[index].1.push(row);
             }
             None => {
                 budget.charge(1)?;
+                let index = groups.len();
+                if let Some(signature) = signature {
+                    buckets.entry(signature).or_default().push(index);
+                }
                 groups.push((key, vec![row]));
             }
         }
     }
     Ok(groups.into_iter().map(|(_, rows)| rows).collect())
+}
+
+/// Canonical hash signature of one group key, or `None` when a component is
+/// outside the canonical form and the row has to go through the linear scan.
+fn group_signature(key: &[Cell], group_keys: &[GroupKey]) -> Option<Vec<ProbeKey>> {
+    key
+        .iter()
+        .zip(group_keys)
+        .map(|(cell, group_key)| {
+            let collation = match group_key {
+                GroupKey::Projected(_, collation) | GroupKey::Expression(_, collation) => *collation,
+            };
+            match probe_key(cell, collation) {
+                Some(part) if !matches!(part, ProbeKey::Wide(_)) => Some(part),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The engine's group equality: every position compares equal under its key's
+/// collation, exactly as the linear scan decided.
+fn group_keys_equal(left: &[Cell], right: &[Cell], group_keys: &[GroupKey]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .zip(group_keys)
+            .all(|((existing, key), group_key)| {
+                let collation = match group_key {
+                    GroupKey::Projected(_, collation) | GroupKey::Expression(_, collation) => *collation,
+                };
+                compare_cells_with(existing, key, collation) == Ordering::Equal
+            })
 }
 
 /// Builds joined rows for a `FROM` clause that uses `JOIN`.
@@ -10142,6 +10527,32 @@ fn binding_order(relation: &Relation, conjuncts: &[ResolvedExpr]) -> Vec<usize> 
 /// Sources are bound in `binding_order`; the merged row keeps `FROM` column
 /// order throughout. A conjunct that contains a subquery cannot be attributed
 /// to one source, so it waits for the complete row instead of pruning early.
+/// Collects the `AND` conjuncts of the form `<column> = <literal>` (or the
+/// mirrored shape) that name a column of one base table, as `(position, cell)`
+/// pairs. Anything outside a plain `AND` of `=` comparisons contributes
+/// nothing, so a missed equality only costs the pushdown, never a row.
+fn collect_index_equalities(expr: &Expr, def: &TableDef, label: &str, out: &mut Vec<(usize, Cell)>) {
+    match expr {
+        Expr::And(left, right) => {
+            collect_index_equalities(left, def, label, out);
+            collect_index_equalities(right, def, label, out);
+        }
+        Expr::Compare { left, op, right } if *op == CompareOp::Eq => {
+            let (column, value) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(column), Expr::Literal(value)) | (Expr::Literal(value), Expr::Column(column)) => (column, value),
+                _ => return,
+            };
+            if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(label)) {
+                return;
+            }
+            if let Some(position) = def.columns.iter().position(|entry| entry.name.eq_ignore_ascii_case(&column.name)) {
+                out.push((position, literal_cell(value)));
+            }
+        }
+        _ => {}
+    }
+}
+
 fn cross_product(
     tables: &[Vec<Vec<Cell>>],
     relation: &Relation,
@@ -13685,6 +14096,122 @@ mod tests {
         );
         // A pinned equality combined with another conjunct keeps the filter.
         assert!(engine.execute_one("SELECT label FROM t WHERE id = 2 AND label = 'zzz'").expect("pin plus filter").rows.is_empty());
+    }
+
+    #[test]
+    fn select_indexed_equality_matches_the_full_scan() {
+        // Duplicate labels make the index non-unique, so the probe returns
+        // more than one rowid and their order must stay the full scan's rowid
+        // order.
+        let statements: &[&str] = &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, score REAL)",
+            "INSERT INTO t VALUES (5,'a',1.5),(2,'b',2.5),(9,'a',3.5),(4,'c',NULL)",
+        ];
+        let mut plain = joined_engine(statements);
+        let mut indexed = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, score REAL)",
+            "INSERT INTO t VALUES (5,'a',1.5),(2,'b',2.5),(9,'a',3.5),(4,'c',NULL)",
+            "CREATE INDEX tl ON t (label)",
+        ]);
+        for sql in [
+            "SELECT id, label FROM t WHERE label = 'a'",
+            "SELECT id FROM t WHERE label = 'b'",
+            "SELECT id FROM t WHERE label = 'zzz'",
+            "SELECT id FROM t WHERE label = 'a' AND score > 2",
+            "SELECT id, label, score FROM t WHERE label = 'a' ORDER BY id DESC",
+        ] {
+            assert_eq!(plain.execute_one(sql).expect("plain").rows, indexed.execute_one(sql).expect("indexed").rows, "{sql}");
+        }
+        // Affinity mismatch keeps the full scan but never changes the answer.
+        assert_eq!(
+            indexed.execute_one("SELECT id FROM t WHERE label = 5").expect("text affinity").rows,
+            plain.execute_one("SELECT id FROM t WHERE label = 5").expect("plain affinity").rows
+        );
+    }
+
+    #[test]
+    fn unique_index_point_lookup_and_multi_column_probe() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER)",
+            "CREATE UNIQUE INDEX tu ON t (a)",
+            "CREATE INDEX tab ON t (a, b)",
+            "INSERT INTO t VALUES (3,'x',1),(1,'y',2),(7,'z',3)",
+        ]);
+        // The unique index probe finds the single row.
+        assert_eq!(engine.execute_one("SELECT id FROM t WHERE a = 'x'").expect("unique").rows, vec![vec![Cell::Integer(3)]]);
+        // The multi-column probe covers both key columns.
+        assert_eq!(engine.execute_one("SELECT id FROM t WHERE a = 'x' AND b = 1").expect("multi").rows, vec![vec![Cell::Integer(3)]]);
+        // A partial multi-column key falls back to the full scan.
+        assert!(engine.execute_one("SELECT id FROM t WHERE a = 'x' AND b = 99").expect("miss").rows.is_empty());
+        // A predicate on a non-leading column keeps the full scan.
+        assert_eq!(engine.execute_one("SELECT id FROM t WHERE b = 2").expect("non-leading").rows, vec![vec![Cell::Integer(1)]]);
+    }
+
+    #[test]
+    fn index_probe_follows_writes() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)",
+            "CREATE INDEX tl ON t (label)",
+            "INSERT INTO t VALUES (1,'a'),(2,'b')",
+        ]);
+        assert_eq!(engine.execute_one("SELECT id FROM t WHERE label = 'b'").expect("b").rows, vec![vec![Cell::Integer(2)]]);
+        engine.execute_one("UPDATE t SET label = 'c' WHERE id = 2").expect("update");
+        assert!(engine.execute_one("SELECT id FROM t WHERE label = 'b'").expect("stale miss").rows.is_empty());
+        assert_eq!(engine.execute_one("SELECT id FROM t WHERE label = 'c'").expect("new key").rows, vec![vec![Cell::Integer(2)]]);
+        engine.execute_one("DELETE FROM t WHERE id = 1").expect("delete");
+        assert!(engine.execute_one("SELECT id FROM t WHERE label = 'a'").expect("deleted").rows.is_empty());
+    }
+
+    #[test]
+    fn order_by_rowid_limit_reads_only_the_prefix() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+        ]);
+        // The rowid-alias order with a limit is the scan prefix itself.
+        assert_eq!(
+            engine.execute_one("SELECT id, v FROM t ORDER BY id LIMIT 2").expect("head").rows,
+            vec![vec![Cell::Integer(1), text("a")], vec![Cell::Integer(2), text("b")]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT id, v FROM t ORDER BY rowid LIMIT 1 OFFSET 3").expect("offset head").rows,
+            vec![vec![Cell::Integer(4), text("d")]]
+        );
+        // `count(*)` over an ordered limit still counts the whole table.
+        assert_eq!(engine.execute_one("SELECT count(*) FROM t ORDER BY id LIMIT 2").expect("count").rows, vec![vec![Cell::Integer(5)]]);
+        // A `WHERE` can drop prefix rows, so the bounded read must not apply.
+        assert_eq!(
+            engine.execute_one("SELECT id FROM t WHERE v <> 'a' ORDER BY id LIMIT 2").expect("filtered").rows,
+            vec![vec![Cell::Integer(2)], vec![Cell::Integer(3)]]
+        );
+        // An aliased projection re-points the order name at another column.
+        assert_eq!(
+            engine.execute_one("SELECT v AS id FROM t ORDER BY id LIMIT 2").expect("alias order").rows,
+            vec![vec![text("a")], vec![text("b")]]
+        );
+    }
+
+    #[test]
+    fn group_by_hash_keeps_first_appearance_order() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, n INTEGER, r REAL)",
+            "INSERT INTO t VALUES (1,'b',1,1.5),(2,'a',1,2.5),(3,'b',2,2.0),(4,'a',1,7.0),(5,'c',2,NULL)",
+        ]);
+        // Text keys: groups appear in first-row order, not sorted.
+        assert_eq!(
+            engine.execute_one("SELECT k, count(*) FROM t GROUP BY k").expect("text groups").rows,
+            vec![vec![text("b"), Cell::Integer(2)], vec![text("a"), Cell::Integer(2)], vec![text("c"), Cell::Integer(1)]]
+        );
+        // A NULL key forms its own group, and a whole-valued real compares
+        // equal to the same integer, so `2.0` and `2` share one group.
+        assert_eq!(
+            engine.execute_one("SELECT count(*) FROM t GROUP BY COALESCE(r, n)").expect("mixed keys").rows,
+            vec![vec![Cell::Integer(1)], vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(1)]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT count(*) FROM t GROUP BY r").expect("null group").rows,
+            vec![vec![Cell::Integer(1)], vec![Cell::Integer(1)], vec![Cell::Integer(1)], vec![Cell::Integer(1)], vec![Cell::Integer(1)]]
+        );
     }
 
     #[test]
