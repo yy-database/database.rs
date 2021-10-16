@@ -209,6 +209,20 @@ fn expect_integer_array(client: &mut TcpStream, expected: &[i64]) {
     }
 }
 
+/// Reads an array of bulk strings without fixing the element order.
+fn bulk_array(client: &mut TcpStream) -> Vec<String> {
+    match read_reply(client) {
+        Reply::Array(Some(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Reply::Bulk(Some(bytes)) => String::from_utf8(bytes).unwrap(),
+                other => panic!("expected bulk array element, got {}", describe(&other)),
+            })
+            .collect(),
+        other => panic!("expected bulk array, got {}", describe(&other)),
+    }
+}
+
 fn expect_scan(client: &mut TcpStream) -> (String, Vec<String>) {
     match read_reply(client) {
         Reply::Array(Some(items)) => {
@@ -1926,6 +1940,96 @@ fn hash_keys_values_exists_and_float_increment() {
         send(&mut client, arguments);
         expect_error(&mut client, WRONGTYPE);
     }
+}
+
+/// `HSETNX` only writes absent fields, and `HRANDFIELD` samples fields with the
+/// distinct contract for positive counts and the repeat contract for negative ones.
+#[test]
+fn hash_setnx_and_randfield() {
+    let (mut client, _server) = memory_server("redis-hash-setnx-randfield");
+    send(&mut client, &["HSET", "h", "a", "1", "b", "2", "c", "3"]);
+    assert_eq!(expect_integer(&mut client), 3);
+
+    send(&mut client, &["HSETNX", "h", "a", "9"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["HGET", "h", "a"]);
+    expect_bulk(&mut client, Some("1"));
+    send(&mut client, &["HSETNX", "h", "d", "4"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HGET", "h", "d"]);
+    expect_bulk(&mut client, Some("4"));
+    send(&mut client, &["HSETNX", "fresh", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TYPE", "fresh"]);
+    expect_status(&mut client, "hash");
+    send(&mut client, &["HSETNX", "h", "a"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'hsetnx' command");
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["HSETNX", "str", "f", "v"]);
+    expect_error(&mut client, WRONGTYPE);
+
+    // `HSETNX` keeps the existing TTL like the other hash writes.
+    send(&mut client, &["EXPIRE", "h", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HSETNX", "h", "e", "5"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TTL", "h"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "HSETNX dropped the TTL: {ttl}");
+
+    // `HRANDFIELD` without a count answers one field, or null when the key is missing.
+    send(&mut client, &["HRANDFIELD", "nope"]);
+    expect_bulk(&mut client, None);
+    let fields = ["a", "b", "c", "d", "e"];
+    send(&mut client, &["HRANDFIELD", "h"]);
+    match read_reply(&mut client) {
+        Reply::Bulk(Some(bytes)) => assert!(fields.contains(&std::str::from_utf8(&bytes).unwrap())),
+        other => panic!("expected bulk field, got {}", describe(&other)),
+    }
+
+    // A positive count answers at most `count` distinct fields.
+    send(&mut client, &["HRANDFIELD", "h", "9"]);
+    let picks = bulk_array(&mut client);
+    assert_eq!(picks.len(), 5);
+    let mut sorted = picks.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 5, "HRANDFIELD repeated a field for a positive count");
+
+    // A negative count answers exactly `|count|` entries drawn with replacement.
+    send(&mut client, &["HRANDFIELD", "h", "-4"]);
+    let picks = bulk_array(&mut client);
+    assert_eq!(picks.len(), 4);
+    for pick in &picks {
+        assert!(fields.contains(&pick.as_str()), "HRANDFIELD invented {pick:?}");
+    }
+
+    // `WITHVALUES` answers field/value pairs consistent with `HGET`.
+    send(&mut client, &["HRANDFIELD", "h", "5", "WITHVALUES"]);
+    let pairs = bulk_array(&mut client);
+    assert_eq!(pairs.len(), 10);
+    for pair in pairs.chunks(2) {
+        send(&mut client, &["HGET", "h", pair[0].as_str()]);
+        expect_bulk(&mut client, Some(pair[1].as_str()));
+    }
+
+    // A zero count and a missing key with a count answer empty arrays.
+    send(&mut client, &["HRANDFIELD", "h", "0"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["HRANDFIELD", "nope", "3"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["HRANDFIELD", "nope", "-3"]);
+    expect_empty_array(&mut client);
+
+    send(&mut client, &["HRANDFIELD", "h", "not-a-number"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["HRANDFIELD", "h", "1", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["HRANDFIELD", "h", "1", "WITHVALUES", "X"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'hrandfield' command");
+    send(&mut client, &["HRANDFIELD", "str", "1"]);
+    expect_error(&mut client, WRONGTYPE);
 }
 
 /// `HSCAN` walks field/value pairs in pages and honours `MATCH`.

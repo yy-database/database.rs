@@ -281,6 +281,7 @@ pub(crate) fn decode_zset(bytes: &[u8]) -> Option<Vec<(Vec<u8>, f64)>> {
 pub(crate) fn is_hash_command(command: &[u8]) -> bool {
     for name in [
         b"HSET".as_slice(),
+        b"HSETNX",
         b"HGET",
         b"HGETALL",
         b"HDEL",
@@ -290,6 +291,7 @@ pub(crate) fn is_hash_command(command: &[u8]) -> bool {
         b"HVALS",
         b"HEXISTS",
         b"HINCRBYFLOAT",
+        b"HRANDFIELD",
         b"HSCAN",
     ] {
         if command.eq_ignore_ascii_case(name) {
@@ -854,6 +856,31 @@ pub(crate) fn handle_hash(
             Loaded::Rejected => Ok(()),
         };
     }
+    if command.eq_ignore_ascii_case(b"HSETNX") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "hsetnx");
+        }
+        let key = request.arguments[1];
+        let field = request.arguments[2].to_vec();
+        let value = request.arguments[3].to_vec();
+        let mut fields = match load_hash(stream, executor, base, key)? {
+            Loaded::Missing => Vec::new(),
+            Loaded::Found(fields) => fields,
+            Loaded::Rejected => return Ok(()),
+        };
+        if fields.iter().any(|(name, _)| *name == field) {
+            return write_integer(stream, 0);
+        }
+        fields.push((field, value));
+        let Some(bytes) = encode_hash(&fields)
+        else {
+            return write_error(stream, "hash exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::Hash.namespace(base), key, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_integer(stream, 1);
+    }
     if command.eq_ignore_ascii_case(b"HINCRBYFLOAT") {
         if request.arguments.len() != 4 {
             return write_arity_error(stream, "hincrbyfloat");
@@ -901,6 +928,67 @@ pub(crate) fn handle_hash(
             return write_storage_error(stream, &message);
         }
         return write_bulk(stream, &encoded);
+    }
+    if command.eq_ignore_ascii_case(b"HRANDFIELD") {
+        if request.arguments.len() < 2 || request.arguments.len() > 4 {
+            return write_arity_error(stream, "hrandfield");
+        }
+        let key = request.arguments[1];
+        let fields = match load_hash(stream, executor, base, key)? {
+            Loaded::Missing => Vec::new(),
+            Loaded::Found(fields) => fields,
+            Loaded::Rejected => return Ok(()),
+        };
+        let Some(raw_count) = request.arguments.get(2)
+        else {
+            if fields.is_empty() {
+                return write_null(stream, protocol);
+            }
+            let mut state = random_state();
+            let index = (next_random(&mut state) as usize) % fields.len();
+            return write_bulk(stream, &fields[index].0);
+        };
+        let Some(count) = parse_index(raw_count)
+        else {
+            return write_error(stream, "value is not an integer or out of range");
+        };
+        let with_values = match request.arguments.get(3) {
+            None => false,
+            Some(raw) if raw.eq_ignore_ascii_case(b"WITHVALUES") => true,
+            _ => return write_error(stream, "syntax error"),
+        };
+        if count > 0 {
+            let take = (count as usize).min(fields.len());
+            let mut order: Vec<usize> = (0..fields.len()).collect();
+            let mut state = random_state();
+            // Fisher-Yates 洗牌后取前 take 个，保证不重复，与 SRANDMEMBER 同一抽取方式。
+            for index in (1..order.len()).rev() {
+                let swap = (next_random(&mut state) as usize) % (index + 1);
+                order.swap(index, swap);
+            }
+            write_array_header(stream, if with_values { take * 2 } else { take })?;
+            for index in order.into_iter().take(take) {
+                write_bulk(stream, &fields[index].0)?;
+                if with_values {
+                    write_bulk(stream, &fields[index].1)?;
+                }
+            }
+            return Ok(());
+        }
+        if count == 0 || fields.is_empty() {
+            return write_array_header(stream, 0);
+        }
+        let picks = count.unsigned_abs() as usize;
+        write_array_header(stream, if with_values { picks * 2 } else { picks })?;
+        let mut state = random_state();
+        for _ in 0..picks {
+            let index = (next_random(&mut state) as usize) % fields.len();
+            write_bulk(stream, &fields[index].0)?;
+            if with_values {
+                write_bulk(stream, &fields[index].1)?;
+            }
+        }
+        return Ok(());
     }
     if command.eq_ignore_ascii_case(b"HSCAN") {
         if request.arguments.len() < 3 {
