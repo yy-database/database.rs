@@ -7,7 +7,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -333,6 +333,14 @@ fn fold_text(text: &str, collation: Collation) -> Vec<u8> {
     }
 }
 
+/// One inclusive/exclusive range bound on an indexed column.
+struct IndexBound {
+    /// Literal the stored key is compared against.
+    cell: Cell,
+    /// Whether a key equal to `cell` is inside the range.
+    inclusive: bool,
+}
+
 /// Cached live key set of one plain column index, valid while `epoch` matches
 /// the engine's write epoch.
 struct IndexProbe {
@@ -340,9 +348,21 @@ struct IndexProbe {
     epoch: u64,
     /// Rowids sharing a canonical key, ascending.
     map: HashMap<Vec<ProbeKey>, Vec<i64>>,
+    /// Decoded key values in index order, used by range probes that need the
+    /// engine's own comparison instead of a hash lookup.
+    entries: Vec<(Vec<Cell>, i64)>,
     /// A stored key the canonical form cannot reproduce; the probe is then
     /// never used and every query falls back to the full scan.
     poisoned: bool,
+}
+
+/// Memoized result of one uncorrelated subquery, valid for a single statement.
+enum SubqueryCache {
+    /// Rows of a scalar subquery or `EXISTS`, in evaluation order.
+    Rows(Vec<Vec<Cell>>),
+    /// Value set of `IN (SELECT ...)`; `keys` is `None` when a value has no
+    /// canonical signature, so membership falls back to the linear scan.
+    InList { values: Vec<Cell>, keys: Option<HashSet<ProbeKey>>, saw_null: bool },
 }
 
 /// One view in the engine catalog, keyed by its lowercase name.
@@ -1111,6 +1131,12 @@ pub struct Engine {
     /// Live key sets of plain column indexes, keyed by lowercase index name,
     /// valid only while the stored epoch matches [`Engine::write_epoch`].
     index_probes: std::cell::RefCell<HashMap<String, IndexProbe>>,
+    /// Memoized uncorrelated subquery results for the running statement, keyed
+    /// by the resolved subquery node address. Cleared before every statement.
+    subquery_cache: std::cell::RefCell<HashMap<usize, SubqueryCache>>,
+    /// Set whenever an `OuterColumn` is read, so a subquery can tell whether it
+    /// depended on the enclosing row and therefore must not be memoized.
+    outer_read: std::cell::Cell<bool>,
 }
 
 /// Explicit transaction bookkeeping, mirroring the writer's snapshot levels.
@@ -1164,6 +1190,8 @@ impl Engine {
             transaction: None,
             write_epoch: std::cell::Cell::new(0),
             index_probes: std::cell::RefCell::new(HashMap::new()),
+            subquery_cache: std::cell::RefCell::new(HashMap::new()),
+            outer_read: std::cell::Cell::new(false),
         };
         engine.load_catalog()?;
         Ok(engine)
@@ -2649,6 +2677,10 @@ impl Engine {
     }
 
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
+        // A subquery memo is only meaningful while one statement's AST is
+        // alive, so every statement starts from an empty cache.
+        self.subquery_cache.borrow_mut().clear();
+        self.outer_read.set(false);
         // Any statement other than a plain read can change rows or schema, so
         // the cached index probes stop being valid from this statement on.
         if !matches!(statement, Statement::Select { .. } | Statement::Explain { .. }) {
@@ -5166,8 +5198,7 @@ impl Engine {
                 }
             }
         }
-        let old_rows: Vec<(i64, Vec<Cell>)> = live.clone();
-        let old_lookup: BTreeMap<i64, Vec<Cell>> = old_rows.iter().cloned().collect();
+        let find_old = |rowid: i64| live.iter().find(|(candidate, _)| *candidate == rowid).map(|(_, cells)| cells.clone()).unwrap_or_default();
         // A `DO UPDATE` is an ordinary UPDATE for trigger and foreign-key
         // purposes: SQLite fires the update triggers with the rewritten row and
         // re-checks references the statement moves.
@@ -5196,7 +5227,7 @@ impl Engine {
         }
         else {
             for (write_rowid, values) in &planned.writes {
-                let old_cells = old_lookup.get(write_rowid).cloned().unwrap_or_default();
+                let old_cells = find_old(*write_rowid);
                 let mut new_cells = old_cells.clone();
                 if new_cells.len() < width {
                     new_cells.resize(width, Cell::Null);
@@ -5233,7 +5264,7 @@ impl Engine {
                 .writes
                 .iter()
                 .map(|(write_rowid, values)| {
-                    let old = old_lookup.get(write_rowid).cloned().unwrap_or_default();
+                    let old = find_old(*write_rowid);
                     let mut next = old.clone();
                     if next.len() < width {
                         next.resize(width, Cell::Null);
@@ -5255,14 +5286,31 @@ impl Engine {
             }
         }
         if self.foreign_keys {
-            self.check_update_foreign_keys(def, &planned, &old_rows, &assigned, "insert")?;
+            self.check_update_foreign_keys(def, &planned, live, &assigned, "insert")?;
         }
         if temp_position.is_none() {
             for (updated_rowid, old_cells, new_cells) in &events {
                 self.queue_update_after(table_key, def, &trigger_columns, &assigned_names, *updated_rowid, old_cells, new_cells);
             }
         }
-        *live = self.live_rows(def, "insert")?;
+        if temp_position.is_none() && !self.table_has_triggers(table_key) {
+            // Without triggers nothing else can rewrite the table, so the
+            // statement's own writes are enough to keep the in-memory rows
+            // current; reloading every row per upsert would make a batch of
+            // single-row upserts quadratic.
+            for (write_rowid, values) in &planned.writes {
+                if let Some((_, cells)) = live.iter_mut().find(|(candidate, _)| *candidate == *write_rowid) {
+                    for (slot, value) in values.iter().enumerate() {
+                        if let (crate::UpdateValue::Set(value), Some(cell)) = (value, cells.get_mut(slot)) {
+                            *cell = write_value_cell(value);
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            *live = self.live_rows(def, "insert")?;
+        }
         let rowid = planned.writes.first().map(|(rowid, _)| *rowid).unwrap_or(rowid);
         Ok(UpsertOutcome::Updated { rowid, rows: planned.returning })
     }
@@ -6471,24 +6519,10 @@ impl Engine {
                 };
                 outputs.push(cells);
             }
-            let mut seen: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
-            let mut kept: Vec<usize> = Vec::with_capacity(rows.len());
-            for &index in &order {
-                let duplicate = seen.iter().any(|existing| {
-                    existing.len() == outputs[index].len()
-                        && existing
-                            .iter()
-                            .zip(&outputs[index])
-                            .enumerate()
-                            .all(|(position, (left, right))| compare_cells_with(left, right, output_collation(position)) == Ordering::Equal)
-                });
-                if !duplicate {
-                    seen.push(outputs[index].clone());
-                    kept.push(index);
-                }
-            }
-            let (start, end) = limit_range(kept.len(), limit);
-            let out: Vec<Vec<Cell>> = kept[start..end].iter().map(|index| outputs[*index].clone()).collect();
+            let ordered: Vec<Vec<Cell>> = order.iter().map(|index| outputs[*index].clone()).collect();
+            let unique = retain_first_distinct(ordered, &output_collations);
+            let (start, end) = limit_range(unique.len(), limit);
+            let out: Vec<Vec<Cell>> = unique.into_iter().skip(start).take(end - start).collect();
             return Ok(ExecResult { statement: "select", columns: labels, rows: out, affected: 0 });
         }
         let (start, end) = limit_range(rows.len(), limit);
@@ -7559,6 +7593,9 @@ impl Engine {
             if let Some(rowids) = self.index_probe_rows(index, def, filter, table.label()) {
                 return Some(rowids);
             }
+            if let Some(rowids) = self.index_range_rows(index, def, filter, table.label()) {
+                return Some(rowids);
+            }
         }
         None
     }
@@ -7607,11 +7644,89 @@ impl Engine {
         rowids
     }
 
+    /// Detects a range predicate on the index's leading column and returns the
+    /// matching rowids in ascending order.
+    ///
+    /// The gate is as narrow as the equality probe: only non-managed indexes
+    /// over declared columns qualify, every bound literal must match the
+    /// column's affinity class, and a poisoned key set keeps the full scan. The
+    /// full predicate still runs downstream, so a wider candidate set is safe,
+    /// and ascending rowids preserve the full-scan order.
+    fn index_range_rows(&self, index: &IndexDef, def: &TableDef, filter: &Expr, label: &str) -> Option<Vec<i64>> {
+        let position = *index.columns.first()?;
+        let mut lower: Option<IndexBound> = None;
+        let mut upper: Option<IndexBound> = None;
+        collect_range_bounds(filter, def, label, position, &mut lower, &mut upper);
+        if lower.is_none() && upper.is_none() {
+            return None;
+        }
+        let affinity = affinity_of(&def.columns[position].declared_type);
+        for bound in [lower.as_ref(), upper.as_ref()].into_iter().flatten() {
+            match (&affinity, &bound.cell) {
+                (Affinity::Text, Cell::Text(_)) | (Affinity::Real, Cell::Real(_)) | (Affinity::Integer, Cell::Integer(_)) => {}
+                _ => return None,
+            }
+        }
+        let collation = index.collations.first().copied().unwrap_or_default();
+        self.index_range_rowids(index, &lower, &upper, collation)
+    }
+
+    /// Filters the cached index entries against the range bounds, rebuilding
+    /// the cache first when the write epoch moved on.
+    fn index_range_rowids(
+        &self,
+        index: &IndexDef,
+        lower: &Option<IndexBound>,
+        upper: &Option<IndexBound>,
+        collation: Collation,
+    ) -> Option<Vec<i64>> {
+        let epoch = self.write_epoch.get();
+        let name = index.name.to_ascii_lowercase();
+        let select = |probe: &IndexProbe| -> Option<Vec<i64>> {
+            if probe.poisoned {
+                return None;
+            }
+            let mut rowids = Vec::new();
+            for (key, rowid) in &probe.entries {
+                let Some(cell) = key.first() else {
+                    continue;
+                };
+                if let Some(bound) = lower {
+                    let ordering = compare_cells_with(cell, &bound.cell, collation);
+                    if ordering == Ordering::Less || (!bound.inclusive && ordering == Ordering::Equal) {
+                        continue;
+                    }
+                }
+                if let Some(bound) = upper {
+                    let ordering = compare_cells_with(cell, &bound.cell, collation);
+                    if ordering == Ordering::Greater || (!bound.inclusive && ordering == Ordering::Equal) {
+                        continue;
+                    }
+                }
+                rowids.push(*rowid);
+            }
+            rowids.sort_unstable();
+            Some(rowids)
+        };
+        {
+            let cache = self.index_probes.borrow();
+            if let Some(probe) = cache.get(&name) {
+                if probe.epoch == epoch {
+                    return select(probe);
+                }
+            }
+        }
+        let probe = self.build_index_probe(index, epoch);
+        let rowids = select(&probe);
+        self.index_probes.borrow_mut().insert(name, probe);
+        rowids
+    }
+
     /// Decodes one index's live key set into canonical signatures. A stored
     /// key outside the canonical form (a NaN or a wide integer) poisons the
     /// probe so every later query keeps the full scan.
     fn build_index_probe(&self, index: &IndexDef, epoch: u64) -> IndexProbe {
-        let mut probe = IndexProbe { epoch, map: HashMap::new(), poisoned: false };
+        let mut probe = IndexProbe { epoch, map: HashMap::new(), entries: Vec::new(), poisoned: false };
         let entries = match self.writer.index_entries_decoded(&index.name) {
             Ok(entries) => entries,
             Err(_) => {
@@ -7619,15 +7734,17 @@ impl Engine {
                 return probe;
             }
         };
+        probe.entries.reserve(entries.len());
         for (values, rowid) in entries {
             if values.len() != index.columns.len() {
                 probe.poisoned = true;
                 break;
             }
+            let cells: Vec<Cell> = values.iter().map(write_value_cell).collect();
             let mut key = Vec::with_capacity(values.len());
             let mut canonical = true;
-            for (value, collation) in values.iter().zip(&index.collations) {
-                match probe_key(&write_value_cell(value), *collation) {
+            for (cell, collation) in cells.iter().zip(&index.collations) {
+                match probe_key(cell, *collation) {
                     Some(part) if !matches!(part, ProbeKey::Wide(_)) => key.push(part),
                     _ => {
                         canonical = false;
@@ -7640,6 +7757,7 @@ impl Engine {
                 break;
             }
             probe.map.entry(key).or_default().push(rowid);
+            probe.entries.push((cells, rowid));
         }
         if !probe.poisoned {
             for rowids in probe.map.values_mut() {
@@ -8109,13 +8227,7 @@ fn rows_contain(rows: &[Vec<Cell>], candidate: &[Cell]) -> bool {
 
 /// Removes duplicate rows while keeping the first occurrence of each value.
 fn distinct_rows(rows: &[Vec<Cell>]) -> Vec<Vec<Cell>> {
-    let mut kept = Vec::new();
-    for row in rows {
-        if !rows_contain(&kept, row) {
-            kept.push(row.clone());
-        }
-    }
-    kept
+    retain_first_distinct(rows.to_vec(), &[])
 }
 
 /// Applies one set operator with SQLite's multiplicity rules.
@@ -8819,7 +8931,10 @@ impl ResolvedExpr {
                 .cloned()
                 .unwrap_or(Cell::Null),
             Self::ExcludedColumn { index } => ctx.engine.upsert_excluded.get(*index).cloned().unwrap_or(Cell::Null),
-            Self::OuterColumn { depth, index } => ctx.outer[*depth].columns[*index].value.clone(),
+            Self::OuterColumn { depth, index } => {
+                ctx.engine.outer_read.set(true);
+                ctx.outer[*depth].columns[*index].value.clone()
+            }
             Self::AggregateRef(index) => ctx.aggregates[*index].clone(),
             Self::Window(index) => ctx.windows.get(*index).and_then(|column| column.get(ctx.window_row)).cloned().unwrap_or(Cell::Null),
             Self::Unary { op, value } => {
@@ -9001,22 +9116,66 @@ impl ResolvedExpr {
                 Cell::Integer(i64::from(matched != *negated))
             }
             Self::Subquery(query) => {
+                let key = query.as_ref() as *const Statement as usize;
+                {
+                    let cache = ctx.engine.subquery_cache.borrow();
+                    if let Some(SubqueryCache::Rows(rows)) = cache.get(&key) {
+                        return Ok(rows.first().map_or(Cell::Null, |row| row[0].clone()));
+                    }
+                }
+                ctx.engine.outer_read.set(false);
                 let result = run_subquery(query, values, ctx)?;
                 check_single_column(&result)?;
+                if !ctx.engine.outer_read.get() {
+                    ctx.engine.subquery_cache.borrow_mut().insert(key, SubqueryCache::Rows(result.rows.clone()));
+                }
                 result.rows.first().map_or(Cell::Null, |row| row[0].clone())
             }
             Self::Exists(query) => {
                 // Existence is two-valued: no result value is consumed, so a
                 // surrounding `NOT` can never turn this into `NULL`.
+                let key = query.as_ref() as *const Statement as usize;
+                {
+                    let cache = ctx.engine.subquery_cache.borrow();
+                    if let Some(SubqueryCache::Rows(rows)) = cache.get(&key) {
+                        return Ok(Cell::Integer(i64::from(!rows.is_empty())));
+                    }
+                }
+                ctx.engine.outer_read.set(false);
                 let result = run_subquery(query, values, ctx)?;
+                if !ctx.engine.outer_read.get() {
+                    ctx.engine.subquery_cache.borrow_mut().insert(key, SubqueryCache::Rows(result.rows.clone()));
+                }
                 Cell::Integer(i64::from(!result.rows.is_empty()))
             }
             Self::InSubquery { value, query, negated } => {
                 let value = value.eval(values, ctx)?;
+                let key = query.as_ref() as *const Statement as usize;
+                {
+                    let cache = ctx.engine.subquery_cache.borrow();
+                    if let Some(SubqueryCache::InList { values: list, keys, saw_null }) = cache.get(&key) {
+                        return Ok(in_result_cached(&value, list, keys.as_ref(), *saw_null, *negated));
+                    }
+                }
+                ctx.engine.outer_read.set(false);
                 let result = run_subquery(query, values, ctx)?;
                 check_single_column(&result)?;
-                let list = result.rows.iter().filter_map(|row| row.first().cloned()).collect::<Vec<_>>();
-                in_result(&value, &list, *negated)
+                let correlated = ctx.engine.outer_read.get();
+                let mut list = Vec::with_capacity(result.rows.len());
+                let mut saw_null = false;
+                for row in &result.rows {
+                    let cell = row[0].clone();
+                    if matches!(cell, Cell::Null) {
+                        saw_null = true;
+                    }
+                    list.push(cell);
+                }
+                let keys = in_list_keys(&list);
+                let answer = in_result_cached(&value, &list, keys.as_ref(), saw_null, *negated);
+                if !correlated {
+                    ctx.engine.subquery_cache.borrow_mut().insert(key, SubqueryCache::InList { values: list, keys, saw_null });
+                }
+                answer
             }
         })
     }
@@ -9953,15 +10112,26 @@ fn truncate_rows(rows: &mut Vec<Vec<Cell>>, limit: Option<(usize, Option<usize>)
 /// Values are compared with `Cell`'s own equality, the same semantics grouping
 /// uses, so integers and reals stay distinct exactly as SQLite keeps them.
 fn retain_first_distinct(rows: Vec<Vec<Cell>>, collations: &[Collation]) -> Vec<Vec<Cell>> {
+    // Canonical signatures give a hash lookup for the common case; once a row
+    // has no signature, the rest of the run falls back to the engine's linear
+    // comparison so semantics never change.
+    let mut buckets: HashSet<Vec<ProbeKey>> = HashSet::with_capacity(rows.len());
     let mut seen: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
     let mut out = Vec::with_capacity(rows.len());
+    let mut linear = false;
     for row in rows {
-        if !seen.iter().any(|existing| {
-            existing.len() == row.len()
-                && existing.iter().zip(&row).enumerate().all(|(position, (left, right))| {
-                    compare_cells_with(left, right, collations.get(position).copied().unwrap_or_default()) == Ordering::Equal
-                })
-        }) {
+        let signature = if linear { None } else { row_signature(&row, collations) };
+        let duplicate = match &signature {
+            Some(signature) => buckets.contains(signature),
+            None => {
+                linear = true;
+                seen.iter().any(|existing| rows_equal_with(existing, &row, collations))
+            }
+        };
+        if !duplicate {
+            if let Some(signature) = signature {
+                buckets.insert(signature);
+            }
             seen.push(row.clone());
             out.push(row);
         }
@@ -10550,6 +10720,60 @@ fn collect_index_equalities(expr: &Expr, def: &TableDef, label: &str, out: &mut 
             }
         }
         _ => {}
+    }
+}
+
+/// Collects the lower and upper bounds of an `AND` conjunction on one column.
+///
+/// Only a plain `AND` of `<column> <op> <literal>` (or the mirrored shape)
+/// contributes; any other shape is ignored, so a missed bound only costs the
+/// pushdown. When several bounds name the same side, the last one wins, which
+/// stays a superset of the true result because the full predicate still runs.
+fn collect_range_bounds(
+    expr: &Expr,
+    def: &TableDef,
+    label: &str,
+    position: usize,
+    lower: &mut Option<IndexBound>,
+    upper: &mut Option<IndexBound>,
+) {
+    match expr {
+        Expr::And(left, right) => {
+            collect_range_bounds(left, def, label, position, lower, upper);
+            collect_range_bounds(right, def, label, position, lower, upper);
+        }
+        Expr::Compare { left, op, right } => {
+            let (column, value, flipped) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(column), Expr::Literal(value)) => (column, value, false),
+                (Expr::Literal(value), Expr::Column(column)) => (column, value, true),
+                _ => return,
+            };
+            if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(label)) {
+                return;
+            }
+            if def.columns.get(position).is_none_or(|entry| !entry.name.eq_ignore_ascii_case(&column.name)) {
+                return;
+            }
+            let op = if flipped { flip_range_op(*op) } else { *op };
+            let bound = IndexBound { cell: literal_cell(value), inclusive: matches!(op, CompareOp::GtEq | CompareOp::LtEq) };
+            match op {
+                CompareOp::Gt | CompareOp::GtEq => *lower = Some(bound),
+                CompareOp::Lt | CompareOp::LtEq => *upper = Some(bound),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mirrors a range comparison written with the literal on the left.
+fn flip_range_op(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::GtEq => CompareOp::LtEq,
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::LtEq => CompareOp::GtEq,
+        other => other,
     }
 }
 
@@ -11266,6 +11490,64 @@ fn in_result(value: &Cell, list: &[Cell], negated: bool) -> Cell {
         }
     }
     if saw_null { Cell::Null } else { Cell::Integer(i64::from(negated)) }
+}
+
+/// Canonical key set for an `IN (SELECT ...)` value list, or `None` when an
+/// item has no canonical signature, so membership has to scan the list.
+fn in_list_keys(values: &[Cell]) -> Option<HashSet<ProbeKey>> {
+    let mut keys = HashSet::with_capacity(values.len());
+    for value in values {
+        match probe_key(value, Collation::Binary) {
+            Some(key) if !matches!(key, ProbeKey::Wide(_)) => {
+                keys.insert(key);
+            }
+            _ => return None,
+        }
+    }
+    Some(keys)
+}
+
+/// Membership with the same three-valued result as [`in_result`], using the
+/// canonical key set when the whole list had one.
+fn in_result_cached(value: &Cell, list: &[Cell], keys: Option<&HashSet<ProbeKey>>, saw_null: bool, negated: bool) -> Cell {
+    if matches!(value, Cell::Null) {
+        return Cell::Null;
+    }
+    if let Some(keys) = keys
+        && let Some(key) = probe_key(value, Collation::Binary)
+        && !matches!(key, ProbeKey::Wide(_))
+    {
+        return if keys.contains(&key) {
+            Cell::Integer(i64::from(!negated))
+        }
+        else if saw_null {
+            Cell::Null
+        }
+        else {
+            Cell::Integer(i64::from(negated))
+        };
+    }
+    in_result(value, list, negated)
+}
+
+/// Canonical hash signature of one output row, or `None` when a cell falls
+/// outside the canonical form and dedup must fall back to the linear scan.
+fn row_signature(row: &[Cell], collations: &[Collation]) -> Option<Vec<ProbeKey>> {
+    row.iter()
+        .enumerate()
+        .map(|(position, cell)| match probe_key(cell, collations.get(position).copied().unwrap_or_default()) {
+            Some(part) if !matches!(part, ProbeKey::Wide(_)) => Some(part),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Row equality under the engine's comparison rules and the given collations.
+fn rows_equal_with(left: &[Cell], right: &[Cell], collations: &[Collation]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).enumerate().all(|(position, (first, second))| {
+            compare_cells_with(first, second, collations.get(position).copied().unwrap_or_default()) == Ordering::Equal
+        })
 }
 
 fn eval_function(name: ScalarFunction, args: &[Cell]) -> Cell {
@@ -14160,6 +14442,154 @@ mod tests {
         assert_eq!(engine.execute_one("SELECT id FROM t WHERE label = 'c'").expect("new key").rows, vec![vec![Cell::Integer(2)]]);
         engine.execute_one("DELETE FROM t WHERE id = 1").expect("delete");
         assert!(engine.execute_one("SELECT id FROM t WHERE label = 'a'").expect("deleted").rows.is_empty());
+    }
+
+    #[test]
+    fn upsert_updates_in_place_and_keeps_unassigned_columns() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, score REAL)",
+            "INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.5)",
+        ]);
+        // Two supplied rows conflict with the same stored row inside one
+        // statement: the second one must see the first one's write.
+        engine
+            .execute_one(
+                "INSERT INTO t (id,label,score) VALUES (2,'bee',20),(2,'boo',30) ON CONFLICT(id) DO UPDATE SET score = excluded.score",
+            )
+            .expect("multi upsert");
+        assert_eq!(
+            engine.execute_one("SELECT id, label, score FROM t ORDER BY id").expect("rows").rows,
+            vec![vec![Cell::Integer(1), text("a"), Cell::Real(1.5)], vec![Cell::Integer(2), text("b"), Cell::Real(30.0)]]
+        );
+        // A fresh INSERT attaches a new row, and a later upsert still finds it.
+        engine.execute_one("INSERT INTO t (id,label,score) VALUES (3,'c',3.5)").expect("insert");
+        engine
+            .execute_one("INSERT INTO t (id,label,score) VALUES (3,'x',4.5) ON CONFLICT(id) DO UPDATE SET score = excluded.score")
+            .expect("upsert new");
+        assert_eq!(
+            engine.execute_one("SELECT label, score FROM t WHERE id = 3").expect("new row").rows,
+            vec![vec![text("c"), Cell::Real(4.5)]]
+        );
+        // A trigger on the table keeps the reload path honest.
+        engine.execute_one("CREATE TABLE audit(score REAL)").expect("audit");
+        engine.execute_one("CREATE TRIGGER t_audit AFTER UPDATE ON t BEGIN INSERT INTO audit VALUES (NEW.score); END").expect("trigger");
+        engine
+            .execute_one("INSERT INTO t (id,label,score) VALUES (3,'x',9.5) ON CONFLICT(id) DO UPDATE SET score = excluded.score")
+            .expect("upsert with trigger");
+        assert_eq!(engine.execute_one("SELECT score FROM audit").expect("audit rows").rows, vec![vec![Cell::Real(9.5)]]);
+    }
+
+    #[test]
+    fn index_range_probe_matches_the_full_scan() {
+        let base: &[&str] = &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, n INTEGER)",
+            "INSERT INTO t VALUES (5,'e',5),(2,'b',2),(9,'i',9),(1,'a',1),(4,'d',4),(3,'c',3)",
+        ];
+        let mut plain = joined_engine(base);
+        let mut indexed = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, n INTEGER)",
+            "INSERT INTO t VALUES (5,'e',5),(2,'b',2),(9,'i',9),(1,'a',1),(4,'d',4),(3,'c',3)",
+            "CREATE INDEX tl ON t (label)",
+            "CREATE INDEX tn ON t (n)",
+        ]);
+        for sql in [
+            "SELECT id, label FROM t WHERE label > 'b'",
+            "SELECT id FROM t WHERE label >= 'b' AND label < 'd'",
+            "SELECT id FROM t WHERE label <= 'c'",
+            // The literal on the left must flip the comparison.
+            "SELECT id FROM t WHERE 'c' < label",
+            "SELECT id FROM t WHERE label BETWEEN 'b' AND 'd'",
+            "SELECT id, label FROM t WHERE label > 'a' ORDER BY label DESC",
+            // Integer affinity goes through the same probe.
+            "SELECT id FROM t WHERE n > 2 AND n <= 4",
+            // A range the probe cannot use (affinity mismatch, OR) still matches.
+            "SELECT id FROM t WHERE label > 2",
+            "SELECT id FROM t WHERE label < 'c' OR n = 9",
+        ] {
+            assert_eq!(plain.execute_one(sql).expect("plain").rows, indexed.execute_one(sql).expect("indexed").rows, "{sql}");
+        }
+        // Writes invalidate the cached entries, exactly like the equality probe.
+        assert!(indexed.execute_one("SELECT id FROM t WHERE label > 'y'").expect("primed miss").rows.is_empty());
+        indexed.execute_one("UPDATE t SET label = 'zz' WHERE id = 1").expect("update");
+        assert_eq!(
+            indexed.execute_one("SELECT id FROM t WHERE label > 'y'").expect("new key hit").rows,
+            vec![vec![Cell::Integer(1)]]
+        );
+        indexed.execute_one("DELETE FROM t WHERE id = 1").expect("delete");
+        assert!(indexed.execute_one("SELECT id FROM t WHERE label > 'y'").expect("deleted").rows.is_empty());
+    }
+
+    #[test]
+    fn subquery_memo_keeps_results_and_invalidates_per_statement() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)",
+            "INSERT INTO t VALUES (1,10),(2,20),(3,30)",
+            "CREATE TABLE u(id INTEGER PRIMARY KEY, keep INTEGER)",
+            "INSERT INTO u VALUES (1,1),(3,0)",
+        ]);
+        // Uncorrelated `IN`: the memo is built once and reused for every row.
+        assert_eq!(
+            engine.execute_one("SELECT id FROM t WHERE n IN (SELECT n FROM t WHERE n > 10)").expect("in").rows,
+            vec![vec![Cell::Integer(2)], vec![Cell::Integer(3)]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT count(*) FROM t WHERE id IN (SELECT id FROM t WHERE n > 10)").expect("in count").rows,
+            vec![vec![Cell::Integer(2)]]
+        );
+        // Correlated `EXISTS` must not be memoized across outer rows.
+        assert_eq!(
+            engine.execute_one("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.keep = 1)").expect("correlated").rows,
+            vec![vec![Cell::Integer(1)]]
+        );
+        // A later statement sees the new rows: the memo never survives a statement.
+        engine.execute_one("INSERT INTO t VALUES (4,40)").expect("insert");
+        assert_eq!(
+            engine.execute_one("SELECT id FROM t WHERE n IN (SELECT n FROM t WHERE n > 10)").expect("in again").rows,
+            vec![vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(4)]]
+        );
+        // `IN` with a NULL on both sides keeps SQLite's three-valued result.
+        engine.execute_one("CREATE TABLE m(id INTEGER, v INTEGER)").expect("create m");
+        engine.execute_one("INSERT INTO m VALUES (1,NULL),(2,5),(3,NULL)").expect("insert m");
+        assert_eq!(
+            engine.execute_one("SELECT id FROM m WHERE v IN (SELECT v FROM m WHERE id = 1)").expect("null in").rows,
+            Vec::<Vec<Cell>>::new()
+        );
+        assert_eq!(
+            engine.execute_one("SELECT id FROM m WHERE v NOT IN (SELECT v FROM m WHERE id = 2)").expect("null not in").rows,
+            Vec::<Vec<Cell>>::new()
+        );
+    }
+
+    #[test]
+    fn distinct_and_union_keep_first_occurrence_with_hash_signatures() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, n INTEGER, r REAL)",
+            "INSERT INTO t VALUES (1,'b',1,1.5),(2,'a',2,2.0),(3,'b',2,NULL),(4,'a',2,2.0),(5,'c',3,3.5)",
+        ]);
+        assert_eq!(
+            engine.execute_one("SELECT DISTINCT k FROM t").expect("distinct text").rows,
+            vec![vec![text("b")], vec![text("a")], vec![text("c")]]
+        );
+        // A whole-valued real compares equal to the same integer, so `2.0` and
+        // `2` collapse into one output row.
+        assert_eq!(
+            engine.execute_one("SELECT DISTINCT n FROM t").expect("distinct numbers").rows,
+            vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT DISTINCT r FROM t").expect("distinct real").rows,
+            vec![vec![Cell::Real(1.5)], vec![Cell::Real(2.0)], vec![Cell::Null], vec![Cell::Real(3.5)]]
+        );
+        // `UNION` deduplicates the same way and keeps first-seen order.
+        assert_eq!(
+            engine.execute_one("SELECT k FROM t WHERE id < 3 UNION SELECT k FROM t WHERE id > 2").expect("union").rows,
+            vec![vec![text("b")], vec![text("a")], vec![text("c")]]
+        );
+        // `INTERSECT` and `EXCEPT` still use the same equality.
+        assert_eq!(
+            engine.execute_one("SELECT k FROM t INTERSECT SELECT k FROM t WHERE n = 2").expect("intersect").rows,
+            vec![vec![text("b")], vec![text("a")]]
+        );
     }
 
     #[test]
