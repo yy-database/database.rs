@@ -146,6 +146,13 @@ pub struct DifferenceObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum BaselineProblem {
+    /// 基线与当前语料的合同版本不一致：不同版本的 seed/count/digest 不可比。
+    VersionDrift {
+        /// 基线语料版本。
+        baseline: u32,
+        /// 当前语料版本。
+        current: u32,
+    },
     /// 基线与当前语料的 seed 不一致。
     SeedDrift {
         /// 基线 seed。
@@ -223,9 +230,12 @@ pub struct Baseline {
 
 /// 比较基线身份与当前语料身份。
 ///
-/// 问题顺序固定为 seed、count、digest，便于与既有实现逐条对齐。
+/// 问题顺序固定为 version、seed、count、digest，便于与既有实现逐条对齐。
 pub fn check_identity(baseline: &BaselineIdentity, current: &BaselineIdentity) -> Vec<BaselineProblem> {
     let mut problems = Vec::new();
+    if baseline.spec.version != current.spec.version {
+        problems.push(BaselineProblem::VersionDrift { baseline: baseline.spec.version, current: current.spec.version });
+    }
     if baseline.spec.seed != current.spec.seed {
         problems.push(BaselineProblem::SeedDrift { baseline: baseline.spec.seed, current: current.spec.seed });
     }
@@ -334,6 +344,14 @@ mod tests {
         assert!(matches!(problems[0], BaselineProblem::SeedDrift { .. }));
         assert!(matches!(problems[1], BaselineProblem::CountDrift { .. }));
         assert!(matches!(problems[2], BaselineProblem::DigestDrift { .. }));
+    }
+
+    #[test]
+    fn version_drift_is_reported_before_seed() {
+        let baseline = BaselineIdentity { spec: CorpusSpec { version: 1, seed: 7, count: 3 }, digest: Digest::of(b"same") };
+        let current = BaselineIdentity { spec: CorpusSpec { version: 999, seed: 7, count: 3 }, digest: Digest::of(b"same") };
+        // seed/count/digest 全同，但合同版本不同，仍必须报问题。
+        assert_eq!(check_identity(&baseline, &current), vec![BaselineProblem::VersionDrift { baseline: 1, current: 999 }]);
     }
 
     #[test]

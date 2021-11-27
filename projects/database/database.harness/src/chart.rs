@@ -94,8 +94,8 @@ mod tests {
         BenchRow {
             workload: workload.to_owned(),
             unit: "ms".to_owned(),
-            ours: summarize(ours),
-            reference: reference.map(summarize),
+            ours: summarize(ours).expect("valid samples"),
+            reference: reference.map(|samples| summarize(samples).expect("valid reference samples")),
             reference_engine: reference.map(|_| "better-sqlite3".to_owned()),
             provenance: None,
         }
@@ -118,7 +118,17 @@ mod tests {
 
     #[test]
     fn nan_stats_are_refused_not_silently_plotted() {
-        let rows = [row("scan", &[], None)];
+        // `summarize` 已经拒绝空样本；这里直接构造一个带 NaN 的 Stats，
+        // 证明绘图入口自身也不会把非有限值画成图。
+        let nan = crate::bench::Stats { median_ms: f64::NAN, p95_ms: f64::NAN, min_ms: f64::NAN, max_ms: f64::NAN, rounds: 0 };
+        let rows = [BenchRow {
+            workload: "scan".into(),
+            unit: "ms".into(),
+            ours: nan,
+            reference: None,
+            reference_engine: None,
+            provenance: None,
+        }];
         assert!(bench_chart_svg(&rows, BenchMetric::Median, "nan").is_err());
     }
 

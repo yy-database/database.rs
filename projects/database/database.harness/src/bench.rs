@@ -99,9 +99,6 @@ impl BenchProvenance {
 }
 
 /// 一组样本的统计结果。
-///
-/// 空样本或含非有限值的样本不静默丢弃：全部统计量置为 NaN、`rounds` 保留
-/// 样本数，让报告侧显式变红。NaN 无法进 JSON，调用方必须在报告前拦截。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Stats {
     /// 中位数毫秒。
@@ -116,29 +113,82 @@ pub struct Stats {
     pub rounds: u32,
 }
 
+/// 基准样本不合格的原因。无效样本不得产生看似正常的统计结果。
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum BenchProblem {
+    /// 没有任何样本。
+    #[error("样本为空，不能计算统计")]
+    EmptySamples,
+    /// 负耗时。
+    #[error("第 {index} 个样本为负耗时 {value}")]
+    NegativeSample {
+        /// 样本下标，零起。
+        index: usize,
+        /// 非法值。
+        value: f64,
+    },
+    /// 非有限数（NaN / Infinity）。
+    #[error("第 {index} 个样本不是有限数")]
+    NonFiniteSample {
+        /// 样本下标，零起。
+        index: usize,
+    },
+    /// 实际轮数与计划不符。
+    #[error("轮数不符：计划 {expected} 轮，实际 {actual} 轮")]
+    RoundCount {
+        /// 计划的测量轮数。
+        expected: u32,
+        /// 实际收到的样本数。
+        actual: u32,
+    },
+    /// 归一操作数为零。
+    #[error("操作数为零，无法归一")]
+    ZeroOps,
+}
+
+/// 基准统计的结果别名。
+pub type BenchResult<T> = std::result::Result<T, BenchProblem>;
+
 /// 对一组毫秒样本求 median/p95/极值。
-#[must_use]
-pub fn summarize(samples_ms: &[f64]) -> Stats {
-    let rounds = samples_ms.len() as u32;
-    if samples_ms.is_empty() || !samples_ms.iter().all(|value| value.is_finite()) {
-        return Stats { median_ms: f64::NAN, p95_ms: f64::NAN, min_ms: f64::NAN, max_ms: f64::NAN, rounds };
+///
+/// 空样本、负耗时与非有限样本一律返回错误；统计结果必须是有限数，调用方
+/// 不得把无效输入当作正常的 0 或 NaN 结果继续报告。
+pub fn summarize(samples_ms: &[f64]) -> BenchResult<Stats> {
+    if samples_ms.is_empty() {
+        return Err(BenchProblem::EmptySamples);
+    }
+    for (index, value) in samples_ms.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(BenchProblem::NonFiniteSample { index });
+        }
+        if *value < 0.0 {
+            return Err(BenchProblem::NegativeSample { index, value: *value });
+        }
     }
 
     let mut sorted = samples_ms.to_vec();
     sorted.sort_by(|left, right| left.partial_cmp(right).expect("all samples are finite"));
 
+    let rounds = sorted.len() as u32;
     let middle = sorted.len() / 2;
     let median_ms = if sorted.len() % 2 == 0 { (sorted[middle - 1] + sorted[middle]) / 2.0 } else { sorted[middle] };
     let rank = (sorted.len() as f64 * 0.95).ceil() as usize - 1;
     let p95_ms = sorted[rank.min(sorted.len() - 1)];
 
-    Stats { median_ms, p95_ms, min_ms: sorted[0], max_ms: sorted[sorted.len() - 1], rounds }
+    Ok(Stats { median_ms, p95_ms, min_ms: sorted[0], max_ms: sorted[sorted.len() - 1], rounds })
 }
 
-/// 单次操作的归一毫秒（以 median 为基准）。`ops` 为 0 时返回 NaN。
-#[must_use]
-pub fn per_op_ms(stats: &Stats, ops: u64) -> f64 {
-    if ops == 0 { f64::NAN } else { stats.median_ms / ops as f64 }
+/// 按计划轮数校验后再统计。`plan.rounds` 为 0 时不校验轮数。
+pub fn summarize_plan(plan: &BenchPlan, samples_ms: &[f64]) -> BenchResult<Stats> {
+    if plan.rounds > 0 && samples_ms.len() as u32 != plan.rounds {
+        return Err(BenchProblem::RoundCount { expected: plan.rounds, actual: samples_ms.len() as u32 });
+    }
+    summarize(samples_ms)
+}
+
+/// 单次操作的归一毫秒（以 median 为基准）。`ops` 为 0 时返回错误，不产生 NaN。
+pub fn per_op_ms(stats: &Stats, ops: u64) -> BenchResult<f64> {
+    if ops == 0 { Err(BenchProblem::ZeroOps) } else { Ok(stats.median_ms / ops as f64) }
 }
 
 /// 一行基准报告：一个 workload 的本方结果与可选对照组。
@@ -245,17 +295,17 @@ mod tests {
 
     #[test]
     fn median_and_p95_match_golden_vectors() {
-        let five = summarize(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let five = summarize(&[1.0, 2.0, 3.0, 4.0, 5.0]).expect("five");
         assert_eq!((five.median_ms, five.p95_ms, five.min_ms, five.max_ms, five.rounds), (3.0, 5.0, 1.0, 5.0, 5));
 
-        let four = summarize(&[1.0, 2.0, 3.0, 4.0]);
+        let four = summarize(&[1.0, 2.0, 3.0, 4.0]).expect("four");
         assert_eq!((four.median_ms, four.p95_ms), (2.5, 4.0));
 
         let hundred: Vec<f64> = (1..=100).map(|value| value as f64).collect();
-        let big = summarize(&hundred);
+        let big = summarize(&hundred).expect("hundred");
         assert_eq!((big.median_ms, big.p95_ms), (50.5, 95.0));
 
-        let single = summarize(&[7.5]);
+        let single = summarize(&[7.5]).expect("single");
         assert_eq!((single.median_ms, single.p95_ms, single.min_ms, single.max_ms), (7.5, 7.5, 7.5, 7.5));
     }
 
@@ -263,7 +313,7 @@ mod tests {
     fn p95_is_nearest_rank_not_interpolated() {
         // 20 轮：ceil(20*0.95)-1 = 18 → 第 19 小的值。
         let samples: Vec<f64> = (1..=20).map(|value| value as f64).collect();
-        assert_eq!(summarize(&samples).p95_ms, 19.0);
+        assert_eq!(summarize(&samples).expect("samples").p95_ms, 19.0);
     }
 
     #[test]
@@ -271,26 +321,43 @@ mod tests {
         let forward: Vec<f64> = (1..=20).map(|value| value as f64).collect();
         let mut shuffled = forward.clone();
         shuffled.reverse();
-        assert_eq!(summarize(&forward), summarize(&shuffled));
+        assert_eq!(summarize(&forward).unwrap(), summarize(&shuffled).unwrap());
     }
 
     #[test]
-    fn empty_and_non_finite_samples_fail_visibly() {
-        assert!(summarize(&[]).median_ms.is_nan());
-        let poisoned = summarize(&[1.0, f64::NAN, 3.0]);
-        assert!(poisoned.median_ms.is_nan() && poisoned.p95_ms.is_nan() && poisoned.rounds == 3);
+    fn invalid_samples_are_refused_not_silently_zeroed() {
+        assert_eq!(summarize(&[]), Err(BenchProblem::EmptySamples));
+        assert_eq!(summarize(&[1.0, f64::NAN, 3.0]), Err(BenchProblem::NonFiniteSample { index: 1 }));
+        assert_eq!(summarize(&[1.0, f64::INFINITY]), Err(BenchProblem::NonFiniteSample { index: 1 }));
+        assert_eq!(summarize(&[-3.0, -1.0]), Err(BenchProblem::NegativeSample { index: 0, value: -3.0 }));
+    }
+
+    #[test]
+    fn planned_rounds_must_match_samples() {
+        let plan = BenchPlan { rounds: 3, warmup: 1 };
+        assert_eq!(summarize_plan(&plan, &[1.0, 2.0]), Err(BenchProblem::RoundCount { expected: 3, actual: 2 }));
+        assert!(summarize_plan(&plan, &[1.0, 2.0, 3.0]).is_ok());
+        // 计划轮数为 0 表示不校验轮数。
+        assert!(summarize_plan(&BenchPlan { rounds: 0, warmup: 0 }, &[1.0]).is_ok());
     }
 
     #[test]
     fn per_op_normalizes_the_median() {
-        let stats = summarize(&[10.0, 20.0, 30.0]);
-        assert_eq!(per_op_ms(&stats, 4), 5.0);
-        assert!(per_op_ms(&stats, 0).is_nan());
+        let stats = summarize(&[10.0, 20.0, 30.0]).expect("stats");
+        assert_eq!(per_op_ms(&stats, 4), Ok(5.0));
+        assert_eq!(per_op_ms(&stats, 0), Err(BenchProblem::ZeroOps));
     }
 
     #[test]
     fn delta_registry_explains_reference_free_rows() {
-        let row = BenchRow { workload: "point-pk".into(), unit: "ms".into(), ours: summarize(&[1.0]), reference: None, reference_engine: None, provenance: None };
+        let row = BenchRow {
+            workload: "point-pk".into(),
+            unit: "ms".into(),
+            ours: summarize(&[1.0]).expect("ours"),
+            reference: None,
+            reference_engine: None,
+            provenance: None,
+        };
         let registry = DeltaRegistry::new(vec![IntentionalDelta { workload: "point-pk".into(), reason: "no comparable index path".into() }]);
         assert!(registry.explains(&row));
         assert!(!registry.explains(&BenchRow { workload: "scan".into(), ..row }));
@@ -315,7 +382,7 @@ mod tests {
 
     #[test]
     fn provenance_stays_off_the_wire_when_unset() {
-        let row = BenchRow { workload: "get-seq".into(), unit: "ms".into(), ours: summarize(&[1.0]), reference: None, reference_engine: None, provenance: None };
+        let row = BenchRow { workload: "get-seq".into(), unit: "ms".into(), ours: summarize(&[1.0]).expect("ours"), reference: None, reference_engine: None, provenance: None };
         let row_json = serde_json::to_string(&row).expect("row serializes");
         assert!(!row_json.contains("provenance"), "unset row provenance must not appear on the wire: {row_json}");
 
@@ -377,7 +444,7 @@ mod tests {
 
         let report = BenchReport {
             provenance: Some(run_level),
-            rows: vec![BenchRow { workload: "set-big".into(), unit: "ms".into(), ours: summarize(&[1.0]), reference: None, reference_engine: None, provenance: Some(row_level) }],
+            rows: vec![BenchRow { workload: "set-big".into(), unit: "ms".into(), ours: summarize(&[1.0]).expect("ours"), reference: None, reference_engine: None, provenance: Some(row_level) }],
         };
         let effective = report.row_provenance(&report.rows[0]);
         assert_eq!(effective.scenario.as_deref(), Some("redis-big-value-set"), "row wins on overlap");

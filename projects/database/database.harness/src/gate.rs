@@ -140,13 +140,16 @@ pub struct GatePolicy {
     pub allow_partial: bool,
     /// 是否允许跳过用例。缺省 false。
     pub allow_skipped: bool,
+    /// 是否允许零用例 suite。缺省 false；纯分析调用显式打开，不能把空集合
+    /// 当作完整验收通过。
+    pub allow_empty_suites: bool,
     /// 必须出现的 suite 名单；缺失即记 `missing-suite`。
     pub required_suites: Vec<String>,
 }
 
 impl Default for GatePolicy {
     fn default() -> Self {
-        Self { allow_partial: false, allow_skipped: false, required_suites: Vec::new() }
+        Self { allow_partial: false, allow_skipped: false, allow_empty_suites: false, required_suites: Vec::new() }
     }
 }
 
@@ -164,6 +167,16 @@ pub enum GateProblem {
         cases: u64,
         /// 状态计数实际总和。
         counted: u64,
+    },
+    /// suite 声明零用例。纯分析集合可以合法，但不能作为完整验收通过。
+    EmptySuite {
+        /// 归属 suite。
+        suite: String,
+    },
+    /// 同一 suite 名重复出现，计数无法归属。
+    DuplicateSuite {
+        /// 重复的 suite 名。
+        suite: String,
     },
     /// 存在失败用例。
     Failed {
@@ -295,6 +308,9 @@ pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
         if counted != tally.cases {
             problems.push(GateProblem::TallyInconsistent { suite: name.clone(), cases: tally.cases, counted });
         }
+        if tally.cases == 0 && !policy.allow_empty_suites {
+            problems.push(GateProblem::EmptySuite { suite: name.clone() });
+        }
         if tally.failed > 0 {
             problems.push(GateProblem::Failed { suite: name.clone(), count: tally.failed });
         }
@@ -336,6 +352,12 @@ pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
             if actual < floor.min {
                 problems.push(GateProblem::FloorUnmet { suite: name.clone(), metric: floor.metric, min: floor.min, actual });
             }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for suite in suites {
+        if !seen.insert(suite.name.as_str()) {
+            problems.push(GateProblem::DuplicateSuite { suite: suite.name.clone() });
         }
     }
     for required in &policy.required_suites {
@@ -486,6 +508,33 @@ mod tests {
                 GateProblem::Unverified { suite: "dup".into(), count: 3 },
             ]
         );
+    }
+
+    #[test]
+    fn empty_required_suite_is_not_a_full_pass() {
+        let empty = SuiteTally::default();
+        let verdict = evaluate(
+            &[suite("required", empty, vec![])],
+            &GatePolicy { required_suites: vec!["required".into()], ..GatePolicy::default() },
+        );
+        assert!(!verdict.ok);
+        assert_eq!(verdict.problems, vec![GateProblem::EmptySuite { suite: "required".into() }]);
+        // 纯分析调用显式允许空集合，但这不是完整验收的默认结论。
+        let analysis = evaluate(
+            &[suite("required", empty, vec![])],
+            &GatePolicy { allow_empty_suites: true, ..GatePolicy::default() },
+        );
+        assert!(analysis.ok);
+    }
+
+    #[test]
+    fn duplicate_suite_names_fail_closed() {
+        let verdict = evaluate(
+            &[suite("sql", tally(2, 0, 2, 0, 0), vec![]), suite("sql", tally(2, 0, 2, 0, 0), vec![])],
+            &GatePolicy::default(),
+        );
+        assert!(!verdict.ok);
+        assert_eq!(verdict.problems, vec![GateProblem::DuplicateSuite { suite: "sql".into() }]);
     }
 
     #[test]

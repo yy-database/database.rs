@@ -17,7 +17,7 @@ use crate::corpus::Digest;
 /// 判定器无法在运行时证明期望值真的来自外部引擎；它只强制调用方把来源写进
 /// 结构，并在报告里对缺失来源的条目标 `unverified`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TruthProvenance {
     /// 真实外部引擎产出的值。
     ExternalEngine {
@@ -70,19 +70,31 @@ pub enum Cell {
 /// `ok`/`code`/`codeName`/`errmsg`、MySQL 的报文头字段），统一为「字段名 → 稳定
 /// 字符串值」。哪些字段允许归一、哪些文案算稳定由调用方决定并负责。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorShape {
     /// 字段名到稳定字符串值的映射，键序固定便于逐字节比较。
     pub fields: BTreeMap<String, String>,
 }
 
 /// 一次观测的载荷。
+///
+/// 行集合与原始字节使用结构体变体（`{"kind":"rows","rows":[...]}`、
+/// `{"kind":"wire","bytes":[...]}`）。内部标签只能与 map/struct 载荷组合，
+/// 序列（`Vec`）载荷必须给字段名，否则 serde 会拒绝序列化，TS 侧也无法
+/// 构造出可穿过 ABI 的形状。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObservedBody {
     /// 行集合：每行是单元格序列。
-    Rows(Vec<Vec<Cell>>),
+    Rows {
+        /// 行集合，行内为单元格序列。
+        rows: Vec<Vec<Cell>>,
+    },
     /// 原始字节（线协议报文、文件镜像等）。
-    Wire(Vec<u8>),
+    Wire {
+        /// 原始字节序列。
+        bytes: Vec<u8>,
+    },
     /// 错误结构。
     Error(ErrorShape),
     /// 引擎或语句不可用：带错误码与原因，不参与值比对。
@@ -96,6 +108,7 @@ pub enum ObservedBody {
 
 /// 一侧的观测值：来源（仅期望侧需要）加载荷。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Observed {
     /// 期望值一侧必须给出来源；实测侧通常为 `None`。
     pub provenance: Option<TruthProvenance>,

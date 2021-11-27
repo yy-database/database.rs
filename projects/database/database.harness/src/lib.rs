@@ -26,8 +26,8 @@ pub mod report;
 #[cfg(feature = "charts")]
 pub mod chart;
 
-pub use bench::{BenchPlan, BenchProvenance, BenchReport, BenchRow, DeltaRegistry, IntentionalDelta, Stats, per_op_ms, summarize};
-pub use compare::{CompareMode, Comparison, Diff, DifferenceClass, classify, compare};
+pub use bench::{BenchPlan, BenchProblem, BenchProvenance, BenchReport, BenchResult, BenchRow, DeltaRegistry, IntentionalDelta, Stats, per_op_ms, summarize, summarize_plan};
+pub use compare::{CompareMode, Comparison, Diff, DifferenceClass, UnavailableEvidence, classify, compare};
 pub use corpus::{
     Baseline, BaselineIdentity, BaselineProblem, BaselineVerdict, CorpusSpec, DifferenceObservation, Digest, KnownDifference, check_baseline,
     check_identity,
@@ -52,6 +52,12 @@ pub enum HarnessError {
     /// 报告序列化失败。
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// 报告版本不是当前合同版本。
+    #[error("不支持的报告版本 {version}")]
+    UnsupportedReportVersion {
+        /// 输入信封声明的版本。
+        version: u32,
+    },
     /// fuzz 生成、重放或语法校验失败。
     #[error("fuzz: {0}")]
     Fuzz(String),

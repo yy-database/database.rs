@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Result,
     corpus::{BaselineProblem, BaselineVerdict, CorpusSpec, Digest},
+    gate::GateVerdict,
 };
 
 /// 当前报告信封版本。
@@ -15,6 +16,7 @@ pub const REPORT_VERSION: u32 = 1;
 
 /// 语料判定段落。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CorpusReport {
     /// 本次运行的语料参数。
     pub spec: CorpusSpec,
@@ -36,7 +38,11 @@ impl CorpusReport {
 }
 
 /// 统一报告信封。
+///
+/// 信封承载已计算的判定结论，不在渲染期重新比较业务值。未知字段一律拒绝，
+/// 避免调用方传入新证据时被静默丢弃。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportEnvelope {
     /// 信封版本。
     pub version: u32,
@@ -44,17 +50,30 @@ pub struct ReportEnvelope {
     pub command: String,
     /// 语料判定段落；没有语料步骤时为空。
     pub corpus: Option<CorpusReport>,
+    /// 门禁判定；没有门禁步骤时为空。
+    pub gate: Option<GateVerdict>,
 }
 
 impl ReportEnvelope {
     /// 以当前版本构造空信封。
     pub fn new(command: impl Into<String>) -> Self {
-        Self { version: REPORT_VERSION, command: command.into(), corpus: None }
+        Self { version: REPORT_VERSION, command: command.into(), corpus: None, gate: None }
+    }
+
+    /// 校验信封版本；未知版本不得被渲染成当前合同。
+    pub fn validate(&self) -> Result<()> {
+        if self.version != REPORT_VERSION {
+            return Err(crate::HarnessError::UnsupportedReportVersion { version: self.version });
+        }
+        Ok(())
     }
 }
 
 /// 将信封渲染为稳定的 JSON 文本：两空格缩进，末尾带一个换行。
+///
+/// 渲染前先校验版本；未知版本直接报错，不输出看似合法的报告。
 pub fn render_json(report: &ReportEnvelope) -> Result<String> {
+    report.validate()?;
     let mut text = serde_json::to_string_pretty(report)?;
     text.push('\n');
     Ok(text)
@@ -81,10 +100,36 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "{{\n  \"version\": 1,\n  \"command\": \"corpus\",\n  \"corpus\": {{\n    \"spec\": {{\n      \"version\": 1,\n      \"seed\": 20261106,\n      \"count\": 2\n    }},\n    \"digest\": \"{}\",\n    \"matched\": 0,\n    \"problems\": [],\n    \"clean\": true\n  }}\n}}\n",
+                "{{\n  \"version\": 1,\n  \"command\": \"corpus\",\n  \"corpus\": {{\n    \"spec\": {{\n      \"version\": 1,\n      \"seed\": 20261106,\n      \"count\": 2\n    }},\n    \"digest\": \"{}\",\n    \"matched\": 0,\n    \"problems\": [],\n    \"clean\": true\n  }},\n  \"gate\": null\n}}\n",
                 identity.digest.to_hex()
             )
         );
+    }
+
+    #[test]
+    fn unknown_version_is_refused() {
+        let mut report = ReportEnvelope::new("corpus");
+        report.version = 999;
+        assert!(matches!(render_json(&report), Err(crate::HarnessError::UnsupportedReportVersion { version: 999 })));
+    }
+
+    #[test]
+    fn unknown_fields_are_refused_not_dropped() {
+        // 旧 renderer 会静默丢掉 verdict/suites；严格信封必须拒绝未知字段。
+        let result = serde_json::from_str::<ReportEnvelope>(
+            "{\"version\":1,\"command\":\"x\",\"corpus\":null,\"gate\":null,\"verdict\":{\"ok\":false}}",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gate_evidence_roundtrips() {
+        let mut report = ReportEnvelope::new("gate");
+        report.gate = Some(crate::gate::GateVerdict { ok: false, problems: vec![] });
+        let text = render_json(&report).unwrap();
+        assert!(text.contains("\"gate\": {"), "{text}");
+        let back: ReportEnvelope = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, report);
     }
 
     #[test]

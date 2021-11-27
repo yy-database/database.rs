@@ -104,10 +104,12 @@ pub enum Diff {
 /// 一次比对的完整结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Comparison {
-    /// 在给定模式下两侧是否一致。
+    /// 在给定模式下两侧是否一致。不可用时即使错误码相同也不算语义一致。
     pub matched: bool,
     /// 期望侧缺少来源标记时为真；此时即使一致也不算通过。
     pub unverified: bool,
+    /// 任一侧不可用时的执行状态证据；不可用是状态，不参与值语义通过。
+    pub unavailable: Option<UnavailableEvidence>,
     /// 差异信号：按比较模式从实测值派生的稳定字符串序列，与台账的
     /// `KnownDifference::signal` 同一词汇。一致时为空。
     pub signal: Vec<String>,
@@ -117,9 +119,19 @@ pub struct Comparison {
     pub truncated: bool,
 }
 
+/// 一侧或两侧不可用的证据。`None` 表示该侧不是不可用状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnavailableEvidence {
+    /// 期望侧错误码；该侧可用时为 `None`。
+    pub expected: Option<String>,
+    /// 实测侧错误码；该侧可用时为 `None`。
+    pub actual: Option<String>,
+}
+
 /// 比对两侧观测值。
 ///
-/// `expected` 的来源缺失时结果标 `unverified`。信号派生规则：
+/// `expected` 的来源缺失时结果标 `unverified`。任一侧为 `Unavailable` 时，
+/// `unavailable` 记录两侧错误码，比较结果不得作为值语义通过。信号派生规则：
 /// `StructuredFields` 按字段顺序产出 `field=value`；其余模式产出一条
 /// 形态级标记。信号只由实测侧的值决定，保证同一观测在任何调用方
 /// 得到同一字符串。
@@ -128,8 +140,17 @@ pub fn compare(expected: &Observed, actual: &Observed, mode: &CompareMode) -> Co
     let mut diffs: Vec<Diff> = Vec::new();
     let mut truncated = false;
 
+    let unavailable = match (&expected.body, &actual.body) {
+        (ObservedBody::Unavailable { code: expected_code, .. }, ObservedBody::Unavailable { code: actual_code, .. }) => {
+            Some(UnavailableEvidence { expected: Some(expected_code.clone()), actual: Some(actual_code.clone()) })
+        }
+        (ObservedBody::Unavailable { code, .. }, _) => Some(UnavailableEvidence { expected: Some(code.clone()), actual: None }),
+        (_, ObservedBody::Unavailable { code, .. }) => Some(UnavailableEvidence { expected: None, actual: Some(code.clone()) }),
+        _ => None,
+    };
+
     match (&expected.body, &actual.body) {
-        (ObservedBody::Rows(expected_rows), ObservedBody::Rows(actual_rows)) => {
+        (ObservedBody::Rows { rows: expected_rows }, ObservedBody::Rows { rows: actual_rows }) => {
             if expected_rows.len() != actual_rows.len() {
                 push_diff(&mut diffs, &mut truncated, Diff::RowCount { expected: expected_rows.len(), actual: actual_rows.len() });
             }
@@ -158,7 +179,7 @@ pub fn compare(expected: &Observed, actual: &Observed, mode: &CompareMode) -> Co
                 }
             }
         }
-        (ObservedBody::Wire(expected_bytes), ObservedBody::Wire(actual_bytes)) => {
+        (ObservedBody::Wire { bytes: expected_bytes }, ObservedBody::Wire { bytes: actual_bytes }) => {
             if expected_bytes.len() != actual_bytes.len() {
                 push_diff(&mut diffs, &mut truncated, Diff::WireLength { expected: expected_bytes.len(), actual: actual_bytes.len() });
             }
@@ -191,13 +212,19 @@ pub fn compare(expected: &Observed, actual: &Observed, mode: &CompareMode) -> Co
 
     let matched = diffs.is_empty();
     let signal = if matched { Vec::new() } else { derive_signal(&expected.body, &actual.body, mode) };
-    Comparison { matched, unverified, signal, diffs, truncated }
+    Comparison { matched, unverified, unavailable, signal, diffs, truncated }
 }
 
 fn compare_errors(expected: &ErrorShape, actual: &ErrorShape, mode: &CompareMode, diffs: &mut Vec<Diff>, truncated: &mut bool) {
     let fields: Vec<String> = match mode {
         CompareMode::StructuredFields { fields } => fields.clone(),
-        CompareMode::Exact | CompareMode::WireHex => expected.fields.keys().cloned().collect(),
+        // `Exact` 必须比较双方字段集合：只遍历 expected 会漏掉实测新增字段。
+        CompareMode::Exact | CompareMode::WireHex => {
+            let mut fields: Vec<String> = expected.fields.keys().chain(actual.fields.keys()).cloned().collect();
+            fields.sort();
+            fields.dedup();
+            fields
+        }
     };
     for field in &fields {
         let expected_value = expected.fields.get(field);
@@ -234,8 +261,8 @@ fn derive_signal(expected: &ObservedBody, actual: &ObservedBody, mode: &CompareM
 
 fn body_name(body: &ObservedBody) -> &'static str {
     match body {
-        ObservedBody::Rows(_) => "rows",
-        ObservedBody::Wire(_) => "wire",
+        ObservedBody::Rows { .. } => "rows",
+        ObservedBody::Wire { .. } => "wire",
         ObservedBody::Error(_) => "error",
         ObservedBody::Unavailable { .. } => "unavailable",
     }
@@ -258,7 +285,14 @@ pub enum DifferenceClass {
     Clean,
     /// 一致但期望值缺少来源——不得计为通过。
     Unverified,
-    /// 不一致，但信号与台账中某条已知差异完全相同。
+    /// 任一侧不可用：保留两侧错误码，不作为值语义通过。
+    Unavailable {
+        /// 期望侧错误码。
+        expected: Option<String>,
+        /// 实测侧错误码。
+        actual: Option<String>,
+    },
+    /// 不一致，但当前用例的台账条目信号完全相同。
     Known {
         /// 台账条目的稳定用例键。
         key: String,
@@ -271,15 +305,23 @@ pub enum DifferenceClass {
 
 /// 把一次比对对照已知差异台账归类。
 ///
-/// 只有信号与台账条目的 `signal` 逐字符串完全相同才算命中；部分相同算
-/// 未登记，由调用方决定是否更新台账。
-pub fn classify(comparison: &Comparison, known: &[KnownDifference]) -> DifferenceClass {
+/// `case_key` 是当前用例的稳定身份。只有台账条目的 `key` 与它相同、且信号
+/// 逐字符串完全相同才算命中；不提供身份或身份不匹配一律记未登记，防止用
+/// 其他用例的台账条目掩盖差异。
+pub fn classify(comparison: &Comparison, case_key: Option<&str>, known: &[KnownDifference]) -> DifferenceClass {
+    if let Some(unavailable) = &comparison.unavailable {
+        return DifferenceClass::Unavailable { expected: unavailable.expected.clone(), actual: unavailable.actual.clone() };
+    }
     if comparison.matched {
         return if comparison.unverified { DifferenceClass::Unverified } else { DifferenceClass::Clean };
     }
+    let Some(case_key) = case_key
+    else {
+        return DifferenceClass::Unlisted;
+    };
     known
         .iter()
-        .find(|entry| entry.signal == comparison.signal)
+        .find(|entry| entry.key == case_key && entry.signal == comparison.signal)
         .map(|entry| DifferenceClass::Known { key: entry.key.clone(), reason: entry.reason.clone() })
         .unwrap_or(DifferenceClass::Unlisted)
 }
@@ -294,11 +336,11 @@ mod tests {
     }
 
     fn rows(values: Vec<Vec<Cell>>) -> Observed {
-        Observed { provenance: external(), body: ObservedBody::Rows(values) }
+        Observed { provenance: external(), body: ObservedBody::Rows { rows: values } }
     }
 
     fn wire(bytes: &[u8]) -> Observed {
-        Observed { provenance: external(), body: ObservedBody::Wire(bytes.to_vec()) }
+        Observed { provenance: external(), body: ObservedBody::Wire { bytes: bytes.to_vec() } }
     }
 
     fn error(fields: &[(&str, &str)]) -> Observed {
@@ -315,7 +357,7 @@ mod tests {
         let actual = rows(vec![vec![Cell::Int(1), Cell::Text("a".into())]]);
         let comparison = compare(&expected, &actual, &CompareMode::Exact);
         assert!(comparison.matched && !comparison.unverified);
-        assert_eq!(classify(&comparison, &[]), DifferenceClass::Clean);
+        assert_eq!(classify(&comparison, Some("case-1"), &[]), DifferenceClass::Clean);
     }
 
     #[test]
@@ -325,7 +367,7 @@ mod tests {
         let comparison = compare(&expected, &rows(vec![vec![Cell::Int(7)]]), &CompareMode::Exact);
         assert!(comparison.matched);
         assert!(comparison.unverified);
-        assert_eq!(classify(&comparison, &[]), DifferenceClass::Unverified);
+        assert_eq!(classify(&comparison, Some("case-1"), &[]), DifferenceClass::Unverified);
     }
 
     #[test]
@@ -368,7 +410,61 @@ mod tests {
             signal: vec!["code=1101".into(), "codeName=duplicate key".into()],
             reason: "structured-rejection".into(),
         }];
-        assert_eq!(classify(&comparison, &known), DifferenceClass::Known { key: "case-7".into(), reason: "structured-rejection".into() });
+        assert_eq!(classify(&comparison, Some("case-7"), &known), DifferenceClass::Known { key: "case-7".into(), reason: "structured-rejection".into() });
+    }
+
+    #[test]
+    fn known_requires_the_current_case_identity() {
+        let expected = error(&[("code", "42601")]);
+        let actual = error(&[("code", "1101")]);
+        let mode = CompareMode::StructuredFields { fields: vec!["code".into()] };
+        let comparison = compare(&expected, &actual, &mode);
+        let known = [KnownDifference { key: "another-case".into(), signal: vec!["code=1101".into()], reason: "structured-rejection".into() }];
+        // 信号相同但属于其他用例：不得命中。
+        assert_eq!(classify(&comparison, Some("case-7"), &known), DifferenceClass::Unlisted);
+        // 没有身份时也不允许按通用信号命中。
+        assert_eq!(classify(&comparison, None, &known), DifferenceClass::Unlisted);
+    }
+
+    #[test]
+    fn exact_error_compares_both_field_sets() {
+        let expected = error(&[("code", "X")]);
+        let actual = error(&[("code", "X"), ("fatal", "true")]);
+        let comparison = compare(&expected, &actual, &CompareMode::Exact);
+        assert!(!comparison.matched, "实测新增字段必须报差异");
+        assert!(matches!(comparison.diffs.as_slice(), [Diff::ErrorField { field, expected: None, actual: Some(_) }] if field == "fatal"));
+    }
+
+    #[test]
+    fn unavailable_is_a_state_not_a_clean_match() {
+        let expected = Observed {
+            provenance: external(),
+            body: ObservedBody::Unavailable { code: "offline".into(), reason: "engine down".into() },
+        };
+        let actual = Observed {
+            provenance: None,
+            body: ObservedBody::Unavailable { code: "offline".into(), reason: "engine down".into() },
+        };
+        let comparison = compare(&expected, &actual, &CompareMode::Exact);
+        assert!(comparison.matched, "错误码相同在载荷层一致");
+        assert!(
+            matches!(&comparison.unavailable, Some(evidence) if evidence.expected.as_deref() == Some("offline") && evidence.actual.as_deref() == Some("offline"))
+        );
+        assert_eq!(
+            classify(&comparison, Some("case-1"), &[]),
+            DifferenceClass::Unavailable { expected: Some("offline".into()), actual: Some("offline".into()) }
+        );
+    }
+
+    #[test]
+    fn rows_and_wire_payloads_use_named_fields() {
+        let value = rows(vec![vec![Cell::Int(1)]]);
+        assert_eq!(serde_json::to_string(&value.body).unwrap(), "{\"kind\":\"rows\",\"rows\":[[{\"int\":1}]]}");
+        let bytes = wire(&[1, 2]);
+        assert_eq!(serde_json::to_string(&bytes.body).unwrap(), "{\"kind\":\"wire\",\"bytes\":[1,2]}");
+        let back: ObservedBody = serde_json::from_str("{\"kind\":\"rows\",\"rows\":[]}").unwrap();
+        assert_eq!(back, ObservedBody::Rows { rows: Vec::new() });
+        assert!(serde_json::from_str::<ObservedBody>("{\"kind\":\"rows\",\"rows\":[],\"extra\":1}").is_err());
     }
 
     #[test]
@@ -378,7 +474,7 @@ mod tests {
         let mode = CompareMode::StructuredFields { fields: vec!["code".into()] };
         let comparison = compare(&expected, &actual, &mode);
         let known = [KnownDifference { key: "case-7".into(), signal: vec!["code=2201".into()], reason: "other".into() }];
-        assert_eq!(classify(&comparison, &known), DifferenceClass::Unlisted);
+        assert_eq!(classify(&comparison, Some("case-7"), &known), DifferenceClass::Unlisted);
     }
 
     #[test]
