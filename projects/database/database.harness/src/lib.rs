@@ -36,7 +36,7 @@ pub use fuzz::{
     FuzzInput, FuzzPlan, Grammar, Rule, ShrinkMove, ShrinkMoveKind, ShrinkSession, SlotPool, SplitMix64, Symbol, TraceEntry, generate, render,
     shrink, shrink_next, shrink_report, shrink_start,
 };
-pub use gate::{BaselineSignal, Floor, GatePolicy, GateProblem, GateVerdict, Metric, OracleQualification, SuiteReport, SuiteTally, evaluate};
+pub use gate::{BaselineSignal, CaseOutcome, CaseRecord, Floor, GatePolicy, GateProblem, GateVerdict, Metric, OracleQualification, SuiteReport, SuiteTally, evaluate};
 pub use observe::{Cell, ErrorShape, Observed, ObservedBody, TruthProvenance};
 pub use report::{CorpusReport, REPORT_VERSION, ReportEnvelope, render_json};
 

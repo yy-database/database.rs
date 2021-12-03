@@ -118,6 +118,87 @@ pub enum BaselineSignal {
     Changed,
 }
 
+/// 一个用例的最终状态。判别值 snake_case。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseOutcome {
+    /// 通过。
+    Passed,
+    /// 失败。
+    Failed,
+    /// 跳过。
+    Skipped,
+    /// 未验证。
+    Unverified,
+    /// 不可用。
+    Unavailable,
+    /// 超时。
+    TimedOut,
+    /// 取消。
+    Cancelled,
+    /// 崩溃。
+    Crashed,
+    /// 未执行。
+    NotRun,
+}
+
+impl CaseOutcome {
+    /// 状态在所有 outcome 中的固定顺序，用于 `case-tally-mismatch` 输出。
+    const ORDER: [CaseOutcome; 9] = [
+        CaseOutcome::Passed,
+        CaseOutcome::Failed,
+        CaseOutcome::Skipped,
+        CaseOutcome::Unverified,
+        CaseOutcome::Unavailable,
+        CaseOutcome::TimedOut,
+        CaseOutcome::Cancelled,
+        CaseOutcome::Crashed,
+        CaseOutcome::NotRun,
+    ];
+
+    /// 该状态的稳定字段名。
+    fn field(self) -> &'static str {
+        match self {
+            CaseOutcome::Passed => "passed",
+            CaseOutcome::Failed => "failed",
+            CaseOutcome::Skipped => "skipped",
+            CaseOutcome::Unverified => "unverified",
+            CaseOutcome::Unavailable => "unavailable",
+            CaseOutcome::TimedOut => "timed_out",
+            CaseOutcome::Cancelled => "cancelled",
+            CaseOutcome::Crashed => "crashed",
+            CaseOutcome::NotRun => "not_run",
+        }
+    }
+
+    /// 对应 `SuiteTally` 的计数字段。
+    fn tally_value(self, tally: &SuiteTally) -> u64 {
+        match self {
+            CaseOutcome::Passed => tally.passed,
+            CaseOutcome::Failed => tally.failed,
+            CaseOutcome::Skipped => tally.skipped,
+            CaseOutcome::Unverified => tally.unverified,
+            CaseOutcome::Unavailable => tally.unavailable,
+            CaseOutcome::TimedOut => tally.timed_out,
+            CaseOutcome::Cancelled => tally.cancelled,
+            CaseOutcome::Crashed => tally.crashed,
+            CaseOutcome::NotRun => tally.not_run,
+        }
+    }
+}
+
+/// 一个用例的一次执行记录。`attempt` 从 1 起，同一 case 的不同 attempt 视为
+/// 同一次重试；最终状态取 attempt 最大的记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaseRecord {
+    /// 稳定用例标识，在 suite 内唯一。
+    pub case: String,
+    /// 执行尝试序号，从 1 起。
+    pub attempt: u32,
+    /// 本次尝试的状态。
+    pub outcome: CaseOutcome,
+}
+
 /// 一个 suite 进门禁所需的全部证据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuiteReport {
@@ -125,6 +206,9 @@ pub struct SuiteReport {
     pub name: String,
     /// 执行状态计数。
     pub tally: SuiteTally,
+    /// 每个用例的尝试记录；完整验收必须提供，纯计数 suite 可留空。
+    #[serde(default)]
+    pub cases: Vec<CaseRecord>,
     /// 本 suite 的 floor 列表，按输入顺序比较。
     pub floors: Vec<Floor>,
     /// oracle 资格。
@@ -143,13 +227,30 @@ pub struct GatePolicy {
     /// 是否允许零用例 suite。缺省 false；纯分析调用显式打开，不能把空集合
     /// 当作完整验收通过。
     pub allow_empty_suites: bool,
+    /// 是否要求逐用例的 case/attempt 证据。缺省 false，完整验收应使用
+    /// [`GatePolicy::acceptance`] 打开；打开后缺证据、重复 case/attempt 或
+    /// 证据与 tally 不一致一律失败关闭。
+    pub require_case_evidence: bool,
     /// 必须出现的 suite 名单；缺失即记 `missing-suite`。
     pub required_suites: Vec<String>,
 }
 
 impl Default for GatePolicy {
     fn default() -> Self {
-        Self { allow_partial: false, allow_skipped: false, allow_empty_suites: false, required_suites: Vec::new() }
+        Self {
+            allow_partial: false,
+            allow_skipped: false,
+            allow_empty_suites: false,
+            require_case_evidence: false,
+            required_suites: Vec::new(),
+        }
+    }
+}
+
+impl GatePolicy {
+    /// 完整验收策略：在默认失败关闭之上要求逐用例证据。
+    pub fn acceptance() -> Self {
+        Self { require_case_evidence: true, ..Self::default() }
     }
 }
 
@@ -177,6 +278,31 @@ pub enum GateProblem {
     DuplicateSuite {
         /// 重复的 suite 名。
         suite: String,
+    },
+    /// 要求逐用例证据，但 suite 没有提供。
+    MissingCaseEvidence {
+        /// 归属 suite。
+        suite: String,
+    },
+    /// 同一 case 的同一 attempt 出现多次，计数会被重复计入。
+    DuplicateCase {
+        /// 归属 suite。
+        suite: String,
+        /// 用例标识。
+        case: String,
+        /// 重复的尝试序号。
+        attempt: u32,
+    },
+    /// 逐用例证据与 tally 不一致。
+    CaseTallyMismatch {
+        /// 归属 suite。
+        suite: String,
+        /// 不一致的字段名（`cases`、`attempts` 或状态名）。
+        field: String,
+        /// tally 声明值。
+        declared: u64,
+        /// 证据派生值。
+        derived: u64,
     },
     /// 存在失败用例。
     Failed {
@@ -289,6 +415,48 @@ pub struct GateVerdict {
     pub problems: Vec<GateProblem>,
 }
 
+/// 校验逐用例证据：同一 case/attempt 只允许出现一次，最终状态按最大 attempt
+/// 取，且派生计数必须与 tally 完全一致。
+fn check_case_evidence(suite: &SuiteReport, problems: &mut Vec<GateProblem>) {
+    let mut seen: std::collections::BTreeSet<(&str, u32)> = std::collections::BTreeSet::new();
+    for record in &suite.cases {
+        if !seen.insert((record.case.as_str(), record.attempt)) {
+            problems.push(GateProblem::DuplicateCase { suite: suite.name.clone(), case: record.case.clone(), attempt: record.attempt });
+        }
+    }
+
+    // 每个 case 取 attempt 最大的记录作为最终状态。
+    let mut finals: std::collections::BTreeMap<&str, (u32, CaseOutcome)> = std::collections::BTreeMap::new();
+    for record in &suite.cases {
+        let entry = finals.entry(record.case.as_str()).or_insert((record.attempt, record.outcome));
+        if record.attempt >= entry.0 {
+            *entry = (record.attempt, record.outcome);
+        }
+    }
+
+    let mut mismatches = Vec::new();
+    let declared_cases = suite.tally.cases;
+    let derived_cases = finals.len() as u64;
+    if declared_cases != derived_cases {
+        mismatches.push(("cases".to_owned(), declared_cases, derived_cases));
+    }
+    let declared_attempts = suite.tally.attempts;
+    let derived_attempts = suite.cases.len() as u64;
+    if declared_attempts != derived_attempts {
+        mismatches.push(("attempts".to_owned(), declared_attempts, derived_attempts));
+    }
+    for outcome in CaseOutcome::ORDER {
+        let derived = finals.values().filter(|(_, final_outcome)| *final_outcome == outcome).count() as u64;
+        let declared = outcome.tally_value(&suite.tally);
+        if declared != derived {
+            mismatches.push((outcome.field().to_owned(), declared, derived));
+        }
+    }
+    for (field, declared, derived) in mismatches {
+        problems.push(GateProblem::CaseTallyMismatch { suite: suite.name.clone(), field, declared, derived });
+    }
+}
+
 /// 按失败关闭规则判定一组 suite。
 pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
     let mut problems = Vec::new();
@@ -310,6 +478,13 @@ pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
         }
         if tally.cases == 0 && !policy.allow_empty_suites {
             problems.push(GateProblem::EmptySuite { suite: name.clone() });
+        }
+        if policy.require_case_evidence {
+            if tally.cases > 0 && suite.cases.is_empty() {
+                problems.push(GateProblem::MissingCaseEvidence { suite: name.clone() });
+            } else if !suite.cases.is_empty() {
+                check_case_evidence(suite, &mut problems);
+            }
         }
         if tally.failed > 0 {
             problems.push(GateProblem::Failed { suite: name.clone(), count: tally.failed });
@@ -381,7 +556,14 @@ mod tests {
     }
 
     fn suite(name: &str, t: SuiteTally, floors: Vec<Floor>) -> SuiteReport {
-        SuiteReport { name: name.to_string(), tally: t, floors, oracle: OracleQualification::not_required(), baseline: BaselineSignal::None }
+        SuiteReport {
+            name: name.to_string(),
+            tally: t,
+            cases: Vec::new(),
+            floors,
+            oracle: OracleQualification::not_required(),
+            baseline: BaselineSignal::None,
+        }
     }
 
     #[test]
@@ -427,6 +609,7 @@ mod tests {
         let s = SuiteReport {
             name: "ext".into(),
             tally: tally(10, 0, 10, 0, 0),
+            cases: Vec::new(),
             floors: vec![],
             oracle: OracleQualification { required: true, available: false, provenance: None },
             baseline: BaselineSignal::None,
@@ -561,6 +744,51 @@ mod tests {
         assert!(json.contains("\"kind\":\"tally-inconsistent\""), "{json}");
         let problem: GateProblem = serde_json::from_str("{\"kind\":\"tally-inconsistent\",\"suite\":\"b\",\"cases\":4,\"counted\":5}").unwrap();
         assert_eq!(problem, GateProblem::TallyInconsistent { suite: "b".into(), cases: 4, counted: 5 });
+    }
+
+    #[test]
+    fn acceptance_requires_case_evidence() {
+        let verdict = evaluate(&[suite("sql", tally(2, 0, 2, 0, 0), vec![])], &GatePolicy::acceptance());
+        assert_eq!(verdict.problems, vec![GateProblem::MissingCaseEvidence { suite: "sql".into() }]);
+    }
+
+    #[test]
+    fn duplicate_case_attempt_is_red() {
+        let t = SuiteTally { cases: 1, assertions: 0, attempts: 2, passed: 1, ..SuiteTally::default() };
+        let mut s = suite("sql", t, vec![]);
+        s.cases = vec![
+            CaseRecord { case: "a".into(), attempt: 1, outcome: CaseOutcome::Passed },
+            CaseRecord { case: "a".into(), attempt: 1, outcome: CaseOutcome::Passed },
+        ];
+        let verdict = evaluate(&[s], &GatePolicy::acceptance());
+        assert_eq!(verdict.problems, vec![GateProblem::DuplicateCase { suite: "sql".into(), case: "a".into(), attempt: 1 }]);
+    }
+
+    #[test]
+    fn evidence_must_match_the_tally() {
+        let t = SuiteTally { cases: 2, assertions: 0, attempts: 2, passed: 2, ..SuiteTally::default() };
+        let mut s = suite("sql", t, vec![]);
+        s.cases = vec![CaseRecord { case: "a".into(), attempt: 1, outcome: CaseOutcome::Passed }];
+        let verdict = evaluate(&[s], &GatePolicy::acceptance());
+        assert_eq!(
+            verdict.problems,
+            vec![
+                GateProblem::CaseTallyMismatch { suite: "sql".into(), field: "cases".into(), declared: 2, derived: 1 },
+                GateProblem::CaseTallyMismatch { suite: "sql".into(), field: "attempts".into(), declared: 2, derived: 1 },
+                GateProblem::CaseTallyMismatch { suite: "sql".into(), field: "passed".into(), declared: 2, derived: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn retries_count_once_by_the_final_attempt() {
+        let t = SuiteTally { cases: 1, assertions: 0, attempts: 2, passed: 1, ..SuiteTally::default() };
+        let mut s = suite("sql", t, vec![]);
+        s.cases = vec![
+            CaseRecord { case: "a".into(), attempt: 1, outcome: CaseOutcome::Failed },
+            CaseRecord { case: "a".into(), attempt: 2, outcome: CaseOutcome::Passed },
+        ];
+        assert!(evaluate(&[s], &GatePolicy::acceptance()).ok);
     }
 
     #[test]
