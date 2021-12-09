@@ -49,8 +49,10 @@ pub struct ReportEnvelope {
     /// 触发本次报告的命令名。
     pub command: String,
     /// 语料判定段落；没有语料步骤时为空。
+    #[serde(default)]
     pub corpus: Option<CorpusReport>,
     /// 门禁判定；没有门禁步骤时为空。
+    #[serde(default)]
     pub gate: Option<GateVerdict>,
 }
 
@@ -120,6 +122,12 @@ mod tests {
             "{\"version\":1,\"command\":\"x\",\"corpus\":null,\"gate\":null,\"verdict\":{\"ok\":false}}",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn missing_evidence_sections_default_to_none() {
+        let report: ReportEnvelope = serde_json::from_str("{\"version\":1,\"command\":\"x\"}").expect("minimal envelope");
+        assert_eq!(report, ReportEnvelope::new("x"));
     }
 
     #[test]

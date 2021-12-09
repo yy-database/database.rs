@@ -219,6 +219,7 @@ pub struct SuiteReport {
 
 /// 门禁策略。缺省全部失败关闭。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GatePolicy {
     /// 是否允许部分 suite 未执行（`not_run > 0`）。缺省 false。
     pub allow_partial: bool,
@@ -789,6 +790,16 @@ mod tests {
             CaseRecord { case: "a".into(), attempt: 2, outcome: CaseOutcome::Passed },
         ];
         assert!(evaluate(&[s], &GatePolicy::acceptance()).ok);
+    }
+
+    #[test]
+    fn partial_policy_json_keeps_fail_closed_defaults() {
+        let policy: GatePolicy = serde_json::from_str("{\"allow_skipped\":true}").expect("partial policy");
+        assert!(policy.allow_skipped);
+        assert!(!policy.allow_partial);
+        assert!(!policy.allow_empty_suites);
+        assert!(!policy.require_case_evidence);
+        assert!(policy.required_suites.is_empty());
     }
 
     #[test]
