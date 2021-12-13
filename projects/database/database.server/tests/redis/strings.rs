@@ -5,16 +5,14 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
     thread,
     time::Duration,
 };
 
 use database_cluster::topology::ShardMap;
 use database_execution::cluster::LocalExecutor;
-use database_server::yyds::redis::{
-    connection::serve_cancellable_with_executor, execute_string_command, resp::RequestLimits,
-};
+use database_server::yyds::redis::{connection::serve_cancellable_with_executor, execute_string_command, resp::RequestLimits};
 use database_storage::cluster_kv::MemoryShard;
 use database_types::cluster::{Namespace, ShardEpoch, ShardId};
 
@@ -393,4 +391,21 @@ fn string_family_entry_matches_the_server() {
     assert_eq!(run_prefixed(&[b"DBSIZE"]), ":1\r\n");
     assert_eq!(run_prefixed(&[b"FLUSHDB"]), "+OK\r\n");
     assert_eq!(run_prefixed(&[b"DBSIZE"]), ":0\r\n");
+}
+
+/// 真机命令名大小写不敏感：小写 `set` / `get` 与 `keys` 必须落到同一族，
+/// 低位命令名不能被当成未知命令。
+#[test]
+fn lowercase_command_names_reach_their_family() {
+    let (mut client, _server) = memory_server("redis-string-lowercase");
+    send(&mut client, &["set", "k", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["get", "k"]);
+    expect_bulk(&mut client, Some("v"));
+    send(&mut client, &["keys", "*"]);
+    expect_array(&mut client, &["k"]);
+    send(&mut client, &["expire", "k", "10"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ttl", "k"]);
+    assert_eq!(expect_integer(&mut client), 10);
 }

@@ -124,15 +124,7 @@ pub(crate) struct ConnectionState {
 
 impl ConnectionState {
     pub(crate) fn new(record: Arc<ClientRecord>) -> Self {
-        Self {
-            protocol: 2,
-            in_multi: false,
-            queue: Vec::new(),
-            record,
-            watched: Vec::new(),
-            multi_error: false,
-            defer_blocking: false,
-        }
+        Self { protocol: 2, in_multi: false, queue: Vec::new(), record, watched: Vec::new(), multi_error: false, defer_blocking: false }
     }
 }
 
@@ -671,25 +663,14 @@ fn handle_set(
 }
 
 /// `SET` 的回复：带 `GET` 时回旧值（缺失为 nil），否则成功回 `+OK`、条件不满足回 nil。
-fn write_set_reply(
-    stream: &mut dyn Write,
-    protocol: u8,
-    get: bool,
-    old_value: &Option<Vec<u8>>,
-    success: bool,
-) -> io::Result<()> {
+fn write_set_reply(stream: &mut dyn Write, protocol: u8, get: bool, old_value: &Option<Vec<u8>>, success: bool) -> io::Result<()> {
     if get {
         return match old_value {
             Some(value) => write_bulk(stream, value),
             None => write_null(stream, protocol),
         };
     }
-    if success {
-        stream.write_all(b"+OK\r\n")
-    }
-    else {
-        write_null(stream, protocol)
-    }
+    if success { stream.write_all(b"+OK\r\n") } else { write_null(stream, protocol) }
 }
 
 /// Absolute Unix-millisecond deadline for a SET expiry option, unless it overflows.
@@ -767,12 +748,7 @@ enum Resolved {
 }
 
 /// 探测逻辑键当前类型；探测失败时写成 RESP 错误并返回 `Rejected`。
-fn resolve_kind(
-    stream: &mut dyn Write,
-    executor: &dyn KeyValueExecutor,
-    namespace: &Namespace,
-    key: &[u8],
-) -> io::Result<Resolved> {
+fn resolve_kind(stream: &mut dyn Write, executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8]) -> io::Result<Resolved> {
     match collections::find_kind(executor, namespace, key) {
         Ok(Some(kind)) => Ok(Resolved::Kind(kind)),
         Ok(None) => Ok(Resolved::Missing),
@@ -825,11 +801,9 @@ fn load_string(executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8
 
 /// 写入字符串键并保留原有过期时间（缺键即普通写入）。
 fn store_string(executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8], value: Vec<u8>) -> Result<(), String> {
-    match executor.execute(None, KeyValueCommand {
-        namespace: namespace.clone(),
-        key: key.to_vec(),
-        action: KeyValueAction::PutKeepingExpiry(value),
-    }) {
+    match executor
+        .execute(None, KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::PutKeepingExpiry(value) })
+    {
         Ok(KeyValueResult::Put { .. }) => Ok(()),
         Ok(_) => Err("PUT executor returned unexpected result".into()),
         Err(error) => Err(error.to_string()),
@@ -983,20 +957,18 @@ fn expire_condition_allows(
     if !flags.any() {
         return Ok(Some(true));
     }
-    let current = match executor.execute(
-        None,
-        KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::GetExpiry },
-    ) {
-        Ok(KeyValueResult::Expiry { expires_at, .. }) => expires_at,
-        Ok(_) => {
-            write_error(stream, "EXPIRE executor returned unexpected result")?;
-            return Ok(None);
-        }
-        Err(error) => {
-            write_error(stream, &error.to_string())?;
-            return Ok(None);
-        }
-    };
+    let current =
+        match executor.execute(None, KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::GetExpiry }) {
+            Ok(KeyValueResult::Expiry { expires_at, .. }) => expires_at,
+            Ok(_) => {
+                write_error(stream, "EXPIRE executor returned unexpected result")?;
+                return Ok(None);
+            }
+            Err(error) => {
+                write_error(stream, &error.to_string())?;
+                return Ok(None);
+            }
+        };
     let allowed = if flags.nx {
         current.is_none()
     }
@@ -1267,10 +1239,7 @@ fn flush_databases(executor: &dyn KeyValueExecutor, databases: impl IntoIterator
 
 /// 进程内伪随机下标，`RANDOMKEY` 用它挑一个键。
 fn random_index(bound: usize) -> usize {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(1);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_nanos() as u64).unwrap_or(1);
     let mut value = nanos ^ 0x9E37_79B9_7F4A_7C15;
     value ^= value << 13;
     value ^= value >> 7;
@@ -1282,12 +1251,7 @@ fn random_index(bound: usize) -> usize {
 ///
 /// 按源键的实际类型复制值 blob，目标键先清空全部类型表示再写入；源键的剩余过期时间
 /// 随副本一起复制，与真机一致。
-fn handle_copy(
-    stream: &mut dyn Write,
-    request: &Request<'_>,
-    executor: &dyn KeyValueExecutor,
-    namespace: &Namespace,
-) -> io::Result<()> {
+fn handle_copy(stream: &mut dyn Write, request: &Request<'_>, executor: &dyn KeyValueExecutor, namespace: &Namespace) -> io::Result<()> {
     if request.arguments.len() < 3 {
         return write_error(stream, "wrong number of arguments for 'copy' command");
     }
@@ -1344,10 +1308,9 @@ fn handle_copy(
         return Ok(());
     }
     let source_namespace = source_kind.namespace(namespace);
-    let value = match executor.execute(
-        None,
-        KeyValueCommand { namespace: source_namespace.clone(), key: source.to_vec(), action: KeyValueAction::Get },
-    ) {
+    let value = match executor
+        .execute(None, KeyValueCommand { namespace: source_namespace.clone(), key: source.to_vec(), action: KeyValueAction::Get })
+    {
         Ok(KeyValueResult::Get(Some(value))) => value,
         Ok(KeyValueResult::Get(None)) => {
             stream.write_all(b":0\r\n")?;
@@ -1356,20 +1319,16 @@ fn handle_copy(
         Ok(_) => return write_error(stream, "COPY executor returned unexpected result"),
         Err(error) => return write_error(stream, &error.to_string()),
     };
-    let expires_at = match executor.execute(
-        None,
-        KeyValueCommand { namespace: source_namespace, key: source.to_vec(), action: KeyValueAction::GetExpiry },
-    ) {
+    let expires_at = match executor
+        .execute(None, KeyValueCommand { namespace: source_namespace, key: source.to_vec(), action: KeyValueAction::GetExpiry })
+    {
         Ok(KeyValueResult::Expiry { expires_at, .. }) => expires_at,
         Ok(_) => return write_error(stream, "COPY executor returned unexpected result"),
         Err(error) => return write_error(stream, &error.to_string()),
     };
     for kind in KeyKind::ALL {
-        let command = KeyValueCommand {
-            namespace: kind.namespace(&destination_base),
-            key: destination.to_vec(),
-            action: KeyValueAction::Delete,
-        };
+        let command =
+            KeyValueCommand { namespace: kind.namespace(&destination_base), key: destination.to_vec(), action: KeyValueAction::Delete };
         if let Err(error) = executor.execute(None, command) {
             return write_error(stream, &error.to_string());
         }
@@ -1384,11 +1343,8 @@ fn handle_copy(
         Err(error) => return write_error(stream, &error.to_string()),
     }
     if let Some(expires_at) = expires_at {
-        let command = KeyValueCommand {
-            namespace: destination_namespace,
-            key: destination.to_vec(),
-            action: KeyValueAction::SetExpiry { expires_at },
-        };
+        let command =
+            KeyValueCommand { namespace: destination_namespace, key: destination.to_vec(), action: KeyValueAction::SetExpiry { expires_at } };
         if let Err(error) = executor.execute(None, command) {
             return write_error(stream, &error.to_string());
         }
@@ -1420,19 +1376,13 @@ fn handle_object(
         || subcommand.eq_ignore_ascii_case(b"FREQ")
         || subcommand.eq_ignore_ascii_case(b"ENCODING");
     if !known {
-        write_error(
-            stream,
-            &format!("unknown subcommand '{}'. Try OBJECT HELP.", String::from_utf8_lossy(subcommand)),
-        )?;
+        write_error(stream, &format!("unknown subcommand '{}'. Try OBJECT HELP.", String::from_utf8_lossy(subcommand)))?;
         return Ok(());
     }
     if count != 3 {
         write_error(
             stream,
-            &format!(
-                "wrong number of arguments for 'object|{}' command",
-                String::from_utf8_lossy(subcommand).to_ascii_lowercase()
-            ),
+            &format!("wrong number of arguments for 'object|{}' command", String::from_utf8_lossy(subcommand).to_ascii_lowercase()),
         )?;
         return Ok(());
     }
@@ -1513,9 +1463,7 @@ fn object_encoding(kind: KeyKind, key: &[u8], value: &[u8]) -> &'static str {
             }
         }
         KeyKind::Hash => match collections::decode_hash(value) {
-            Some(fields) if fields.len() <= 128 && fields.iter().all(|(field, value)| field.len() <= 64 && value.len() <= 64) => {
-                "listpack"
-            }
+            Some(fields) if fields.len() <= 128 && fields.iter().all(|(field, value)| field.len() <= 64 && value.len() <= 64) => "listpack",
             _ => "hashtable",
         },
         KeyKind::List => match collections::decode_list(value) {
@@ -1541,8 +1489,15 @@ fn object_encoding(kind: KeyKind, key: &[u8], value: &[u8]) -> &'static str {
 /// 这些命令共享同一条执行链：值读写、计数器、位域、过期、键搬移、枚举与库级操作。
 /// 集合类型（hash / list / set / zset）不在其中，由各自的族入口承接。
 pub(crate) fn is_string_command(command: &[u8]) -> bool {
+    // 真机命令名大小写不敏感；先把命令名折叠成大写，再与清单逐字比较。
+    let mut upper = [0u8; 16];
+    if command.len() > upper.len() {
+        return false;
+    }
+    upper[..command.len()].copy_from_slice(command);
+    upper[..command.len()].make_ascii_uppercase();
     matches!(
-        command,
+        &upper[..command.len()],
         b"GET"
             | b"SET"
             | b"SETNX"
@@ -1598,7 +1553,14 @@ pub(crate) fn is_string_command(command: &[u8]) -> bool {
 /// 四个命令都只读键空间元信息：枚举键名、按游标分批返回、报告类型与对象编码。
 /// 它们与字符串共享同一套类型探测与过期判定，单独成族只是为了给绑定层一个稳定入口。
 pub(crate) fn is_keyspace_command(command: &[u8]) -> bool {
-    matches!(command, b"KEYS" | b"SCAN" | b"TYPE" | b"OBJECT")
+    // 与字符串族一致：命令名按真机口径大小写不敏感。
+    let mut upper = [0u8; 16];
+    if command.len() > upper.len() {
+        return false;
+    }
+    upper[..command.len()].copy_from_slice(command);
+    upper[..command.len()].make_ascii_uppercase();
+    matches!(&upper[..command.len()], b"KEYS" | b"SCAN" | b"TYPE" | b"OBJECT")
 }
 
 /// 服务键空间族，返回 `false` 表示命令不属于该族。
@@ -2118,8 +2080,7 @@ pub(crate) fn handle_string(
             return Ok(true);
         }
         let key = request.arguments[1];
-        let (Some(start), Some(stop)) =
-            (collections::parse_index(request.arguments[2]), collections::parse_index(request.arguments[3]))
+        let (Some(start), Some(stop)) = (collections::parse_index(request.arguments[2]), collections::parse_index(request.arguments[3]))
         else {
             write_error(stream, "value is not an integer or out of range")?;
             return Ok(true);
@@ -2368,8 +2329,7 @@ pub(crate) fn handle_string(
             None
         }
         else {
-            let (Some(start), Some(stop)) =
-                (collections::parse_index(request.arguments[2]), collections::parse_index(request.arguments[3]))
+            let (Some(start), Some(stop)) = (collections::parse_index(request.arguments[2]), collections::parse_index(request.arguments[3]))
             else {
                 write_error(stream, "value is not an integer or out of range")?;
                 return Ok(true);
@@ -2470,7 +2430,8 @@ pub(crate) fn handle_string(
             }
         };
         // 键不存在时真机把它视为无限长的 0 串，忽略范围：找 0 回 0，找 1 回 -1。
-        let Some(value) = value else {
+        let Some(value) = value
+        else {
             let answer = if target == 0 { 0 } else { -1 };
             write!(stream, ":{answer}\r\n")?;
             return Ok(true);
@@ -2692,10 +2653,7 @@ pub(crate) fn handle_string(
         if let Some(spec) = spec {
             let action = match spec {
                 ExpirySpec::Persist => database_query::cluster_kv::KeyValueAction::ClearExpiry,
-                ExpirySpec::Seconds(raw)
-                | ExpirySpec::Milliseconds(raw)
-                | ExpirySpec::SecondsAt(raw)
-                | ExpirySpec::MillisecondsAt(raw) => {
+                ExpirySpec::Seconds(raw) | ExpirySpec::Milliseconds(raw) | ExpirySpec::SecondsAt(raw) | ExpirySpec::MillisecondsAt(raw) => {
                     let Some(value) = parse_integer(raw)
                     else {
                         stream.write_all(b"-ERR value is not an integer or out of range\r\n")?;
@@ -2783,11 +2741,8 @@ pub(crate) fn handle_string(
         if destination_exists {
             // 覆盖目标时先清掉它可能存在的其它类型表示，避免一次逻辑键出现两份值。
             for other in KeyKind::ALL {
-                let command = KeyValueCommand {
-                    namespace: other.namespace(namespace),
-                    key: destination.to_vec(),
-                    action: KeyValueAction::Delete,
-                };
+                let command =
+                    KeyValueCommand { namespace: other.namespace(namespace), key: destination.to_vec(), action: KeyValueAction::Delete };
                 if let Err(error) = executor.execute(None, command) {
                     write_error(stream, &error.to_string())?;
                     return Ok(true);
@@ -2894,10 +2849,7 @@ pub(crate) fn handle_string(
             write_error(stream, "wrong number of arguments for 'flushall' command")?;
             return Ok(true);
         }
-        if count == 2
-            && !request.arguments[1].eq_ignore_ascii_case(b"ASYNC")
-            && !request.arguments[1].eq_ignore_ascii_case(b"SYNC")
-        {
+        if count == 2 && !request.arguments[1].eq_ignore_ascii_case(b"ASYNC") && !request.arguments[1].eq_ignore_ascii_case(b"SYNC") {
             write_error(stream, "syntax error")?;
             return Ok(true);
         }
@@ -2917,10 +2869,7 @@ pub(crate) fn handle_string(
             write_error(stream, "wrong number of arguments for 'flushdb' command")?;
             return Ok(true);
         }
-        if count == 2
-            && !request.arguments[1].eq_ignore_ascii_case(b"ASYNC")
-            && !request.arguments[1].eq_ignore_ascii_case(b"SYNC")
-        {
+        if count == 2 && !request.arguments[1].eq_ignore_ascii_case(b"ASYNC") && !request.arguments[1].eq_ignore_ascii_case(b"SYNC") {
             write_error(stream, "syntax error")?;
             return Ok(true);
         }
@@ -2957,20 +2906,18 @@ pub(crate) fn handle_string(
             }
             Resolved::Kind(kind) => kind.namespace(namespace),
         };
-        let (present, expires_at) = match executor.execute(
-            None,
-            KeyValueCommand { namespace: target, key: key.to_vec(), action: KeyValueAction::GetExpiry },
-        ) {
-            Ok(KeyValueResult::Expiry { present, expires_at }) => (present, expires_at),
-            Ok(_) => {
-                write_error(stream, "EXPIRETIME executor returned unexpected result")?;
-                return Ok(true);
-            }
-            Err(error) => {
-                write_error(stream, &error.to_string())?;
-                return Ok(true);
-            }
-        };
+        let (present, expires_at) =
+            match executor.execute(None, KeyValueCommand { namespace: target, key: key.to_vec(), action: KeyValueAction::GetExpiry }) {
+                Ok(KeyValueResult::Expiry { present, expires_at }) => (present, expires_at),
+                Ok(_) => {
+                    write_error(stream, "EXPIRETIME executor returned unexpected result")?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    write_error(stream, &error.to_string())?;
+                    return Ok(true);
+                }
+            };
         let value = if !present {
             -2
         }
@@ -3012,9 +2959,7 @@ pub(crate) fn handle_string(
                 let action = database_query::cluster_kv::KeyValueAction::PutIfAbsent(request.arguments[2].to_vec());
                 let command = database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action };
                 match executor.execute(None, command) {
-                    Ok(KeyValueResult::PutIfAbsent { revision }) => {
-                        stream.write_all(if revision.is_some() { b":1\r\n" } else { b":0\r\n" })?
-                    }
+                    Ok(KeyValueResult::PutIfAbsent { revision }) => stream.write_all(if revision.is_some() { b":1\r\n" } else { b":0\r\n" })?,
                     Ok(_) => write_error(stream, "SETNX executor returned unexpected result")?,
                     Err(error) => write_error(stream, &error.to_string())?,
                 }
@@ -3094,14 +3039,7 @@ pub(crate) fn handle_string(
             stream.write_all(b"-ERR unsupported command\r\n")?;
             return Ok(true);
         };
-        collections::handle_bitfield(
-            stream,
-            executor,
-            namespace,
-            &request.arguments,
-            command.eq_ignore_ascii_case(b"BITFIELD_RO"),
-            protocol,
-        )?;
+        collections::handle_bitfield(stream, executor, namespace, &request.arguments, command.eq_ignore_ascii_case(b"BITFIELD_RO"), protocol)?;
         return Ok(true);
     }
     else if let Some(executor) = executor {
@@ -3112,10 +3050,7 @@ pub(crate) fn handle_string(
             Ok(command) => {
                 // 这些命令只对字符串有效：hash / list 键在真机上回 WRONGTYPE 而不是 nil。
                 // 绑定成功后再探测，保证参数错误优先于类型错误。
-                if matches!(
-                    command.action,
-                    BoundAction::Get | BoundAction::GetDelete | BoundAction::GetSet(_) | BoundAction::IncrementBy(_)
-                ) {
+                if matches!(command.action, BoundAction::Get | BoundAction::GetDelete | BoundAction::GetSet(_) | BoundAction::IncrementBy(_)) {
                     match resolve_kind(stream, executor, namespace, &command.key)? {
                         Resolved::Kind(KeyKind::String) | Resolved::Missing => {}
                         Resolved::Kind(_) => {
@@ -3164,7 +3099,6 @@ pub(crate) fn handle_string(
     }
     Ok(true)
 }
-
 
 fn respond(
     stream: &mut dyn Write,
@@ -3503,8 +3437,7 @@ fn respond(
 /// 未知命令的真机文案：命令名之外还要回显参数前缀，末尾带一个空格。
 pub(crate) fn write_unknown_command(stream: &mut dyn Write, arguments: &[&[u8]]) -> io::Result<()> {
     let name = String::from_utf8_lossy(&arguments[0]);
-    let shown: Vec<String> =
-        arguments[1..].iter().map(|argument| format!("'{}'", String::from_utf8_lossy(argument))).collect();
+    let shown: Vec<String> = arguments[1..].iter().map(|argument| format!("'{}'", String::from_utf8_lossy(argument))).collect();
     if shown.is_empty() {
         write_error(stream, &format!("unknown command '{name}'"))
     }
@@ -3819,10 +3752,7 @@ fn validate_command_for_queue(
         return Ok(());
     }
     // RANDOMKEY / DBSIZE: exactly 1. FLUSHALL accepts an optional ASYNC / SYNC.
-    if command.eq_ignore_ascii_case(b"RANDOMKEY")
-        || command.eq_ignore_ascii_case(b"DBSIZE")
-        || command.eq_ignore_ascii_case(b"FLUSHALL")
-    {
+    if command.eq_ignore_ascii_case(b"RANDOMKEY") || command.eq_ignore_ascii_case(b"DBSIZE") || command.eq_ignore_ascii_case(b"FLUSHALL") {
         if executor.is_none() {
             return Err(b"-ERR unsupported command\r\n".to_vec());
         }
@@ -3884,10 +3814,7 @@ fn validate_command_for_queue(
     }
     // String range and bit commands: they need the executor. Argument values are
     // validated at runtime, so queueing only checks arity like upstream.
-    if command.eq_ignore_ascii_case(b"GETRANGE")
-        || command.eq_ignore_ascii_case(b"SETRANGE")
-        || command.eq_ignore_ascii_case(b"SETBIT")
-    {
+    if command.eq_ignore_ascii_case(b"GETRANGE") || command.eq_ignore_ascii_case(b"SETRANGE") || command.eq_ignore_ascii_case(b"SETBIT") {
         if executor.is_none() {
             return Err(b"-ERR unsupported command\r\n".to_vec());
         }
@@ -4088,9 +4015,7 @@ fn handle_pubsub(stream: &mut dyn Write, pubsub: &PubSubRegistry, arguments: &[&
 /// Error Redis returns for a known `PUBSUB` subcommand with the wrong argument count.
 fn write_pubsub_subcommand_error(stream: &mut dyn Write, subcommand: &[u8]) -> io::Result<()> {
     let name = String::from_utf8_lossy(subcommand);
-    stream.write_all(
-        format!("-ERR unknown subcommand or wrong number of arguments for '{name}'. Try PUBSUB HELP.\r\n").as_bytes(),
-    )
+    stream.write_all(format!("-ERR unknown subcommand or wrong number of arguments for '{name}'. Try PUBSUB HELP.\r\n").as_bytes())
 }
 
 /// Reads the current value of one key, which is the version compared by `WATCH`.
