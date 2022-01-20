@@ -26,7 +26,10 @@ pub mod report;
 #[cfg(feature = "charts")]
 pub mod chart;
 
-pub use bench::{BenchPlan, BenchProblem, BenchProvenance, BenchReport, BenchResult, BenchRow, DeltaRegistry, IntentionalDelta, Stats, per_op_ms, summarize, summarize_plan};
+pub use bench::{
+    BenchPlan, BenchProblem, BenchProvenance, BenchReport, BenchResult, BenchRow, DeltaRegistry, IntentionalDelta, Stats, per_op_ms, summarize,
+    summarize_plan,
+};
 pub use compare::{CompareMode, Comparison, Diff, DifferenceClass, UnavailableEvidence, classify, compare};
 pub use corpus::{
     Baseline, BaselineIdentity, BaselineProblem, BaselineVerdict, CorpusSpec, DifferenceObservation, Digest, KnownDifference, check_baseline,
@@ -36,9 +39,12 @@ pub use fuzz::{
     FuzzInput, FuzzPlan, Grammar, Rule, ShrinkMove, ShrinkMoveKind, ShrinkSession, SlotPool, SplitMix64, Symbol, TraceEntry, generate, render,
     shrink, shrink_next, shrink_report, shrink_start,
 };
-pub use gate::{BaselineSignal, CaseOutcome, CaseRecord, Floor, GatePolicy, GateProblem, GateVerdict, Metric, OracleQualification, SuiteReport, SuiteTally, evaluate};
+pub use gate::{
+    BaselineSignal, CaseOutcome, CaseRecord, ExpectedCase, Floor, GateManifest, GatePolicy, GateProblem, GateVerdict, Metric,
+    OracleQualification, SuiteReport, SuiteTally, evaluate, evaluate_with_manifest,
+};
 pub use observe::{Cell, ErrorShape, Observed, ObservedBody, TruthProvenance};
-pub use report::{CorpusReport, REPORT_VERSION, ReportEnvelope, render_json};
+pub use report::{CorpusReport, REPORT_VERSION, ReportEnvelope, RunIdentity, render_json};
 
 /// 判定协议的错误。
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +63,12 @@ pub enum HarnessError {
     UnsupportedReportVersion {
         /// 输入信封声明的版本。
         version: u32,
+    },
+    /// 验收报告缺必填身份字段。
+    #[error("报告字段 {field} 不能为空")]
+    EmptyReportField {
+        /// 缺失的字段名。
+        field: &'static str,
     },
     /// fuzz 生成、重放或语法校验失败。
     #[error("fuzz: {0}")]

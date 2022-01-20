@@ -402,6 +402,63 @@ pub enum GateProblem {
         /// 缺失的 suite 名。
         suite: String,
     },
+    /// 本次运行没有提交任何 suite。完整验收不得把空运行当作通过。
+    EmptyRun,
+    /// 用例标识为空，无法归属到稳定 case。
+    EmptyCase {
+        /// 归属 suite。
+        suite: String,
+    },
+    /// 尝试序号必须从 1 起。
+    InvalidAttempt {
+        /// 归属 suite。
+        suite: String,
+        /// 用例标识。
+        case: String,
+        /// 非法的尝试序号。
+        attempt: u32,
+    },
+    /// 预声明 manifest 中的用例没有出现在证据里。
+    MissingCase {
+        /// 归属 suite。
+        suite: String,
+        /// 缺失的用例标识。
+        case: String,
+    },
+    /// 证据里出现了 manifest 未声明的用例。
+    UnexpectedCase {
+        /// 归属 suite。
+        suite: String,
+        /// 多出的用例标识。
+        case: String,
+    },
+}
+
+/// 预声明的一条例用：suite 名与稳定 case 标识。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExpectedCase {
+    /// suite 稳定命名。
+    pub suite: String,
+    /// 用例标识，在 suite 内唯一。
+    pub case: String,
+}
+
+/// 本次运行预声明的完整用例清单。
+///
+/// 有了 manifest，门禁才能区分“提交上来的记录彼此自洽”和“计划执行的用例
+/// 全部出现”：漏跑一个同时把 tally 减一，没有清单就无法发现。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GateManifest {
+    /// 预声明用例，按 `(suite, case)` 排序无关。
+    pub cases: Vec<ExpectedCase>,
+}
+
+impl GateManifest {
+    /// 由 `(suite, case)` 序列构造清单。
+    pub fn new(cases: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>) -> Self {
+        Self { cases: cases.into_iter().map(|(suite, case)| ExpectedCase { suite: suite.into(), case: case.into() }).collect() }
+    }
 }
 
 /// 门禁判定结果。
@@ -421,6 +478,12 @@ pub struct GateVerdict {
 fn check_case_evidence(suite: &SuiteReport, problems: &mut Vec<GateProblem>) {
     let mut seen: std::collections::BTreeSet<(&str, u32)> = std::collections::BTreeSet::new();
     for record in &suite.cases {
+        if record.case.trim().is_empty() {
+            problems.push(GateProblem::EmptyCase { suite: suite.name.clone() });
+        }
+        if record.attempt == 0 {
+            problems.push(GateProblem::InvalidAttempt { suite: suite.name.clone(), case: record.case.clone(), attempt: record.attempt });
+        }
         if !seen.insert((record.case.as_str(), record.attempt)) {
             problems.push(GateProblem::DuplicateCase { suite: suite.name.clone(), case: record.case.clone(), attempt: record.attempt });
         }
@@ -460,7 +523,48 @@ fn check_case_evidence(suite: &SuiteReport, problems: &mut Vec<GateProblem>) {
 
 /// 按失败关闭规则判定一组 suite。
 pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
+    evaluate_with_manifest(suites, policy, None)
+}
+
+/// 校验预声明清单与逐用例证据是否完全吻合。
+///
+/// 清单里的每个 `(suite, case)` 都必须出现；证据里也不能出现清单之外的
+/// 用例。两边的比较以最终 attempt 的 case 身份为准，不按尝试次数。
+fn check_manifest(suites: &[SuiteReport], manifest: &GateManifest, problems: &mut Vec<GateProblem>) {
+    let mut expected: std::collections::BTreeSet<(&str, &str)> = std::collections::BTreeSet::new();
+    for entry in &manifest.cases {
+        if !expected.insert((entry.suite.as_str(), entry.case.as_str())) {
+            problems.push(GateProblem::DuplicateCase { suite: entry.suite.clone(), case: entry.case.clone(), attempt: 0 });
+        }
+    }
+    let mut observed: std::collections::BTreeSet<(&str, &str)> = std::collections::BTreeSet::new();
+    for suite in suites {
+        for record in &suite.cases {
+            observed.insert((suite.name.as_str(), record.case.as_str()));
+        }
+    }
+    let suite_names: std::collections::BTreeSet<&str> = suites.iter().map(|suite| suite.name.as_str()).collect();
+    for (suite, case) in &expected {
+        if !suite_names.contains(suite) {
+            problems.push(GateProblem::MissingSuite { suite: (*suite).to_owned() });
+        }
+        else if !observed.contains(&(*suite, *case)) {
+            problems.push(GateProblem::MissingCase { suite: (*suite).to_owned(), case: (*case).to_owned() });
+        }
+    }
+    for (suite, case) in &observed {
+        if !expected.contains(&(*suite, *case)) {
+            problems.push(GateProblem::UnexpectedCase { suite: (*suite).to_owned(), case: (*case).to_owned() });
+        }
+    }
+}
+
+/// 按失败关闭规则判定一组 suite，并可附带预声明 manifest。
+pub fn evaluate_with_manifest(suites: &[SuiteReport], policy: &GatePolicy, manifest: Option<&GateManifest>) -> GateVerdict {
     let mut problems = Vec::new();
+    if suites.is_empty() && !policy.allow_empty_suites {
+        problems.push(GateProblem::EmptyRun);
+    }
     for suite in suites {
         let name = suite.name.clone();
         let tally = &suite.tally;
@@ -483,7 +587,8 @@ pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
         if policy.require_case_evidence {
             if tally.cases > 0 && suite.cases.is_empty() {
                 problems.push(GateProblem::MissingCaseEvidence { suite: name.clone() });
-            } else if !suite.cases.is_empty() {
+            }
+            else if !suite.cases.is_empty() {
                 check_case_evidence(suite, &mut problems);
             }
         }
@@ -540,6 +645,9 @@ pub fn evaluate(suites: &[SuiteReport], policy: &GatePolicy) -> GateVerdict {
         if !suites.iter().any(|suite| &suite.name == required) {
             problems.push(GateProblem::MissingSuite { suite: required.clone() });
         }
+    }
+    if let Some(manifest) = manifest {
+        check_manifest(suites, manifest, &mut problems);
     }
     GateVerdict { ok: problems.is_empty(), problems }
 }
@@ -697,26 +805,19 @@ mod tests {
     #[test]
     fn empty_required_suite_is_not_a_full_pass() {
         let empty = SuiteTally::default();
-        let verdict = evaluate(
-            &[suite("required", empty, vec![])],
-            &GatePolicy { required_suites: vec!["required".into()], ..GatePolicy::default() },
-        );
+        let verdict =
+            evaluate(&[suite("required", empty, vec![])], &GatePolicy { required_suites: vec!["required".into()], ..GatePolicy::default() });
         assert!(!verdict.ok);
         assert_eq!(verdict.problems, vec![GateProblem::EmptySuite { suite: "required".into() }]);
         // 纯分析调用显式允许空集合，但这不是完整验收的默认结论。
-        let analysis = evaluate(
-            &[suite("required", empty, vec![])],
-            &GatePolicy { allow_empty_suites: true, ..GatePolicy::default() },
-        );
+        let analysis = evaluate(&[suite("required", empty, vec![])], &GatePolicy { allow_empty_suites: true, ..GatePolicy::default() });
         assert!(analysis.ok);
     }
 
     #[test]
     fn duplicate_suite_names_fail_closed() {
-        let verdict = evaluate(
-            &[suite("sql", tally(2, 0, 2, 0, 0), vec![]), suite("sql", tally(2, 0, 2, 0, 0), vec![])],
-            &GatePolicy::default(),
-        );
+        let verdict =
+            evaluate(&[suite("sql", tally(2, 0, 2, 0, 0), vec![]), suite("sql", tally(2, 0, 2, 0, 0), vec![])], &GatePolicy::default());
         assert!(!verdict.ok);
         assert_eq!(verdict.problems, vec![GateProblem::DuplicateSuite { suite: "sql".into() }]);
     }
@@ -812,5 +913,42 @@ mod tests {
         assert_eq!(problem, GateProblem::OracleUnavailable { suite: "s".into() });
         let signal: BaselineSignal = serde_json::from_str("\"unlisted\"").unwrap();
         assert_eq!(signal, BaselineSignal::Unlisted);
+    }
+
+    #[test]
+    fn acceptance_rejects_an_empty_run() {
+        let verdict = evaluate(&[], &GatePolicy::acceptance());
+        assert!(!verdict.ok);
+        assert_eq!(verdict.problems, vec![GateProblem::EmptyRun]);
+        // 纯分析调用可以显式放行空集合，但不能冒充验收。
+        assert!(evaluate(&[], &GatePolicy { allow_empty_suites: true, ..GatePolicy::default() }).ok);
+    }
+
+    #[test]
+    fn manifest_reports_missing_and_unexpected_cases() {
+        let t = SuiteTally { cases: 2, assertions: 0, attempts: 2, passed: 2, ..SuiteTally::default() };
+        let mut s = suite("sql", t, vec![]);
+        s.cases = vec![
+            CaseRecord { case: "a".into(), attempt: 1, outcome: CaseOutcome::Passed },
+            CaseRecord { case: "extra".into(), attempt: 1, outcome: CaseOutcome::Passed },
+        ];
+        let manifest = GateManifest::new([("sql", "a"), ("sql", "b")]);
+        let verdict = evaluate_with_manifest(&[s], &GatePolicy::acceptance(), Some(&manifest));
+        assert!(!verdict.ok);
+        assert!(verdict.problems.contains(&GateProblem::MissingCase { suite: "sql".into(), case: "b".into() }));
+        assert!(verdict.problems.contains(&GateProblem::UnexpectedCase { suite: "sql".into(), case: "extra".into() }));
+    }
+
+    #[test]
+    fn case_identity_and_attempt_are_validated() {
+        let t = SuiteTally { cases: 2, assertions: 0, attempts: 2, passed: 2, ..SuiteTally::default() };
+        let mut s = suite("sql", t, vec![]);
+        s.cases = vec![
+            CaseRecord { case: " ".into(), attempt: 1, outcome: CaseOutcome::Passed },
+            CaseRecord { case: "b".into(), attempt: 0, outcome: CaseOutcome::Passed },
+        ];
+        let verdict = evaluate(&[s], &GatePolicy::acceptance());
+        assert!(verdict.problems.contains(&GateProblem::EmptyCase { suite: "sql".into() }));
+        assert!(verdict.problems.contains(&GateProblem::InvalidAttempt { suite: "sql".into(), case: "b".into(), attempt: 0 }));
     }
 }

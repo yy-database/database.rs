@@ -37,6 +37,31 @@ impl CorpusReport {
     }
 }
 
+/// 一次运行的产物与身份证据。
+///
+/// 报告只承载已计算结论，但必须能回答“谁跑的、跑的是哪个产物、对照是谁”。
+/// 这些字段为空时不允许渲染成验收报告。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunIdentity {
+    /// 本次运行标识，由调用方生成且在一次运行内唯一。
+    pub run_id: String,
+    /// 被测产品名（如 `sqlite`、`redis`）。
+    pub product: String,
+    /// 被测产品版本。
+    pub product_version: String,
+    /// 被测源码 revision 或产物摘要。
+    pub product_revision: String,
+    /// harness 合同版本，例如 `database.harness/v0`。
+    pub harness_contract: String,
+    /// 独立对照来源（引擎版本、官方语料 revision、采集证据引用）；无对照时为空。
+    #[serde(default)]
+    pub oracle: Option<String>,
+    /// 判定为通过时引用的证据摘要；没有证据时为空。
+    #[serde(default)]
+    pub evidence: Option<Digest>,
+}
+
 /// 统一报告信封。
 ///
 /// 信封承载已计算的判定结论，不在渲染期重新比较业务值。未知字段一律拒绝，
@@ -48,6 +73,9 @@ pub struct ReportEnvelope {
     pub version: u32,
     /// 触发本次报告的命令名。
     pub command: String,
+    /// 运行产物与身份证据；纯内部草稿可为空，验收报告必须提供。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunIdentity>,
     /// 语料判定段落；没有语料步骤时为空。
     #[serde(default)]
     pub corpus: Option<CorpusReport>,
@@ -59,13 +87,26 @@ pub struct ReportEnvelope {
 impl ReportEnvelope {
     /// 以当前版本构造空信封。
     pub fn new(command: impl Into<String>) -> Self {
-        Self { version: REPORT_VERSION, command: command.into(), corpus: None, gate: None }
+        Self { version: REPORT_VERSION, command: command.into(), run: None, corpus: None, gate: None }
     }
 
     /// 校验信封版本；未知版本不得被渲染成当前合同。
     pub fn validate(&self) -> Result<()> {
         if self.version != REPORT_VERSION {
             return Err(crate::HarnessError::UnsupportedReportVersion { version: self.version });
+        }
+        if let Some(run) = &self.run {
+            for (field, value) in [
+                ("run_id", run.run_id.as_str()),
+                ("product", run.product.as_str()),
+                ("product_version", run.product_version.as_str()),
+                ("product_revision", run.product_revision.as_str()),
+                ("harness_contract", run.harness_contract.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(crate::HarnessError::EmptyReportField { field });
+                }
+            }
         }
         Ok(())
     }
@@ -147,5 +188,24 @@ mod tests {
         let text = render_json(&report).unwrap();
         let back: ReportEnvelope = serde_json::from_str(&text).unwrap();
         assert_eq!(back, report);
+    }
+
+    #[test]
+    fn run_identity_is_optional_but_validated_when_present() {
+        let mut report = ReportEnvelope::new("gate");
+        report.run = Some(RunIdentity {
+            run_id: "run-1".into(),
+            product: "sqlite".into(),
+            product_version: "0.0.1".into(),
+            product_revision: "abc123".into(),
+            harness_contract: "database.harness/v0".into(),
+            oracle: Some("sqlite 3.45".into()),
+            evidence: Some(Digest::of(b"evidence")),
+        });
+        let text = render_json(&report).unwrap();
+        assert!(text.contains("\"run\": {"), "{text}");
+
+        report.run.as_mut().unwrap().product_revision.clear();
+        assert!(matches!(render_json(&report), Err(crate::HarnessError::EmptyReportField { field: "product_revision" })));
     }
 }
