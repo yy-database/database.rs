@@ -464,10 +464,11 @@ fn serve_io(
                     pending.drain(..consumed);
                 }
                 Ok(None) => break,
-                // 真机静默忽略空多批量（`*0\r\n`）：不回复，连接保持。解码器在偏移 4
-                // 处判定，因此这里直接丢掉该帧。
+                // `*0\r\n` 是非法多批量长度，真机回复协议错误并关闭连接；静默丢弃
+                // 会让等待回复的客户端一直挂起。
                 Err(FrameError::EmptyCommand) => {
-                    pending.drain(..4);
+                    writer.write_all(b"-ERR Protocol error or request limit exceeded\r\n")?;
+                    return Ok(());
                 }
                 Err(_) => {
                     writer.write_all(b"-ERR Protocol error or request limit exceeded\r\n")?;
@@ -3266,6 +3267,20 @@ fn respond(
 
     // ---- Below is the normal, command-by-command execution path.
 
+    if command.eq_ignore_ascii_case(b"AUTH") {
+        // 本地网关没有口令模型。真机在未配置密码时对 AUTH 回复的正是这条文案，
+        // 客户端据此区分「服务端未设密码」与「命令不存在」。
+        if count == 2 || count == 3 {
+            stream.write_all(
+                b"-ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?\r\n",
+            )?;
+        }
+        else {
+            stream.write_all(b"-ERR wrong number of arguments for 'auth' command\r\n")?;
+        }
+        return Ok(true);
+    }
+
     if command.eq_ignore_ascii_case(b"HELLO") {
         // Modern clients (redis-py 8, ioredis, redis-cli) send `HELLO 3` on connect. The
         // answered version becomes the connection's protocol: subsequent null replies use
@@ -3538,6 +3553,14 @@ fn validate_command_for_queue(
     if command.eq_ignore_ascii_case(b"QUIT") {
         if count != 1 {
             return Err(b"-ERR wrong number of arguments for 'quit' command\r\n".to_vec());
+        }
+        return Ok(());
+    }
+    // AUTH: password or username + password. Upstream queues it and answers the
+    // no-password error at EXEC, so queueing only checks arity here.
+    if command.eq_ignore_ascii_case(b"AUTH") {
+        if !matches!(count, 2 | 3) {
+            return Err(b"-ERR wrong number of arguments for 'auth' command\r\n".to_vec());
         }
         return Ok(());
     }
