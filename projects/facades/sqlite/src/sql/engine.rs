@@ -1269,6 +1269,21 @@ impl Engine {
             }
             TransactionAction::Release(name) => {
                 let index = self.savepoint_position(&name, "release")?;
+                let closing = {
+                    let state = self.transaction.as_ref().expect("an open savepoint implies a transaction");
+                    index == 0 && !state.from_begin
+                };
+                if closing {
+                    // Releasing the last savepoint of a transaction that no
+                    // `BEGIN` opened commits it, so the commit gate runs
+                    // first: deferred foreign keys must pass before any
+                    // savepoint state is destroyed, and a failed check leaves
+                    // the transaction open for a repair or a rollback.
+                    self.check_deferred_foreign_keys()?;
+                    for attached in &self.attached {
+                        attached.engine.check_deferred_foreign_keys()?;
+                    }
+                }
                 self.writer.release(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
                 for attached in &mut self.attached {
                     attached
