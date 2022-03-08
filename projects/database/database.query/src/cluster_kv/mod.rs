@@ -68,6 +68,11 @@ pub enum KeyValueAction {
     ClearExpiry,
     /// Read whether the key is present and its current expiry deadline.
     GetExpiry,
+    /// Read the current record's revision without materialising its value.
+    ///
+    /// Every successful write path assigns a fresh shard-monotonic revision, so this is the
+    /// authoritative mutation version: a byte-identical rewrite still advances it.
+    GetRevision,
     /// Move the record to another key in the same shard, keeping its value and deadline.
     Rename {
         /// Destination key bytes.
@@ -125,6 +130,11 @@ pub enum KeyValueResult {
         /// `true` 表示过期元数据已变更。
         applied: bool,
     },
+    /// [`KeyValueAction::GetRevision`] 观察到的记录修订号。
+    Revision(
+        /// 存活记录的修订号；键缺失（含已过期）为 `None`。
+        Option<u64>,
+    ),
     /// [`KeyValueAction::Rename`] 是否找到源键并完成搬迁。
     Rename {
         /// 搬迁时源键是否有存活记录。

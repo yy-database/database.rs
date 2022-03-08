@@ -244,6 +244,10 @@ where
                 let record = shard.get(&key)?;
                 Ok(KeyValueResult::Expiry { present: record.is_some(), expires_at: record.and_then(|record| record.expires_at) })
             }
+            KeyValueAction::GetRevision => {
+                let revision = shard.get(&key)?.map(|record| record.revision);
+                Ok(KeyValueResult::Revision(revision))
+            }
             KeyValueAction::Rename { destination, if_absent } => {
                 // A rename is one shard-local commit: both keys must live on the shard that
                 // already owns the source. Cross-shard moves would need a distributed
@@ -427,6 +431,11 @@ impl TransactionHandle for LocalTransactionHandle {
                 // The buffered commit path only carries Put/Delete change sets; expiry mutations
                 // have no buffered representation and must not silently degrade into plain writes.
                 Err(Error::Unsupported("expiry actions are not supported inside transactions"))
+            }
+            KeyValueAction::GetRevision => {
+                // Buffered writes have no revision until commit; reporting the base revision
+                // would pretend an uncommitted transaction had already mutated the record.
+                Err(Error::Unsupported("revision reads are not supported inside transactions"))
             }
             KeyValueAction::Rename { .. } => Err(Error::Unsupported("rename actions are not supported inside transactions")),
         }

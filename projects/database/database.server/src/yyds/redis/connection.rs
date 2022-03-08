@@ -74,13 +74,13 @@ struct QueuedCommand {
     request: OwnedRequest,
 }
 
-/// One key pinned by `WATCH`, together with the value it had when the watch was taken.
+/// One key pinned by `WATCH`, together with the record revision it had when the watch was taken.
 ///
-/// The snapshot *is* the version used for optimistic locking: `EXEC` compares it against
-/// the current value through the executor and abandons the transaction on any difference.
-/// Comparing bytes (rather than a server-side revision counter) keeps the watch state
-/// session-scoped without adding a revision read to the KV contract, at the cost of not
-/// noticing a write that stores byte-identical content.
+/// The revision *is* the version used for optimistic locking: `EXEC` re-reads it through the
+/// KV contract and abandons the transaction on any difference. Every successful write path
+/// assigns a fresh shard-monotonic revision, so a byte-identical rewrite, an ABA overwrite and
+/// an expiry transition (the record disappears and its revision read becomes `None`) are all
+/// visible, which a value-byte comparison could not detect.
 #[derive(Debug, Clone)]
 struct WatchedKey {
     /// Namespace (`SELECT` target) the key was watched in. Watches are per-database, like
@@ -88,8 +88,8 @@ struct WatchedKey {
     namespace: Namespace,
     /// Opaque key bytes.
     key: Vec<u8>,
-    /// Value observed at watch time (`None` means the key was absent).
-    snapshot: Option<Vec<u8>>,
+    /// Revision observed at watch time (`None` means the key was absent).
+    revision: Option<u64>,
 }
 
 /// Per-connection state carried across RESP2 frames.
@@ -192,6 +192,8 @@ impl TrackedExecutor<'_> {
             | KeyValueResult::GetDelete(_)
             | KeyValueResult::Delete { .. }
             | KeyValueResult::PutIfPresent { revision: None } => self.tracker.forget(namespace, key),
+            // 修订号读取是纯版本探测（`WATCH`/`EXEC` 用），不刷新空闲计时，与 `OBJECT` 同理。
+            KeyValueResult::Revision(_) => {}
             KeyValueResult::Expiry { present, .. } => {
                 if *present {
                     self.tracker.mark(namespace, key)
@@ -687,9 +689,9 @@ fn set_deadline(expiry: SetExpiry) -> Option<i64> {
     }
 }
 
-/// `WATCH key [key ...]` — pins each key's current value as the version `EXEC` validates.
+/// `WATCH key [key ...]` — pins each key's current record revision as the version `EXEC` validates.
 ///
-/// A repeated `WATCH` of an already-pinned key keeps the original snapshot, and a missing
+/// A repeated `WATCH` of an already-pinned key keeps the original revision, and a missing
 /// key is pinned as absent, so a later insert also aborts the transaction. Watching inside
 /// `MULTI` is rejected without touching the existing watch list, like upstream Redis.
 fn handle_watch(
@@ -717,14 +719,14 @@ fn handle_watch(
         if state.watched.iter().any(|entry| entry.namespace == *namespace && entry.key.as_slice() == *key) {
             continue;
         }
-        let snapshot = match key_snapshot(executor, namespace, key) {
-            Ok(snapshot) => snapshot,
+        let revision = match key_revision(executor, namespace, key) {
+            Ok(revision) => revision,
             Err(message) => {
                 write_error(stream, &message)?;
                 return Ok(());
             }
         };
-        state.watched.push(WatchedKey { namespace: namespace.clone(), key: key.to_vec(), snapshot });
+        state.watched.push(WatchedKey { namespace: namespace.clone(), key: key.to_vec(), revision });
     }
     stream.write_all(b"+OK\r\n")
 }
@@ -3078,9 +3080,12 @@ pub(crate) fn handle_string(
                             KeyValueResult::PutIfPresent { revision: None } => write_null(stream, protocol)?,
                             KeyValueResult::Increment { value } => write!(stream, ":{value}\r\n")?,
                             KeyValueResult::Delete { removed } => stream.write_all(if removed { b":1\r\n" } else { b":0\r\n" })?,
-                            // Expiry and rename results only surface through their dedicated
-                            // paths, never through the generic bind() commands.
-                            KeyValueResult::Expiry { .. } | KeyValueResult::ExpiryChanged { .. } | KeyValueResult::Rename { .. } => {
+                            // Expiry, revision and rename results only surface through their
+                            // dedicated paths, never through the generic bind() commands.
+                            KeyValueResult::Expiry { .. }
+                            | KeyValueResult::ExpiryChanged { .. }
+                            | KeyValueResult::Revision(_)
+                            | KeyValueResult::Rename { .. } => {
                                 write_error(stream, "unexpected result from bind command")?;
                                 return Ok(true);
                             }
@@ -3178,7 +3183,7 @@ fn respond(
         // Optimistic locking: any write to a watched key since WATCH abandons the whole
         // transaction before a single queued command runs. The reply is the nil array.
         if !state.watched.is_empty() {
-            // 版本比对只读取值，不刷新访问计时，否则 `EXEC` 前的探测会把空闲时间清零。
+            // 版本比对只读取修订号，不刷新访问计时，否则 `EXEC` 前的探测会把空闲时间清零。
             let modified = match probe {
                 Some(probe) => watched_keys_modified(probe, &state.watched),
                 None => Ok(true),
@@ -4041,23 +4046,24 @@ fn write_pubsub_subcommand_error(stream: &mut dyn Write, subcommand: &[u8]) -> i
     stream.write_all(format!("-ERR unknown subcommand or wrong number of arguments for '{name}'. Try PUBSUB HELP.\r\n").as_bytes())
 }
 
-/// Reads the current value of one key, which is the version compared by `WATCH`.
-fn key_snapshot(executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    let command = KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::Get };
+/// Reads the current record revision of one key, which is the version compared by `WATCH`.
+fn key_revision(executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8]) -> Result<Option<u64>, String> {
+    let command = KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::GetRevision };
     match executor.execute(None, command) {
-        Ok(KeyValueResult::Get(value)) => Ok(value),
+        Ok(KeyValueResult::Revision(revision)) => Ok(revision),
         Ok(_) => Err("WATCH executor returned unexpected result".into()),
         Err(error) => Err(error.to_string()),
     }
 }
 
-/// Compares every watched snapshot against the current value.
+/// Compares every watched revision against the current record revision.
 ///
 /// `true` means at least one watched key was written (or expired) after the watch was
-/// taken, so the caller must abandon the transaction instead of executing it.
+/// taken, so the caller must abandon the transaction instead of executing it. A
+/// byte-identical rewrite still advances the revision and is therefore visible here.
 fn watched_keys_modified(executor: &dyn KeyValueExecutor, watched: &[WatchedKey]) -> Result<bool, String> {
     for entry in watched {
-        if key_snapshot(executor, &entry.namespace, &entry.key)? != entry.snapshot {
+        if key_revision(executor, &entry.namespace, &entry.key)? != entry.revision {
             return Ok(true);
         }
     }

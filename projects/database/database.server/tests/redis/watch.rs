@@ -147,6 +147,62 @@ fn watch_inside_multi_is_rejected() {
     expect(&mut client, b"*0\r\n");
 }
 
+/// A byte-identical rewrite still advances the record revision, so `EXEC` aborts even
+/// though the observable value never changed — the gap the old value-snapshot contract
+/// could not close.
+#[test]
+fn exec_aborts_on_byte_identical_rewrite() {
+    let (mut client, executor, _server) = executor_server();
+    send(&mut client, &["SET", "k", "v1"]);
+    expect(&mut client, b"+OK\r\n");
+    send(&mut client, &["WATCH", "k"]);
+    expect(&mut client, b"+OK\r\n");
+    put(executor.as_ref(), "k", "v1");
+    send(&mut client, &["MULTI"]);
+    expect(&mut client, b"+OK\r\n");
+    send(&mut client, &["SET", "k", "v2"]);
+    expect(&mut client, b"+QUEUED\r\n");
+    send(&mut client, &["EXEC"]);
+    expect(&mut client, b"*-1\r\n");
+}
+
+/// An ABA round trip (change away and back before `EXEC`) also aborts: the revision only
+/// moves forward, so the value returning to its watched bytes does not hide the writes.
+#[test]
+fn exec_aborts_on_abba_roundtrip() {
+    let (mut client, executor, _server) = executor_server();
+    send(&mut client, &["SET", "k", "v1"]);
+    expect(&mut client, b"+OK\r\n");
+    send(&mut client, &["WATCH", "k"]);
+    expect(&mut client, b"+OK\r\n");
+    put(executor.as_ref(), "k", "v2");
+    put(executor.as_ref(), "k", "v1");
+    send(&mut client, &["MULTI"]);
+    expect(&mut client, b"+OK\r\n");
+    send(&mut client, &["SET", "k", "v3"]);
+    expect(&mut client, b"+QUEUED\r\n");
+    send(&mut client, &["EXEC"]);
+    expect(&mut client, b"*-1\r\n");
+}
+
+/// A watched key whose deadline elapses between `WATCH` and `EXEC` reads as absent, which
+/// changes the revision to `None` and aborts the transaction.
+#[test]
+fn exec_aborts_when_watched_key_expires() {
+    let (mut client, _executor, _server) = executor_server();
+    send(&mut client, &["SET", "k", "v1", "PX", "60"]);
+    expect(&mut client, b"+OK\r\n");
+    send(&mut client, &["WATCH", "k"]);
+    expect(&mut client, b"+OK\r\n");
+    thread::sleep(Duration::from_millis(120));
+    send(&mut client, &["MULTI"]);
+    expect(&mut client, b"+OK\r\n");
+    send(&mut client, &["SET", "k", "v2"]);
+    expect(&mut client, b"+QUEUED\r\n");
+    send(&mut client, &["EXEC"]);
+    expect(&mut client, b"*-1\r\n");
+}
+
 /// RESP3 reports the aborted transaction as the dedicated null type.
 #[test]
 fn exec_abort_uses_resp3_null() {
