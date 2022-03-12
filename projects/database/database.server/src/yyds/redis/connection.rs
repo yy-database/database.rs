@@ -3147,9 +3147,9 @@ fn respond(
             return Ok(true);
         }
         if state.in_multi {
+            // 真机把嵌套 `MULTI` 当作控制面拒绝：报错但不毒化事务，队列中的命令仍会被
+            // `EXEC` 执行。只有排队命令自身的语法/arity 失败才置 `multi_error`。
             stream.write_all(b"-ERR MULTI calls can not be nested\r\n")?;
-            // 同 TypeScript 侧：队列中的规划失败会毒化事务。
-            state.multi_error = true;
             return Ok(true);
         }
         state.in_multi = true;
