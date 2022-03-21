@@ -60,6 +60,9 @@ pub struct Prepared {
     slots: Vec<(usize, String)>,
     /// 语句是否会改变存储的数据库镜像。
     is_write: bool,
+    /// prepare 时刻由引擎目录推导出的结果列标签;`None` 表示语句没有行集
+    /// 结果,或目录不足以在不执行的前提下确定表头。
+    columns: Option<Vec<String>>,
 }
 
 impl Prepared {
@@ -88,12 +91,18 @@ impl Prepared {
         self.is_write
     }
 
-    /// 结果列标签。
+    /// 结果列标签,prepare 时刻由引擎目录推导,不执行语句。
     ///
-    /// 引擎在执行时才计算结果头,预编译阶段拿不到,因此如实返回 `None`。
-    /// TODO(oak-sql):引擎长出 describe 步骤后返回真实表头,不得偷偷执行来凑。
+    /// 行集语句给出与成功执行后 `ExecResult.columns` 逐字节一致的表头:
+    /// `SELECT`(含视图、派生表、CTE、复合查询与 `*` 展开)、带 `RETURNING`
+    /// 的 `INSERT`/`UPDATE`/`DELETE`、`EXPLAIN` 与读形 `PRAGMA`。
+    /// `None` 如实表示两种情况:语句本就没有行集结果(无 `RETURNING` 的
+    /// DML、DDL、事务控制、写形 `PRAGMA`),或目录不足以确定表头(缺表、
+    /// 缺列等——这类语句执行时本就会报错,错误语义与执行期一致)。
+    /// 标签在 prepare 时刻的目录上定格;此后 schema 再变化,以执行期结果
+    /// 为准,本方法不重新推导。
     pub fn columns(&self) -> Option<Vec<String>> {
-        None
+        self.columns.clone()
     }
 }
 
@@ -157,6 +166,9 @@ impl Connection {
     ///
     /// 恰好一条语句:空输入与多语句分别以 `empty-statement` 和
     /// `multiple-statements` 拒绝,与 [`Engine::execute_one`] 的合同一致。
+    /// 结果列标签在本时刻的目录上推导;目录解析失败(缺表、缺列)不改变
+    /// 拒绝口径——`prepare` 仍然成功,标签如实为 `None`,错误留给执行期按
+    /// 既有语义抛出。
     pub fn prepare(&self, sql: &str) -> Result<Prepared, SqlError> {
         let statements = parse(sql)?;
         let statement = match statements.len() {
@@ -166,7 +178,8 @@ impl Connection {
         };
         let slots = parameter_slots(&statement);
         let is_write = statement.writes();
-        Ok(Prepared { sql: sql.to_string(), statement, slots, is_write })
+        let columns = self.engine.describe(&statement).ok().flatten();
+        Ok(Prepared { sql: sql.to_string(), statement, slots, is_write, columns })
     }
 
     /// 执行一条预编译语句,绑定零基位置参数。
@@ -453,5 +466,153 @@ mod tests {
     fn sqlite_version_reports_the_format_three_library_stamp() {
         let connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
         assert_eq!(connection.sqlite_version().expect("header carries a version"), crate::ENGINE_LIBRARY_VERSION);
+    }
+
+    /// 对照用例:一批覆盖各类行集语句的 SQL,`prepare` 推导的列标签必须与
+    /// 执行后 `ExecResult.columns` 逐字节相等。任何一条不等都说明 describe
+    /// 路径与执行路径的标签推导漂移了。
+    #[test]
+    fn prepared_columns_match_the_executed_header() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        for setup in [
+            "CREATE TABLE t1 (a INTEGER, b TEXT)",
+            "CREATE TABLE t2 (a INTEGER, y TEXT)",
+            "CREATE TABLE sp (\"A\" TEXT, bb INTEGER)",
+            "CREATE TABLE wo (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+            "INSERT INTO t1 VALUES (1, 'one'), (2, 'two')",
+            "INSERT INTO t2 VALUES (1, 'x'), (3, 'z')",
+            "INSERT INTO sp VALUES ('s', 7)",
+            "INSERT INTO wo VALUES ('k', 1)",
+            "CREATE VIEW v1 AS SELECT a, b FROM t1",
+            "CREATE VIEW v2 (c, d) AS SELECT a, a FROM t1",
+        ] {
+            connection.execute(setup, &[]).unwrap_or_else(|error| panic!("setup `{setup}`: {error}"));
+        }
+        let queries = [
+            "SELECT 1",
+            "SELECT a, b FROM t1",
+            "SELECT A, bb FROM sp",
+            "SELECT a AS one, b FROM t1",
+            "SELECT a+1, upper(b) FROM t1",
+            "SELECT * FROM t1",
+            "SELECT * FROM t1, t2",
+            "SELECT * FROM t1 JOIN t2 ON t1.a = t2.a",
+            "SELECT * FROM t1 JOIN t2 USING (a)",
+            "SELECT * FROM t1 NATURAL JOIN t2",
+            "SELECT * FROM wo",
+            "SELECT count(*) FROM t1",
+            "SELECT rowid, a FROM t1",
+            "SELECT a, a FROM t1",
+            "SELECT 1 UNION SELECT 2",
+            "SELECT a FROM t1 UNION ALL SELECT a FROM t2 ORDER BY 1",
+            "WITH c AS (SELECT a FROM t1) SELECT * FROM c",
+            "WITH c(x) AS (SELECT a FROM t1) SELECT x FROM c",
+            "WITH c AS (SELECT a AS z FROM t1) SELECT z FROM c",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3) SELECT n FROM r",
+            "SELECT * FROM v1",
+            "SELECT * FROM v2",
+            "SELECT * FROM (SELECT a, b FROM t1) AS d",
+            "SELECT * FROM (SELECT a, a FROM t1)",
+            "SELECT * FROM sqlite_master",
+            "SELECT b FROM t1 WHERE b IS NOT NULL ORDER BY 1",
+            "SELECT DISTINCT b FROM t1",
+            "SELECT b, count(*) FROM t1 GROUP BY b",
+            "SELECT a FROM t1 GROUP BY a HAVING count(*) > 0",
+            "SELECT a, row_number() OVER (ORDER BY a) FROM t1",
+            "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END FROM t1",
+            "SELECT b FROM t1 LIMIT 1 OFFSET 1",
+            "PRAGMA table_info(t1)",
+            "PRAGMA table_xinfo(t1)",
+            "PRAGMA index_list(t1)",
+            "PRAGMA foreign_keys",
+            "PRAGMA database_list",
+            "PRAGMA integrity_check",
+            "EXPLAIN SELECT a FROM t1",
+            "EXPLAIN QUERY PLAN SELECT a FROM t1",
+            "INSERT INTO t1 VALUES (10, 'ten') RETURNING a, b",
+            "INSERT INTO t1 VALUES (11, 'eleven') RETURNING *",
+            "UPDATE t1 SET b = 'changed' WHERE a = 10 RETURNING a",
+            "DELETE FROM t1 WHERE a = 11 RETURNING b",
+        ];
+        for query in queries {
+            let prepared = connection.prepare(query).unwrap_or_else(|error| panic!("prepare `{query}`: {error}"));
+            let results = connection.execute(query, &[]).unwrap_or_else(|error| panic!("run `{query}`: {error}"));
+            let executed = results.last().expect("one result").columns.clone();
+            assert_eq!(prepared.columns(), Some(executed), "columns of `{query}`");
+        }
+    }
+
+    /// 非行集语句(无 `RETURNING` 的 DML、DDL、事务控制、写形 `PRAGMA`)
+    /// 在 prepare 期如实返回 `None`。
+    #[test]
+    fn prepared_columns_report_none_without_a_rowset() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        connection.execute("CREATE TABLE t1 (a INTEGER, b TEXT)", &[]).expect("table exists");
+        connection.execute("INSERT INTO t1 VALUES (1, 'one')", &[]).expect("row exists");
+        for query in [
+            "INSERT INTO t1 VALUES (2, 'a')",
+            "UPDATE t1 SET b = 'z'",
+            "DELETE FROM t1 WHERE a = 2",
+            "CREATE TABLE other (i INTEGER)",
+            "DROP TABLE other",
+            "BEGIN",
+            "COMMIT",
+            "PRAGMA foreign_keys = ON",
+            "PRAGMA user_version = 7",
+        ] {
+            let prepared = connection.prepare(query).unwrap_or_else(|error| panic!("prepare `{query}`: {error}"));
+            assert!(prepared.columns().is_none(), "no rowset for `{query}`");
+            connection.execute(query, &[]).unwrap_or_else(|error| panic!("run `{query}`: {error}"));
+        }
+    }
+
+    /// 目录解析失败不改变拒绝口径:`prepare` 仍然成功、标签如实为 `None`,
+    /// 缺表与缺列错误留在执行期,错误码与既有行为一致。
+    #[test]
+    fn prepare_keeps_run_time_errors_out_of_the_columns_path() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        connection.execute("CREATE TABLE t1 (a INTEGER)", &[]).expect("table exists");
+        let prepared = connection.prepare("SELECT * FROM missing_table").expect("prepare still succeeds");
+        assert_eq!(prepared.columns(), None, "an unknown source has no derivable header");
+        let error = connection.execute("SELECT * FROM missing_table", &[]).expect_err("run reports the missing table");
+        assert_eq!(error.code, "unknown-table");
+        let prepared = connection.prepare("SELECT bogus FROM t1").expect("prepare still succeeds");
+        assert_eq!(prepared.columns(), None, "an unknown projection column has no derivable header");
+        let error = connection.execute("SELECT bogus FROM t1", &[]).expect_err("run reports the missing column");
+        assert_eq!(error.code, "unknown-column");
+    }
+
+    /// 诚实性红线:`prepare` 绝不执行语句——预编译一条 `INSERT` 不会写入任何行。
+    #[test]
+    fn prepare_does_not_execute_the_statement() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        connection.execute("CREATE TABLE t (a INTEGER)", &[]).expect("table exists");
+        let prepared = connection.prepare("INSERT INTO t VALUES (1)").expect("parses");
+        assert!(prepared.is_write());
+        let rows = connection.execute("SELECT a FROM t", &[]).expect("read back").last().expect("result").rows.clone();
+        assert!(rows.is_empty(), "prepare must not insert");
+    }
+
+    /// 只读连接同样能在 prepare 期拿到表头;写语句的 `RETURNING` 标签照常
+    /// 推导,拒绝仍发生在执行期,与既有只读语义一致。
+    #[test]
+    fn read_only_connections_still_describe_prepared_statements() {
+        let path = temp_path("describe-readonly");
+        {
+            let mut writer =
+                Connection::open(ConnectionOptions { filename: Some(path.clone()), ..Default::default() }).expect("file connection");
+            writer.execute("CREATE TABLE t (a INTEGER, b TEXT)", &[]).expect("create publishes");
+            writer.execute("INSERT INTO t VALUES (1, 'one')", &[]).expect("insert publishes");
+        }
+        let mut reader = Connection::open(ConnectionOptions { filename: Some(path.clone()), read_only: true, ..Default::default() })
+            .expect("read-only connection");
+        let prepared = reader.prepare("SELECT * FROM t").expect("parses");
+        assert_eq!(prepared.columns(), Some(vec!["a".to_string(), "b".to_string()]));
+        let executed = reader.run(&prepared, &[]).expect("read runs").columns;
+        assert_eq!(prepared.columns(), Some(executed));
+        let insert = reader.prepare("INSERT INTO t VALUES (2, 'two') RETURNING a").expect("parses");
+        assert_eq!(insert.columns(), Some(vec!["a".to_string()]));
+        assert_eq!(reader.run(&insert, &[]).expect_err("write rejected").code, "read-only");
+        fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
     }
 }
