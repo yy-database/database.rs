@@ -1126,10 +1126,11 @@ fn executable_field_plan(field: &str, predicate: Option<&BsonValue>) -> FieldPla
         if lower.is_none() && upper.is_none() {
             return None;
         }
+        // 数值范围缺边即 ±无穷，`COUNT_SCAN` 的 `startKey`/`endKey` 如实渲染。
         let count = CountRange {
-            start: lower.as_ref().map(|(value, _)| value.clone()).unwrap_or_else(min_key_value),
+            start: lower.as_ref().map(|(value, _)| value.clone()).unwrap_or_else(|| BsonValue::Double(f64::NEG_INFINITY)),
             start_inclusive: lower.as_ref().is_none_or(|(_, inclusive)| *inclusive),
-            end: upper.as_ref().map(|(value, _)| value.clone()).unwrap_or_else(max_key_value),
+            end: upper.as_ref().map(|(value, _)| value.clone()).unwrap_or_else(|| BsonValue::Double(f64::INFINITY)),
             end_inclusive: upper.as_ref().is_none_or(|(_, inclusive)| *inclusive),
         };
         Some(FieldPlan { field: field.to_string(), bound: KeyBound::Range { lower, upper }, count })
@@ -1174,42 +1175,123 @@ fn numeric_range_bound(value: &BsonValue) -> Option<i64> {
 
 /// 构建执行器真正会消费的索引计划。
 ///
-/// 只有首个键字段可以带探针边界；复合索引的后续字段一律按全范围报告，
-/// 因为执行器不会按第二字段切范围。`residual` 就是回表后实际应用的完整过滤
-/// 条件，`explain` 直接拿它渲染 `FETCH.filter`。
+/// 首个键字段按谓词切探针边界；前面字段全是等值时，后续字段的等值谓词继续
+/// 收窄同一前缀，遇到范围或非谓词字段即停。边界已完整消费的谓词从 `residual`
+/// 移除，`explain` 的 `FETCH.filter` 只报告回表复核真正还要再查的条件。排序与
+/// 索引键完全同向或反向时按索引序交付（反向即 `backward` 扫描），否则内存排序。
+/// hint 指向部分索引而查询不被 `partialFilterExpression` 蕴含时，索引域与查询
+/// 域不相交，按全范围扫描整个部分索引，与 `mongod` 的 hint 行为一致。
 fn build_hinted_plan(documents: &[BsonDocument], spec: &IndexSpec, filter: &BsonDocument, sort: &[(String, i32)]) -> HintedPlan {
     let mut fields = Vec::with_capacity(spec.key.fields.len());
-    for (position, (field, _)) in spec.key.fields.iter().enumerate() {
-        if position == 0 {
-            fields.push(executable_field_plan(field, filter.get(field)));
-        }
-        else {
+    let mut consumed: Vec<String> = Vec::new();
+    let partial_outside = spec.partial_filter_expression.as_ref().is_some_and(|partial| !query_implies_partial(filter, partial));
+    if partial_outside {
+        for (field, _) in &spec.key.fields {
             fields.push(FieldPlan { field: field.clone(), bound: KeyBound::Full, count: full_count_range() });
         }
     }
+    else {
+        let mut narrowing = true;
+        for (position, (field, _)) in spec.key.fields.iter().enumerate() {
+            if position == 0 {
+                let plan = executable_field_plan(field, filter.get(field));
+                if !matches!(plan.bound, KeyBound::Full) {
+                    consumed.push(field.clone());
+                }
+                narrowing = matches!(plan.bound, KeyBound::Eq(_));
+                fields.push(plan);
+            }
+            else if narrowing {
+                match equality_bound(filter.get(field)) {
+                    Some(value) => {
+                        consumed.push(field.clone());
+                        fields.push(FieldPlan {
+                            field: field.clone(),
+                            bound: KeyBound::Eq(value.clone()),
+                            count: equality_count_range(&value),
+                        });
+                    }
+                    None => {
+                        narrowing = false;
+                        fields.push(FieldPlan { field: field.clone(), bound: KeyBound::Full, count: full_count_range() });
+                    }
+                }
+            }
+            else {
+                fields.push(FieldPlan { field: field.clone(), bound: KeyBound::Full, count: full_count_range() });
+            }
+        }
+    }
+    let mut residual = BsonDocument::new();
+    for (field, value) in &filter.fields {
+        if !field.starts_with('$') && consumed.iter().any(|consumed| consumed == field) {
+            continue;
+        }
+        // `FETCH.filter` 报告解析后的形态：裸等值渲染成 `$eq`。
+        let normalized = match value {
+            BsonValue::Document(operators) if has_operator(operators) => value.clone(),
+            other => {
+                let mut equality = BsonDocument::new();
+                equality.push("$eq".to_string(), other.clone());
+                BsonValue::Document(equality)
+            }
+        };
+        residual.push(field.clone(), normalized);
+    }
+    let key_matches = |reverse: bool| {
+        sort.len() == spec.key.fields.len()
+            && sort.iter().zip(spec.key.fields.iter()).all(|((sort_field, sort_direction), (field, key_direction))| {
+                sort_field == field
+                    && int_value(key_direction).is_some_and(|key| i64::from(*sort_direction) == if reverse { -key } else { key })
+            })
+    };
     let multi_paths = spec.key.fields.iter().map(|(field, _)| field_holds_array(documents, field)).collect::<Vec<_>>();
     HintedPlan {
         spec: spec.clone(),
         fields,
-        residual: filter.clone(),
-        // 执行器没有按索引序反向扫描，也没有把排序交给索引：任何排序都在内存里做。
-        direction: "forward",
-        sort_covered: sort.is_empty(),
+        residual,
+        direction: if key_matches(true) { "backward" } else { "forward" },
+        sort_covered: sort.is_empty() || key_matches(false) || key_matches(true),
         is_multi_key: multi_paths.iter().any(|flag| *flag),
     }
 }
 
-/// `partialFilterExpression` 的每个字段都要求查询里有一条同字段等值条件，
-/// 复杂条件要求查询逐字包含同一条件；不满足就不用这个部分索引。
+/// 复合索引前缀可用的等值谓词值；非等值返回 `None`。
+fn equality_bound(predicate: Option<&BsonValue>) -> Option<BsonValue> {
+    match predicate? {
+        BsonValue::Document(document) if has_operator(document) => {
+            if document.fields.len() == 1 {
+                return document.get("$eq").cloned();
+            }
+            None
+        }
+        BsonValue::Regex { .. } => None,
+        other => Some(other.clone()),
+    }
+}
+
+fn equality_count_range(value: &BsonValue) -> CountRange {
+    CountRange { start: value.clone(), start_inclusive: true, end: value.clone(), end_inclusive: true }
+}
+
+/// `partialFilterExpression` 的每个字段都要求查询里有一条同字段条件，且该
+/// 条件落在部分索引域内（等值直接对表达式求值，复杂条件要求逐字相同）；
+/// 不满足就不用这个部分索引。
 fn query_implies_partial(filter: &BsonDocument, partial: &BsonDocument) -> bool {
     partial.fields.iter().all(|(field, expected)| {
         let Some(actual) = filter.get(field)
         else {
             return false;
         };
-        match (plain_equality(actual), plain_equality(expected)) {
-            (Some(left), Some(right)) => compare_values(left, right) == Ordering::Equal,
-            _ => actual == expected,
+        match plain_equality(actual) {
+            Some(plain) => {
+                let mut probe = BsonDocument::new();
+                probe.push(field.clone(), plain.clone());
+                let mut clause = BsonDocument::new();
+                clause.push(field.clone(), expected.clone());
+                document_matches(&probe, &clause).unwrap_or(false)
+            }
+            None => actual == expected,
         }
     })
 }
@@ -1238,10 +1320,23 @@ struct IndexSpan {
 }
 
 /// 首键字段要读的索引区间；`None` 表示整段读取（无谓词的 hint 全索引扫描）。
+///
+/// 前面字段全是等值时，探针前缀沿索引键逐个拼接，复合等值一次落到区间上。
 fn plan_spans(plan: &HintedPlan) -> Option<Vec<IndexSpan>> {
     match plan.fields.first().map(|field| &field.bound)? {
         KeyBound::Full => None,
-        KeyBound::Eq(value) => Some(vec![equality_span(value)]),
+        KeyBound::Eq(_) => {
+            let prefix: Vec<BsonValue> = plan
+                .fields
+                .iter()
+                .take_while(|field| matches!(field.bound, KeyBound::Eq(_)))
+                .filter_map(|field| match &field.bound {
+                    KeyBound::Eq(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect();
+            Some(vec![IndexSpan { prefix: index_tuple(&prefix), after: None, before: None }])
+        }
         KeyBound::In(values) => Some(values.iter().map(equality_span).collect()),
         KeyBound::Range { lower, upper } => Some(range_spans(lower.as_ref(), upper.as_ref())),
     }
@@ -1323,8 +1418,10 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 /// 这个索引计划能否被当前执行器如实执行。
 ///
 /// 排序规则、稀疏索引的 null 等值、无法被查询蕴含的部分索引都会让索引项与
-/// 匹配语义不再一一对应，遇到这些情况一律退回 `COLLSCAN`。
-fn index_executable(plan: &HintedPlan, filter: &BsonDocument) -> bool {
+/// 匹配语义不再一一对应，遇到这些情况一律退回 `COLLSCAN`。显式 `hint` 指向
+/// 部分索引时例外：`mongod` 照样扫描整个部分索引，`build_hinted_plan` 已把
+/// 边界收敛为全范围。
+fn index_executable(plan: &HintedPlan, filter: &BsonDocument, explicit_hint: bool) -> bool {
     let specification = &plan.spec;
     if !specification.is_visible() || specification.collation.is_some() {
         return false;
@@ -1345,7 +1442,8 @@ fn index_executable(plan: &HintedPlan, filter: &BsonDocument) -> bool {
             return false;
         }
     }
-    if let Some(partial) = &specification.partial_filter_expression
+    if !explicit_hint
+        && let Some(partial) = &specification.partial_filter_expression
         && !query_implies_partial(filter, partial)
     {
         return false;
@@ -1378,7 +1476,7 @@ fn automatic_index(store: &dyn MongoStorage, namespace: &str, filter: &BsonDocum
             continue;
         }
         let plan = build_hinted_plan(&[], &specification, filter, &[]);
-        if plan_spans(&plan).is_some() && index_executable(&plan, filter) && index_has_entries(store, namespace, &specification)? {
+        if plan_spans(&plan).is_some() && index_executable(&plan, filter, false) && index_has_entries(store, namespace, &specification)? {
             return Ok(Some(specification));
         }
     }
@@ -1391,15 +1489,21 @@ fn bound_text(bound: &KeyBound, backward: bool) -> Vec<String> {
         KeyBound::Eq(value) => vec![format!("[{}, {}]", scalar_text(value), scalar_text(value))],
         KeyBound::In(values) => values.iter().map(|value| format!("[{}, {}]", scalar_text(value), scalar_text(value))).collect(),
         KeyBound::Range { lower, upper } => {
-            let start = match lower {
-                Some((value, inclusive)) => format!("{}{}", if *inclusive { "[" } else { "(" }, scalar_text(value)),
-                None => "[MinKey".to_string(),
+            let (start_value, start_inclusive) = match lower {
+                Some((value, inclusive)) => (scalar_text(value), *inclusive),
+                None => ("-inf.0".to_string(), true),
             };
-            let end = match upper {
-                Some((value, inclusive)) => format!("{}{}", scalar_text(value), if *inclusive { "]" } else { ")" }),
-                None => "MaxKey]".to_string(),
+            let (end_value, end_inclusive) = match upper {
+                Some((value, inclusive)) => (scalar_text(value), *inclusive),
+                None => ("inf.0".to_string(), true),
             };
-            vec![format!("{start}, {end}")]
+            let (first, first_inclusive, last, last_inclusive) = if backward {
+                (end_value, end_inclusive, start_value, start_inclusive)
+            }
+            else {
+                (start_value, start_inclusive, end_value, end_inclusive)
+            };
+            vec![format!("{}{}, {}{}", if first_inclusive { "[" } else { "(" }, first, last, if last_inclusive { "]" } else { ")" })]
         }
     }
 }
@@ -1473,7 +1577,17 @@ fn add_fetch_wrapper(stage: BsonDocument, filter: &BsonDocument) -> BsonDocument
 }
 
 fn hinted_find_plan(plan: &HintedPlan, documents: &[BsonDocument], skip: usize, limit: usize, sort: &[(String, i32)]) -> BsonDocument {
-    let mut stage = add_fetch_wrapper(scan_stage_document(plan, documents, false), &plan.residual);
+    let pushed = skip > 0 && plan.residual.fields.is_empty() && (sort.is_empty() || plan.sort_covered);
+    let mut scan = scan_stage_document(plan, documents, false);
+    if pushed {
+        // `skip` 下推到索引层：`SKIP` 夹在 `IXSCAN` 与 `FETCH` 之间，跳过的命中不回表。
+        let mut skipped = BsonDocument::new();
+        skipped.push("stage".to_string(), BsonValue::String("SKIP".to_string()));
+        skipped.push("skipAmount".to_string(), count_value(skip as i64));
+        skipped.push("inputStage".to_string(), BsonValue::Document(scan));
+        scan = skipped;
+    }
+    let mut stage = add_fetch_wrapper(scan, &plan.residual);
     if !plan.sort_covered {
         let mut pattern = BsonDocument::new();
         for (field, direction) in sort {
@@ -1487,7 +1601,7 @@ fn hinted_find_plan(plan: &HintedPlan, documents: &[BsonDocument], skip: usize, 
         sorted.push("inputStage".to_string(), BsonValue::Document(stage));
         stage = sorted;
     }
-    if skip > 0 {
+    if skip > 0 && !pushed {
         let mut skipped = BsonDocument::new();
         skipped.push("stage".to_string(), BsonValue::String("SKIP".to_string()));
         skipped.push("skipAmount".to_string(), count_value(skip as i64));
@@ -1510,7 +1624,13 @@ fn hinted_find_plan(plan: &HintedPlan, documents: &[BsonDocument], skip: usize, 
 }
 
 fn hinted_count_plan(plan: &HintedPlan, documents: &[BsonDocument]) -> BsonDocument {
-    let stage = add_fetch_wrapper(scan_stage_document(plan, documents, false), &plan.residual);
+    // 边界完整消费查询时计数不回表，`mongod` 用 `COUNT_SCAN` 直接数索引项。
+    let stage = if plan.residual.fields.is_empty() {
+        scan_stage_document(plan, documents, true)
+    }
+    else {
+        add_fetch_wrapper(scan_stage_document(plan, documents, false), &plan.residual)
+    };
     let mut counted = BsonDocument::new();
     counted.push("stage".to_string(), BsonValue::String("COUNT".to_string()));
     counted.push("inputStage".to_string(), BsonValue::Document(stage));
@@ -1539,10 +1659,11 @@ fn execution_base(stage: &str, advanced: i64, works: i64, eof: bool) -> BsonDocu
 
 /// 用执行器真实消费的账目渲染 `IXSCAN`。
 ///
-/// `keys_examined` 与实际扫描的索引项数一致，`documents_examined` 与实际回表
-/// 次数一致；两者都由执行路径回填，不做按 limit 的提前收尾估算。
-fn index_scan_stage(plan: &HintedPlan, documents: &[BsonDocument], keys_examined: i64, documents_examined: i64) -> BsonDocument {
-    let mut stage = execution_base("IXSCAN", documents_examined, keys_examined + 1, true);
+/// `keys_examined` 与实际扫描的索引项数一致，`advanced` 是交付给上层的命中数
+/// （含在索引层被 `skip` 跳过的项）；早停时不计读到区间末尾的那次额外 work。
+fn index_scan_stage(plan: &HintedPlan, documents: &[BsonDocument], keys_examined: i64, advanced: i64, exhausted: bool) -> BsonDocument {
+    let works = keys_examined + i64::from(exhausted);
+    let mut stage = execution_base("IXSCAN", advanced, works, exhausted);
     for (field, value) in scan_stage_document(plan, documents, false).fields.into_iter().skip(1) {
         stage.push(field, value);
     }
@@ -1553,19 +1674,42 @@ fn index_scan_stage(plan: &HintedPlan, documents: &[BsonDocument], keys_examined
     stage
 }
 
+/// 用执行器真实消费的账目渲染 `COUNT_SCAN`。
+///
+/// 计数不回表；`keysExamined` 连同收尾探针一并计入，与 `mongod` 数索引项的
+/// 账目一致。
+fn count_scan_stage(plan: &HintedPlan, documents: &[BsonDocument], keys_examined: i64, advanced: i64, exhausted: bool) -> BsonDocument {
+    let works = keys_examined + i64::from(exhausted);
+    let mut stage = execution_base("COUNT_SCAN", advanced, works, exhausted);
+    for (field, value) in scan_stage_document(plan, documents, true).fields.into_iter().skip(1) {
+        stage.push(field, value);
+    }
+    stage.push("keysExamined".to_string(), count_value(works));
+    stage
+}
+
 fn reported_find_stats(
     plan: &HintedPlan,
     documents: &[BsonDocument],
-    keys_examined: i64,
-    documents_examined: i64,
+    outcome: &ScanOutcome,
     matched: usize,
     skip: usize,
     limit: usize,
     all_plans: bool,
 ) -> BsonDocument {
-    let works = keys_examined + 1;
-    let mut stage = index_scan_stage(plan, documents, keys_examined, documents_examined);
-    let mut fetch = execution_base("FETCH", matched as i64, works, true);
+    let keys_examined = outcome.keys_examined;
+    let documents_examined = outcome.documents_examined;
+    let skipped = outcome.skipped_at_index as i64;
+    let works = keys_examined + i64::from(outcome.exhausted);
+    let mut stage = index_scan_stage(plan, documents, keys_examined, documents_examined + skipped, outcome.exhausted);
+    if skipped > 0 {
+        // `skip` 下推到索引层：`SKIP` 夹在 `IXSCAN` 与 `FETCH` 之间，跳过的命中不回表。
+        let mut skipped_stage = execution_base("SKIP", documents_examined, works, outcome.exhausted);
+        skipped_stage.push("skipAmount".to_string(), count_value(skip as i64));
+        skipped_stage.push("inputStage".to_string(), BsonValue::Document(stage));
+        stage = skipped_stage;
+    }
+    let mut fetch = execution_base("FETCH", documents_examined, works, outcome.exhausted);
     if !plan.residual.fields.is_empty() {
         fetch.push("filter".to_string(), BsonValue::Document(plan.residual.clone()));
     }
@@ -1574,20 +1718,20 @@ fn reported_find_stats(
     fetch.push("inputStage".to_string(), BsonValue::Document(stage));
     stage = fetch;
     if !plan.sort_covered {
-        let mut sorted = execution_base("SORT", matched as i64, works, true);
+        let mut sorted = execution_base("SORT", matched as i64, keys_examined + 1, true);
         sorted.push("inputStage".to_string(), BsonValue::Document(stage));
         stage = sorted;
     }
     let after_skip = matched.saturating_sub(skip);
     let returned = if limit > 0 { after_skip.min(limit) } else { after_skip };
-    if skip > 0 {
-        let mut skipped = execution_base("SKIP", after_skip as i64, works, true);
-        skipped.push("skipAmount".to_string(), count_value(skip as i64));
-        skipped.push("inputStage".to_string(), BsonValue::Document(stage));
-        stage = skipped;
+    if skip > 0 && skipped == 0 {
+        let mut skipped_stage = execution_base("SKIP", after_skip as i64, keys_examined + 1, true);
+        skipped_stage.push("skipAmount".to_string(), count_value(skip as i64));
+        skipped_stage.push("inputStage".to_string(), BsonValue::Document(stage));
+        stage = skipped_stage;
     }
     if limit > 0 {
-        let mut limited = execution_base("LIMIT", returned as i64, works, true);
+        let mut limited = execution_base("LIMIT", returned as i64, keys_examined + 1, true);
         limited.push("limitAmount".to_string(), count_value(limit as i64));
         limited.push("inputStage".to_string(), BsonValue::Document(stage));
         stage = limited;
@@ -1613,27 +1757,34 @@ fn reported_find_stats(
 fn reported_count_stats(
     plan: &HintedPlan,
     documents: &[BsonDocument],
-    keys_examined: i64,
-    documents_examined: i64,
+    outcome: &ScanOutcome,
     matched: usize,
     skip: usize,
     limit: usize,
     all_plans: bool,
 ) -> BsonDocument {
-    let works = keys_examined + 1;
-    let mut input = index_scan_stage(plan, documents, keys_examined, documents_examined);
-    let mut fetch = execution_base("FETCH", matched as i64, works, true);
-    if !plan.residual.fields.is_empty() {
-        fetch.push("filter".to_string(), BsonValue::Document(plan.residual.clone()));
+    let keys_examined = outcome.keys_examined;
+    let documents_examined = outcome.documents_examined;
+    let advanced = documents_examined + outcome.skipped_at_index as i64;
+    let exhausted = outcome.exhausted;
+    let index_only = plan.residual.fields.is_empty();
+    let input = if index_only {
+        count_scan_stage(plan, documents, keys_examined, advanced, exhausted)
     }
-    fetch.push("docsExamined".to_string(), count_value(documents_examined));
-    fetch.push("alreadyHasObj".to_string(), BsonValue::Int32(0));
-    fetch.push("inputStage".to_string(), BsonValue::Document(input));
-    input = fetch;
+    else {
+        let works = keys_examined + i64::from(exhausted);
+        let stage = index_scan_stage(plan, documents, keys_examined, advanced, exhausted);
+        let mut fetch = execution_base("FETCH", advanced, works, exhausted);
+        fetch.push("filter".to_string(), BsonValue::Document(plan.residual.clone()));
+        fetch.push("docsExamined".to_string(), count_value(documents_examined));
+        fetch.push("alreadyHasObj".to_string(), BsonValue::Int32(0));
+        fetch.push("inputStage".to_string(), BsonValue::Document(stage));
+        fetch
+    };
     let skipped_matches = matched.min(skip);
     let available = matched - skipped_matches;
     let counted = if limit > 0 { available.min(limit) } else { available };
-    let mut counted_stage = execution_base("COUNT", 0, works + 1, true);
+    let mut counted_stage = execution_base("COUNT", 0, keys_examined + 1, true);
     counted_stage.push("nCounted".to_string(), count_value(counted as i64));
     counted_stage.push("nSkipped".to_string(), count_value(skipped_matches as i64));
     counted_stage.push("inputStage".to_string(), BsonValue::Document(input));
@@ -1646,8 +1797,8 @@ fn reported_count_stats(
     stats.push("executionSuccess".to_string(), BsonValue::Bool(true));
     stats.push("nReturned".to_string(), BsonValue::Int32(0));
     stats.push("executionTimeMillis".to_string(), BsonValue::Int32(0));
-    stats.push("totalKeysExamined".to_string(), count_value(keys_examined));
-    stats.push("totalDocsExamined".to_string(), count_value(documents_examined));
+    stats.push("totalKeysExamined".to_string(), count_value(keys_examined + i64::from(exhausted && index_only)));
+    stats.push("totalDocsExamined".to_string(), count_value(if index_only { 0 } else { documents_examined }));
     stats.push("executionStages".to_string(), BsonValue::Document(cached));
     if all_plans {
         stats.push("allPlansExecution".to_string(), BsonValue::Array(Vec::new()));
@@ -1672,6 +1823,21 @@ struct ScanOutcome {
     documents: Vec<BsonDocument>,
     keys_examined: i64,
     documents_examined: i64,
+    /// 扫描是否读到区间末尾；`limit` 早停后为 `false`。
+    exhausted: bool,
+    /// 在索引层被跳过、没有回表的命中数；只有边界完整消费查询时才可能非零。
+    skipped_at_index: usize,
+}
+
+/// 边界完整消费查询时，`skip` 可以下推到索引层：跳过的命中不回表。
+///
+/// 只有结果顺序就是扫描顺序（无排序，或排序由索引序覆盖）时才允许下推，
+/// 否则「先跳」与「先排」会给出不同的窗口。
+fn pushed_skip(access: &QueryAccess, sort: &[(String, i32)], skip: usize) -> usize {
+    match access {
+        QueryAccess::Index(plan) if plan.residual.fields.is_empty() && (sort.is_empty() || plan.sort_covered) => skip,
+        _ => 0,
+    }
 }
 
 /// 决定一次查询走集合扫描还是索引探针。
@@ -1694,7 +1860,7 @@ fn choose_access(
         Hint::Natural(direction) => Ok(QueryAccess::Collection { direction: *direction }),
         Hint::Index(specification) => {
             let plan = build_hinted_plan(documents, specification, filter, sort);
-            if index_executable(&plan, filter) && index_has_entries(store, namespace, specification)? {
+            if index_executable(&plan, filter, true) && index_has_entries(store, namespace, specification)? {
                 Ok(QueryAccess::Index(plan))
             }
             else {
@@ -1712,6 +1878,10 @@ fn choose_access(
 ///
 /// `stop_after` 是命中数边界：达到之后立即停止读取，用于 `limit` 早停。只有
 /// 不受排序约束的查询才能给出这个边界，否则「先停」与「先排」会给出不同结果。
+/// `skip` 是索引层跳过的命中数（仅在边界完整消费查询时下推），跳过的命中不
+/// 回表，账目与 `mongod` 的 `FETCH{SKIP{IXSCAN}}` 一致。反向扫描读完整个区间
+/// 再倒序交付，索引项读取数如实计入。
+#[allow(clippy::too_many_arguments)]
 fn scan_with_access(
     store: &dyn MongoStorage,
     namespace: &str,
@@ -1720,49 +1890,94 @@ fn scan_with_access(
     session: Option<&str>,
     need_total: bool,
     stop_after: Option<usize>,
+    skip: usize,
 ) -> Result<ScanOutcome, CommandError> {
     match access {
         QueryAccess::Collection { .. } => {
             let (documents, documents_examined) = collect_matching_bounded(store, namespace, filter, session, need_total, stop_after)?;
-            Ok(ScanOutcome { documents, keys_examined: 0, documents_examined })
+            Ok(ScanOutcome { documents, keys_examined: 0, documents_examined, exhausted: true, skipped_at_index: 0 })
         }
         QueryAccess::Index(plan) => {
             let entry_namespace = crate::storage::index_namespace(namespace, &plan.spec.name);
             let spans = plan_spans(plan).unwrap_or_else(|| vec![IndexSpan { prefix: Vec::new(), after: None, before: None }]);
+            let backward = plan.direction == "backward";
             let mut keys_examined = 0i64;
             let mut documents_examined = 0i64;
             let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
             let mut documents = Vec::new();
+            let mut skipped_at_index = 0usize;
+            let mut exhausted = true;
+            let deliver = |document_key: Vec<u8>,
+                           store: &dyn MongoStorage,
+                           seen: &mut BTreeSet<Vec<u8>>,
+                           documents: &mut Vec<BsonDocument>,
+                           documents_examined: &mut i64,
+                           skipped_at_index: &mut usize|
+             -> Result<bool, CommandError> {
+                if !seen.insert(document_key.clone()) {
+                    return Ok(false);
+                }
+                if *skipped_at_index < skip {
+                    // `skip` 下推到索引层：跳过的命中不回表，与 `mongod` 的 `FETCH{SKIP{IXSCAN}}` 账目一致。
+                    *skipped_at_index += 1;
+                    return Ok(true);
+                }
+                // 回表尝试如实计数：悬挂索引项也算一次 `docsExamined`，与 `mongod` 一致。
+                *documents_examined += 1;
+                if let Some(payload) = namespace_document(store, namespace, &document_key, session)?
+                    && let Ok(document) = parse_bson(&payload)
+                    && document_matches(&document, filter)?
+                {
+                    documents.push(document);
+                    return Ok(true);
+                }
+                Ok(false)
+            };
             'scan: for span in spans {
-                // 区间内部分页：每页只读还差的命中数，避免为了早停把整段前缀取回。
                 let mut cursor = span.after.clone();
-                loop {
-                    let page = match stop_after {
-                        Some(bound) => (bound - documents.len()).max(1),
-                        None => 0,
-                    };
-                    let entries = store
-                        .scan_reserved_range(&entry_namespace, &span.prefix, cursor.as_deref(), span.before.as_deref(), page)
-                        .map_err(|error| CommandError::new(1, format!("index scan failed: {error}")))?;
-                    if entries.is_empty() {
-                        break;
+                if backward {
+                    // 反向扫描没有按游标倒读的能力：整段读完再倒序交付，索引项读取数如实计入。
+                    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    loop {
+                        let batch = store
+                            .scan_reserved_range(&entry_namespace, &span.prefix, cursor.as_deref(), span.before.as_deref(), 0)
+                            .map_err(|error| CommandError::new(1, format!("index scan failed: {error}")))?;
+                        if batch.is_empty() {
+                            break;
+                        }
+                        entries.extend(batch);
+                        if let Some(last) = entries.last() {
+                            cursor = Some(last.0.clone());
+                        }
                     }
                     keys_examined += entries.len() as i64;
-                    let fetched = entries.len();
-                    for (entry_key, document_key) in entries {
+                    entries.reverse();
+                    for (_entry_key, document_key) in entries {
+                        deliver(document_key, store, &mut seen, &mut documents, &mut documents_examined, &mut skipped_at_index)?;
+                    }
+                    continue 'scan;
+                }
+                // 区间内部分页：每页只读还差的命中数，避免为了早停把整段前缀取回。
+                loop {
+                    let page = match stop_after {
+                        Some(bound) => (bound - documents.len() - skipped_at_index).max(1),
+                        None => 0,
+                    };
+                    let batch = store
+                        .scan_reserved_range(&entry_namespace, &span.prefix, cursor.as_deref(), span.before.as_deref(), page)
+                        .map_err(|error| CommandError::new(1, format!("index scan failed: {error}")))?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    let fetched = batch.len();
+                    keys_examined += fetched as i64;
+                    for (entry_key, document_key) in batch {
                         cursor = Some(entry_key);
-                        if !seen.insert(document_key.clone()) {
-                            continue;
-                        }
-                        documents_examined += 1;
-                        if let Some(payload) = namespace_document(store, namespace, &document_key, session)?
-                            && let Ok(document) = parse_bson(&payload)
-                            && document_matches(&document, filter)?
+                        if deliver(document_key, store, &mut seen, &mut documents, &mut documents_examined, &mut skipped_at_index)?
+                            && stop_after.is_some_and(|bound| documents.len() + skipped_at_index >= bound)
                         {
-                            documents.push(document);
-                            if stop_after.is_some_and(|bound| documents.len() >= bound) {
-                                break 'scan;
-                            }
+                            exhausted = false;
+                            break 'scan;
                         }
                     }
                     if stop_after.is_none() || fetched < page {
@@ -1770,7 +1985,7 @@ fn scan_with_access(
                     }
                 }
             }
-            Ok(ScanOutcome { documents, keys_examined, documents_examined })
+            Ok(ScanOutcome { documents, keys_examined, documents_examined, exhausted, skipped_at_index })
         }
     }
 }
@@ -1847,13 +2062,14 @@ pub fn find(command: &BsonDocument, store: &dyn MongoStorage, cursors: &mut Curs
     let access = choose_access(store, &namespace, &filter, &hint, &sort, &[], session.key())?;
     // 无排序时结果顺序就是扫描顺序，命中前 `skip + limit` 篇即可停手。
     let stop_after = scan_stop_after(&sort, skip, limit);
-    let mut documents = scan_with_access(store, &namespace, &filter, &access, session.key(), false, stop_after)?.documents;
+    let pushed = pushed_skip(&access, &sort, skip);
+    let mut documents = scan_with_access(store, &namespace, &filter, &access, session.key(), false, stop_after, pushed)?.documents;
     if matches!(access, QueryAccess::Collection { direction: -1 }) {
         documents.reverse();
     }
     sort_documents(&mut documents, &sort);
 
-    let start = skip.min(documents.len());
+    let start = if pushed > 0 { 0 } else { skip.min(documents.len()) };
     let end = if limit > 0 { (start + limit).min(documents.len()) } else { documents.len() };
     let mut window: Vec<BsonValue> = Vec::new();
     for document in documents.into_iter().skip(start).take(end - start) {
@@ -1902,7 +2118,9 @@ pub fn count(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonDoc
     let matched = {
         let access = choose_access(store, &namespace, &filter, &hint, &[], &[], session.key())?;
         let stop_after = scan_stop_after(&[], skip, limit);
-        scan_with_access(store, &namespace, &filter, &access, session.key(), false, stop_after)?.documents.len()
+        let pushed = pushed_skip(&access, &[], skip);
+        let outcome = scan_with_access(store, &namespace, &filter, &access, session.key(), false, stop_after, pushed)?;
+        outcome.documents.len() + outcome.skipped_at_index
     };
     let start = skip.min(matched);
     let end = if limit > 0 { (start + limit).min(matched) } else { matched };
@@ -1968,8 +2186,9 @@ pub fn explain(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonD
     let access = choose_access(store, &namespace, &filter, &hint, &sort, &all_documents, None)?;
     // 与 find / count 用同一个早停边界，explain 报的扫描量就是执行器真实读到的量。
     let stop_after = scan_stop_after(&sort, skip, limit);
-    let outcome = scan_with_access(store, &namespace, &filter, &access, None, true, stop_after)?;
-    let matched = outcome.documents.len();
+    let pushed = pushed_skip(&access, &sort, skip);
+    let outcome = scan_with_access(store, &namespace, &filter, &access, None, true, stop_after, pushed)?;
+    let matched = outcome.documents.len() + outcome.skipped_at_index;
     let counted = if limit > 0 { matched.saturating_sub(skip).min(limit) } else { matched.saturating_sub(skip) };
     let direction = match &access {
         QueryAccess::Collection { direction: -1 } => "backward",
@@ -2008,26 +2227,12 @@ pub fn explain(command: &BsonDocument, store: &dyn MongoStorage) -> Result<BsonD
     }
     if verbosity != "queryPlanner" {
         let stats = match (&access, name) {
-            (QueryAccess::Index(plan), "find") => reported_find_stats(
-                plan,
-                &all_documents,
-                outcome.keys_examined,
-                outcome.documents_examined,
-                matched,
-                skip,
-                limit,
-                verbosity == "allPlansExecution",
-            ),
-            (QueryAccess::Index(plan), _) => reported_count_stats(
-                plan,
-                &all_documents,
-                outcome.keys_examined,
-                outcome.documents_examined,
-                matched,
-                skip,
-                limit,
-                verbosity == "allPlansExecution",
-            ),
+            (QueryAccess::Index(plan), "find") => {
+                reported_find_stats(plan, &all_documents, &outcome, matched, skip, limit, verbosity == "allPlansExecution")
+            }
+            (QueryAccess::Index(plan), _) => {
+                reported_count_stats(plan, &all_documents, &outcome, matched, skip, limit, verbosity == "allPlansExecution")
+            }
             (QueryAccess::Collection { .. }, _) => explain_execution_stats(ExecutionStats {
                 command: name,
                 filter: &normalized,
@@ -2319,7 +2524,7 @@ pub fn aggregate(command: &BsonDocument, store: &dyn MongoStorage) -> Result<Bso
         validate_filter(filter, "aggregate $match")?;
         let stop_after = aggregate_stop_after(&stages[1..]);
         let access = choose_access(store, &namespace, filter, &Hint::None, &[], &[], session.key())?;
-        documents = scan_with_access(store, &namespace, filter, &access, session.key(), false, stop_after)?.documents;
+        documents = scan_with_access(store, &namespace, filter, &access, session.key(), false, stop_after, 0)?.documents;
         remaining = &stages[1..];
     }
     else {

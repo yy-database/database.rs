@@ -2008,7 +2008,16 @@ fn explain_reports_the_plan_the_executor_actually_runs() {
 
     let counted = explain_count(&store, "items", filter.clone());
     assert_eq!(plan_stage(nested(&counted, &["queryPlanner", "winningPlan"]).expect("count plan")), "COUNT");
-    assert_eq!(int(nested(&counted, &["executionStats"]).expect("count stats"), "totalDocsExamined"), 10);
+    assert_eq!(
+        plan_stage(nested(nested(&counted, &["queryPlanner", "winningPlan"]).expect("count plan"), &["inputStage"]).expect("count scan stage")),
+        "COUNT_SCAN",
+        "the bounds consume the predicate, so the count never leaves the index"
+    );
+    assert_eq!(
+        int(nested(&counted, &["executionStats"]).expect("count stats"), "totalDocsExamined"),
+        0,
+        "a covered count reads index entries only"
+    );
 
     let mut drop = command("dropIndexes", "items", "app");
     drop.push("index", text("a_1"));
