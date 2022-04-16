@@ -661,6 +661,8 @@ fn canonical_sql_type(field_type: &SqlFieldType) -> &'static str {
         SqlFieldType::Bool => "BOOLEAN",
         SqlFieldType::Bytes => "BYTEA",
         SqlFieldType::Decimal => "DECIMAL",
+        SqlFieldType::Date => "DATE",
+        SqlFieldType::Datetime => "DATETIME",
         SqlFieldType::Unknown | SqlFieldType::Optional(_) => "TEXT",
     }
 }
@@ -682,9 +684,12 @@ fn map_sql_type(sql_type: &str) -> Result<(SqlFieldType, Option<u32>), SqlFronte
         "FLOAT" | "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT4" | "FLOAT8" => SqlFieldType::Float64,
         "VARCHAR" | "CHAR" | "CHARACTER" | "CHARACTER VARYING" => SqlFieldType::String,
         "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => SqlFieldType::String,
-        "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMP WITHOUT TIME ZONE" | "UUID" => {
-            SqlFieldType::String
-        }
+        "DATE" => SqlFieldType::Date,
+        "DATETIME" | "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMP WITHOUT TIME ZONE" => SqlFieldType::Datetime,
+        "TIME" | "UUID" => SqlFieldType::String,
+        // `DECIMAL(p,s)` keeps its value as decimal text; the declared precision
+        // and scale are dialect display facts and do not narrow the gateway type.
+        "DECIMAL" | "NUMERIC" | "DEC" | "FIXED" => SqlFieldType::Decimal,
         "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BYTEA" => SqlFieldType::Bytes,
         _ => {
             return Err(SqlFrontendError::unsupported(format!("column type `{sql_type}` has no 集群 SQL gateway equivalent")));
@@ -865,6 +870,9 @@ enum FieldTypeDocument {
     String,
     Bool,
     Bytes,
+    Decimal,
+    Date,
+    Datetime,
     Unknown,
 }
 
@@ -877,6 +885,9 @@ impl FieldTypeDocument {
             Self::String => SqlFieldType::String,
             Self::Bool => SqlFieldType::Bool,
             Self::Bytes => SqlFieldType::Bytes,
+            Self::Decimal => SqlFieldType::Decimal,
+            Self::Date => SqlFieldType::Date,
+            Self::Datetime => SqlFieldType::Datetime,
             Self::Unknown => SqlFieldType::Unknown,
         }
     }
@@ -889,7 +900,9 @@ impl FieldTypeDocument {
             SqlFieldType::String => Self::String,
             SqlFieldType::Bool => Self::Bool,
             SqlFieldType::Bytes => Self::Bytes,
-            SqlFieldType::Decimal => Self::Unknown,
+            SqlFieldType::Decimal => Self::Decimal,
+            SqlFieldType::Date => Self::Date,
+            SqlFieldType::Datetime => Self::Datetime,
             SqlFieldType::Optional(_) | SqlFieldType::Unknown => Self::Unknown,
         }
     }

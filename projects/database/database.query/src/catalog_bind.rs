@@ -35,8 +35,15 @@ pub enum SqlFieldType {
     Bytes,
     /// Exact decimal result type. MySQL reports `SUM`/`AVG` over exact operands
     /// as `DECIMAL`, which drivers surface as a string rather than a number.
-    /// Result metadata only: stored columns never project to this type.
+    /// A declared `DECIMAL(p,s)` column also projects here and keeps its value
+    /// as decimal text end to end.
     Decimal,
+    /// Calendar date without a time part (`DATE`). Values stay text:
+    /// the gateway stores and reports the `YYYY-MM-DD` spelling verbatim.
+    Date,
+    /// Date and time of day (`DATETIME` / `TIMESTAMP`). Values stay text: the
+    /// gateway stores and reports the `YYYY-MM-DD HH:MM:SS` spelling verbatim.
+    Datetime,
     /// Optional wrapper — inner type + NULL. Box breaks the recursion
     Optional(Box<SqlFieldType>),
     /// Anything the gateway does not recognise stays opaque.
@@ -75,7 +82,9 @@ pub fn project_resolved_type(ty: &ResolvedCanonicalType) -> SqlFieldType {
             CanonicalScalar::Utf8 | CanonicalScalar::Utf16 => SqlFieldType::String,
             CanonicalScalar::Bool => SqlFieldType::Bool,
             CanonicalScalar::Bytes => SqlFieldType::Bytes,
-            CanonicalScalar::Uuid | CanonicalScalar::Date | CanonicalScalar::Time | CanonicalScalar::DateTime => SqlFieldType::String,
+            CanonicalScalar::Date => SqlFieldType::Date,
+            CanonicalScalar::DateTime => SqlFieldType::Datetime,
+            CanonicalScalar::Uuid | CanonicalScalar::Time => SqlFieldType::String,
             // `u64` cannot narrow into `i64` without lying about the range and
             // `decimal` has no lossless gateway numeric type. Both stay
             // `Unknown` and are rejected at bind time with the VOS type name.

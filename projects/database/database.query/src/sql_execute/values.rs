@@ -84,6 +84,7 @@ impl SqlValue {
     /// - `Int64`/`Int32` 按整数解析。
     /// - `Float64` 按浮点解析。
     /// - `Bool` 识别 `true`/`false`/`1`/`0`。
+    /// - `Date`/`Datetime` 原样保留写入时的日期/时间文本。
     /// - `Unknown` 退回到 [`Self::from_row_bytes`] 的宽松推断。
     ///
     /// 解码失败时降级为 [`SqlValue::String`] 保留原始 UTF-8 文本，
@@ -96,6 +97,11 @@ impl SqlValue {
             // Exact decimals arrive on the wire as text; keep them textual so
             // drivers observe the same value they would from MySQL.
             crate::catalog_bind::SqlFieldType::Decimal => SqlValue::String(String::from_utf8_lossy(bytes).into_owned()),
+            // `DATE`/`DATETIME` columns store the canonical text spelling; the gateway
+            // re-emits it verbatim and the driver-side column type turns it into a date.
+            crate::catalog_bind::SqlFieldType::Date | crate::catalog_bind::SqlFieldType::Datetime => {
+                SqlValue::String(String::from_utf8_lossy(bytes).into_owned())
+            }
             crate::catalog_bind::SqlFieldType::Int64 | crate::catalog_bind::SqlFieldType::Int32 => {
                 if bytes.is_empty() {
                     return SqlValue::Null;

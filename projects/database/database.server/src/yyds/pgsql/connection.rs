@@ -877,6 +877,8 @@ fn pg_sqlstate(kind: SqlErrorKind) -> &'static str {
         TypeMismatch => "42804",
         ValueTooLong => "22001",
         NotNullViolation => "23502",
+        // PostgreSQL 把「缺 NOT NULL 且无 DEFAULT 的列」并入 not-null 违例。
+        MissingDefault => "23502",
         Unsupported => "0A000",
         UnknownFunction => "42883",
         UnknownVariable => "42704",
@@ -1814,6 +1816,9 @@ fn pg_oid(field_type: &SqlFieldType) -> u32 {
         SqlFieldType::Bool => OID_BOOL,
         SqlFieldType::Bytes => OID_BYTEA,
         SqlFieldType::Decimal => OID_NUMERIC,
+        // PostgreSQL 侧仍按文本传输日期/时间：网关不建模时区与日期二进制编码，
+        // 与类型上报改造前的 `String` 行为逐字节一致。
+        SqlFieldType::Date | SqlFieldType::Datetime => OID_TEXT,
         SqlFieldType::String | SqlFieldType::Unknown | SqlFieldType::Optional(_) => OID_TEXT,
     }
 }
