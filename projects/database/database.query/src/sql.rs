@@ -32,6 +32,10 @@ pub enum SqlErrorKind {
     ValueTooLong,
     /// A write supplies `NULL` for a primary key.
     NotNullViolation,
+    /// A write omits a `NOT NULL` column that carries no `DEFAULT`, so there is
+    /// no value to store. MySQL reports `1364` / `HY000`; PostgreSQL folds this
+    /// into its not-null violation `23502`.
+    MissingDefault,
     /// The statement is valid SQL but outside the gateway's supported subset.
     Unsupported,
     /// A function name or arity is not part of the gateway subset.

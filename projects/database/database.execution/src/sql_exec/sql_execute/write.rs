@@ -621,10 +621,19 @@ pub(crate) fn execute_update(
         }
     }
 
-    for field in &plan.fields {
-        match sql_value_to_bytes(&field.value) {
-            Some(bytes) => row.insert(field.field_id, bytes),
-            None => row.remove(field.field_id),
+    // 所有 SET 右值先基于改写前的行求值，再统一应用：`SET a = b, b = a` 必须交换，
+    // 与 `ON CONFLICT DO UPDATE` 的同时赋值语义一致。
+    let mut updates = Vec::with_capacity(plan.fields.len());
+    for assignment in &plan.fields {
+        let value = eval_row_expression(&assignment.value, &row, &plan.field_types, dialect, executor, transaction)?;
+        let literal = value_to_literal(value);
+        check_write_literal(&literal, &assignment.field_type, &assignment.field_name, dialect, assignment.capacity)?;
+        updates.push((assignment.field_id, sql_value_to_bytes(&literal)));
+    }
+    for (field_id, bytes) in updates {
+        match bytes {
+            Some(bytes) => row.insert(field_id, bytes),
+            None => row.remove(field_id),
         }
     }
     if let Some(constraint) =
@@ -791,10 +800,18 @@ pub(crate) fn execute_update_scan(
                 continue;
             }
         }
-        for field in &plan.fields {
-            match sql_value_to_bytes(&field.value) {
-                Some(bytes) => row.insert(field.field_id, bytes),
-                None => row.remove(field.field_id),
+        // SET 右值基于改写前的行求值，全部求完再统一应用（同时赋值语义）。
+        let mut updates = Vec::with_capacity(plan.fields.len());
+        for assignment in &plan.fields {
+            let value = eval_row_expression(&assignment.value, &row, &plan.field_types, dialect, executor, transaction)?;
+            let literal = value_to_literal(value);
+            check_write_literal(&literal, &assignment.field_type, &assignment.field_name, dialect, assignment.capacity)?;
+            updates.push((assignment.field_id, sql_value_to_bytes(&literal)));
+        }
+        for (field_id, bytes) in updates {
+            match bytes {
+                Some(bytes) => row.insert(field_id, bytes),
+                None => row.remove(field_id),
             }
         }
         if !plan.unique_constraints.is_empty() {

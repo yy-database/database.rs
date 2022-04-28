@@ -4,8 +4,10 @@
 //! `KeyValueExecutor` 的执行计划。计划本身不做读/写；它只决定：
 //!
 //! 1. **namespace** — 目标表的字符串标签，形如 `table:{type_id}`。
-//! 2. **rowid / rowid_prefix / rowid_after / rowid_before** — 主键查询参数
-//!    （WHERE 里 `pk = literal` / `pk > X` / `pk LIKE 'prefix%'` 等）。
+//! 2. **rowid / rowid_prefix** — 主键查询参数
+//!    （WHERE 里 `pk = literal` / `pk LIKE 'prefix%'`）。
+//!    `pk > / >= / < / <=` 不下推为 `rowid_after` / `rowid_before`：整数主键编码成
+//!    不补零的十进制 ASCII，字节序与数值序不一致，范围条件留在 remaining 行级过滤。
 //! 3. **projection fields** — 投影需要的字段 ID 列表，`*` 会在此时展开。
 //! 4. **remaining predicate** — 从 WHERE 里剥掉 pk 条件后剩下的表达式，
 //!    拿到 row 后再做一次过滤。
@@ -167,10 +169,13 @@ pub fn plan_select_for_dialect(
         validate_distinct_order_by(select.order_by.as_ref(), &projection_fields, &projection_expressions)?;
     }
 
-    // 2. 递归解析 predicate 的 AND 树，把 pk 条件提取出来。
-    let (pk_equality, pk_prefix, pk_after, pk_before, remaining_predicate) = match select.predicate {
-        None => (None, None, None, None, None),
-        Some(expr) => extract_pk_range(expr, source.row_id(pk_field.field_id))?,
+    // 2. 递归解析 predicate 的 AND 树，把 pk 等值与 LIKE 前缀提取出来；范围条件留在 remaining。
+    // 聚合与 GROUP BY 只在扫描路径求值，窗口函数需要看到分区里的其余行——这三种情况
+    // 不允许点读，等值必须留在 remaining 里由扫描逐行过滤，否则谓词会被抽取吞掉。
+    let point_read_allowed = !has_window && !has_aggregate && select.group_by.is_none();
+    let (pk_equality, pk_prefix, remaining_predicate) = match select.predicate {
+        None => (None, None, None),
+        Some(expr) => extract_pk_range(expr, source.row_id(pk_field.field_id), point_read_allowed)?,
     };
 
     // 3. 分流：有精确 pk 等值 → Read；其他全部 → Scan。
@@ -187,25 +192,23 @@ pub fn plan_select_for_dialect(
         .collect();
 
     if let Some(lit) = pk_equality {
-        // 窗口函数需要看到分区里的其余行，单点读无法求值，必须退回扫描。
-        if !has_window {
-            let rowid = pk_literal_to_rowid(&lit)?;
-            return Ok(SqlExecutionPlan::Read(ReadPlan {
-                namespace,
-                rowid,
-                projection_fields,
-                projection_expressions,
-                remaining_predicate,
-                // `LIMIT 0` 按 SQL 语义返回空结果集，单点读同样不能绕过；`OFFSET >= 1`
-                // 会跳过这唯一一行，因此也必须在单点读这一层就抑制。
-                suppress_rows: limit == Some(0) || offset.is_some_and(|value| value > 0),
-                field_types: field_types.clone(),
-                field_defaults,
-            }));
-        }
+        // 走到这里说明 point_read_allowed 成立（等值只在允许点读时才被抽取）。
+        let rowid = pk_literal_to_rowid(&lit)?;
+        return Ok(SqlExecutionPlan::Read(ReadPlan {
+            namespace,
+            rowid,
+            projection_fields,
+            projection_expressions,
+            remaining_predicate,
+            // `LIMIT 0` 按 SQL 语义返回空结果集，单点读同样不能绕过；`OFFSET >= 1`
+            // 会跳过这唯一一行，因此也必须在单点读这一层就抑制。
+            suppress_rows: limit == Some(0) || offset.is_some_and(|value| value > 0),
+            field_types: field_types.clone(),
+            field_defaults,
+        }));
     }
 
-    // Scan 路径：prefix / after / before 都是 bytes。
+    // Scan 路径：prefix 是 bytes；after / before 不再由范围条件下推填充。
     // ORDER BY / GROUP BY / 聚合 / remaining_predicate 时 kv-scan 不设 limit
     // —— 先 filter/aggregate/sort/group 才能知道前 N 行是哪些。
     // OFFSET 同样不能下推：kv-scan 只能「取前 N 行」，跳过的行仍要真实扫描，
@@ -222,8 +225,8 @@ pub fn plan_select_for_dialect(
     Ok(SqlExecutionPlan::Scan(ScanPlan {
         namespace,
         rowid_prefix: pk_prefix.unwrap_or_default(),
-        rowid_after: pk_after,
-        rowid_before: pk_before,
+        rowid_after: None,
+        rowid_before: None,
         limit: kv_limit,
         projection_fields,
         projection_expressions,
@@ -606,6 +609,22 @@ pub fn plan_insert(insert: SqlCatalogBoundInsert, catalog: &SqlCatalog, dialect:
     let conflict = plan_on_conflict(conflict, table, dialect)?;
     let returning = plan_returning(returning, table, dialect)?;
     let unique_constraints = unique_constraints_of(table);
+    // 真实 MySQL 对「INSERT 未点名、且列 NOT NULL 又无 DEFAULT」整条语句报 `1364`，
+    // 而不是静默写入 NULL。带 DEFAULT 的缺列沿用读取路径的默认值回填，可空列缺列
+    // 仍按缺失字段解码为 NULL；`AUTO_INCREMENT` 列在计划前已由 `apply_auto_increment`
+    // 补进目标列，不会走到这里误报。
+    for field in &table.fields {
+        if field.field_type.is_nullable() || field.default.is_some() {
+            continue;
+        }
+        if target_fields.iter().any(|target| target.field_id == field.field_id) {
+            continue;
+        }
+        return Err(SqlFrontendError::new(
+            SqlErrorKind::MissingDefault,
+            format!("Field '{}' doesn't have a default value", field.name),
+        ));
+    }
     if let Some(select) = select {
         return plan_insert_select(*select, target_fields, namespace, field_types, unique_constraints, catalog, dialect, conflict, returning);
     }
@@ -871,10 +890,19 @@ pub fn plan_update(update: SqlCatalogBoundUpdate, catalog: &SqlCatalog, dialect:
 
     let mut write_fields = Vec::new();
     for (field, value_expr) in &update.assignments {
-        let lit = literal_from_expression(value_expr)?;
         let field_type = field_types.get(&field.field_id).cloned().unwrap_or(crate::catalog_bind::SqlFieldType::Unknown);
-        check_write_literal(&lit, &field_type, &field.field_name, dialect, field.capacity)?;
-        write_fields.push(WriteField { field_id: field.field_id, value: lit, field_type, capacity: field.capacity });
+        // 纯字面量右值保持计划期类型校验；算术、列引用与标量函数表达式由执行层
+        // 对每个命中行按当前行值求值，再走同一 `check_write_literal` 守卫。
+        if let Ok(lit) = literal_from_expression(value_expr) {
+            check_write_literal(&lit, &field_type, &field.field_name, dialect, field.capacity)?;
+        }
+        write_fields.push(UpdateAssignment {
+            field_id: field.field_id,
+            field_name: field.field_name.clone(),
+            field_type,
+            capacity: field.capacity,
+            value: value_expr.clone(),
+        });
     }
 
     let Some(predicate) = update.predicate
@@ -891,7 +919,8 @@ pub fn plan_update(update: SqlCatalogBoundUpdate, catalog: &SqlCatalog, dialect:
         }));
     };
 
-    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) = extract_pk_range(predicate.clone(), pk_field.field_id)?;
+    // UPDATE 没有聚合与分组，等值始终可以交给点读。
+    let (pk_literal, pk_prefix, remaining) = extract_pk_range(predicate.clone(), pk_field.field_id, true)?;
     if let Some(rowid_literal) = pk_literal {
         return Ok(SqlExecutionPlan::Update(UpdatePlan {
             namespace,
@@ -905,8 +934,8 @@ pub fn plan_update(update: SqlCatalogBoundUpdate, catalog: &SqlCatalog, dialect:
     Ok(SqlExecutionPlan::UpdateScan(UpdateScanPlan {
         namespace,
         rowid_prefix: pk_prefix.unwrap_or_default(),
-        rowid_after: pk_after,
-        rowid_before: pk_before,
+        rowid_after: None,
+        rowid_before: None,
         fields: write_fields,
         predicate: remaining,
         field_types,
@@ -934,7 +963,8 @@ pub fn plan_delete(delete: SqlCatalogBoundDelete, catalog: &SqlCatalog) -> Resul
         }));
     };
 
-    let (pk_literal, pk_prefix, pk_after, pk_before, remaining) = extract_pk_range(predicate.clone(), pk_field.field_id)?;
+    // DELETE 没有聚合与分组，等值始终可以交给点读。
+    let (pk_literal, pk_prefix, remaining) = extract_pk_range(predicate.clone(), pk_field.field_id, true)?;
     if let Some(rowid_literal) = pk_literal {
         return Ok(SqlExecutionPlan::Delete(DeletePlan {
             namespace,
@@ -946,8 +976,8 @@ pub fn plan_delete(delete: SqlCatalogBoundDelete, catalog: &SqlCatalog) -> Resul
     Ok(SqlExecutionPlan::DeleteScan(DeleteScanPlan {
         namespace,
         rowid_prefix: pk_prefix.unwrap_or_default(),
-        rowid_after: pk_after,
-        rowid_before: pk_before,
+        rowid_after: None,
+        rowid_before: None,
         predicate: remaining,
         field_types,
     }))
@@ -1010,8 +1040,15 @@ pub fn check_write_literal(
             SqlBoundLiteral::String(text) => text.parse::<f64>().is_ok(),
             SqlBoundLiteral::Boolean(_) | SqlBoundLiteral::Bytes(_) => false,
         },
-        // `Decimal` is result metadata only; no column stores it.
-        SqlFieldType::Decimal => false,
+        // A declared `DECIMAL` column keeps its value as decimal text: numeric
+        // literals and numeric text are both accepted and re-emitted verbatim.
+        SqlFieldType::Decimal => {
+            matches!(literal, SqlBoundLiteral::Null | SqlBoundLiteral::String(_) | SqlBoundLiteral::Integer(_) | SqlBoundLiteral::Number(_))
+        }
+        // `DATE`/`DATETIME` columns store the canonical text spelling written by
+        // the client; the gateway re-emits it and the driver-side column type
+        // turns it back into a date, so no format validation happens here.
+        SqlFieldType::Date | SqlFieldType::Datetime => matches!(literal, SqlBoundLiteral::Null | SqlBoundLiteral::String(_)),
         SqlFieldType::Bool => match literal {
             SqlBoundLiteral::Null | SqlBoundLiteral::Boolean(_) => true,
             SqlBoundLiteral::Integer(value) => *value == 0 || *value == 1,
@@ -1040,7 +1077,8 @@ pub fn check_write_literal(
     }
 }
 
-/// 从 bound expression 里提取 literal。目前 INSERT/UPDATE 的值必须是 literal。
+/// 从 bound expression 里提取 literal。INSERT 的值必须是 literal；UPDATE 用它识别
+/// 可计划期校验的字面量右值，失败则右值按行表达式交给执行层求值。
 fn literal_from_expression(expr: &SqlCatalogBoundExpression) -> Result<SqlBoundLiteral, SqlFrontendError> {
     match expr {
         SqlCatalogBoundExpression::Literal(lit) => Ok(lit.clone()),
@@ -1176,8 +1214,10 @@ pub struct ScanPlan {
     /// rowid 前缀 bytes；空 = 整个 namespace 全扫。
     pub rowid_prefix: Vec<u8>,
     /// exclusive lower cursor —— 跳过所有 `rowid <= after` 的记录。None = 无下界。
+    /// 整数主键的范围条件不得下推成字节边界，planner 当前恒为 None；字段保留给 KV scan API。
     pub rowid_after: Option<Vec<u8>>,
     /// exclusive upper cursor —— 跳过所有 `rowid >= before` 的记录。None = 无上界。
+    /// 同 [`Self::rowid_after`]，planner 当前恒为 None。
     pub rowid_before: Option<Vec<u8>>,
     /// 下推到 kv-store 的 scan limit（0 = 无上限）。ORDER BY / 聚合 / GROUP BY 存在时保持 0。
     pub limit: usize,
@@ -1409,8 +1449,8 @@ pub struct UpdatePlan {
     pub namespace: String,
     /// 要写入的 row 的主键值 bytes。
     pub rowid: Vec<u8>,
-    /// 要 SET 的字段。
-    pub fields: Vec<WriteField>,
+    /// 要 SET 的赋值，右值可为字面量或行表达式。
+    pub fields: Vec<UpdateAssignment>,
     /// 从原 WHERE 里剥掉主键等值后剩下的表达式。
     /// execute_update 会在写入前对现有 row 评估此 predicate。
     pub remaining_predicate: Option<SqlCatalogBoundExpression>,
@@ -1418,6 +1458,26 @@ pub struct UpdatePlan {
     pub field_types: std::collections::BTreeMap<u64, crate::catalog_bind::SqlFieldType>,
     /// 该表声明的 `UNIQUE` 约束，执行层在写入前逐条校验。
     pub unique_constraints: Vec<UniqueConstraintPlan>,
+}
+
+/// UPDATE 的一条 SET 赋值。
+///
+/// 右值携带绑定后的行表达式：纯字面量已在计划期通过 `check_write_literal`，
+/// 执行层求值得到同一字面量；算术、列引用与标量函数表达式由执行层对每个命中行
+/// 按当前行值求值，再走同一类型与容量守卫。求值一律基于改写前的行，
+/// 与 `ON CONFLICT DO UPDATE` 的同时赋值语义一致。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateAssignment {
+    /// 目标 field_id。
+    pub field_id: u64,
+    /// 目标列名，用于类型错误诊断。
+    pub field_name: String,
+    /// 目标列声明类型，执行层编码校验用。
+    pub field_type: crate::catalog_bind::SqlFieldType,
+    /// 目标列声明的字符/octet 容量，执行层长度守卫用。
+    pub capacity: Option<u32>,
+    /// 赋值右值表达式。
+    pub value: SqlCatalogBoundExpression,
 }
 
 /// 一个要写入的字段。
@@ -1458,8 +1518,8 @@ pub struct UpdateScanPlan {
     pub rowid_after: Option<Vec<u8>>,
     /// exclusive upper cursor。
     pub rowid_before: Option<Vec<u8>>,
-    /// 要 SET 的字段。
-    pub fields: Vec<WriteField>,
+    /// 要 SET 的赋值，右值可为字面量或行表达式。
+    pub fields: Vec<UpdateAssignment>,
     /// 已去掉可下推主键范围后的完整行级过滤条件；`None` 表示整段区间都匹配。
     pub predicate: Option<SqlCatalogBoundExpression>,
     /// field_id → SqlFieldType 映射，execute 层解码与求值用。
@@ -1487,29 +1547,35 @@ pub struct DeleteScanPlan {
 
 /// 从 WHERE predicate 里提取所有关于 pk 字段的条件。
 ///
-/// 返回五元组：
+/// 返回三元组：
 /// - `Option<SqlBoundLiteral>` —— pk = literal 等值（读单点）
 /// - `Option<Vec<u8>>` —— pk LIKE 'prefix%' 前缀
-/// - `Option<Vec<u8>>` —— after exclusive lower cursor（来自 pk > X 或 pk >= X → exclusive X）
-/// - `Option<Vec<u8>>` —— before exclusive upper cursor（来自 pk < Y 或 pk <= Y → exclusive Y+ε）
 /// - `Option<SqlCatalogBoundExpression>` —— 剩余不能下推的条件
 ///
-/// 冲突规则：两个等值 / 两个不同前缀 / after ≥ before → planner_error。
+/// `pk > / >= / < / <=` 与 `BETWEEN`（脱糖成 `>= AND <=`）一律留在 remaining，
+/// 由行级数值求值过滤：整数主键编码成不补零的十进制 ASCII，KV 扫描按字节序比较
+/// 键，字节边界下推会把数值序变成字典序。等值与 LIKE 前缀是精确字节匹配，
+/// 编码一致时结果集不变，仍然下推。
+///
+/// 冲突规则：两个等值 / 两个不同前缀 → planner_error。
+///
+/// `point_read_allowed` 为 `false` 时等值也不抽取（聚合 / GROUP BY / 窗口只在扫描
+/// 路径求值，点读承载不了；等值被抽走又没人按 key 读，行级过滤就丢了这一条）。
+/// 此时等值原样留在 remaining，由扫描逐行求值。
 fn extract_pk_range(
     predicate: SqlCatalogBoundExpression,
     pk_row_id: u64,
-) -> Result<(Option<SqlBoundLiteral>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<SqlCatalogBoundExpression>), SqlFrontendError> {
+    point_read_allowed: bool,
+) -> Result<(Option<SqlBoundLiteral>, Option<Vec<u8>>, Option<SqlCatalogBoundExpression>), SqlFrontendError> {
     match predicate {
         // AND 拆分 — 两侧分别提取，再合并。
         SqlCatalogBoundExpression::Binary { left, operator: SqlBoundBinaryOperator::And, right } => {
-            let (l_eq, l_pre, l_after, l_before, l_rem) = extract_pk_range(*left, pk_row_id)?;
-            let (r_eq, r_pre, r_after, r_before, r_rem) = extract_pk_range(*right, pk_row_id)?;
+            let (l_eq, l_pre, l_rem) = extract_pk_range(*left, pk_row_id, point_read_allowed)?;
+            let (r_eq, r_pre, r_rem) = extract_pk_range(*right, pk_row_id, point_read_allowed)?;
             let eq = merge_opt(l_eq, r_eq, "conflicting primary-key equality inside AND")?;
             let prefix = merge_opt(l_pre, r_pre, "conflicting primary-key LIKE prefix inside AND")?;
-            let after = merge_opt(l_after, r_after, "conflicting primary-key lower bound inside AND")?;
-            let before = merge_opt(l_before, r_before, "conflicting primary-key upper bound inside AND")?;
             let remaining = combine_remaining(l_rem, r_rem);
-            Ok((eq, prefix, after, before, remaining))
+            Ok((eq, prefix, remaining))
         }
 
         // 所有其他 Binary 表达式 —— 尝试识别 pk 条件。
@@ -1518,42 +1584,10 @@ fn extract_pk_range(
                 // pk = literal
                 (SqlBoundBinaryOperator::Equal, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
                 | (SqlBoundBinaryOperator::Equal, SqlCatalogBoundExpression::Literal(lit), SqlCatalogBoundExpression::Column(col))
-                    if col.row_id == pk_row_id =>
+                    if col.row_id == pk_row_id && point_read_allowed =>
                 {
                     let _rowid = pk_literal_to_rowid(&lit)?;
-                    Ok((Some(lit), None, None, None, None))
-                }
-
-                // pk > literal → after exclusive
-                (SqlBoundBinaryOperator::Greater, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id =>
-                {
-                    let rowid = pk_literal_to_rowid(&lit)?;
-                    Ok((None, None, Some(rowid), None, None))
-                }
-
-                // pk >= literal → after exclusive：key > (lit-1) 等价于 key >= lit
-                (SqlBoundBinaryOperator::GreaterEqual, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id =>
-                {
-                    let rowid = pk_literal_to_rowid(&lit)?;
-                    Ok((None, None, Some(rowid_decrement(&rowid)), None, None))
-                }
-
-                // pk < literal → before exclusive
-                (SqlBoundBinaryOperator::Less, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id =>
-                {
-                    let rowid = pk_literal_to_rowid(&lit)?;
-                    Ok((None, None, None, Some(rowid), None))
-                }
-
-                // pk <= literal → before exclusive：key < (lit+1) 等价于 key <= lit
-                (SqlBoundBinaryOperator::LessEqual, SqlCatalogBoundExpression::Column(col), SqlCatalogBoundExpression::Literal(lit))
-                    if col.row_id == pk_row_id =>
-                {
-                    let rowid = pk_literal_to_rowid(&lit)?;
-                    Ok((None, None, None, Some(rowid_increment(&rowid)), None))
+                    Ok((Some(lit), None, None))
                 }
 
                 // pk LIKE 'prefix%'
@@ -1567,8 +1601,6 @@ fn extract_pk_range(
                             return Ok((
                                 None,
                                 None,
-                                None,
-                                None,
                                 Some(SqlCatalogBoundExpression::Binary {
                                     left: Box::new(SqlCatalogBoundExpression::Column(col)),
                                     operator: SqlBoundBinaryOperator::Like,
@@ -1577,13 +1609,11 @@ fn extract_pk_range(
                             ));
                         }
                     };
-                    Ok((None, Some(prefix), None, None, None))
+                    Ok((None, Some(prefix), None))
                 }
 
                 // 其他所有 Binary —— 留在 remaining
                 (op, left, right) => Ok((
-                    None,
-                    None,
                     None,
                     None,
                     Some(SqlCatalogBoundExpression::Binary { left: Box::new(left), operator: op, right: Box::new(right) }),
@@ -1592,7 +1622,7 @@ fn extract_pk_range(
         }
 
         // OR、Between、Unary、Column-alone、Literal-alone 等全部留作 remaining。
-        other => Ok((None, None, None, None, Some(other))),
+        other => Ok((None, None, Some(other))),
     }
 }
 
@@ -1628,37 +1658,6 @@ pub fn pk_literal_to_rowid(literal: &SqlBoundLiteral) -> Result<Vec<u8>, SqlFron
         SqlBoundLiteral::Bytes(bytes) => Ok(bytes.clone()),
         SqlBoundLiteral::Boolean(value) => Ok((if *value { "1" } else { "0" }).as_bytes().to_vec()),
         SqlBoundLiteral::Null => Err(SqlFrontendError::new(SqlErrorKind::NotNullViolation, "primary key must not be NULL")),
-    }
-}
-
-/// rowid + 1 并转为 bytes。用于把 inclusive upper bound 转为 exclusive before。
-fn rowid_increment(rowid: &[u8]) -> Vec<u8> {
-    let s = String::from_utf8_lossy(rowid);
-    match s.parse::<u128>() {
-        Ok(n) => (n + 1).to_string().into_bytes(),
-        Err(_) => {
-            let mut v = rowid.to_vec();
-            if let Some(last) = v.last_mut() {
-                *last = last.saturating_add(1);
-            }
-            v
-        }
-    }
-}
-
-/// rowid - 1 并转为 bytes。用于把 inclusive lower bound 转为 exclusive after。
-fn rowid_decrement(rowid: &[u8]) -> Vec<u8> {
-    let s = String::from_utf8_lossy(rowid);
-    match s.parse::<u128>() {
-        Ok(0) => rowid.to_vec(),
-        Ok(n) => (n - 1).to_string().into_bytes(),
-        Err(_) => {
-            let mut v = rowid.to_vec();
-            if let Some(last) = v.last_mut() {
-                *last = last.saturating_sub(1);
-            }
-            v
-        }
     }
 }
 
@@ -2105,5 +2104,181 @@ mod default_value_tests {
         assert_eq!(parse_default_value("TRUE"), Some(DefaultValue::Boolean(true)));
         assert_eq!(parse_default_value("1.5"), Some(DefaultValue::NumberBits(1.5_f64.to_bits())));
         assert_eq!(parse_default_value("CURRENT_TIMESTAMP"), None);
+    }
+}
+
+#[cfg(test)]
+mod write_plan_type_tests {
+    use super::{SqlExecutionPlan, plan_insert};
+    use crate::catalog_bind::{SqlCatalogBoundStatement, SqlFieldType, bind_sql_catalog};
+    use crate::sql::{SqlDialect, SqlErrorKind};
+    use crate::sql_ddl::parse_ddl;
+    use crate::sql_schema::SqlSchemaRegistry;
+
+    fn apply_ddl(registry: &SqlSchemaRegistry, sql: &str) {
+        let statement = parse_ddl(sql, SqlDialect::Mysql).expect("parse").expect("DDL statement");
+        registry.apply_ddl(&statement).expect("apply DDL");
+    }
+
+    fn plan_mysql_insert(registry: &SqlSchemaRegistry, sql: &str) -> Result<SqlExecutionPlan, crate::sql::SqlFrontendError> {
+        let catalog = registry.catalog();
+        let SqlCatalogBoundStatement::Insert(insert) = bind_sql_catalog(sql, &catalog, catalog.schema_version(), SqlDialect::Mysql).expect("bind")
+        else {
+            panic!("expected INSERT");
+        };
+        plan_insert(insert, &catalog, SqlDialect::Mysql)
+    }
+
+    #[test]
+    fn omitted_not_null_column_without_default_reports_missing_default() {
+        let registry = SqlSchemaRegistry::new_in_memory();
+        apply_ddl(&registry, "CREATE TABLE truth_err (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)");
+        assert!(plan_mysql_insert(&registry, "INSERT INTO truth_err (id, v) VALUES (1, 5)").is_ok());
+        let error = plan_mysql_insert(&registry, "INSERT INTO truth_err (id) VALUES (4)").expect_err("missing NOT NULL column must fail");
+        assert_eq!(error.kind, SqlErrorKind::MissingDefault);
+        assert_eq!(error.message, "Field 'v' doesn't have a default value");
+    }
+
+    #[test]
+    fn omitted_nullable_or_defaulted_column_still_plans() {
+        let registry = SqlSchemaRegistry::new_in_memory();
+        apply_ddl(&registry, "CREATE TABLE truth_ok (id INT NOT NULL PRIMARY KEY, note INT, tag VARCHAR(8) NOT NULL DEFAULT 'x')");
+        assert!(plan_mysql_insert(&registry, "INSERT INTO truth_ok (id) VALUES (1)").is_ok());
+    }
+
+    #[test]
+    fn date_and_datetime_ddl_project_their_own_field_types() {
+        let registry = SqlSchemaRegistry::new_in_memory();
+        apply_ddl(&registry, "CREATE TABLE truth_types (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME, ts TIMESTAMP NULL)");
+        let catalog = registry.catalog();
+        let table = catalog.tables().iter().find(|table| table.name == "truth_types").expect("table");
+        let field_type = |name: &str| table.fields.iter().find(|field| field.name == name).expect("field").field_type.inner();
+        assert_eq!(field_type("d"), SqlFieldType::Date);
+        assert_eq!(field_type("dt"), SqlFieldType::Datetime);
+        assert_eq!(field_type("ts"), SqlFieldType::Datetime);
+    }
+
+    #[test]
+    fn decimal_ddl_projects_the_decimal_field_type() {
+        let registry = SqlSchemaRegistry::new_in_memory();
+        apply_ddl(&registry, "CREATE TABLE truth_dec (id INT NOT NULL PRIMARY KEY, price DECIMAL(10,2))");
+        let catalog = registry.catalog();
+        let table = catalog.tables().iter().find(|table| table.name == "truth_dec").expect("table");
+        let price = table.fields.iter().find(|field| field.name == "price").expect("field");
+        assert_eq!(price.field_type.inner(), SqlFieldType::Decimal);
+    }
+}
+
+#[cfg(test)]
+mod pk_range_pushdown_tests {
+    use super::{SqlExecutionPlan, plan_statement_for_dialect};
+    use crate::catalog_bind::{SqlCatalog, SqlCatalogBoundExpression, bind_sql_catalog};
+    use crate::sql::{SqlBoundBinaryOperator, SqlDialect};
+    use crate::sql_ddl::parse_ddl;
+    use crate::sql_schema::SqlSchemaRegistry;
+
+    fn mysql_catalog(ddl: &str) -> SqlCatalog {
+        let registry = SqlSchemaRegistry::new_in_memory();
+        let statement = parse_ddl(ddl, SqlDialect::Mysql).expect("parse").expect("DDL statement");
+        registry.apply_ddl(&statement).expect("apply DDL");
+        registry.catalog()
+    }
+
+    fn plan_mysql(catalog: &SqlCatalog, sql: &str) -> SqlExecutionPlan {
+        let bound = bind_sql_catalog(sql, catalog, catalog.schema_version(), SqlDialect::Mysql).expect("bind");
+        plan_statement_for_dialect(bound, catalog, SqlDialect::Mysql).expect("plan")
+    }
+
+    /// 整数主键的范围条件不得变成 KV 字节边界：`rowid_after` / `rowid_before` 必须为空，
+    /// 条件整体留在 remaining 行级过滤。`BETWEEN` 脱糖成 `>= AND <=`，同样留在 remaining。
+    #[test]
+    fn integer_pk_range_stays_row_level_without_byte_bounds() {
+        let catalog = mysql_catalog("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)");
+        for sql in [
+            "SELECT id FROM t WHERE id > 6",
+            "SELECT id FROM t WHERE id >= 50",
+            "SELECT id FROM t WHERE id < 10",
+            "SELECT id FROM t WHERE id <= 10",
+            "SELECT id FROM t WHERE id BETWEEN 6 AND 46",
+            "SELECT id FROM t WHERE id > 6 AND id < 46",
+        ] {
+            let SqlExecutionPlan::Scan(scan) = plan_mysql(&catalog, sql) else { panic!("`{sql}` must plan to a scan") };
+            assert!(scan.rowid_after.is_none(), "`{sql}` must not push a byte lower bound");
+            assert!(scan.rowid_before.is_none(), "`{sql}` must not push a byte upper bound");
+            assert!(scan.remaining_predicate.is_some(), "`{sql}` must keep the range as a row filter");
+            // remaining 谓词存在时 kv-scan 不能带 limit，否则字节序截断仍会丢行。
+            assert_eq!(scan.limit, 0, "`{sql}` must scan without a pushed-down limit");
+        }
+    }
+
+    /// UPDATE / DELETE 的范围谓词同样留在行级：扫描边界为空，执行层按 predicate 逐行过滤。
+    #[test]
+    fn update_and_delete_range_stays_row_level() {
+        let catalog = mysql_catalog("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)");
+        let SqlExecutionPlan::UpdateScan(update) = plan_mysql(&catalog, "UPDATE t SET v = 1 WHERE id > 6") else { panic!("UPDATE must scan") };
+        assert!(update.rowid_after.is_none() && update.rowid_before.is_none());
+        assert!(update.predicate.is_some(), "UPDATE must keep the range as a row filter");
+        let SqlExecutionPlan::DeleteScan(delete) = plan_mysql(&catalog, "DELETE FROM t WHERE id >= 50") else { panic!("DELETE must scan") };
+        assert!(delete.rowid_after.is_none() && delete.rowid_before.is_none());
+        assert!(delete.predicate.is_some(), "DELETE must keep the range as a row filter");
+    }
+
+    /// 等值主键仍走单点读：rowid 是主键字面量的规范字节。
+    #[test]
+    fn pk_equality_still_reads_one_rowid_point() {
+        let catalog = mysql_catalog("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)");
+        let SqlExecutionPlan::Read(read) = plan_mysql(&catalog, "SELECT id FROM t WHERE id = 42") else { panic!("equality must plan to a point read") };
+        assert_eq!(read.rowid, b"42".to_vec());
+        assert!(read.remaining_predicate.is_none());
+    }
+
+    /// 等值 + 其他谓词：点读保留，其余条件留在 remaining。
+    #[test]
+    fn pk_equality_with_conjunct_keeps_remaining_filter() {
+        let catalog = mysql_catalog("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)");
+        let SqlExecutionPlan::Read(read) = plan_mysql(&catalog, "SELECT id FROM t WHERE id = 42 AND v > 1") else { panic!("equality must plan to a point read") };
+        assert_eq!(read.rowid, b"42".to_vec());
+        assert!(read.remaining_predicate.is_some());
+    }
+
+    /// 字符串主键的前缀 LIKE 仍下推为字节前缀扫描。
+    #[test]
+    fn string_pk_like_prefix_still_pushes_down() {
+        let catalog = mysql_catalog("CREATE TABLE s (name TEXT NOT NULL PRIMARY KEY, v INT)");
+        let SqlExecutionPlan::Scan(scan) = plan_mysql(&catalog, "SELECT name FROM s WHERE name LIKE 'abc%'") else { panic!("LIKE prefix must plan to a scan") };
+        assert_eq!(scan.rowid_prefix, b"abc".to_vec());
+        assert!(scan.remaining_predicate.is_none(), "prefix LIKE is fully pushed down");
+    }
+
+    /// 非纯前缀的 LIKE 模式不下推，留在 remaining 行级求值。
+    #[test]
+    fn like_pattern_beyond_prefix_stays_row_level() {
+        let catalog = mysql_catalog("CREATE TABLE s (name TEXT NOT NULL PRIMARY KEY, v INT)");
+        let SqlExecutionPlan::Scan(scan) = plan_mysql(&catalog, "SELECT name FROM s WHERE name LIKE 'a%c'") else { panic!("LIKE must plan to a scan") };
+        assert!(scan.rowid_prefix.is_empty());
+        assert!(scan.remaining_predicate.is_some());
+    }
+
+    /// UPDATE 的 SET 右值携带绑定后的行表达式；纯字面量右值仍是 Literal 并保持计划期校验。
+    #[test]
+    fn update_set_carries_bound_row_expressions() {
+        use super::UpdateAssignment;
+        let catalog = mysql_catalog("CREATE TABLE inv (id INT NOT NULL PRIMARY KEY, stock INT, name TEXT)");
+        let SqlExecutionPlan::Update(update) = plan_mysql(&catalog, "UPDATE inv SET stock = stock - 1 WHERE id = 1") else { panic!("point update") };
+        let UpdateAssignment { field_name, value, .. } = &update.fields[0];
+        assert_eq!(field_name, "stock");
+        let SqlCatalogBoundExpression::Binary { operator, .. } = value else { panic!("arithmetic RHS must stay a Binary expression") };
+        assert_eq!(*operator, SqlBoundBinaryOperator::Minus);
+        // 字面量右值保持原形状。
+        let SqlExecutionPlan::Update(literal_update) = plan_mysql(&catalog, "UPDATE inv SET stock = 5 WHERE id = 1") else { panic!("point update") };
+        assert!(matches!(&literal_update.fields[0].value, SqlCatalogBoundExpression::Literal(crate::sql::SqlBoundLiteral::Integer(5))));
+        // 字面量的类型校验仍在计划期报错。
+        let error = bind_and_plan_err(&catalog, "UPDATE inv SET stock = 'abc' WHERE id = 1");
+        assert_eq!(error.kind, crate::sql::SqlErrorKind::TypeMismatch);
+    }
+
+    fn bind_and_plan_err(catalog: &SqlCatalog, sql: &str) -> crate::sql::SqlFrontendError {
+        let bound = bind_sql_catalog(sql, catalog, catalog.schema_version(), SqlDialect::Mysql).expect("bind");
+        plan_statement_for_dialect(bound, catalog, SqlDialect::Mysql).expect_err("plan must fail")
     }
 }

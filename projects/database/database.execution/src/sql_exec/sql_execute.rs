@@ -153,9 +153,16 @@ fn resolve_subqueries(
         }
         SqlExecutionPlan::Update(plan) => {
             lower_optional(&mut plan.remaining_predicate, executor, transaction, dialect)?;
+            // SET 右值可以是表达式，其中非相关子查询与谓词一样先一次物化。
+            for assignment in &mut plan.fields {
+                lower_in_place(&mut assignment.value, executor, transaction, dialect)?;
+            }
         }
         SqlExecutionPlan::UpdateScan(plan) => {
             lower_optional(&mut plan.predicate, executor, transaction, dialect)?;
+            for assignment in &mut plan.fields {
+                lower_in_place(&mut assignment.value, executor, transaction, dialect)?;
+            }
         }
         SqlExecutionPlan::Delete(plan) => {
             lower_optional(&mut plan.remaining_predicate, executor, transaction, dialect)?;
