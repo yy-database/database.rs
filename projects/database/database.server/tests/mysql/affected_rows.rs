@@ -172,3 +172,85 @@ fn affected_rows_stay_real_for_single_row_dml_and_remaining_table() {
     let _ = fs::remove_file(directory.join("local-0.yykv"));
     let _ = fs::remove_dir(&directory);
 }
+
+/// 解 SELECT 文本协议结果集：列数包 → 列定义包若干 → EOF → 行包若干 → EOF。
+/// 只支持单列结果，行值按 length-encoded string 解出，`0xFB` 记为 `None`（NULL）。
+fn query_text_rows(client: &mut TcpStream, sql: &str) -> Vec<Option<String>> {
+    let mut payload = vec![COM_QUERY];
+    payload.extend_from_slice(sql.as_bytes());
+    write_packet(client, 0, &payload);
+    let (_, column_count) = read_packet(client);
+    assert_eq!(column_count.first(), Some(&0x01), "`{sql}` must return one column, got {column_count:?}");
+    loop {
+        let (_, packet) = read_packet(client);
+        if is_eof_packet(&packet) {
+            break;
+        }
+    }
+    let mut rows = Vec::new();
+    loop {
+        let (_, packet) = read_packet(client);
+        if is_eof_packet(&packet) {
+            break;
+        }
+        let (length, offset) = read_lenenc(&packet, 0);
+        if length == usize::MAX {
+            rows.push(None);
+        }
+        else {
+            rows.push(Some(String::from_utf8_lossy(&packet[offset..offset + length]).into_owned()));
+        }
+    }
+    rows
+}
+
+fn is_eof_packet(packet: &[u8]) -> bool {
+    packet.first() == Some(&0xFE) && packet.len() < 9
+}
+
+fn read_lenenc(payload: &[u8], offset: usize) -> (usize, usize) {
+    match payload[offset] {
+        0x00..=0xFA => (usize::from(payload[offset]), offset + 1),
+        0xFB => (usize::MAX, offset + 1),
+        0xFC => (usize::from(u16::from_le_bytes([payload[offset + 1], payload[offset + 2]])), offset + 3),
+        0xFD => (usize::try_from(u32::from_le_bytes([payload[offset + 1], payload[offset + 2], payload[offset + 3], 0])).expect("3-byte length fits usize"), offset + 4),
+        other => panic!("invalid length-encoded prefix {other} in row packet"),
+    }
+}
+
+/// `UPDATE ... SET` 右值算术经文本协议端到端生效：点读路径与扫描路径都按当前行求值，
+/// affectedRows 与读回的行值一起钉死，防止「计数对但值错」的回归。
+#[test]
+fn update_set_arithmetic_round_trips_over_the_wire() {
+    let (mut client, directory) = connect_gateway("update-expr");
+    query_affected_rows(&mut client, "CREATE TABLE inv (id INT NOT NULL PRIMARY KEY, stock INT)");
+    assert_eq!(query_affected_rows(&mut client, "INSERT INTO inv (id, stock) VALUES (1, 10), (2, 20)"), 2);
+
+    // 点读路径：`SET stock = stock - 1 WHERE id = 1`。
+    assert_eq!(query_affected_rows(&mut client, "UPDATE inv SET stock = stock - 1 WHERE id = 1"), 1);
+    assert_eq!(query_text_rows(&mut client, "SELECT stock FROM inv WHERE id = 1"), vec![Some("9".to_string())]);
+
+    // 扫描路径：范围条件按数值序命中两行（旧字节边界会漏掉 id=1..9 里的一部分）。
+    assert_eq!(query_affected_rows(&mut client, "UPDATE inv SET stock = stock + 5 WHERE id > 0"), 2);
+    assert_eq!(query_text_rows(&mut client, "SELECT stock FROM inv WHERE id = 2"), vec![Some("25".to_string())]);
+    assert_eq!(query_text_rows(&mut client, "SELECT stock FROM inv WHERE id = 1"), vec![Some("14".to_string())]);
+
+    drop(client);
+    let _ = fs::remove_file(directory.join("local-0.yykv"));
+    let _ = fs::remove_dir(&directory);
+}
+
+/// 整数主键的范围条件经文本协议按数值序过滤：`id >= 50` 命中 51 行而不是字节序的 55 行。
+#[test]
+fn integer_primary_key_range_scan_counts_over_the_wire() {
+    let (mut client, directory) = connect_gateway("pk-range");
+    query_affected_rows(&mut client, "CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, v INT)");
+    let values: Vec<String> = (1..=100).map(|id| format!("({id}, {id})")).collect();
+    assert_eq!(query_affected_rows(&mut client, &format!("INSERT INTO nums (id, v) VALUES {}", values.join(", "))), 100);
+    assert_eq!(query_text_rows(&mut client, "SELECT COUNT(*) FROM nums WHERE id >= 50"), vec![Some("51".to_string())]);
+    assert_eq!(query_text_rows(&mut client, "SELECT COUNT(*) FROM nums WHERE id BETWEEN 6 AND 46"), vec![Some("41".to_string())]);
+    assert_eq!(query_text_rows(&mut client, "SELECT COUNT(*) FROM nums WHERE id < 10"), vec![Some("9".to_string())]);
+    drop(client);
+    let _ = fs::remove_file(directory.join("local-0.yykv"));
+    let _ = fs::remove_dir(&directory);
+}

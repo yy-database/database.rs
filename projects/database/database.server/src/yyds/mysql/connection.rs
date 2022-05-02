@@ -67,6 +67,8 @@ const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 const MYSQL_TYPE_NULL: u8 = 0x06;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_TYPE_INT24: u8 = 0x09;
+const MYSQL_TYPE_DATE: u8 = 0x0A;
+const MYSQL_TYPE_DATETIME: u8 = 0x0C;
 const MYSQL_TYPE_YEAR: u8 = 0x0D;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xF6;
 const MYSQL_TYPE_TINY_BLOB: u8 = 0xF9;
@@ -187,11 +189,16 @@ pub fn serve_connection(stream: TcpStream, runtime: Option<Arc<MysqlSqlRuntime>>
 }
 
 /// Serves a loopback session that can be interrupted by the owning node.
+///
+/// 套接字保持阻塞模式：数据到达由内核即时唤醒线程，不再有 sleep 轮询地板。
+/// 读超时只是停机标志的检查节拍（取消延迟上界 = `CANCELLABLE_READ_TIMEOUT`），
+/// 写超时设长，避免慢客户端下半包被超时打断丢数据。
 pub fn serve_cancellable(stream: TcpStream, stopping: Arc<AtomicBool>, runtime: Option<Arc<MysqlSqlRuntime>>) -> io::Result<()> {
     if !stream.peer_addr()?.ip().is_loopback() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "MySQL requires loopback until authentication and TLS are implemented"));
     }
-    stream.set_nonblocking(true)?;
+    stream.set_read_timeout(Some(CANCELLABLE_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(CANCELLABLE_WRITE_TIMEOUT))?;
     serve_session(CancellableSocket { stream, stopping }, runtime)
 }
 
@@ -1055,6 +1062,8 @@ fn mysql_error_code(kind: SqlErrorKind) -> (u16, &'static str) {
         TypeMismatch => (1366, "HY000"),
         ValueTooLong => (1406, "22001"),
         NotNullViolation => (1048, "23000"),
+        // 真库 8.4 对「INSERT 缺 NOT NULL 且无 DEFAULT 的列」报 `ER_NO_DEFAULT_FOR_FIELD`。
+        MissingDefault => (1364, "HY000"),
         Unsupported => (1235, "42000"),
         UnknownFunction => (1305, "42000"),
         UnknownVariable => (1193, "HY000"),
@@ -1419,6 +1428,10 @@ fn mysql_field_type(field_type: &SqlFieldType) -> u8 {
         // Exact aggregate results (`SUM`/`AVG` over integer operands) are reported
         // as `DECIMAL` in MySQL, which drivers read back as strings.
         SqlFieldType::Decimal => MYSQL_TYPE_NEWDECIMAL,
+        // 列类型上报为 DATE/DATETIME 后，mysql2 会按类型把文本值转成 JS Date，
+        // 与真库 8.4 的 `types` 场景一致。
+        SqlFieldType::Date => MYSQL_TYPE_DATE,
+        SqlFieldType::Datetime => MYSQL_TYPE_DATETIME,
         SqlFieldType::String | SqlFieldType::Unknown | SqlFieldType::Optional(_) => MYSQL_TYPE_VAR_STRING,
     }
 }
@@ -1542,10 +1555,43 @@ fn encode_binary_row(row: &[SqlValue], column_types: &[u8]) -> Vec<u8> {
             (MYSQL_TYPE_TINY, SqlValue::Boolean(truth)) => out.push(u8::from(*truth)),
             (MYSQL_TYPE_DOUBLE, SqlValue::Number(number)) => out.extend_from_slice(&number.to_le_bytes()),
             (MYSQL_TYPE_FLOAT, SqlValue::Number(number)) => out.extend_from_slice(&(*number as f32).to_le_bytes()),
+            (MYSQL_TYPE_DATE, SqlValue::String(text)) => encode_binary_date(&mut out, text, false),
+            (MYSQL_TYPE_DATETIME, SqlValue::String(text)) => encode_binary_date(&mut out, text, true),
             _ => encode_sql_value(&mut out, value),
         }
     }
     out
+}
+
+/// `DATE`/`DATETIME` 的 binary protocol 编码：长度字节 + 年（u16 LE）+ 月 + 日，
+/// `DATETIME` 再追加时/分/秒（缺省补 0，长度恒为 7），与真库报文布局一致，
+/// mysql2 据此还原 JS Date。无法按日期文本解析的值退回文本编码，不伪造字段。
+fn encode_binary_date(out: &mut Vec<u8>, text: &str, with_time: bool) {
+    let parsed: Option<Vec<u8>> = (|| {
+        let (date, time) = text.split_once(' ').unwrap_or((text, ""));
+        let mut parts = date.split('-');
+        let year = parts.next()?.parse::<u16>().ok()?;
+        let month = parts.next()?.parse::<u8>().ok()?;
+        let day = parts.next()?.parse::<u8>().ok()?;
+        let mut fields = Vec::with_capacity(7);
+        fields.extend_from_slice(&year.to_le_bytes());
+        fields.push(month);
+        fields.push(day);
+        if with_time {
+            let mut parts = time.split(':');
+            fields.push(parts.next().and_then(|value| value.parse::<u8>().ok()).unwrap_or(0));
+            fields.push(parts.next().and_then(|value| value.parse::<u8>().ok()).unwrap_or(0));
+            fields.push(parts.next().and_then(|value| value.parse::<u8>().ok()).unwrap_or(0));
+        }
+        Some(fields)
+    })();
+    match parsed {
+        Some(fields) => {
+            out.push(fields.len() as u8);
+            out.extend_from_slice(&fields);
+        }
+        None => encode_sql_value(out, &SqlValue::String(text.to_string())),
+    }
 }
 
 /// 按首批非空值推断 MySQL 列类型：`LONGLONG`、`DOUBLE`、`TINY`、`VAR_STRING`。
@@ -1673,6 +1719,16 @@ fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// 可取消会话的读超时节拍：阻塞读在数据到达时被内核即时唤醒；超时到期只
+/// 意味着“这段时间没有数据”，回到循环顶检查停机标志后继续等。取消延迟上界即此值。
+const CANCELLABLE_READ_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// 可取消会话的写超时：设长，避免慢客户端下发送半包时被超时打断丢数据。
+const CANCELLABLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 单次 I/O 操作的总时限，与 `serve_connection` 的 30 秒空闲超时口径一致。
+const CANCELLABLE_IO_DEADLINE: Duration = Duration::from_secs(30);
+
 struct CancellableSocket {
     stream: TcpStream,
     stopping: Arc<AtomicBool>,
@@ -1680,17 +1736,18 @@ struct CancellableSocket {
 
 impl CancellableSocket {
     fn attempt<T>(&mut self, mut operation: impl FnMut(&mut TcpStream) -> io::Result<T>) -> io::Result<T> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + CANCELLABLE_IO_DEADLINE;
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "MySQL service stopping"));
             }
             match operation(&mut self.stream) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // 阻塞套接字 + 短超时：超时到期仅代表“这段时间没有数据到达 / 缓冲未腾空”，
+                // 检查停机标志后继续等。Linux 超时回 WouldBlock，Windows 回 TimedOut，两者都按可重试处理。
+                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                     if Instant::now() >= deadline {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "MySQL socket I/O timeout"));
                     }
-                    std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 result => return result,
