@@ -1182,6 +1182,18 @@ pub enum Expr {
         /// Arguments in source order.
         args: Vec<Expr>,
     },
+    /// 宿主注册的自定义标量函数调用。
+    ///
+    /// 解析期只在带宿主注册表的 [`parse_with_host_functions`] 路径上产生:
+    /// 名字按 ASCII 小写折叠后命中注册表且元数相符才成为本节点;折叠名与
+    /// 内建函数同名同元数时本节点优先,即注册替换内建派发。求值由引擎
+    /// 经 `database-udf` 合同转给宿主运行时。
+    HostFunction {
+        /// 折叠小写后的注册名。
+        name: String,
+        /// 实参,按书写顺序。
+        args: Vec<Expr>,
+    },
     /// Scalar subquery `(SELECT ...)`.
     ///
     /// Yields the first row's only column, or `NULL` when the subquery returns
@@ -1374,6 +1386,17 @@ impl Expr {
             }
             Self::Function { name, args } => {
                 let mut text = format!("{}(", name.name());
+                for (index, arg) in args.iter().enumerate() {
+                    if index > 0 {
+                        text.push(',');
+                    }
+                    text.push_str(&arg.label());
+                }
+                text.push(')');
+                text
+            }
+            Self::HostFunction { name, args } => {
+                let mut text = format!("{name}(");
                 for (index, arg) in args.iter().enumerate() {
                     if index > 0 {
                         text.push(',');
@@ -2040,7 +2063,20 @@ impl Token {
 }
 
 /// Parses one or more semicolon-separated statements.
+///
+/// 不带宿主注册表:未知函数名一律按内建口径拒绝,与历史行为一致。
+/// 需要让宿主自定义函数参与解析期派发时使用 [`parse_with_host_functions`]。
 pub fn parse(source: &str) -> Result<Vec<Statement>, SqlError> {
+    parse_with_host_functions(source, None)
+}
+
+/// Parses one or more semicolon-separated statements against a host function table.
+///
+/// 解析顺序为宿主注册表 → 内建函数 → `unknown-function` 拒绝:折叠名命中
+/// 注册表且元数相符的调用成为 [`Expr::HostFunction`] 节点,同名同元数的
+/// 内建派发被替换(与 SQLite `sqlite3_create_function` 的覆盖行为一致);
+/// 未命中的名字保持既有拒绝口径。`hosts` 为 `None` 时与 [`parse`] 等价。
+pub fn parse_with_host_functions(source: &str, hosts: Option<&crate::sql::host::HostFunctionTable>) -> Result<Vec<Statement>, SqlError> {
     let (tokens, offsets) = tokenize(source)?;
     let mut parser = Parser {
         source,
@@ -2052,6 +2088,7 @@ pub fn parse(source: &str) -> Result<Vec<Statement>, SqlError> {
         statement_start: 0,
         next_parameter: 0,
         parameter_names: std::collections::BTreeMap::new(),
+        hosts,
     };
     let mut statements = Vec::new();
     while !parser.done() {
@@ -2820,6 +2857,8 @@ struct Parser<'a> {
     next_parameter: usize,
     /// Named placeholders already seen, so a repeated name reuses its index.
     parameter_names: std::collections::BTreeMap<String, usize>,
+    /// 会话宿主函数表;`None` 表示本路径不解析宿主函数。
+    hosts: Option<&'a crate::sql::host::HostFunctionTable>,
 }
 
 impl<'a> Parser<'a> {
@@ -3370,6 +3409,31 @@ impl<'a> Parser<'a> {
         else {
             None
         };
+        // 宿主注册表优先于内建派发:`count(*)` 是解析器特殊形态,始终走内建。
+        // 折叠名命中注册表且元数相符即成为宿主调用;同名同元数的内建被替换,
+        // 与 SQLite `sqlite3_create_function` 的覆盖行为一致。
+        if !count_star {
+            if let Some(hosts) = self.hosts {
+                if let Some(arity) = hosts.expected_arity(&name) {
+                    let folded = crate::sql::host::fold_name(&name);
+                    if arity.is_some() && arity != Some(args.len()) {
+                        return Err(self.error("wrong-arguments", format!("wrong number of arguments to function {folded}()")));
+                    }
+                    if self.peek_keyword("over") {
+                        let mut error = self.error(
+                            "unsupported-clause",
+                            format!("host function `{folded}` is scalar-only and cannot be used as a window function"),
+                        );
+                        error.clause = Some("OVER".to_string());
+                        return Err(error);
+                    }
+                    if distinct || !order.is_empty() || filter.is_some() {
+                        return Err(self.error("syntax", format!("`{name}()` is not an aggregate and cannot carry `DISTINCT`, `ORDER BY` or `FILTER`")));
+                    }
+                    return Ok(Expr::HostFunction { name: folded, args });
+                }
+            }
+        }
         if self.peek_keyword("over") {
             if aggregate.is_none() && (distinct || !order.is_empty() || filter.is_some()) {
                 return Err(self.error("syntax", format!("`DISTINCT`, `ORDER BY` and `FILTER` require an aggregate function, not `{name}`")));
@@ -5784,7 +5848,7 @@ fn expr_references(expr: &Expr, name: &str) -> bool {
                 || otherwise.as_ref().is_some_and(|expr| expr_references(expr, name))
         }
         Expr::In { value, list, .. } => expr_references(value, name) || list.iter().any(|item| expr_references(item, name)),
-        Expr::Function { args, .. } => args.iter().any(|arg| expr_references(arg, name)),
+        Expr::Function { args, .. } | Expr::HostFunction { args, .. } => args.iter().any(|arg| expr_references(arg, name)),
         Expr::Subquery(statement) | Expr::Exists(statement) => statement_references(statement, name),
         Expr::InSubquery { value, query, .. } => expr_references(value, name) || statement_references(query, name),
         Expr::Aggregate { argument, filter, order, .. } => {
@@ -6117,7 +6181,7 @@ fn collect_expr_slots(expr: &Expr, slots: &mut Vec<(usize, String)>) {
                 collect_expr_slots(item, slots);
             }
         }
-        Expr::Function { args, .. } => {
+        Expr::Function { args, .. } | Expr::HostFunction { args, .. } => {
             for arg in args {
                 collect_expr_slots(arg, slots);
             }

@@ -14,12 +14,14 @@
 pub(crate) mod datetime;
 pub mod engine;
 pub mod error;
+pub mod host;
 pub(crate) mod json;
 pub mod sql;
 
 pub use engine::{Cell, Engine, ExecResult, results_json};
 pub use error::SqlError;
-pub use sql::{ColumnRef, IndexColumn, Literal, SelectItems, Statement, TableRef, TransactionAction, parameter_slots, parse};
+pub use host::HostFunctionTable;
+pub use sql::{ColumnRef, IndexColumn, Literal, SelectItems, Statement, TableRef, TransactionAction, parameter_slots, parse, parse_with_host_functions};
 
 pub(crate) fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);

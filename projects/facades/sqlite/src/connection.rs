@@ -11,12 +11,17 @@
 //!   由存储层 [`crate::SqliteWriter::save`] 完成,宿主不再写临时 snapshot
 //!   再改名冒充备份。
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{
     SqliteWriter,
-    sql::{Cell, Engine, ExecResult, SqlError, Statement, TransactionAction, parameter_slots, parse},
+    sql::{Cell, Engine, ExecResult, SqlError, Statement, TransactionAction, parameter_slots},
 };
+
+use database_udf::{HostMicroDefinition, HostRuntimeAdapter};
 
 /// 把存储层错误映射为结构化的 SQL 拒绝。
 fn storage_error(error: impl std::fmt::Display) -> SqlError {
@@ -162,6 +167,12 @@ impl Connection {
         self.engine.sqlite_version()
     }
 
+    /// 注册一个宿主自定义标量函数;解析与求值都经本连接的引擎,注册语义
+    /// 见 [`Engine::register_host_function`]。
+    pub fn register_host_function(&mut self, definition: HostMicroDefinition, adapter: Arc<dyn HostRuntimeAdapter>) -> Result<(), SqlError> {
+        self.engine.register_host_function(definition, adapter)
+    }
+
     /// 解析一次 SQL,得到可反复执行的预编译语句。
     ///
     /// 恰好一条语句:空输入与多语句分别以 `empty-statement` 和
@@ -170,7 +181,7 @@ impl Connection {
     /// 拒绝口径——`prepare` 仍然成功,标签如实为 `None`,错误留给执行期按
     /// 既有语义抛出。
     pub fn prepare(&self, sql: &str) -> Result<Prepared, SqlError> {
-        let statements = parse(sql)?;
+        let statements = self.engine.parse(sql)?;
         let statement = match statements.len() {
             1 => statements.into_iter().next().expect("length checked"),
             0 => return Err(SqlError::new("empty-statement", "expected exactly one statement but found 0")),
@@ -201,7 +212,7 @@ impl Connection {
 
     /// 执行一段分号分隔的脚本,逐条语句应用只读拒绝与提交边界。
     pub fn execute(&mut self, sql: &str, parameters: &[Cell]) -> Result<Vec<ExecResult>, SqlError> {
-        let statements = parse(sql)?;
+        let statements = self.engine.parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             let is_write = statement.writes();
@@ -373,6 +384,32 @@ mod tests {
         let connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
         assert_eq!(connection.prepare("").expect_err("empty input").code, "empty-statement");
         assert_eq!(connection.prepare("SELECT 1; SELECT 2").expect_err("two statements").code, "multiple-statements");
+    }
+
+    /// 连接层注册的宿主函数在 `prepare` 与 `execute` 两条路径上都可解析求值。
+    #[test]
+    fn host_functions_registered_on_the_connection_reach_prepare_and_execute() {
+        use database_udf::Result as UdfResult;
+        use database_udf::{HostFunctionHandle, HostMicroDefinition, UdfError, UdfType, UdfValue};
+
+        struct Constant;
+        impl HostRuntimeAdapter for Constant {
+            fn invoke_scalar(&self, _handle: &HostFunctionHandle, _args: &[UdfValue]) -> UdfResult<UdfValue> {
+                Ok(UdfValue::I64(42))
+            }
+
+            fn invoke_batch(&self, _handle: &HostFunctionHandle, _batches: &[Vec<UdfValue>]) -> UdfResult<Vec<UdfValue>> {
+                Err(UdfError::UnsupportedEffect)
+            }
+        }
+
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        let definition =
+            HostMicroDefinition::from_scalar("answer", 1, Vec::new(), UdfType::I64, 7, "host/answer", 1, [0u8; 32]).expect("definition");
+        connection.register_host_function(definition, Arc::new(Constant)).expect("register host function");
+        let prepared = connection.prepare("SELECT answer()").expect("host function parses");
+        assert_eq!(connection.run(&prepared, &[]).expect("prepared run").rows, vec![vec![Cell::Integer(42)]]);
+        assert_eq!(connection.execute("SELECT ANSWER()", &[]).expect("script run")[0].rows, vec![vec![Cell::Integer(42)]]);
     }
 
     #[test]

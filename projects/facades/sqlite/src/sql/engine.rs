@@ -9,7 +9,10 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+use database_udf::{Budget as UdfBudget, HostMicroDefinition, HostRuntimeAdapter, UdfContext, UdfImplementation};
 
 use crate::{
     Affinity, Collation, ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue,
@@ -19,13 +22,14 @@ use crate::{
 use super::{
     datetime::{self, DateTimeFunction},
     error::SqlError,
+    host::{cell_to_udf_value, udf_error_to_sql_error, udf_value_to_cell, HostFunctionTable},
     json_string,
     sql::{
         AggregateFunction, AlterAction, Assignment, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp,
         CompoundTerm, ConflictAction, ConflictClause, DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge,
         FrameExclude, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore,
         SelectItems, Statement, TableConstraint, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp, WindowFunction, WindowSpec,
-        core_references, parse, rewrite_create_index_column, rewrite_create_index_table, rewrite_create_table_column,
+        core_references, parse, parse_with_host_functions, rewrite_create_index_column, rewrite_create_index_table, rewrite_create_table_column,
         rewrite_create_table_drop_column, rewrite_create_table_name, rewrite_view_column, rewrite_view_table, statement_references,
         strip_schema_qualifiers,
     },
@@ -1137,6 +1141,8 @@ pub struct Engine {
     /// Set whenever an `OuterColumn` is read, so a subquery can tell whether it
     /// depended on the enclosing row and therefore must not be memoized.
     outer_read: std::cell::Cell<bool>,
+    /// 会话宿主函数表,按折叠小写名索引;解析期与求值期共用同一份。
+    host_functions: HostFunctionTable,
 }
 
 /// Explicit transaction bookkeeping, mirroring the writer's snapshot levels.
@@ -1192,6 +1198,7 @@ impl Engine {
             index_probes: std::cell::RefCell::new(HashMap::new()),
             subquery_cache: std::cell::RefCell::new(HashMap::new()),
             outer_read: std::cell::Cell::new(false),
+            host_functions: HostFunctionTable::default(),
         };
         engine.load_catalog()?;
         Ok(engine)
@@ -1966,7 +1973,7 @@ impl Engine {
 
     /// Executes exactly one statement.
     pub fn execute_one(&mut self, statement: &str) -> Result<ExecResult, SqlError> {
-        let statements = parse(statement)?;
+        let statements = self.parse(statement)?;
         match statements.len() {
             1 => {
                 let only = statements.into_iter().next().expect("length checked");
@@ -1988,7 +1995,7 @@ impl Engine {
 
     /// Executes a semicolon-separated script and returns the results in order.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<ExecResult>, SqlError> {
-        let statements = parse(sql)?;
+        let statements = self.parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             results.push(self.run_triggered(statement)?);
@@ -2015,6 +2022,47 @@ impl Engine {
         let result = self.run_triggered(statement.clone());
         self.parameters.clear();
         result
+    }
+
+    /// 按本引擎的宿主函数表解析一段分号分隔的脚本。
+    ///
+    /// 与 [`crate::sql::parse`] 的唯一区别:折叠名命中宿主注册表且元数相符
+    /// 的函数调用成为 [`Expr::HostFunction`] 节点,同名同元数的内建派发被
+    /// 替换。宿主在 prepare 之前注册即可让语句通过解析;注册发生在某条
+    /// 已解析语句之后时,该语句里的宿主调用在执行期按当时的注册表求值,
+    /// 未注册的名字以 `unknown-function` 如实拒绝。
+    pub fn parse(&self, sql: &str) -> Result<Vec<Statement>, SqlError> {
+        parse_with_host_functions(sql, Some(&self.host_functions))
+    }
+
+    /// 注册一个宿主自定义标量函数,形态取自 `database-udf` 合同。
+    ///
+    /// `definition` 是合同的 [`HostMicroDefinition`] 元数据(身份名、签名、
+    /// 策略、不透明句柄、指纹),`adapter` 是宿主运行时中真实函数注册表的
+    /// 适配器;注册前按合同校验元数据,不合合同的定义以
+    /// `udf-invalid-definition` 拒绝。派发名按 ASCII 小写折叠,与内建函数
+    /// 同一口径;折叠同名再次注册替换旧实现(JS API 的注册语义),折叠名
+    /// 与内建函数同名同元数时宿主实现优先,与 SQLite
+    /// `sqlite3_create_function` 替换内建的真实行为一致。
+    ///
+    /// 注册同时传播到已附加库的引擎,并对之后 `ATTACH` 的库继续生效,
+    /// 使宿主函数在跨库语句与附加库视图展开里同样可求值。
+    ///
+    /// 合同是 Phase-1 标量形态,没有 step / final 聚合语义:宿主聚合与
+    /// 宿主窗口函数不接入,`OVER` / `FILTER` / `DISTINCT` 形态在解析期以
+    /// 明确错误拒绝。
+    pub fn register_host_function(&mut self, definition: HostMicroDefinition, adapter: Arc<dyn HostRuntimeAdapter>) -> Result<(), SqlError> {
+        let implementation = HostFunctionTable::build(definition, adapter)?;
+        self.host_functions.install(implementation.clone());
+        for attached in &mut self.attached {
+            attached.engine.host_functions.install(implementation.clone());
+        }
+        Ok(())
+    }
+
+    /// 当前会话注册的宿主函数名(折叠小写,字典序)。
+    pub fn host_function_names(&self) -> Vec<String> {
+        self.host_functions.names()
     }
 
     /// `PRAGMA synchronous` 的透传:`false` 时落盘跳过持久化刷新。
@@ -2869,6 +2917,9 @@ impl Engine {
         };
         let mut engine = Box::new(engine);
         engine.alias = Some(name.to_string());
+        // 宿主函数在本会话注册一次后对之后 `ATTACH` 的库同样生效;表内只存放
+        // `Arc` 句柄,克隆不会复制宿主实现。
+        engine.host_functions = self.host_functions.clone();
         let index = self.attached.len();
         self.attached.push(AttachedDb { name: name.to_string(), file: path, display, engine, dirty: false });
         self.attached_lookup.insert(key, index);
@@ -8931,7 +8982,7 @@ fn row_preserving_expr(expr: &Expr) -> bool {
                 && otherwise.as_ref().map_or(true, |expr| row_preserving_expr(expr))
         }
         Expr::In { value, list, .. } => row_preserving_expr(value) && list.iter().all(row_preserving_expr),
-        Expr::Function { args, .. } => args.iter().all(row_preserving_expr),
+        Expr::Function { args, .. } | Expr::HostFunction { args, .. } => args.iter().all(row_preserving_expr),
         Expr::Alias { value, .. } | Expr::Cast { value, .. } | Expr::Collate { value, .. } => row_preserving_expr(value),
         Expr::Like { value, pattern, escape, .. } => {
             row_preserving_expr(value) && row_preserving_expr(pattern) && escape.as_ref().map_or(true, |expr| row_preserving_expr(expr))
@@ -9455,6 +9506,13 @@ enum ResolvedExpr {
     In { value: Box<ResolvedExpr>, list: Vec<ResolvedExpr>, negated: bool, collation: Option<Collation> },
     /// Scalar function call.
     Function { name: ScalarFunction, args: Vec<ResolvedExpr> },
+    /// 宿主注册的自定义标量函数调用;名字已折叠为小写。
+    HostFunction {
+        /// 折叠小写后的注册名。
+        name: String,
+        /// 实参,按书写顺序。
+        args: Vec<ResolvedExpr>,
+    },
     /// `CAST(expr AS type)`.
     Cast { value: Box<ResolvedExpr>, target: CastType },
     /// `expr COLLATE name`；只改变文本比较规则，求值结果与内层表达式相同。
@@ -9703,6 +9761,20 @@ impl ResolvedExpr {
                     eval_function(*name, &values)
                 }
             }
+            Self::HostFunction { name, args } => {
+                let values = args.iter().map(|arg| arg.eval(values, ctx)).collect::<Result<Vec<_>, _>>()?;
+                let implementation = ctx
+                    .engine
+                    .host_functions
+                    .get(name)
+                    .ok_or_else(|| SqlError::new("unknown-function", format!("no such function: {name}")))?;
+                let arguments = values.iter().map(|cell| cell_to_udf_value(name, cell)).collect::<Result<Vec<_>, _>>()?;
+                let mut context = UdfContext::new(UdfBudget::new(ctx.budget.remaining.get() as u64));
+                implementation
+                    .invoke(&mut context, &arguments)
+                    .map_err(|error| udf_error_to_sql_error(name, error))
+                    .map(udf_value_to_cell)?
+            }
             Self::Cast { value, target } => cast_cell(&value.eval(values, ctx)?, *target),
             Self::Collate { value, .. } => value.eval(values, ctx)?,
             Self::IsDistinct { left, right, negated, collation } => {
@@ -9875,7 +9947,7 @@ impl ResolvedExpr {
                 }
             }
             Self::InSubquery { value, .. } => value.collect_sources(out),
-            Self::Function { args, .. } => {
+            Self::Function { args, .. } | Self::HostFunction { args, .. } => {
                 for arg in args {
                     arg.collect_sources(out);
                 }
@@ -9915,7 +9987,7 @@ impl ResolvedExpr {
                     || otherwise.as_ref().is_some_and(|otherwise| otherwise.contains_subquery())
             }
             Self::In { value, list, .. } => value.contains_subquery() || list.iter().any(ResolvedExpr::contains_subquery),
-            Self::Function { args, .. } => args.iter().any(ResolvedExpr::contains_subquery),
+            Self::Function { args, .. } | Self::HostFunction { args, .. } => args.iter().any(ResolvedExpr::contains_subquery),
             Self::Like { value, pattern, escape, .. } => {
                 value.contains_subquery() || pattern.contains_subquery() || escape.as_ref().is_some_and(|escape| escape.contains_subquery())
             }
@@ -10171,6 +10243,13 @@ fn resolve_expr(
         },
         Expr::Function { name, args } => ResolvedExpr::Function {
             name: *name,
+            args: args
+                .iter()
+                .map(|arg| resolve_expr(arg, relation, outer, named, windows, aggregates, allow_aggregate, allow_window))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        Expr::HostFunction { name, args } => ResolvedExpr::HostFunction {
+            name: name.clone(),
             args: args
                 .iter()
                 .map(|arg| resolve_expr(arg, relation, outer, named, windows, aggregates, allow_aggregate, allow_window))
@@ -13562,7 +13641,9 @@ fn expression_mentions_column(expr: &Expr, column: &str, qualifiers: Option<&[&s
             expression_mentions_column(value, column, qualifiers)
                 || list.iter().any(|item| expression_mentions_column(item, column, qualifiers))
         }
-        Expr::Function { args, .. } => args.iter().any(|argument| expression_mentions_column(argument, column, qualifiers)),
+        Expr::Function { args, .. } | Expr::HostFunction { args, .. } => {
+            args.iter().any(|argument| expression_mentions_column(argument, column, qualifiers))
+        }
         Expr::Subquery(statement) | Expr::Exists(statement) => statement_mentions_column(statement, column, qualifiers),
         Expr::InSubquery { value, query, .. } => {
             expression_mentions_column(value, column, qualifiers) || statement_mentions_column(query, column, qualifiers)
@@ -14065,6 +14146,8 @@ fn program_row(addr: i64, opcode: &str, p1: i64, p2: i64, p3: i64, p4: Option<&s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use database_udf::Result as UdfResult;
+    use database_udf::{HostFunctionHandle, UdfError, UdfType, UdfValue};
 
     #[test]
     fn from_writer_reopens_an_existing_image() {
@@ -16557,5 +16640,67 @@ mod tests {
         assert_eq!(engine.execute_one("SELECT count(*) FROM log").expect("log after b").rows, vec![vec![Cell::Integer(0)]]);
         engine.execute("UPDATE t SET a = 'y'").expect("update a");
         assert_eq!(engine.execute_one("SELECT v FROM log").expect("log after a").rows, vec![vec![Cell::Text("y".to_string())]]);
+    }
+
+    /// 宿主适配器:把文本转成大写,其余值原样返回。
+    struct UpperAdapter;
+
+    impl HostRuntimeAdapter for UpperAdapter {
+        fn invoke_scalar(&self, _handle: &HostFunctionHandle, args: &[UdfValue]) -> UdfResult<UdfValue> {
+            Ok(match &args[0] {
+                UdfValue::Text(text) => UdfValue::Text(text.to_ascii_uppercase()),
+                other => other.clone(),
+            })
+        }
+
+        fn invoke_batch(&self, _handle: &HostFunctionHandle, _batches: &[Vec<UdfValue>]) -> UdfResult<Vec<UdfValue>> {
+            Err(UdfError::UnsupportedEffect)
+        }
+    }
+
+    fn scalar_definition(name: &str, args: Vec<UdfType>, returns: UdfType) -> HostMicroDefinition {
+        HostMicroDefinition::from_scalar(name, 1, args, returns, 7, format!("host/{name}"), 1, [0u8; 32])
+            .expect("definition is valid")
+    }
+
+    /// 未注册的宿主名保持 `unknown-function`;注册后按折叠名解析并求值,
+    /// 元数不符在执行前拒绝。
+    #[test]
+    fn host_function_registration_dispatches_and_folds_the_name() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let missing = engine.execute_one("SELECT shout('x')").expect_err("unregistered host function");
+        assert_eq!(missing.code, "unknown-function");
+
+        engine
+            .register_host_function(scalar_definition("shout", vec![UdfType::Text], UdfType::Text), Arc::new(UpperAdapter))
+            .expect("register host function");
+        assert_eq!(engine.host_function_names(), vec!["shout".to_string()]);
+        assert_eq!(engine.execute_one("SELECT SHOUT('x')").expect("host call").rows, vec![vec![Cell::Text("X".to_string())]]);
+        let wrong = engine.execute_one("SELECT shout('x', 'y')").expect_err("arity mismatch");
+        assert_eq!(wrong.code, "wrong-arguments");
+    }
+
+    /// 折叠名与内建函数同名同元数时宿主实现优先;`count(*)` 特殊形态仍走内建。
+    #[test]
+    fn host_function_replaces_a_builtin_of_the_same_arity() {
+        struct Constant;
+        impl HostRuntimeAdapter for Constant {
+            fn invoke_scalar(&self, _handle: &HostFunctionHandle, _args: &[UdfValue]) -> UdfResult<UdfValue> {
+                Ok(UdfValue::I64(7))
+            }
+
+            fn invoke_batch(&self, _handle: &HostFunctionHandle, _batches: &[Vec<UdfValue>]) -> UdfResult<Vec<UdfValue>> {
+                Err(UdfError::UnsupportedEffect)
+            }
+        }
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE t(a)").expect("t");
+        engine.execute("INSERT INTO t VALUES ('abc'), ('de')").expect("seed");
+        engine
+            .register_host_function(scalar_definition("length", vec![UdfType::Any], UdfType::I64), Arc::new(Constant))
+            .expect("register host function");
+        let rows = engine.execute_one("SELECT length(a) FROM t").expect("host call").rows;
+        assert_eq!(rows, vec![vec![Cell::Integer(7)], vec![Cell::Integer(7)]]);
+        assert_eq!(engine.execute_one("SELECT count(*) FROM t").expect("count stays builtin").rows, vec![vec![Cell::Integer(2)]]);
     }
 }

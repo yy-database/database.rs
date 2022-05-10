@@ -15,3 +15,4 @@ path = "src/lib.rs"
 [dependencies]
 database-formats = { workspace = true }
 database-storage = { workspace = true }
+database-udf = { workspace = true }
