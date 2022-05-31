@@ -511,6 +511,7 @@ fn leading_schema(statement: &Statement) -> Option<&str> {
         | Statement::Update { schema, .. }
         | Statement::Delete { schema, .. }
         | Statement::Pragma { schema, .. }
+        | Statement::Vacuum { schema, .. }
         | Statement::CreateTrigger { schema, .. } => schema.as_deref(),
         _ => None,
     };
@@ -543,7 +544,8 @@ fn clear_statement_schema(statement: &mut Statement, schema: &str) {
         | Statement::Insert { schema: slot, .. }
         | Statement::Update { schema: slot, .. }
         | Statement::Delete { schema: slot, .. }
-        | Statement::Pragma { schema: slot, .. } => clear(slot, schema),
+        | Statement::Pragma { schema: slot, .. }
+        | Statement::Vacuum { schema: slot, .. } => clear(slot, schema),
         Statement::CreateTrigger { schema: slot, table_schema, .. } => {
             clear(slot, schema);
             clear(table_schema, schema);
@@ -2945,6 +2947,196 @@ impl Engine {
         Ok(ExecResult { statement: "detach", columns: Vec::new(), rows: Vec::new(), affected: 0 })
     }
 
+    /// `VACUUM [schema] [INTO target]`.
+    ///
+    /// 重建与上游 `VACUUM` 同形:按 `sqlite_master` 的顺序重放表结构,复制行,
+    /// 再重建索引、视图与触发器。新镜像没有 freelist 页,并保留页大小、文本
+    /// 编码、`user_version` 与 `application_id`。不带 `INTO` 时新镜像替换
+    /// 当前页集合;带 `INTO` 时写到目标文件,当前库保持不变。
+    ///
+    /// 与上游一致的边界:`VACUUM`/`VACUUM INTO` 在事务内拒绝,`VACUUM` 也不能
+    /// 出现在触发器体里(解析期按上游报 `near "vacuum": syntax error`);
+    /// `temp` 库的 `VACUUM` 是空操作,`VACUUM temp INTO` 写出空库;目标文件
+    /// 已存在时报 `output file already exists`,目标父目录缺失或目标是目录时
+    /// 报 `unable to open database`,目标不是文本时报 `non-text filename`。
+    fn vacuum_statement(&mut self, into: Option<&Expr>) -> Result<ExecResult, SqlError> {
+        if self.transaction.is_some() {
+            return Err(SqlError::new("SQLITE_ERROR", "cannot VACUUM from within a transaction").in_statement("vacuum"));
+        }
+        if self.scope == TableScope::Temp {
+            if let Some(expression) = into {
+                let target = self.vacuum_target(expression)?;
+                let empty = SqliteWriter::create(self.writer.page_size())
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+                self.write_vacuum_image(&target, empty.pages())?;
+            }
+            return Ok(ExecResult { statement: "vacuum", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+        }
+        let image = self.vacuum_image()?;
+        if let Some(expression) = into {
+            let target = self.vacuum_target(expression)?;
+            self.write_vacuum_image(&target, &image)?;
+        }
+        else {
+            let synchronous = self.writer.synchronous();
+            let mut writer =
+                SqliteWriter::from_pages(image).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+            writer.set_synchronous(synchronous);
+            self.writer = writer;
+            self.reload_catalog()?;
+            self.index_probes.borrow_mut().clear();
+            self.subquery_cache.borrow_mut().clear();
+            self.write_epoch.set(self.write_epoch.get() + 1);
+        }
+        Ok(ExecResult { statement: "vacuum", columns: Vec::new(), rows: Vec::new(), affected: 0 })
+    }
+
+    /// 求出 `VACUUM INTO` 的文件名;SQLite 要求表达式的结果是文本。
+    fn vacuum_target(&self, expression: &Expr) -> Result<String, SqlError> {
+        match self.eval_trigger_expression(expression, "vacuum")? {
+            Cell::Text(target) => Ok(target),
+            _ => Err(SqlError::new("SQLITE_ERROR", "non-text filename").in_statement("vacuum")),
+        }
+    }
+
+    /// 把重建镜像写到 `target`,`VACUUM INTO` 的真实落盘步骤。
+    ///
+    /// 空文件名与 `:memory:` 与上游一样不产生文件,命令仍然成功。目标已存在
+    /// 时不覆盖;父目录缺失、目标是目录或写入失败都报 `unable to open database`。
+    fn write_vacuum_image(&self, target: &str, image: &[u8]) -> Result<(), SqlError> {
+        if target.is_empty() || target.eq_ignore_ascii_case(":memory:") {
+            return Ok(());
+        }
+        let unable = || SqlError::new("SQLITE_CANTOPEN", format!("unable to open database: {target}")).in_statement("vacuum");
+        let path = PathBuf::from(target);
+        if path.is_dir() || path.parent().is_some_and(|parent| !parent.as_os_str().is_empty() && !parent.exists()) {
+            return Err(unable());
+        }
+        if path.exists() {
+            return Err(SqlError::new("SQLITE_ERROR", "output file already exists").in_statement("vacuum"));
+        }
+        std::fs::write(&path, image).map_err(|_| unable())
+    }
+
+    /// 生成 `VACUUM` 的重建镜像。
+    ///
+    /// 顺序与上游一致:先建表,再复制行(触发器尚未建立,复制不会改写数据),
+    /// 最后建索引、视图与触发器。`sqlite_sequence` 的高水位先于行复制写入,
+    /// 之后的显式 rowid 只会上抬、不会覆盖。`rowid` 表按 rowid 升序复制,
+    /// 没有 `INTEGER PRIMARY KEY` 的表因此像上游一样重新编号。
+    fn vacuum_image(&mut self) -> Result<Vec<u8>, SqlError> {
+        let page_size = self.writer.page_size();
+        let encoding = match u32::from_be_bytes(
+            self.writer
+                .pages()
+                .get(56..60)
+                .and_then(|marker| marker.try_into().ok())
+                .ok_or_else(|| SqlError::new("storage", "sqlite header too short").in_statement("vacuum"))?,
+        ) {
+            2 => TextEncoding::Utf16Le,
+            3 => TextEncoding::Utf16Be,
+            _ => TextEncoding::Utf8,
+        };
+        let user_version = self.writer.user_version();
+        let application_id = self.writer.application_id();
+        let limits = TableLimits::default();
+        let objects = self.writer.schema_objects(limits).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+        let writer = SqliteWriter::create_with_encoding(page_size, encoding)
+            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+        let mut fresh = Engine::from_writer(writer)?;
+        for object in &objects {
+            if object.kind != SchemaObjectKind::Table || object.name.eq_ignore_ascii_case("sqlite_sequence") {
+                continue;
+            }
+            if let Some(sql) = &object.sql {
+                fresh.execute_one(sql)?;
+            }
+        }
+        // `sqlite_sequence` 是保留表,不在主目录里,因此直接读存储层。它在
+        // 源库里存在就照样出现在重建镜像里,高水位在建表后先写入。
+        let sequence_present =
+            objects.iter().any(|object| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case("sqlite_sequence"));
+        if sequence_present {
+            let fresh_present = fresh
+                .writer
+                .schema_objects(limits)
+                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?
+                .iter()
+                .any(|object| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case("sqlite_sequence"));
+            if !fresh_present {
+                // 源库可能只留下一个空的 `sqlite_sequence`(最后一个 AUTOINCREMENT
+                // 表被删后行没了、表还在),重建镜像要照样保留它。
+                let columns: Vec<ColumnSpec> = ["name", "seq"]
+                    .into_iter()
+                    .map(|name| ColumnSpec {
+                        name: name.to_string(),
+                        declared_type: String::new(),
+                        not_null: false,
+                        default_value: None,
+                        default_text: None,
+                        primary_key: false,
+                        unique: false,
+                        autoincrement: false,
+                        collate: None,
+                    })
+                    .collect();
+                fresh
+                    .writer
+                    .create_table_with_primary_key_sql("sqlite_sequence", &columns, &[], Some("CREATE TABLE sqlite_sequence(name,seq)"))
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+            }
+            let limits = TableLimits::default();
+            for row in self
+                .writer
+                .table_rows("sqlite_sequence", limits)
+                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?
+            {
+                let values = decode_record(&row.payload, encoding, RecordLimits { max_columns: 1024, max_payload_bytes: 16 * 1024 * 1024 })
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+                let cells: Vec<Cell> = values
+                    .iter()
+                    .map(|value| match value {
+                        crate::RecordValue::Null => Cell::Null,
+                        crate::RecordValue::Integer(value) => Cell::Integer(*value),
+                        crate::RecordValue::Real(value) => Cell::Real(*value),
+                        crate::RecordValue::Text(value) => Cell::Text(value.clone()),
+                        crate::RecordValue::Blob(value) => Cell::Blob(value.to_vec()),
+                    })
+                    .collect();
+                let slots: Vec<Option<crate::WriteValue>> = cells.iter().map(|cell| Some(cell_write_value(cell))).collect();
+                fresh
+                    .writer
+                    .insert("sqlite_sequence", &slots)
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+            }
+        }
+        for def in self.tables.clone() {
+            if def.temp || def.name.to_ascii_lowercase().starts_with("sqlite_") {
+                continue;
+            }
+            for (_, cells) in self.live_rows(&def, "vacuum")? {
+                let slots: Vec<Option<crate::WriteValue>> = cells.iter().map(|cell| Some(cell_write_value(cell))).collect();
+                fresh.writer.insert(&def.name, &slots).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+            }
+        }
+        fresh.writer.materialize_without_rowid().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+        for kind in [SchemaObjectKind::Index, SchemaObjectKind::View, SchemaObjectKind::Trigger] {
+            for object in &objects {
+                if object.kind != kind {
+                    continue;
+                }
+                if let Some(sql) = &object.sql {
+                    fresh.execute_one(sql)?;
+                }
+            }
+        }
+        fresh.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+        fresh.writer.materialize_without_rowid().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+        fresh.writer.set_user_version(user_version);
+        fresh.writer.set_application_id(application_id);
+        Ok(fresh.writer.pages().to_vec())
+    }
+
     /// Executes `CREATE TABLE name AS SELECT ...`.
     ///
     /// The declared columns are derived from the query output: a bare column
@@ -3125,6 +3317,7 @@ impl Engine {
             Statement::Transaction { action } => self.transaction(action),
             Statement::Attach { file, name } => self.attach_database(&file, &name),
             Statement::Detach { name } => self.detach_database(&name),
+            Statement::Vacuum { into, .. } => self.vacuum_statement(into.as_ref()),
             Statement::CreateTable {
                 schema: _,
                 name,
@@ -16702,5 +16895,296 @@ mod tests {
         let rows = engine.execute_one("SELECT length(a) FROM t").expect("host call").rows;
         assert_eq!(rows, vec![vec![Cell::Integer(7)], vec![Cell::Integer(7)]]);
         assert_eq!(engine.execute_one("SELECT count(*) FROM t").expect("count stays builtin").rows, vec![vec![Cell::Integer(2)]]);
+    }
+
+    /// 一次完整的 `VACUUM`:重建后 freelist 清空、镜像变小,schema 与行不变。
+    #[test]
+    fn vacuum_rebuilds_the_image_and_clears_the_freelist() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+                 CREATE INDEX t_v ON t(v);
+                 CREATE TABLE wo(k TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID;
+                 CREATE TABLE ex(a INT, b TEXT);
+                 CREATE INDEX ex_lower ON ex(lower(b));
+                 CREATE TABLE col(c TEXT COLLATE NOCASE);
+                 CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+                 CREATE TABLE orphan(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+                 CREATE VIEW vv AS SELECT id, v FROM t;
+                 CREATE TABLE log(x);
+                 CREATE TABLE dropped(z);
+                 INSERT INTO dropped VALUES ('z');
+                 DROP TABLE orphan",
+            )
+            .expect("schema");
+        for value in 1..=200 {
+            engine.execute(&format!("INSERT INTO t VALUES ({value}, 'v{value}')")).expect("row");
+            engine.execute(&format!("INSERT INTO ex VALUES ({value}, 'B{value}')")).expect("expression row");
+        }
+        engine.execute("INSERT INTO wo VALUES ('k', 1); INSERT INTO col VALUES ('Q')").expect("side tables");
+        engine.execute("INSERT INTO ai(v) VALUES ('a'), ('b'), ('c'); DELETE FROM ai WHERE id = 3").expect("autoincrement high-water mark");
+        engine.execute("DELETE FROM t WHERE id % 2 = 0; DROP TABLE dropped").expect("free pages");
+        engine
+            .execute("PRAGMA user_version = 7; PRAGMA application_id = 42; CREATE TEMP TABLE tt(x); INSERT INTO tt VALUES (1)")
+            .expect("session state");
+        engine.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.v); END").expect("trigger");
+        let before = engine.snapshot().to_vec();
+        assert!(database_formats::sqlite::read_freelist_count(&before) > 0, "the drop must leave freelist pages");
+
+        engine.execute_one("VACUUM").expect("vacuum");
+        let after = engine.snapshot().to_vec();
+        assert_eq!(database_formats::sqlite::read_freelist_count(&after), 0);
+        assert!(after.len() < before.len(), "vacuum must compact the image: {} -> {}", before.len(), after.len());
+        assert_eq!(engine.execute_one("PRAGMA integrity_check").expect("check").rows, vec![vec![text("ok")]]);
+        assert_eq!(engine.execute_one("SELECT count(*) FROM t").expect("rows").rows, vec![vec![Cell::Integer(100)]]);
+        assert_eq!(engine.execute_one("SELECT * FROM wo").expect("without rowid").rows, vec![vec![text("k"), Cell::Integer(1)]]);
+        assert_eq!(engine.execute_one("SELECT a FROM ex WHERE lower(b) = 'b7'").expect("expression index").rows, vec![vec![Cell::Integer(7)]]);
+        assert_eq!(engine.execute_one("SELECT c FROM col WHERE c = 'q'").expect("collation").rows, vec![vec![text("Q")]]);
+        assert_eq!(engine.execute_one("SELECT count(*) FROM vv").expect("view").rows, vec![vec![Cell::Integer(100)]]);
+        assert_eq!(engine.execute_one("PRAGMA user_version").expect("version").rows, vec![vec![Cell::Integer(7)]]);
+        assert_eq!(engine.execute_one("PRAGMA application_id").expect("application").rows, vec![vec![Cell::Integer(42)]]);
+        // 临时对象跟随会话,不参与主库重建。
+        assert_eq!(engine.execute_one("SELECT * FROM tt").expect("temp table").rows, vec![vec![Cell::Integer(1)]]);
+        // AUTOINCREMENT 高水位跨重建保留,下一行继续从 4 开始。
+        assert_eq!(
+            engine.execute_one("SELECT seq FROM sqlite_sequence WHERE name = 'ai'").expect("sequence").rows,
+            vec![vec![Cell::Integer(3)]]
+        );
+        // 最后一个 AUTOINCREMENT 表被删后留下的空 `sqlite_sequence` 也照旧存在。
+        let sequence_tables = engine.execute_one("SELECT count(*) FROM sqlite_sequence").expect("sequence table kept").rows;
+        assert_eq!(sequence_tables, vec![vec![Cell::Integer(1)]]);
+        engine.execute("INSERT INTO ai(v) VALUES ('d')").expect("next autoincrement row");
+        assert_eq!(engine.execute_one("SELECT max(id) FROM ai").expect("id").rows, vec![vec![Cell::Integer(4)]]);
+        // 触发器在重建后照常触发。
+        engine.execute("INSERT INTO t VALUES (201, 'after')").expect("insert after vacuum");
+        assert_eq!(engine.execute_one("SELECT x FROM log").expect("log").rows, vec![vec![text("after")]]);
+        // `CREATE` 文本与表名逐字节保留。
+        let master = engine
+            .execute_one("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ('t','wo','ex','col') ORDER BY name")
+            .expect("master");
+        assert_eq!(
+            master.rows,
+            vec![
+                vec![text("col"), text("CREATE TABLE col(c TEXT COLLATE NOCASE)")],
+                vec![text("ex"), text("CREATE TABLE ex(a INT, b TEXT)")],
+                vec![text("t"), text("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")],
+                vec![text("wo"), text("CREATE TABLE wo(k TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID")],
+            ]
+        );
+    }
+
+    /// `VACUUM INTO` 写出重建副本,源镜像逐字节不变。
+    #[test]
+    fn vacuum_into_writes_a_rebuilt_copy_without_touching_the_source() {
+        let directory = temp_directory("vacuum-into");
+        let target = directory.join("copy.db");
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+                 CREATE INDEX t_v ON t(v);
+                 CREATE TABLE wo(k TEXT PRIMARY KEY) WITHOUT ROWID;
+                 CREATE TABLE discarded(z)",
+            )
+            .expect("schema");
+        for value in 1..=50 {
+            engine.execute(&format!("INSERT INTO t VALUES ({value}, 'v{value}')")).expect("row");
+        }
+        engine.execute("INSERT INTO wo VALUES ('a'); DROP TABLE discarded").expect("free pages");
+        let before = engine.snapshot().to_vec();
+        engine.execute_one(&format!("VACUUM INTO '{}'", target.display())).expect("vacuum into");
+        assert_eq!(engine.snapshot(), before.as_slice(), "VACUUM INTO must leave the source image alone");
+
+        let bytes = std::fs::read(&target).expect("target written");
+        assert_eq!(database_formats::sqlite::read_freelist_count(&bytes), 0);
+        let mut copy = Engine::from_writer(SqliteWriter::from_pages(bytes).expect("open copy")).expect("copy catalog");
+        assert_eq!(copy.execute_one("PRAGMA integrity_check").expect("check").rows, vec![vec![text("ok")]]);
+        assert_eq!(copy.execute_one("SELECT count(*) FROM t").expect("rows").rows, vec![vec![Cell::Integer(50)]]);
+        assert_eq!(copy.execute_one("SELECT * FROM wo").expect("without rowid").rows, vec![vec![text("a")]]);
+
+        // `INTO` 目标可以是参数,槽位与绑定规则和其他语句一致。
+        let bound = directory.join("bound.db");
+        engine.execute_with_parameters("VACUUM INTO ?", &[Cell::Text(bound.display().to_string())]).expect("bound target");
+        assert!(bound.exists(), "a bound target writes the same rebuilt copy");
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    /// 目标已存在(含与源同路径)、父目录缺失与非文本目标按上游拒绝。
+    #[test]
+    fn vacuum_into_rejects_an_existing_or_unusable_target() {
+        let directory = temp_directory("vacuum-into-errors");
+        let target = directory.join("taken.db");
+        std::fs::write(&target, b"occupied").expect("seed target");
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE t(a)").expect("table");
+
+        let existing = engine.execute_one(&format!("VACUUM INTO '{}'", target.display())).expect_err("existing target");
+        assert_eq!(existing.code, "SQLITE_ERROR");
+        assert_eq!(existing.message, "output file already exists");
+        assert_eq!(std::fs::read(&target).expect("target kept"), b"occupied");
+
+        let missing =
+            engine.execute_one(&format!("VACUUM INTO '{}'", directory.join("missing").join("x.db").display())).expect_err("missing parent");
+        assert_eq!(missing.code, "SQLITE_CANTOPEN");
+        assert!(missing.message.starts_with("unable to open database: "), "unexpected message: {}", missing.message);
+
+        let directory_target = engine.execute_one(&format!("VACUUM INTO '{}'", directory.display())).expect_err("directory target");
+        assert_eq!(directory_target.code, "SQLITE_CANTOPEN");
+
+        let not_text = engine.execute_one("VACUUM INTO 5").expect_err("numeric target");
+        assert_eq!(not_text.code, "SQLITE_ERROR");
+        assert_eq!(not_text.message, "non-text filename");
+
+        // 与源同路径同样按“已存在”拒绝,源文件一个字节都不改。
+        let source = directory.join("source.db");
+        let original = engine.snapshot().to_vec();
+        std::fs::write(&source, &original).expect("seed source");
+        let same = engine.execute_one(&format!("VACUUM INTO '{}'", source.display())).expect_err("same source");
+        assert_eq!(same.message, "output file already exists");
+        assert_eq!(std::fs::read(&source).expect("source kept"), original);
+
+        // 空文件名与 `:memory:` 与上游一样成功且不落盘。
+        engine.execute_one("VACUUM INTO ''").expect("empty target");
+        engine.execute_one("VACUUM INTO ':memory:'").expect("memory target");
+        assert_eq!(std::fs::read_dir(&directory).expect("list").count(), 2);
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    /// `VACUUM` 在事务里(含只有 `SAVEPOINT` 的作用域)被拒绝。
+    #[test]
+    fn vacuum_is_rejected_inside_a_transaction() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE t(a)").expect("table");
+        engine.execute("BEGIN").expect("transaction");
+        for statement in ["VACUUM", "VACUUM INTO 'ignored.db'"] {
+            let error = engine.execute_one(statement).expect_err("transaction blocks vacuum");
+            assert_eq!(error.code, "SQLITE_ERROR");
+            assert_eq!(error.message, "cannot VACUUM from within a transaction");
+        }
+        engine.execute("ROLLBACK").expect("rollback");
+
+        engine.execute("SAVEPOINT s").expect("savepoint");
+        assert_eq!(engine.execute_one("VACUUM").expect_err("savepoint scope").message, "cannot VACUUM from within a transaction");
+        engine.execute("RELEASE s").expect("release");
+        engine.execute_one("VACUUM").expect("autocommit vacuum");
+    }
+
+    /// `VACUUM temp` 是空操作,`VACUUM temp INTO` 写出空库。
+    #[test]
+    fn vacuum_temp_is_a_no_op_and_vacuum_temp_into_writes_an_empty_database() {
+        let directory = temp_directory("vacuum-temp");
+        let target = directory.join("empty.db");
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE t(a); CREATE TEMP TABLE tt(x); INSERT INTO tt VALUES (1)").expect("schema");
+        engine.execute_one("VACUUM temp").expect("temp vacuum");
+        assert_eq!(engine.execute_one("SELECT * FROM tt").expect("temp table").rows, vec![vec![Cell::Integer(1)]]);
+        engine.execute_one(&format!("VACUUM temp INTO '{}'", target.display())).expect("temp into");
+        let mut copy = Engine::from_writer(SqliteWriter::open(&target).expect("open empty copy")).expect("copy catalog");
+        assert_eq!(copy.execute_one("SELECT count(*) FROM sqlite_master").expect("schema rows").rows, vec![vec![Cell::Integer(0)]]);
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    /// `VACUUM aux` 重建附加库并落回它自己的文件。
+    #[test]
+    fn vacuum_rebuilds_an_attached_database() {
+        let directory = temp_directory("vacuum-attached");
+        let file = directory.join("aux.db");
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS aux;
+                 CREATE TABLE aux.t(id INTEGER PRIMARY KEY, v TEXT);
+                 CREATE TABLE aux.discarded(z);
+                 INSERT INTO aux.t VALUES (1, 'a'), (2, 'b');
+                 DROP TABLE aux.discarded",
+                file.display()
+            ))
+            .expect("attached schema");
+        engine.execute_one("VACUUM aux").expect("vacuum attached");
+        assert_eq!(
+            engine.execute_one("SELECT id, v FROM aux.t ORDER BY id").expect("attached rows").rows,
+            vec![vec![Cell::Integer(1), text("a")], vec![Cell::Integer(2), text("b")]]
+        );
+        let mut reopened = Engine::from_writer(SqliteWriter::open(&file).expect("open attached file")).expect("attached catalog");
+        assert_eq!(reopened.execute_one("SELECT count(*) FROM t").expect("file rows").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(reopened.execute_one("PRAGMA integrity_check").expect("check").rows, vec![vec![text("ok")]]);
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    /// `VACUUM INTO` 的产物由真实 SQLite 打开并通过 `integrity_check`。
+    #[test]
+    fn vacuum_into_is_readable_by_upstream_sqlite() {
+        let Some(python) = reference_python()
+        else {
+            eprintln!("skipped: no python3/python with the sqlite3 module");
+            return;
+        };
+        let directory = temp_directory("vacuum-upstream");
+        let target = directory.join("upstream.db");
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+                 CREATE INDEX t_v ON t(v);
+                 CREATE TABLE wo(k TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID;
+                 CREATE TABLE ex(a INT, b TEXT);
+                 CREATE INDEX ex_lower ON ex(lower(b));
+                 CREATE TABLE col(c TEXT COLLATE NOCASE);
+                 CREATE VIEW vv AS SELECT id, v FROM t;
+                 CREATE TABLE log(x);
+                 CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.v); END",
+            )
+            .expect("schema");
+        for value in 1..=40 {
+            engine.execute(&format!("INSERT INTO t VALUES ({value}, 'v{value}')")).expect("row");
+            engine.execute(&format!("INSERT INTO ex VALUES ({value}, 'B{value}')")).expect("expression row");
+        }
+        engine.execute("INSERT INTO wo VALUES ('k', 7); INSERT INTO col VALUES ('Q')").expect("side tables");
+        engine.execute(&format!("VACUUM INTO '{}'", target.display())).expect("vacuum into");
+
+        let script = r#"
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",), "integrity_check"
+assert db.execute("SELECT count(*) FROM t").fetchone() == (40,), "rows"
+assert db.execute("SELECT count(*) FROM ex WHERE lower(b) = 'b7'").fetchone() == (1,), "expression index"
+assert db.execute("SELECT c FROM col WHERE c = 'q'").fetchone() == ("Q",), "collation"
+assert db.execute("SELECT count(*) FROM vv").fetchone() == (40,), "view"
+assert db.execute("SELECT name FROM sqlite_master WHERE name = 'tr'").fetchone() == ("tr",), "trigger"
+db.execute("INSERT INTO t VALUES (41, 'upstream')")
+assert db.execute("SELECT count(*) FROM log WHERE x = 'upstream'").fetchone() == (1,), "trigger body"
+db.close()
+"#;
+        let output = std::process::Command::new(python)
+            .args(["-c", script, target.to_str().expect("utf-8 path")])
+            .output()
+            .expect("spawn upstream sqlite");
+        assert!(output.status.success(), "upstream SQLite rejected the vacuum image: {}", String::from_utf8_lossy(&output.stderr));
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    /// 每次调用生成一个唯一的临时目录,由调用方负责删除。
+    fn temp_directory(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock is ahead of unix epoch").as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("sqlite-{label}-{}-{stamp}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&directory).expect("create temp directory");
+        directory
+    }
+
+    /// 第一个装有 `sqlite3` 模块的解释器,与互操作用例同一探测口径。
+    fn reference_python() -> Option<String> {
+        ["python3", "python"].into_iter().find_map(|candidate| {
+            std::process::Command::new(candidate)
+                .args(["-c", "import sqlite3"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+                .then(|| candidate.to_string())
+        })
     }
 }

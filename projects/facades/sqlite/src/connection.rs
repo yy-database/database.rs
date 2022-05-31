@@ -377,6 +377,14 @@ mod tests {
         assert_eq!(prepared.parameter_count(), 3);
         assert!(prepared.is_write());
         assert_eq!(prepared.statement_name(), "insert");
+
+        // `VACUUM INTO` 的目标是普通参数槽位;只有不带 `INTO` 的 `VACUUM` 写镜像。
+        let into = connection.prepare("VACUUM INTO ?").expect("vacuum parses");
+        assert_eq!(into.slots(), &[(0, "?".to_string())]);
+        assert_eq!(into.statement_name(), "vacuum");
+        assert!(!into.is_write(), "VACUUM INTO reads the source and writes another file");
+        assert!(connection.prepare("VACUUM").expect("plain vacuum parses").is_write());
+        assert!(connection.prepare("VACUUM").expect("plain vacuum parses").columns().is_none());
     }
 
     #[test]

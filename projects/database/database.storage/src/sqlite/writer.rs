@@ -402,6 +402,11 @@ impl SqliteWriter {
         self.synchronous = on;
     }
 
+    /// 当前 `save` 的持久化强度,与 [`SqliteWriter::set_synchronous`] 成对。
+    pub fn synchronous(&self) -> bool {
+        self.synchronous
+    }
+
     /// Starts a transaction level. A nested level lets a statement roll itself
     /// back without discarding the scope its caller opened.
     pub fn begin(&mut self) -> Result<()> {

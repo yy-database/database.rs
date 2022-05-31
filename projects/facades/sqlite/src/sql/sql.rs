@@ -1923,6 +1923,14 @@ pub enum Statement {
         /// Schema name as written.
         name: String,
     },
+    /// `VACUUM [schema] [INTO target]`.
+    Vacuum {
+        /// Optional database name to rebuild (`main`, `temp` or an attached
+        /// database); `None` rebuilds `main`.
+        schema: Option<String>,
+        /// Optional `INTO` target expression; it must evaluate to text.
+        into: Option<Expr>,
+    },
     /// `EXPLAIN [QUERY PLAN] statement`.
     Explain {
         /// `QUERY PLAN` was written: the rows describe the query planner's
@@ -1987,6 +1995,7 @@ impl Statement {
             Self::Pragma { .. } => "pragma",
             Self::Attach { .. } => "attach",
             Self::Detach { .. } => "detach",
+            Self::Vacuum { .. } => "vacuum",
             Self::Explain { .. } => "explain",
             Self::Transaction { action } => match action {
                 TransactionAction::Begin => "begin",
@@ -2003,7 +2012,9 @@ impl Statement {
     ///
     /// 只有 DDL 与 DML 会弄脏镜像；`SELECT`、`PRAGMA`、`ATTACH`、`DETACH`
     /// 和 `EXPLAIN` 单独都不写文件。事务控制语句本身不写,它们移动提交边界,
-    /// 由连接层在 `COMMIT` 成功后统一落盘。宿主不得再用关键词猜这件事。
+    /// 由连接层在 `COMMIT` 成功后统一落盘。`VACUUM` 重建主库镜像因此算写,
+    /// `VACUUM INTO` 只读当前库并写另一个文件,与上游一致地不算写。
+    /// 宿主不得再用关键词猜这件事。
     pub fn writes(&self) -> bool {
         matches!(
             self,
@@ -2019,7 +2030,7 @@ impl Statement {
                 | Self::DropView { .. }
                 | Self::DropTrigger { .. }
                 | Self::AlterTable { .. }
-        )
+        ) || matches!(self, Self::Vacuum { into: None, .. })
     }
 }
 
@@ -3969,6 +3980,10 @@ impl<'a> Parser<'a> {
             self.kind = Some("detach");
             return self.detach_statement();
         }
+        if self.eat_word("vacuum") {
+            self.kind = Some("vacuum");
+            return self.vacuum();
+        }
         if self.peek_keyword("select") {
             self.kind = Some("select");
             self.at += 1;
@@ -4098,6 +4113,28 @@ impl<'a> Parser<'a> {
         let name = self.name()?;
         self.expect_end("ATTACH")?;
         Ok(Statement::Attach { file, name })
+    }
+
+    /// Reads `VACUUM [schema] [INTO target]`.
+    ///
+    /// `schema` names the database to rebuild: `main`, `temp` or an attached
+    /// database. `INTO` takes any expression, matching SQLite, which evaluates
+    /// it at run time and requires a text filename.
+    fn vacuum(&mut self) -> Result<Statement, SqlError> {
+        let schema = if self.peek_keyword("into") {
+            None
+        }
+        else if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Quoted(_))) {
+            let name = self.name()?;
+            self.reject_qualified(&name)?;
+            Some(name)
+        }
+        else {
+            None
+        };
+        let into = if self.eat_word("into") { Some(self.or_expr()?) } else { None };
+        self.expect_end("VACUUM")?;
+        Ok(Statement::Vacuum { schema, into })
     }
 
     /// Reads `DETACH [DATABASE] name`.
@@ -4237,6 +4274,10 @@ impl<'a> Parser<'a> {
             }
             if self.peek().is_none() {
                 return Err(self.error("syntax", "the trigger body is not closed by `END`"));
+            }
+            // `VACUUM` is not a trigger statement in SQLite's grammar.
+            if self.peek_keyword("vacuum") {
+                return Err(self.near_syntax_error());
             }
             body.push(self.statement()?);
         }
@@ -6081,6 +6122,11 @@ fn collect_statement_slots(statement: &Statement, slots: &mut Vec<(usize, String
         | Statement::DropView { .. }
         | Statement::DropTrigger { .. }
         | Statement::AlterTable { .. } => {}
+        Statement::Vacuum { into, .. } => {
+            if let Some(into) = into {
+                collect_expr_slots(into, slots);
+            }
+        }
     }
 }
 
