@@ -7131,12 +7131,13 @@ impl Engine {
                     ctes,
                 )?;
             }
-            ResolvedWindowFunction::Aggregate { function, argument, separator, distinct, filter, order } => {
+            ResolvedWindowFunction::Aggregate { function, argument, separator, distinct, filter, order, collation } => {
                 self.evaluate_frame_aggregate(
                     *function,
                     argument.as_ref(),
                     separator.as_ref(),
                     *distinct,
+                    *collation,
                     filter.as_ref(),
                     order,
                     window,
@@ -7277,6 +7278,7 @@ impl Engine {
         argument: Option<&ResolvedExpr>,
         separator: Option<&ResolvedExpr>,
         distinct: bool,
+        collation: Collation,
         filter: Option<&ResolvedExpr>,
         order: &[(ResolvedExpr, SortDirection)],
         window: &ResolvedWindow,
@@ -7320,7 +7322,7 @@ impl Engine {
                 let keys = order.iter().map(|(expr, _)| expr.eval(&row.values, &row_ctx)).collect::<Result<Vec<_>, SqlError>>()?;
                 entries.push((value, separator, keys));
             }
-            let (values, separators) = shape_aggregate_inputs(entries, distinct, order);
+            let (values, separators) = shape_aggregate_inputs(entries, distinct, order, collation);
             column[indices[slot]] = aggregate_cells(function, &values, if separator.is_some() { Some(&separators) } else { None });
         }
         Ok(())
@@ -9106,6 +9108,8 @@ struct AggregateSpec {
     filter: Option<ResolvedExpr>,
     /// `ORDER BY` inside the argument list, used by `group_concat`.
     order: Vec<(ResolvedExpr, SortDirection)>,
+    /// `DISTINCT` 去重时使用的排序规则，取自参数表达式的生效排序规则。
+    collation: Collation,
 }
 
 /// Two result rows are equal when every cell compares equal under the engine's
@@ -9788,6 +9792,8 @@ enum ResolvedWindowFunction {
         filter: Option<ResolvedExpr>,
         /// `ORDER BY` inside the argument list, used by `group_concat`.
         order: Vec<(ResolvedExpr, SortDirection)>,
+        /// `DISTINCT` 去重时使用的排序规则，取自参数表达式的生效排序规则。
+        collation: Collation,
     },
 }
 
@@ -10509,7 +10515,8 @@ fn resolve_expr(
                 })
                 .collect::<Result<Vec<_>, SqlError>>()?;
             let index = aggregates.len();
-            aggregates.push(AggregateSpec { function: *function, argument, separator, distinct: *distinct, filter, order });
+            let collation = argument.as_ref().map(|arg| resolved_collation(arg, relation)).unwrap_or_default();
+            aggregates.push(AggregateSpec { function: *function, argument, separator, distinct: *distinct, filter, order, collation });
             ResolvedExpr::AggregateRef(index)
         }
         Expr::Window { function, spec } => {
@@ -10715,13 +10722,16 @@ fn resolve_window_function(
                 let collation = resolved_collation(&resolved, relation);
                 resolved_order.push((resolved, SortDirection::of(key).with_collation(collation)));
             }
+            let resolved_argument = value.as_ref().map(|expr| argument(expr)).transpose()?;
+            let collation = resolved_argument.as_ref().map(|arg| resolved_collation(arg, relation)).unwrap_or_default();
             ResolvedWindowFunction::Aggregate {
                 function: *function,
-                argument: value.as_ref().map(|expr| argument(expr)).transpose()?,
+                argument: resolved_argument,
                 separator: separator.as_ref().map(|expr| argument(expr)).transpose()?,
                 distinct: *distinct,
                 filter: filter.as_ref().map(|expr| argument(expr)).transpose()?,
                 order: resolved_order,
+                collation,
             }
         }
     })
@@ -11082,7 +11092,7 @@ fn compute_aggregate(spec: &AggregateSpec, rows: &[Vec<Cell>], ctx: &EvalContext
         let keys = spec.order.iter().map(|(expr, _)| expr.eval(row, ctx)).collect::<Result<Vec<_>, SqlError>>()?;
         entries.push((value, separator, keys));
     }
-    let (values, separators) = shape_aggregate_inputs(entries, spec.distinct, &spec.order);
+    let (values, separators) = shape_aggregate_inputs(entries, spec.distinct, &spec.order, spec.collation);
     Ok(aggregate_cells(spec.function, &values, if spec.separator.is_some() { Some(&separators) } else { None }))
 }
 
@@ -11096,11 +11106,12 @@ fn shape_aggregate_inputs(
     mut entries: Vec<(Cell, Cell, Vec<Cell>)>,
     distinct: bool,
     order: &[(ResolvedExpr, SortDirection)],
+    collation: Collation,
 ) -> (Vec<Cell>, Vec<Cell>) {
     let directions: Vec<SortDirection> = order.iter().map(|(_, direction)| *direction).collect();
     if distinct {
-        entries.sort_by(|left, right| compare_cells(&left.0, &right.0));
-        entries.dedup_by(|left, right| compare_cells(&left.0, &right.0) == Ordering::Equal);
+        entries.sort_by(|left, right| compare_cells_with(&left.0, &right.0, collation));
+        entries.dedup_by(|left, right| compare_cells_with(&left.0, &right.0, collation) == Ordering::Equal);
         if !order.is_empty() {
             entries.sort_by(|left, right| compare_ordered(&left.2, &right.2, &directions));
         }
@@ -14375,6 +14386,22 @@ mod tests {
         // Reading a reopened image never rewrites it.
         assert_eq!(reopened.snapshot(), image.as_slice());
         std::fs::remove_file(&path).expect("cleanup image");
+    }
+
+    /// `DISTINCT` 聚合参数必须使用参数表达式的生效排序规则，而不是二进制比较。
+    #[test]
+    fn aggregate_distinct_honours_argument_collation() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute_batch(&[
+                "CREATE TABLE t(s TEXT COLLATE NOCASE)".to_string(),
+                "INSERT INTO t VALUES ('a'), ('A'), ('b'), ('B')".to_string(),
+            ])
+            .expect("seed image");
+        let result = engine.execute_one("SELECT count(DISTINCT s), count(s) FROM t").expect("aggregate executes");
+        assert_eq!(result.rows, vec![vec![Cell::Integer(2), Cell::Integer(4)]]);
+        let joined = engine.execute_one("SELECT group_concat(DISTINCT s) FROM t").expect("group_concat executes");
+        assert_eq!(joined.rows, vec![vec![Cell::Text("a,b".to_string())]]);
     }
 
     /// `PRAGMA integrity_check` walks the image rather than echoing a fixed
