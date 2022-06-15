@@ -2105,6 +2105,13 @@ impl Engine {
         self.writer.save(path).map_err(|error| SqlError::new("storage", error.to_string()))
     }
 
+    /// Flushes the current database image to `path` without ever exposing a
+    /// half-written file, by renaming a complete sibling temporary file over
+    /// it.
+    pub fn save_atomic(&mut self, path: impl AsRef<Path>) -> Result<(), SqlError> {
+        self.writer.save_atomic(path).map_err(|error| SqlError::new("storage", error.to_string()))
+    }
+
     /// Configured page size.
     pub fn page_size(&self) -> u32 {
         self.writer.page_size() as u32

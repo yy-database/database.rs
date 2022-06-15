@@ -10,7 +10,11 @@
 //! composite PRIMARY KEYs, AUTOINCREMENT, DROP, ALTER, views, triggers, WAL
 //! output and UTF-16 database creation.
 
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use database_formats::sqlite::{
     RecordValue, TextEncoding, WriteValue, blank_with_page_size, bump_change_counter, decode_record, decode_varint, encode_record,
@@ -380,17 +384,48 @@ impl SqliteWriter {
     /// Materializes every index tree from its live key set, bumps the change
     /// counter and writes the image to `path`.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        self.materialize()?;
+        self.write_image(path.as_ref())
+    }
+
+    /// Writes the image through a sibling temporary file and renames it over
+    /// `path`.
+    ///
+    /// A concurrent reader that opens `path` while this connection publishes
+    /// therefore sees either the previous or the new complete image, never a
+    /// half-written one. The temporary file is removed when publication fails.
+    pub fn save_atomic(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        self.materialize()?;
+        let path = path.as_ref();
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(format!(".{}.tmp", std::process::id()));
+        let temporary = PathBuf::from(temporary);
+        let result = self.write_image(&temporary).and_then(|()| fs::rename(&temporary, path).map_err(Error::Io));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    /// Rebuilds the materialized trees and bumps the change counter, so every
+    /// caller that writes the image shares one publication boundary.
+    fn materialize(&mut self) -> Result<()> {
         self.materialize_without_rowid()?;
         self.materialize_indexes()?;
         self.touch_page(1);
         bump_change_counter(&mut self.pages);
+        Ok(())
+    }
+
+    /// Writes the current image to `path` with the configured durability.
+    fn write_image(&self, path: &Path) -> Result<()> {
         if self.synchronous {
-            let mut file = fs::File::create(path.as_ref()).map_err(Error::Io)?;
+            let mut file = fs::File::create(path).map_err(Error::Io)?;
             file.write_all(&self.pages).map_err(Error::Io)?;
             file.sync_all().map_err(Error::Io)?;
         }
         else {
-            fs::write(path.as_ref(), &self.pages).map_err(Error::Io)?;
+            fs::write(path, &self.pages).map_err(Error::Io)?;
         }
         Ok(())
     }
