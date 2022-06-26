@@ -227,6 +227,37 @@ fn updates_rewrite_records_and_move_rowid_aliases() {
 }
 
 #[test]
+fn repeated_updates_reuse_the_freed_cell_instead_of_growing_the_page() {
+    let mut writer = SqliteWriter::create(4096).expect("create database");
+    let mut id = column("id", "INTEGER");
+    id.primary_key = true;
+    writer.create_table("items", &[id, column("label", "TEXT"), column("score", "REAL")]).expect("create table");
+    for row in 1..=50i64 {
+        writer.insert("items", &[integer(row), text(&format!("row-{row}")), Some(WriteValue::Real(row as f64))]).expect("insert");
+    }
+    let pages_before = writer.pages().len();
+    writer.begin().expect("begin");
+    for round in 0..1000 {
+        let row = (round % 50) + 1;
+        writer
+            .update(
+                "items",
+                row,
+                &[UpdateValue::Keep, UpdateValue::Keep, UpdateValue::Set(WriteValue::Real(7.25))],
+            )
+            .expect("update reuses the delete hole");
+    }
+    writer.commit().expect("commit");
+    assert_eq!(writer.pages().len(), pages_before, "an update must reuse the freed cell instead of consuming new page space");
+    let rows = writer.table_rows("items", limits()).expect("read rows");
+    assert_eq!(rows.len(), 50);
+    for row in &rows {
+        let values = decode_record(&row.payload, TextEncoding::Utf8, RecordLimits::default()).expect("decode");
+        assert_eq!(values[2], RecordValue::Real(7.25));
+    }
+}
+
+#[test]
 fn unique_constraints_reject_duplicates() {
     let mut writer = SqliteWriter::create(4096).expect("create database");
     let mut sku = column("sku", "TEXT");

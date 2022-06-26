@@ -3625,7 +3625,9 @@ impl Engine {
                     }
                     None => None,
                 };
-                let mut upsert_live = if upsert.is_some() { self.live_rows(def, "insert")? } else { Vec::new() };
+                let fast_upsert = upsert.as_ref().is_some_and(|plan| self.upsert_rowid_fast_path(def, &key, plan, temp_position));
+                let mut upsert_live = if upsert.is_some() && !fast_upsert { self.live_rows(def, "insert")? } else { Vec::new() };
+                let mut upsert_live_loaded = upsert.is_some() && !fast_upsert;
                 let mut slots_by_row = Vec::with_capacity(rows.len().max(1));
                 if default_values {
                     // `DEFAULT VALUES` leaves every slot unset so the writer fills
@@ -3738,24 +3740,58 @@ impl Engine {
                     }
                     else {
                         match &upsert {
-                            Some(plan) => match self.apply_upsert(
-                                def,
-                                &key,
-                                &table,
-                                plan,
-                                slots,
-                                temp_position,
-                                &mut upsert_live,
-                                returning.as_ref(),
-                                &returning_shape.scope,
-                                &check_budget,
-                            ) {
-                                Ok(outcome) => outcome,
-                                Err(error) => {
-                                    failure = Some(error);
-                                    break;
+                            Some(plan) => {
+                                let fast = if fast_upsert {
+                                    Some(self.apply_upsert_rowid(
+                                        def,
+                                        &key,
+                                        &table,
+                                        plan,
+                                        slots,
+                                        returning.as_ref(),
+                                        &returning_shape.scope,
+                                        &check_budget,
+                                    ))
                                 }
-                            },
+                                else {
+                                    None
+                                };
+                                let outcome = match fast {
+                                    Some(Ok(Some(outcome))) => Ok(outcome),
+                                    Some(Err(error)) => Err(error),
+                                    Some(Ok(None)) | None => {
+                                        if !upsert_live_loaded {
+                                            upsert_live = match self.live_rows(def, "insert") {
+                                                Ok(rows) => rows,
+                                                Err(error) => {
+                                                    failure = Some(error);
+                                                    break;
+                                                }
+                                            };
+                                            upsert_live_loaded = true;
+                                        }
+                                        self.apply_upsert(
+                                            def,
+                                            &key,
+                                            &table,
+                                            plan,
+                                            slots,
+                                            temp_position,
+                                            &mut upsert_live,
+                                            returning.as_ref(),
+                                            &returning_shape.scope,
+                                            &check_budget,
+                                        )
+                                    }
+                                };
+                                match outcome {
+                                    Ok(outcome) => outcome,
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
                             None => {
                                 let inserted = if let Some(position) = temp_position {
                                     let table = &mut self.temp_tables[position];
@@ -4200,7 +4236,7 @@ impl Engine {
                 };
                 let mut needs_index = self.has_indexes(def, &key);
                 let plan =
-                    self.plan_update(def, &key, &targets, predicate.as_ref(), joined.as_ref(), returning.as_ref(), &shape.scope, &budget)?;
+                    self.plan_update(def, &key, &targets, predicate.as_ref(), joined.as_ref(), returning.as_ref(), &shape.scope, &budget, None)?;
                 // Old row values are needed to tell which referenced keys this
                 // statement rewrites, so they are read before the transaction.
                 let old_rows = self.live_rows(def, "update")?;
@@ -5347,6 +5383,108 @@ impl Engine {
         Ok(None)
     }
 
+    /// Whether an `ON CONFLICT (rowid-alias)` target can be resolved by
+    /// probing the primary key instead of materializing the whole table.
+    ///
+    /// The fast path only applies when nothing else can observe the table:
+    /// no temporary shadow table, no other uniqueness rule, no managed unique
+    /// index, no trigger, no foreign key, and no assignment that moves the
+    /// rowid. Everything else keeps the full-scan [`Self::apply_upsert`].
+    fn upsert_rowid_fast_path(&self, def: &TableDef, table_key: &str, plan: &UpsertPlan, temp_position: Option<usize>) -> bool {
+        temp_position.is_none()
+            && def.rowid_alias.is_some()
+            && matches!(plan.keys.as_slice(), [UniqueKey::Rowid(_)])
+            && plan.managed.is_empty()
+            && plan.others.is_empty()
+            && plan.other_managed.is_empty()
+            && plan.assignments.iter().all(|(position, _)| Some(*position) != def.rowid_alias)
+            && (!self.foreign_keys || (def.foreign_keys.is_empty() && self.referencing_foreign_keys(&def.name).is_empty()))
+            && !self.table_has_triggers(table_key)
+    }
+
+    /// Applies one supplied row of a rowid-keyed upsert by probing only the
+    /// conflicting primary-key row.
+    ///
+    /// `None` means the row has no explicit rowid value, so the caller must
+    /// fall back to the scanning path. Rows written earlier in the same
+    /// statement are already in storage, so a later supplied row still sees
+    /// them exactly as a full scan would.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_upsert_rowid(
+        &mut self,
+        def: &TableDef,
+        table_key: &str,
+        table: &str,
+        plan: &UpsertPlan,
+        slots: &[Option<crate::WriteValue>],
+        returning: Option<&ReturningPlan>,
+        shape: &ScopeShape,
+        budget: &Budget,
+    ) -> Result<Option<UpsertOutcome>, SqlError> {
+        let width = def.columns.len();
+        let Some(alias) = def.rowid_alias
+        else {
+            return Ok(None);
+        };
+        let rowid = match slots.get(alias).and_then(|slot| slot.as_ref()) {
+            Some(crate::WriteValue::Integer(rowid)) => *rowid,
+            _ => return Ok(None),
+        };
+        let payload = self
+            .writer
+            .row_payload(table, rowid)
+            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+        let Some(payload) = payload
+        else {
+            let inserted = self
+                .writer
+                .insert(table, slots)
+                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+            return Ok(Some(UpsertOutcome::Inserted(inserted)));
+        };
+        if matches!(plan.action, UpsertAction::Nothing) {
+            return Ok(Some(UpsertOutcome::Skipped));
+        }
+        let stored = decode_row(&payload, def, rowid)?;
+        let candidate = check_row(def, slots, rowid);
+        let mut eval_cells = stored.clone();
+        eval_cells.push(Cell::Integer(rowid));
+        self.upsert_excluded = candidate[..width].to_vec();
+        if let Some(filter) = &plan.filter {
+            let ctx =
+                EvalContext { engine: self, outer: &[], current: shape, aggregates: &[], windows: &[], window_row: 0, budget, ctes: None };
+            let keep = truthiness(&filter.eval(&eval_cells, &ctx)?) == Some(true);
+            if !keep {
+                self.upsert_excluded.clear();
+                return Ok(Some(UpsertOutcome::Skipped));
+            }
+        }
+        let mut joined = BTreeMap::new();
+        joined.insert(rowid, eval_cells);
+        let state = vec![(rowid, stored)];
+        let planned = self.plan_update(def, table_key, &plan.assignments, None, Some(&joined), returning, shape, budget, Some(&state));
+        self.upsert_excluded.clear();
+        let planned = planned?;
+        if planned.writes.is_empty() {
+            return Ok(Some(UpsertOutcome::Skipped));
+        }
+        for (_, values) in &planned.writes {
+            for (position, value) in values.iter().enumerate() {
+                if let crate::UpdateValue::Set(value) = value {
+                    if let Some(error) = strict_value_violation(def, position, value, "insert") {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        for (write_rowid, values) in &planned.writes {
+            if let Err(error) = self.writer.update(table, *write_rowid, values) {
+                return Err(write_failure(error, "insert", def));
+            }
+        }
+        Ok(Some(UpsertOutcome::Updated { rowid, rows: planned.returning }))
+    }
+
     /// Applies one supplied row of an upsert: insert it, skip it, or rewrite the
     /// stored row it conflicts with. `live` is the statement's own view of the
     /// table so a later supplied row sees rows written earlier in the same
@@ -5448,7 +5586,7 @@ impl Engine {
             predicate = ResolvedExpr::And(Box::new(predicate), Box::new(filter.clone()));
         }
         self.upsert_excluded = candidate[..width].to_vec();
-        let planned = self.plan_update(def, table_key, &plan.assignments, Some(&predicate), None, returning, shape, budget);
+        let planned = self.plan_update(def, table_key, &plan.assignments, Some(&predicate), None, returning, shape, budget, None);
         self.upsert_excluded.clear();
         let planned = planned?;
         if planned.writes.is_empty() {
@@ -6270,15 +6408,23 @@ impl Engine {
         returning: Option<&ReturningPlan>,
         shape: &ScopeShape,
         budget: &Budget,
+        state_override: Option<&[(i64, Vec<Cell>)]>,
     ) -> Result<UpdatePlan, SqlError> {
         let width = def.columns.len();
         let keys = self.unique_keys(def, table_key);
-        let live = self.live_rows(def, "update")?;
-        let mut state = live.clone();
+        let owned_live;
+        let live: &[(i64, Vec<Cell>)] = match state_override {
+            Some(rows) => rows,
+            None => {
+                owned_live = self.live_rows(def, "update")?;
+                &owned_live
+            }
+        };
+        let mut state = live.to_vec();
         let mut writes = Vec::new();
         let mut returned = Vec::new();
         let mut affected = 0usize;
-        for (rowid, cells) in &live {
+        for (rowid, cells) in live {
             let eval_cells = match joined {
                 Some(joined) => match joined.get(rowid) {
                     Some(row) => row.clone(),
@@ -15436,6 +15582,39 @@ mod tests {
             .execute_one("INSERT INTO t (id,label,score) VALUES (3,'x',9.5) ON CONFLICT(id) DO UPDATE SET score = excluded.score")
             .expect("upsert with trigger");
         assert_eq!(engine.execute_one("SELECT score FROM audit").expect("audit rows").rows, vec![vec![Cell::Real(9.5)]]);
+    }
+
+    #[test]
+    fn rowid_keyed_upsert_honors_do_nothing_and_the_update_predicate() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, score REAL)",
+            "INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.5)",
+        ]);
+        engine.execute_one("INSERT INTO t (id,label,score) VALUES (1,'a',9) ON CONFLICT(id) DO NOTHING").expect("do nothing");
+        engine
+            .execute_one("INSERT INTO t (id,label,score) VALUES (2,'b',8) ON CONFLICT(id) DO UPDATE SET score = excluded.score WHERE excluded.score > score")
+            .expect("predicate true");
+        engine
+            .execute_one("INSERT INTO t (id,label,score) VALUES (1,'a',1) ON CONFLICT(id) DO UPDATE SET score = excluded.score WHERE excluded.score > score")
+            .expect("predicate false");
+        engine.execute_one("INSERT INTO t (id,label,score) VALUES (3,'c',3.5) ON CONFLICT(id) DO UPDATE SET score = excluded.score").expect("insert");
+        assert_eq!(
+            engine.execute_one("SELECT id, label, score FROM t ORDER BY id").expect("rows").rows,
+            vec![
+                vec![Cell::Integer(1), text("a"), Cell::Real(1.5)],
+                vec![Cell::Integer(2), text("b"), Cell::Real(8.0)],
+                vec![Cell::Integer(3), text("c"), Cell::Real(3.5)],
+            ]
+        );
+    }
+
+    #[test]
+    fn rowid_keyed_upsert_still_reports_other_unique_conflicts() {
+        let mut engine = joined_engine(&["CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT UNIQUE)", "INSERT INTO t VALUES (1,'a')"]);
+        let error = engine
+            .execute_one("INSERT INTO t (id,label) VALUES (2,'a') ON CONFLICT(id) DO UPDATE SET label = excluded.label")
+            .expect_err("a column UNIQUE constraint outside the conflict target must still abort");
+        assert_eq!(error.code, "unique-constraint");
     }
 
     #[test]

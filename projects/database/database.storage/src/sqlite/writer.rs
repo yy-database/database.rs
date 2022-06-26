@@ -381,6 +381,18 @@ impl SqliteWriter {
         self.page_size
     }
 
+    /// Reads one stored row by rowid, as its raw record payload.
+    ///
+    /// `None` means the table has no row with that rowid. `WITHOUT ROWID`
+    /// tables have no rowid address space and are rejected.
+    pub fn row_payload(&self, table: &str, rowid: i64) -> Result<Option<Vec<u8>>> {
+        let meta = self.table_meta(table)?;
+        if meta.without_rowid {
+            return Err(Error::Unsupported("sqlite WITHOUT ROWID table has no rowid"));
+        }
+        self.read_payload(meta.root_page, rowid)
+    }
+
     /// Materializes every index tree from its live key set, bumps the change
     /// counter and writes the image to `path`.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
@@ -2278,23 +2290,74 @@ impl SqliteWriter {
         self.touch_page(page);
         let offset = self.page_offset(page);
         let header_relative = Self::header_offset(page);
-        let kind = self.pages[offset + header_relative];
-        let header_size = if matches!(kind, PAGE_TABLE_INTERIOR | PAGE_INDEX_INTERIOR) { 12 } else { 8 };
-        let count = u16::from_be_bytes(self.pages[offset + header_relative + 3..offset + header_relative + 5].try_into().unwrap()) as usize;
         let raw_start = u16::from_be_bytes(self.pages[offset + header_relative + 5..offset + header_relative + 7].try_into().unwrap());
         let content_start = if raw_start == 0 { 65_536 } else { raw_start as usize };
         let target = content_start - cell.len();
         self.pages[offset + target..offset + target + cell.len()].copy_from_slice(cell);
+        self.insert_leaf_pointer(page, position, target);
+        let content_field = if target == 65_536 { 0u16 } else { target as u16 };
+        self.pages[offset + header_relative + 5..offset + header_relative + 7].copy_from_slice(&content_field.to_be_bytes());
+    }
+
+    /// Inserts one cell at an already allocated offset and adds its pointer.
+    fn place_leaf_cell_at(&mut self, page: u32, position: usize, cell: &[u8], start: usize) {
+        self.touch_page(page);
+        let offset = self.page_offset(page);
+        self.pages[offset + start..offset + start + cell.len()].copy_from_slice(cell);
+        self.insert_leaf_pointer(page, position, start);
+    }
+
+    /// Adds `start` to the page's cell pointer array at `position`, shifting the
+    /// pointers above it right by one slot.
+    fn insert_leaf_pointer(&mut self, page: u32, position: usize, start: usize) {
+        let offset = self.page_offset(page);
+        let header_relative = Self::header_offset(page);
+        let kind = self.pages[offset + header_relative];
+        let header_size = if matches!(kind, PAGE_TABLE_INTERIOR | PAGE_INDEX_INTERIOR) { 12 } else { 8 };
+        let count = u16::from_be_bytes(self.pages[offset + header_relative + 3..offset + header_relative + 5].try_into().unwrap()) as usize;
         let pointer_base = offset + header_relative + header_size;
-        // Shift pointers [position..count] right by one slot in place (no
-        // per-insert Vec), then write the new pointer into the freed slot.
         let shift_start = pointer_base + position * 2;
         let shift_end = pointer_base + count * 2;
         self.pages.copy_within(shift_start..shift_end, shift_start + 2);
-        self.pages[shift_start..shift_start + 2].copy_from_slice(&(target as u16).to_be_bytes());
+        self.pages[shift_start..shift_start + 2].copy_from_slice(&(start as u16).to_be_bytes());
         self.pages[offset + header_relative + 3..offset + header_relative + 5].copy_from_slice(&((count + 1) as u16).to_be_bytes());
-        let content_field = if target == 65_536 { 0u16 } else { target as u16 };
-        self.pages[offset + header_relative + 5..offset + header_relative + 7].copy_from_slice(&content_field.to_be_bytes());
+    }
+
+    /// Carves a `size`-byte span out of the page's freeblock chain and returns
+    /// its offset.
+    ///
+    /// Reusing the hole a `DELETE` left behind keeps a `DELETE` + `INSERT`
+    /// pair (an `UPDATE` row rewrite) from shifting the cell content area and
+    /// eventually forcing a whole-leaf compaction. A remainder smaller than
+    /// the four-byte freeblock header is dropped, matching upstream
+    /// `allocateSpace`.
+    fn take_freeblock(&mut self, page: u32, size: usize) -> Option<usize> {
+        let offset = self.page_offset(page);
+        let header_relative = Self::header_offset(page);
+        let mut link = header_relative + 1;
+        let mut cursor =
+            u16::from_be_bytes(self.pages[offset + header_relative + 1..offset + header_relative + 3].try_into().unwrap()) as usize;
+        while cursor != 0 {
+            let next = u16::from_be_bytes(self.pages[offset + cursor..offset + cursor + 2].try_into().unwrap()) as usize;
+            let block_size = u16::from_be_bytes(self.pages[offset + cursor + 2..offset + cursor + 4].try_into().unwrap()) as usize;
+            if block_size >= size {
+                self.touch_page(page);
+                let remainder = block_size - size;
+                if remainder >= 4 {
+                    let split = cursor + size;
+                    self.pages[offset + split..offset + split + 2].copy_from_slice(&(next as u16).to_be_bytes());
+                    self.pages[offset + split + 2..offset + split + 4].copy_from_slice(&(remainder as u16).to_be_bytes());
+                    self.pages[offset + link..offset + link + 2].copy_from_slice(&(split as u16).to_be_bytes());
+                }
+                else {
+                    self.pages[offset + link..offset + link + 2].copy_from_slice(&(next as u16).to_be_bytes());
+                }
+                return Some(cursor);
+            }
+            link = cursor;
+            cursor = next;
+        }
+        None
     }
 
     // ------------------------------------------------------------------
@@ -2482,6 +2545,10 @@ impl SqliteWriter {
                     return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
                 }
                 let cell = self.build_cell(PAGE_TABLE_LEAF, Some(rowid), payload)?;
+                if let Some(start) = self.take_freeblock(page, cell.len()) {
+                    self.place_leaf_cell_at(page, position, &cell, start);
+                    return Ok(None);
+                }
                 if cell.len() + 2 <= self.free_space(page) {
                     self.place_leaf_cell(page, position, &cell);
                     return Ok(None);
