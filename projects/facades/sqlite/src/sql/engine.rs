@@ -9,14 +9,15 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
 use database_udf::{Budget as UdfBudget, HostMicroDefinition, HostRuntimeAdapter, UdfContext, UdfImplementation};
 
 use crate::{
-    Affinity, Collation, ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue,
-    affinity_of, decode_library_version, decode_record, read_index_table_with, read_table, validate_database,
+    Affinity, Collation, ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TableRow, TextEncoding,
+    UpdateValue, affinity_of, decode_library_version, decode_record, read_index_table_with, read_table, validate_database,
 };
 
 use super::{
@@ -1140,6 +1141,10 @@ pub struct Engine {
     /// Memoized uncorrelated subquery results for the running statement, keyed
     /// by the resolved subquery node address. Cleared before every statement.
     subquery_cache: std::cell::RefCell<HashMap<usize, SubqueryCache>>,
+    /// 单条语句内已解码的整表行,按小写表名索引。只缓存主库普通 rowid 表的
+    /// 无提示全表扫描,让自连接与同表内外层子查询共享一次解码。语句开始与
+    /// 结束都清空,不跨语句保留。
+    statement_scans: std::cell::RefCell<HashMap<String, Rc<Vec<Vec<Cell>>>>>,
     /// Set whenever an `OuterColumn` is read, so a subquery can tell whether it
     /// depended on the enclosing row and therefore must not be memoized.
     outer_read: std::cell::Cell<bool>,
@@ -1199,6 +1204,7 @@ impl Engine {
             write_epoch: std::cell::Cell::new(0),
             index_probes: std::cell::RefCell::new(HashMap::new()),
             subquery_cache: std::cell::RefCell::new(HashMap::new()),
+            statement_scans: std::cell::RefCell::new(HashMap::new()),
             outer_read: std::cell::Cell::new(false),
             host_functions: HostFunctionTable::default(),
         };
@@ -2749,10 +2755,17 @@ impl Engine {
     }
 
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
-        // A subquery memo is only meaningful while one statement's AST is
-        // alive, so every statement starts from an empty cache.
+        // 子查询备忘与已解码行集都只在一条语句的 AST 存活期内有意义。
         self.subquery_cache.borrow_mut().clear();
+        self.statement_scans.borrow_mut().clear();
         self.outer_read.set(false);
+        let result = self.run_statement_dispatch(statement);
+        // 释放本条语句解码的整表行,避免大表在下一条语句前仍驻留内存。
+        self.statement_scans.borrow_mut().clear();
+        result
+    }
+
+    fn run_statement_dispatch(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         // Any statement other than a plain read can change rows or schema, so
         // the cached index probes stop being valid from this statement on.
         if !matches!(statement, Statement::Select { .. } | Statement::Explain { .. }) {
@@ -4148,7 +4161,7 @@ impl Engine {
                         star_override: vec![None; width],
                     }];
                     let mut offset = width + usize::from(!def.without_rowid);
-                    let mut from_tables: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(from.len());
+                    let mut from_tables: Vec<Rc<Vec<Vec<Cell>>>> = Vec::with_capacity(from.len());
                     for entry in &from {
                         let (columns, rows) = self.select_source(entry, &budget, None, None)?;
                         let visible = columns.width();
@@ -6584,7 +6597,7 @@ impl Engine {
         // the scan order already satisfies that sort.
         let scan = scan.or_else(|| self.rowid_head_bound(first, &order, limit).map(ScanHint::Head));
         let mut sources = Vec::with_capacity(from.len());
-        let mut tables: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(from.len());
+        let mut tables: Vec<Rc<Vec<Vec<Cell>>>> = Vec::with_capacity(from.len());
         let mut offset = 0;
         for table in from {
             let (columns, rows) = self.select_source(table, budget, ctes, scan.as_ref())?;
@@ -8232,11 +8245,11 @@ impl Engine {
         budget: &Budget,
         ctes: Option<&CteEnv>,
         scan: Option<&ScanHint>,
-    ) -> Result<(SourceColumns<'b>, Vec<Vec<Cell>>), SqlError> {
+    ) -> Result<(SourceColumns<'b>, Rc<Vec<Vec<Cell>>>), SqlError> {
         if let Some(query) = &table.query {
             let result = self.select_statement(query, &[], budget, ctes)?;
             let names = unique_output_names(&result.columns);
-            return Ok((SourceColumns::Materialized { names, rowid: false }, result.rows));
+            return Ok((SourceColumns::Materialized { names, rowid: false }, Rc::new(result.rows)));
         }
         let scope = match table.schema.as_deref() {
             None => Some(TableScope::Default),
@@ -8269,19 +8282,22 @@ impl Engine {
         };
         if table.schema.is_none() {
             if let Some(materialized) = ctes.and_then(|env| env.lookup(&table.name)) {
-                return Ok((SourceColumns::Materialized { names: materialized.columns.clone(), rowid: false }, materialized.rows.clone()));
+                return Ok((
+                    SourceColumns::Materialized { names: materialized.columns.clone(), rowid: false },
+                    Rc::new(materialized.rows.clone()),
+                ));
             }
         }
         if let Some(system) = system_for_scope(scope, &table.name) {
             let (columns, rows, rowid) = self.system_rows(system, &table.name)?;
-            return Ok((SourceColumns::Materialized { names: columns, rowid }, rows));
+            return Ok((SourceColumns::Materialized { names: columns, rowid }, Rc::new(rows)));
         }
         let key = table.name.to_ascii_lowercase();
         if scope != TableScope::Main {
             if let Some(view) = self.temp_views.get(&key) {
                 let _depth = ViewDepthGuard::enter()?;
                 let (names, rows) = self.expand_view(&view.def, budget)?;
-                return Ok((SourceColumns::Materialized { names, rowid: false }, rows));
+                return Ok((SourceColumns::Materialized { names, rowid: false }, Rc::new(rows)));
             }
         }
         if scope != TableScope::Temp {
@@ -8291,7 +8307,7 @@ impl Engine {
                 // correlated, so they see no outer row or CTE from this query.
                 let _depth = ViewDepthGuard::enter()?;
                 let (names, rows) = self.expand_view(view, budget)?;
-                return Ok((SourceColumns::Materialized { names, rowid: false }, rows));
+                return Ok((SourceColumns::Materialized { names, rowid: false }, Rc::new(rows)));
             }
         }
         if scope != TableScope::Main {
@@ -8306,7 +8322,7 @@ impl Engine {
                         cells
                     })
                     .collect::<Vec<Vec<Cell>>>();
-                return Ok((SourceColumns::Table(def), decoded));
+                return Ok((SourceColumns::Table(def), Rc::new(decoded)));
             }
         }
         let position = if scope == TableScope::Temp { None } else { self.table_lookup.get(&key).copied() };
@@ -8318,6 +8334,21 @@ impl Engine {
                     .without_rowid_rows(&def.name, TableLimits::default())
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
                 let decoded = stored.iter().map(|payload| def.decode_without_rowid(payload)).collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
+                return Ok((SourceColumns::Table(def), Rc::new(decoded)));
+            }
+            // 无扫描提示的普通全表扫描在本语句内只解码一次。自连接和内外层
+            // 同表子查询因此共享同一份行集,结果与逐次解码完全一致。
+            if scan.is_none() {
+                let key = def.name.to_ascii_lowercase();
+                if let Some(cached) = self.statement_scans.borrow().get(&key) {
+                    return Ok((SourceColumns::Table(def), Rc::clone(cached)));
+                }
+                let stored = self
+                    .writer
+                    .table_rows(&def.name, TableLimits::default())
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+                let decoded = Rc::new(decode_stored_rows(&stored, def)?);
+                self.statement_scans.borrow_mut().insert(key, Rc::clone(&decoded));
                 return Ok((SourceColumns::Table(def), decoded));
             }
             let stored = match scan {
@@ -8353,22 +8384,9 @@ impl Engine {
                     .writer
                     .table_head(&def.name, *max_rows, TableLimits::default())
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
-                None => self
-                    .writer
-                    .table_rows(&def.name, TableLimits::default())
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+                None => unreachable!("plain table scans are cached above"),
             };
-            let decoded = stored
-                .iter()
-                .map(|row| {
-                    let mut cells = decode_row(&row.payload, def, row.rowid)?;
-                    // Rowid tables expose the implicit integer primary key
-                    // through `rowid`, `_rowid_` and `oid`.
-                    cells.push(Cell::Integer(row.rowid));
-                    Ok(cells)
-                })
-                .collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
-            return Ok((SourceColumns::Table(def), decoded));
+            return Ok((SourceColumns::Table(def), Rc::new(decode_stored_rows(&stored, def)?)));
         }
         if table.schema.is_none() {
             // The attached databases come after temp and main in the search
@@ -8393,22 +8411,22 @@ impl Engine {
         qualifier: &str,
         table: &TableRef,
         budget: &Budget,
-    ) -> Result<(SourceColumns<'b>, Vec<Vec<Cell>>), SqlError> {
+    ) -> Result<(SourceColumns<'b>, Rc<Vec<Vec<Cell>>>), SqlError> {
         let engine = &self.attached[index].engine;
         if let Some(system) = SystemTable::from_name(&table.name) {
             let (columns, rows, rowid) = engine.system_rows(system, &table.name)?;
-            return Ok((SourceColumns::Materialized { names: columns, rowid }, rows));
+            return Ok((SourceColumns::Materialized { names: columns, rowid }, Rc::new(rows)));
         }
         let key = table.name.to_ascii_lowercase();
         if let Some(view) = engine.temp_views.get(&key) {
             let _depth = ViewDepthGuard::enter()?;
             let (names, rows) = engine.expand_view(&view.def, budget)?;
-            return Ok((SourceColumns::Materialized { names, rowid: false }, rows));
+            return Ok((SourceColumns::Materialized { names, rowid: false }, Rc::new(rows)));
         }
         if let Some(view) = engine.views.get(&key) {
             let _depth = ViewDepthGuard::enter()?;
             let (names, rows) = engine.expand_view(view, budget)?;
-            return Ok((SourceColumns::Materialized { names, rowid: false }, rows));
+            return Ok((SourceColumns::Materialized { names, rowid: false }, Rc::new(rows)));
         }
         if let Some(position) = engine.table_lookup.get(&key).copied() {
             let def = &engine.tables[position];
@@ -8416,15 +8434,7 @@ impl Engine {
                 .writer
                 .table_rows(&def.name, TableLimits::default())
                 .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
-            let decoded = stored
-                .iter()
-                .map(|row| {
-                    let mut cells = decode_row(&row.payload, def, row.rowid)?;
-                    cells.push(Cell::Integer(row.rowid));
-                    Ok(cells)
-                })
-                .collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
-            return Ok((SourceColumns::Table(def), decoded));
+            return Ok((SourceColumns::Table(def), Rc::new(decode_stored_rows(&stored, def)?)));
         }
         Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{}", table.name)).in_statement("select"))
     }
@@ -11515,7 +11525,7 @@ fn group_keys_equal(left: &[Cell], right: &[Cell], group_keys: &[GroupKey]) -> b
 fn join_rows(
     relation: &Relation,
     ons: &[Option<ResolvedExpr>],
-    tables: &[Vec<Vec<Cell>>],
+    tables: &[Rc<Vec<Vec<Cell>>>],
     conjuncts: &[ResolvedExpr],
     take: usize,
     ctx: &EvalContext,
@@ -11539,7 +11549,7 @@ fn join_rows(
             if unconditional || !pairs.is_empty() || !matches!(kind, JoinKind::Inner) { None } else { rowid_join_probe(source, &ons[index], index) };
         if unconditional {
             for left in &rows {
-                for values in &tables[index] {
+                for values in tables[index].iter() {
                     let mut merged = left.clone();
                     merged[source.offset..source.offset + width].clone_from_slice(values);
                     ctx.budget.charge(1)?;
@@ -11707,12 +11717,12 @@ fn rowid_join_probe<'a>(source: &Source, on: &'a Option<ResolvedExpr>, index: us
 /// Every source row already carries its hidden rowid slot, so concatenating
 /// them in `FROM` order reproduces the merged row the relation resolves
 /// against.
-fn join_product(tables: &[Vec<Vec<Cell>>]) -> Vec<Vec<Cell>> {
+fn join_product(tables: &[Rc<Vec<Vec<Cell>>>]) -> Vec<Vec<Cell>> {
     let mut product: Vec<Vec<Cell>> = vec![Vec::new()];
     for rows in tables {
         let mut next = Vec::with_capacity(product.len() * rows.len());
         for prefix in &product {
-            for row in rows {
+            for row in rows.iter() {
                 let mut merged = prefix.clone();
                 merged.extend(row.iter().cloned());
                 next.push(merged);
@@ -11863,7 +11873,7 @@ fn flip_range_op(op: CompareOp) -> CompareOp {
 }
 
 fn cross_product(
-    tables: &[Vec<Vec<Cell>>],
+    tables: &[Rc<Vec<Vec<Cell>>>],
     relation: &Relation,
     conjuncts: &[ResolvedExpr],
     take: usize,
@@ -11902,7 +11912,7 @@ fn cross_product(
 #[allow(clippy::too_many_arguments)]
 fn emit_rows(
     slot: usize,
-    tables: &[Vec<Vec<Cell>>],
+    tables: &[Rc<Vec<Vec<Cell>>>],
     relation: &Relation,
     order: &[usize],
     conjuncts: &[ResolvedExpr],
@@ -11928,7 +11938,7 @@ fn emit_rows(
         return Ok(());
     }
     let source = &relation.sources[order[slot]];
-    for values in &tables[order[slot]] {
+    for values in tables[order[slot]].iter() {
         merged[source.offset..source.offset + values.len()].clone_from_slice(values);
         let mut pruned = false;
         for (conjunct, bound) in conjuncts.iter().zip(depths) {
@@ -14383,6 +14393,20 @@ fn decode_row(payload: &[u8], def: &TableDef, rowid: i64) -> Result<Vec<Cell>, S
         }
     }
     Ok(cells)
+}
+
+/// Decodes stored row payloads into merged rows, appending each hidden rowid.
+fn decode_stored_rows(stored: &[TableRow], def: &TableDef) -> Result<Vec<Vec<Cell>>, SqlError> {
+    stored
+        .iter()
+        .map(|row| {
+            let mut cells = decode_row(&row.payload, def, row.rowid)?;
+            // Rowid tables expose the implicit integer primary key through
+            // `rowid`, `_rowid_` and `oid`.
+            cells.push(Cell::Integer(row.rowid));
+            Ok(cells)
+        })
+        .collect()
 }
 /// Decodes a raw record into cells without expanding an implicit rowid alias.
 fn decode_cells(payload: &[u8]) -> Result<Vec<Cell>, SqlError> {
