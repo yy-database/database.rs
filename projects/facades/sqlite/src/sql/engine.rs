@@ -6789,6 +6789,42 @@ impl Engine {
         if let Some(predicate) = predicate {
             split_conjuncts(predicate, &mut conjuncts);
         }
+        // 裸 `count(*)` 的内连接只需要计数,不必把每个匹配行合并成
+        // `Vec<Cell>`。限定在全部为普通源或内连接的形态,其余连接走通用路径。
+        let bare_count_star = grouped
+            && keys.is_empty()
+            && having_expr.is_none()
+            && !windowed
+            && !*distinct
+            && matches!(projection.as_deref(), Some([ResolvedExpr::AggregateRef(0)]))
+            && matches!(specs.as_slice(), [spec]
+                if matches!(spec.function, AggregateFunction::CountStar)
+                    && spec.argument.is_none()
+                    && spec.filter.is_none()
+                    && !spec.distinct
+                    && spec.order.is_empty());
+        if bare_count_star
+            && joined
+            && relation.sources.iter().all(|source| matches!(source.join, None | Some(JoinKind::Inner)))
+            && relation.using.iter().all(|pairs| pairs.is_empty())
+        {
+            let count = count_inner_join_rows(&relation, &ons, &tables, &conjuncts, &ctx)?;
+            let visible = match limit {
+                None => true,
+                Some((offset, limit)) => offset == 0 && limit.map_or(true, |limit| limit > 0),
+            };
+            let rows = if visible { vec![vec![Cell::Integer(count as i64)]] } else { Vec::new() };
+            return Ok(ExecResult { statement: "select", columns: labels, rows, affected: 0 });
+        }
+        if bare_count_star && !joined {
+            let count = count_cross_product_rows(&tables, &relation, &conjuncts, &ctx)?;
+            let visible = match limit {
+                None => true,
+                Some((offset, limit)) => offset == 0 && limit.map_or(true, |limit| limit > 0),
+            };
+            let rows = if visible { vec![vec![Cell::Integer(count as i64)]] } else { Vec::new() };
+            return Ok(ExecResult { statement: "select", columns: labels, rows, affected: 0 });
+        }
         let rows = if joined {
             join_rows(&relation, &ons, &tables, &conjuncts, take, &ctx)?
         }
@@ -11512,6 +11548,119 @@ fn group_keys_equal(left: &[Cell], right: &[Cell], group_keys: &[GroupKey]) -> b
             })
 }
 
+/// 统计普通源与内连接的匹配行数,不物化匹配行。
+///
+/// 与 [`join_rows`] 的通用路径逐行等价:按 `FROM` 顺序绑定,`ON` 在候选行上
+/// 求值,`WHERE` 合取在完整行上求值。只有 `rowid` 等值探针借用右表的 rowid
+/// 升序做二分,其余形态退回逐行扫描,因而不会改变计数结果。
+fn count_inner_join_rows(
+    relation: &Relation,
+    ons: &[Option<ResolvedExpr>],
+    tables: &[Rc<Vec<Vec<Cell>>>],
+    conjuncts: &[ResolvedExpr],
+    ctx: &EvalContext,
+) -> Result<usize, SqlError> {
+    // 探针形态与右表有序性每条语句只判定一次,避免在每行递归里重算。
+    let probes: Vec<Option<RowidProbe<'_>>> = relation
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            Ok(rowid_join_probe(source, &ons[index], index).map(|(right_slot, probe)| {
+                let within = right_slot - source.offset;
+                let ascending = tables[index].windows(2).all(|pair| match (&pair[0][within], &pair[1][within]) {
+                    (Cell::Integer(left), Cell::Integer(right)) => left < right,
+                    _ => false,
+                });
+                RowidProbe { within, probe, ascending }
+            }))
+        })
+        .collect::<Result<Vec<_>, SqlError>>()?;
+    let mut merged = vec![Cell::Null; relation.columns()];
+    let mut count = 0usize;
+    count_join_level(0, relation, ons, tables, &probes, conjuncts, ctx, &mut merged, &mut count)?;
+    Ok(count)
+}
+
+/// 一条 `ON <右侧 rowid> = <前缀表达式>` 的等值探针,`ascending` 表示右表按该
+/// rowid 列严格升序,可用二分定位。
+struct RowidProbe<'a> {
+    within: usize,
+    probe: &'a ResolvedExpr,
+    ascending: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn count_join_level(
+    index: usize,
+    relation: &Relation,
+    ons: &[Option<ResolvedExpr>],
+    tables: &[Rc<Vec<Vec<Cell>>>],
+    probes: &[Option<RowidProbe<'_>>],
+    conjuncts: &[ResolvedExpr],
+    ctx: &EvalContext,
+    merged: &mut [Cell],
+    count: &mut usize,
+) -> Result<(), SqlError> {
+    if index == relation.sources.len() {
+        for conjunct in conjuncts {
+            if truthiness(&conjunct.eval(merged, ctx)?) != Some(true) {
+                return Ok(());
+            }
+        }
+        ctx.budget.charge(1)?;
+        *count += 1;
+        return Ok(());
+    }
+    let source = &relation.sources[index];
+    let start = source.offset;
+    let end = start + source.width();
+    // 第一项与后续无 `ON` 的内连接都是无条件乘积。
+    let Some(on) = ons[index].as_ref()
+    else {
+        for values in tables[index].iter() {
+            merged[start..end].clone_from_slice(values);
+            count_join_level(index + 1, relation, ons, tables, probes, conjuncts, ctx, merged, count)?;
+        }
+        return Ok(());
+    };
+    if let Some(rowid) = &probes[index] {
+        let right = tables[index].as_slice();
+        if let Cell::Integer(key) = rowid.probe.eval(merged, ctx)? {
+            if rowid.ascending {
+                let within = rowid.within;
+                let position = right.partition_point(|row| matches!(&row[within], Cell::Integer(value) if *value < key));
+                if let Some(row) = right.get(position) {
+                    if matches!(&row[within], Cell::Integer(value) if *value == key) {
+                        merged[start..end].clone_from_slice(row);
+                        if truthiness(&on.eval(merged, ctx)?) == Some(true) {
+                            count_join_level(index + 1, relation, ons, tables, probes, conjuncts, ctx, merged, count)?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let within = rowid.within;
+            for row in right {
+                if matches!(&row[within], Cell::Integer(value) if *value == key) {
+                    merged[start..end].clone_from_slice(row);
+                    if truthiness(&on.eval(merged, ctx)?) == Some(true) {
+                        count_join_level(index + 1, relation, ons, tables, probes, conjuncts, ctx, merged, count)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+    for row in tables[index].iter() {
+        merged[start..end].clone_from_slice(row);
+        if truthiness(&on.eval(merged, ctx)?) == Some(true) {
+            count_join_level(index + 1, relation, ons, tables, probes, conjuncts, ctx, merged, count)?;
+        }
+    }
+    Ok(())
+}
+
 /// Builds joined rows for a `FROM` clause that uses `JOIN`.
 ///
 /// Sources are added left to right, and rows come out in left-major order, as
@@ -11870,6 +12019,83 @@ fn flip_range_op(op: CompareOp) -> CompareOp {
         CompareOp::LtEq => CompareOp::GtEq,
         other => other,
     }
+}
+
+/// 统计笛卡尔积中满足全部合取的行数,不物化结果行。
+///
+/// 绑定顺序与提前剪枝复用 [`cross_product`] 的同一套规则,因此计数与通用
+/// 路径逐行一致,只是把最终结果行换成了计数。
+fn count_cross_product_rows(
+    tables: &[Rc<Vec<Vec<Cell>>>],
+    relation: &Relation,
+    conjuncts: &[ResolvedExpr],
+    ctx: &EvalContext,
+) -> Result<usize, SqlError> {
+    let order = binding_order(relation, conjuncts);
+    let mut position = vec![0usize; order.len()];
+    for (slot, source) in order.iter().enumerate() {
+        position[*source] = slot;
+    }
+    let mut refs = Vec::new();
+    let depths: Vec<Option<usize>> = conjuncts
+        .iter()
+        .map(|conjunct| {
+            if conjunct.contains_subquery() {
+                return Some(order.len().saturating_sub(1));
+            }
+            refs.clear();
+            conjunct.collect_sources(&mut refs);
+            refs.iter().map(|source| position[*source]).max()
+        })
+        .collect();
+    let mut merged = vec![Cell::Null; relation.columns()];
+    for (conjunct, depth) in conjuncts.iter().zip(&depths) {
+        if depth.is_none() && truthiness(&conjunct.eval(&merged, ctx)?) == Some(false) {
+            return Ok(0);
+        }
+    }
+    let mut count = 0usize;
+    count_cross_level(0, tables, relation, &order, conjuncts, &depths, ctx, &mut merged, &mut count)?;
+    Ok(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn count_cross_level(
+    slot: usize,
+    tables: &[Rc<Vec<Vec<Cell>>>],
+    relation: &Relation,
+    order: &[usize],
+    conjuncts: &[ResolvedExpr],
+    depths: &[Option<usize>],
+    ctx: &EvalContext,
+    merged: &mut [Cell],
+    count: &mut usize,
+) -> Result<(), SqlError> {
+    if slot == order.len() {
+        for conjunct in conjuncts {
+            if truthiness(&conjunct.eval(merged, ctx)?) != Some(true) {
+                return Ok(());
+            }
+        }
+        ctx.budget.charge(1)?;
+        *count += 1;
+        return Ok(());
+    }
+    let source = &relation.sources[order[slot]];
+    for values in tables[order[slot]].iter() {
+        merged[source.offset..source.offset + values.len()].clone_from_slice(values);
+        let mut pruned = false;
+        for (conjunct, depth) in conjuncts.iter().zip(depths) {
+            if *depth == Some(slot) && truthiness(&conjunct.eval(merged, ctx)?) == Some(false) {
+                pruned = true;
+                break;
+            }
+        }
+        if !pruned {
+            count_cross_level(slot + 1, tables, relation, order, conjuncts, depths, ctx, merged, count)?;
+        }
+    }
+    Ok(())
 }
 
 fn cross_product(
@@ -15482,6 +15708,51 @@ mod tests {
         assert_eq!(
             engine.execute_one("SELECT l.v, r.w FROM l JOIN r ON r.id = l.id AND r.w <> 'Y'").expect("compound on join").rows,
             vec![vec![text("a"), text("X")]]
+        );
+    }
+
+    #[test]
+    fn count_star_join_counts_without_materializing_rows() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE l(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO l VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')",
+            "CREATE TABLE r(id INTEGER PRIMARY KEY, w TEXT)",
+            "INSERT INTO r VALUES (1,'X'),(2,'Y'),(4,'Z')",
+        ]);
+        // 裸 `count(*)` 的内连接走计数路径,不物化匹配行。
+        assert_eq!(
+            engine.execute_one("SELECT count(*) AS n FROM l JOIN r ON r.id = l.id").expect("count join").rows,
+            vec![vec![Cell::Integer(3)]]
+        );
+        // `WHERE` 合取仍在完整行上生效。
+        assert_eq!(
+            engine.execute_one("SELECT count(*) AS n FROM l JOIN r ON r.id = l.id WHERE r.w <> 'Y'").expect("filtered").rows,
+            vec![vec![Cell::Integer(2)]]
+        );
+        // 逗号乘积走计数路径,行数与通用路径一致。
+        assert_eq!(engine.execute_one("SELECT count(*) AS n FROM l, r").expect("product").rows, vec![vec![Cell::Integer(12)]]);
+        assert!(engine.execute_one("SELECT count(*) AS n FROM l, r LIMIT 0").expect("limit zero").rows.is_empty());
+        // 外连接不走计数路径,但结果仍按通用路径计算。
+        assert_eq!(
+            engine.execute_one("SELECT count(*) AS n FROM l LEFT JOIN r ON r.id = l.id").expect("left join").rows,
+            vec![vec![Cell::Integer(4)]]
+        );
+    }
+
+    #[test]
+    fn count_star_product_and_subquery_count_without_materializing_rows() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, score REAL)",
+            "INSERT INTO t VALUES (1,1.0),(2,2.0),(3,3.0)",
+        ]);
+        assert_eq!(
+            engine.execute_one("SELECT count(*) AS n FROM t WHERE score > 1.5").expect("count filter").rows,
+            vec![vec![Cell::Integer(2)]]
+        );
+        // 同表内外层共享一次扫描,行集仍按 `IN` 子查询的结果计算。
+        assert_eq!(
+            engine.execute_one("SELECT count(*) AS n FROM t WHERE id IN (SELECT id FROM t WHERE score > 1.5)").expect("in subquery").rows,
+            vec![vec![Cell::Integer(2)]]
         );
     }
 
