@@ -356,6 +356,8 @@ struct IndexProbe {
     /// Decoded key values in index order, used by range probes that need the
     /// engine's own comparison instead of a hash lookup.
     entries: Vec<(Vec<Cell>, i64)>,
+    /// `entries` 按首列排序规则非递减,范围探针因此可以二分定位。
+    sorted: bool,
     /// A stored key the canonical form cannot reproduce; the probe is then
     /// never used and every query falls back to the full scan.
     poisoned: bool,
@@ -8137,6 +8139,36 @@ impl Engine {
             if probe.poisoned {
                 return None;
             }
+            // 索引项按首列有序时,用两次二分取出候选区间,只遍历命中项。
+            if probe.sorted {
+                let collation = collation;
+                let lower_start = match lower {
+                    None => 0,
+                    Some(bound) => probe.entries.partition_point(|(key, _)| match key.first() {
+                        Some(cell) => {
+                            let ordering = compare_cells_with(cell, &bound.cell, collation);
+                            ordering == Ordering::Less || (!bound.inclusive && ordering == Ordering::Equal)
+                        }
+                        None => true,
+                    }),
+                };
+                let upper_end = match upper {
+                    None => probe.entries.len(),
+                    Some(bound) => probe.entries.partition_point(|(key, _)| match key.first() {
+                        Some(cell) => {
+                            let ordering = compare_cells_with(cell, &bound.cell, collation);
+                            ordering == Ordering::Less || (bound.inclusive && ordering == Ordering::Equal)
+                        }
+                        None => false,
+                    }),
+                };
+                if lower_start >= upper_end {
+                    return Some(Vec::new());
+                }
+                let mut rowids: Vec<i64> = probe.entries[lower_start..upper_end].iter().map(|(_, rowid)| *rowid).collect();
+                rowids.sort_unstable();
+                return Some(rowids);
+            }
             let mut rowids = Vec::new();
             for (key, rowid) in &probe.entries {
                 let Some(cell) = key.first() else {
@@ -8177,7 +8209,7 @@ impl Engine {
     /// key outside the canonical form (a NaN or a wide integer) poisons the
     /// probe so every later query keeps the full scan.
     fn build_index_probe(&self, index: &IndexDef, epoch: u64) -> IndexProbe {
-        let mut probe = IndexProbe { epoch, map: HashMap::new(), entries: Vec::new(), poisoned: false };
+        let mut probe = IndexProbe { epoch, map: HashMap::new(), entries: Vec::new(), sorted: false, poisoned: false };
         let entries = match self.writer.index_entries_decoded(&index.name) {
             Ok(entries) => entries,
             Err(_) => {
@@ -8214,6 +8246,12 @@ impl Engine {
             for rowids in probe.map.values_mut() {
                 rowids.sort_unstable();
             }
+            // 索引项通常按首列有序存储,确认一次后范围探针即可二分。
+            let collation = index.collations.first().copied().unwrap_or_default();
+            probe.sorted = probe.entries.windows(2).all(|pair| match (pair[0].0.first(), pair[1].0.first()) {
+                (Some(left), Some(right)) => compare_cells_with(left, right, collation) != Ordering::Greater,
+                _ => false,
+            });
         }
         probe
     }
@@ -8268,6 +8306,35 @@ impl Engine {
             }
         }
         Some(offset.saturating_add(count))
+    }
+
+    /// 按候选 rowid 读取行,保持升序。
+    ///
+    /// 候选稠密时用一次 `[first, last]` 范围读后按集合过滤,避免对每个 rowid
+    /// 都重走一次表元数据与 b-tree 定位。候选含重复或跨度过大时退回逐点读,
+    /// 两条路径都按 rowid 升序返回,与全表扫描顺序一致。
+    fn rows_for_rowids(&self, table: &str, rowids: &[i64]) -> Result<Vec<TableRow>, SqlError> {
+        let ascending = rowids.windows(2).all(|pair| pair[0] < pair[1]);
+        let dense = rowids.len() >= 2
+            && ascending
+            && rowids.last().and_then(|last| last.checked_sub(rowids[0])).is_some_and(|span| span <= (rowids.len() as i64).saturating_mul(4).saturating_add(16));
+        if dense {
+            let stored = self
+                .writer
+                .table_range(table, rowids[0], rowids[rowids.len() - 1], TableLimits::default())
+                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+            let wanted: HashSet<i64> = rowids.iter().copied().collect();
+            return Ok(stored.into_iter().filter(|row| wanted.contains(&row.rowid)).collect());
+        }
+        let mut stored = Vec::with_capacity(rowids.len());
+        for rowid in rowids {
+            stored.extend(
+                self.writer
+                    .table_range(table, *rowid, *rowid, TableLimits::default())
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+            );
+        }
+        Ok(stored)
     }
 
     /// Runs a nested `SELECT` statement through the same entry point as a
@@ -8398,21 +8465,11 @@ impl Engine {
                     .table_range(&def.name, *rowid, *rowid, TableLimits::default())
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
                 // A `WHERE <indexed column> = <literal>` covering every key
-                // column of a plain index: fetch just the probe's rowids, each
-                // by its own point read. They arrive ascending, which is both
-                // the index order under one full-key equality and the order of
-                // the full scan, so the emitted rows keep their position.
-                Some(ScanHint::Rowids(rowids)) => {
-                    let mut stored = Vec::with_capacity(rowids.len());
-                    for rowid in rowids.iter() {
-                        stored.extend(
-                            self.writer
-                                .table_range(&def.name, *rowid, *rowid, TableLimits::default())
-                                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
-                        );
-                    }
-                    stored
-                }
+                // column of a plain index: fetch just the probe's rowids. They
+                // arrive ascending, which is both the index order under one
+                // full-key equality and the order of the full scan, so the
+                // emitted rows keep their position.
+                Some(ScanHint::Rowids(rowids)) => self.rows_for_rowids(&def.name, rowids)?,
                 // `ORDER BY <rowid order> LIMIT n`: read only the leading rows;
                 // the scan order already satisfies the sort, and the generic
                 // sort downstream just confirms it over this small prefix.
@@ -15754,6 +15811,27 @@ mod tests {
             engine.execute_one("SELECT count(*) AS n FROM t WHERE id IN (SELECT id FROM t WHERE score > 1.5)").expect("in subquery").rows,
             vec![vec![Cell::Integer(2)]]
         );
+    }
+
+    #[test]
+    fn index_range_reads_sparse_candidates_like_the_full_scan() {
+        let mut plain = Engine::new(None).expect("blank");
+        let mut indexed = Engine::new(None).expect("blank");
+        for engine in [&mut plain, &mut indexed] {
+            engine.execute_one("CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)").expect("create");
+            for row in 1..=64i64 {
+                let label = if row % 8 == 0 { "hit".to_string() } else { format!("row-{row}") };
+                engine.execute_one(&format!("INSERT INTO t VALUES ({row}, '{label}')")).expect("insert");
+            }
+        }
+        indexed.execute_one("CREATE INDEX tl ON t (label)").expect("index");
+        for sql in [
+            "SELECT id FROM t WHERE label = 'hit'",
+            "SELECT id FROM t WHERE label BETWEEN 'hit' AND 'hit' ORDER BY label",
+            "SELECT id FROM t WHERE label >= 'hit'",
+        ] {
+            assert_eq!(plain.execute_one(sql).expect("plain").rows, indexed.execute_one(sql).expect("indexed").rows, "{sql}");
+        }
     }
 
     #[test]
