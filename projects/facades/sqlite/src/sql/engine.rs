@@ -14696,14 +14696,15 @@ fn decode_cells(payload: &[u8]) -> Result<Vec<Cell>, SqlError> {
     let limits = RecordLimits { max_columns: 1024, max_payload_bytes: 16 * 1024 * 1024 };
     let values = decode_record(payload, TextEncoding::Utf8, limits)
         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+    // 文本字段直接移交解码结果里的 `String`,不再多复制一次。
     Ok(values
-        .iter()
+        .into_iter()
         .map(|value| match value {
             crate::RecordValue::Null => Cell::Null,
-            crate::RecordValue::Integer(value) => Cell::Integer(*value),
-            crate::RecordValue::Real(value) => Cell::Real(*value),
-            crate::RecordValue::Text(value) => Cell::Text(value.clone()),
-            crate::RecordValue::Blob(value) => Cell::Blob(value.to_vec()),
+            crate::RecordValue::Integer(value) => Cell::Integer(value),
+            crate::RecordValue::Real(value) => Cell::Real(value),
+            crate::RecordValue::Text(text) => Cell::Text(text),
+            crate::RecordValue::Blob(bytes) => Cell::Blob(bytes.to_vec()),
         })
         .collect())
 }
