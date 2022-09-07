@@ -11330,6 +11330,28 @@ fn retain_first_distinct(rows: Vec<Vec<Cell>>, collations: &[Collation]) -> Vec<
 ///
 /// Empty input follows SQLite: `count` is `0`, every other aggregate is `NULL`.
 fn compute_aggregate(spec: &AggregateSpec, rows: &[Vec<Cell>], ctx: &EvalContext) -> Result<Cell, SqlError> {
+    // 无 `DISTINCT`、无参数内 `ORDER BY` 时不需要物化 (value, separator, key)
+    // 三元组,直接按行收集参数值,省掉每组一次分配与二次装载。
+    if !spec.distinct && spec.order.is_empty() {
+        let mut values = Vec::with_capacity(rows.len());
+        let mut separators = if spec.separator.is_some() { Vec::with_capacity(rows.len()) } else { Vec::new() };
+        for row in rows {
+            if let Some(filter) = &spec.filter {
+                if truthiness(&filter.eval(row, ctx)?) != Some(true) {
+                    continue;
+                }
+            }
+            let value = match &spec.argument {
+                Some(argument) => argument.eval(row, ctx)?,
+                None => Cell::Null,
+            };
+            if let Some(separator) = &spec.separator {
+                separators.push(separator.eval(row, ctx)?);
+            }
+            values.push(value);
+        }
+        return Ok(aggregate_cells(spec.function, &values, if spec.separator.is_some() { Some(&separators) } else { None }));
+    }
     let mut entries: Vec<(Cell, Cell, Vec<Cell>)> = Vec::with_capacity(rows.len());
     for row in rows {
         if let Some(filter) = &spec.filter {
