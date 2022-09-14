@@ -2351,6 +2351,14 @@ impl SqliteWriter {
                 }
                 else {
                     self.pages[offset + link..offset + link + 2].copy_from_slice(&(next as u16).to_be_bytes());
+                    // 剩余 1 到 3 字节放不下 freeblock 头，按上游语义记为碎片，
+                    // 页头 `nFrag` 必须同步累加，否则 `integrity_check` 会报
+                    // “Fragmentation of N bytes reported as 0”。
+                    if remainder > 0 {
+                        let fragmented = offset + header_relative + 7;
+                        let current = self.pages[fragmented] as usize;
+                        self.pages[fragmented] = current.saturating_add(remainder).min(255) as u8;
+                    }
                 }
                 return Some(cursor);
             }
