@@ -6,7 +6,7 @@
 #![warn(missing_docs)]
 
 mod database;
-mod journal;
+pub mod journal;
 mod schema;
 mod table;
 mod wal;
