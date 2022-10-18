@@ -15,7 +15,7 @@
 pub mod connection;
 pub mod sql;
 
-pub use connection::{Connection, ConnectionOptions, Prepared};
+pub use connection::{Connection, ConnectionOptions, JournalMode, Prepared};
 pub use sql::{
     Cell, ColumnRef, Engine, ExecResult, IndexColumn, Literal, SelectItems, SqlError, Statement, TableRef, parameter_slots, parse, results_json,
 };

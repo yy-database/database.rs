@@ -13,7 +13,7 @@
 
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
-    io::{Seek, SeekFrom, Write},
+    io::{ErrorKind, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -24,6 +24,7 @@ use crate::{
     sql::{Cell, Engine, ExecResult, SqlError, Statement, TransactionAction, parameter_slots},
 };
 
+use database_storage::sqlite::journal;
 use database_udf::{HostMicroDefinition, HostRuntimeAdapter};
 
 /// 把存储层错误映射为结构化的 SQL 拒绝。
@@ -102,6 +103,45 @@ fn busy_message(path: &Path) -> String {
     }
 }
 
+/// 提交时发布新镜像并处理回滚日志的方式。
+///
+/// `Delete` 与 `Truncate` 在替换主文件前写出真实格式的 rollback journal:
+/// 提交中断后,重新打开(本绑定或外部 SQLite 引擎)会回滚到旧镜像。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JournalMode {
+    /// 只做原子改名发布,不生成回滚日志(本绑定的默认行为)。
+    #[default]
+    Preserve,
+    /// 发布前写 `<db>-journal`,发布成功后删除该文件。
+    Delete,
+    /// 发布前写 `<db>-journal`,发布成功后把它截断为 0 字节。
+    Truncate,
+}
+
+impl JournalMode {
+    /// 解析 `journalMode` 名称。
+    ///
+    /// `preserve`、`delete`、`truncate` 之外(含 `wal`)一律以 `unsupported`
+    /// 拒绝,不静默降级。
+    pub fn parse(name: &str) -> Result<Self, SqlError> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "preserve" => Ok(Self::Preserve),
+            "delete" => Ok(Self::Delete),
+            "truncate" => Ok(Self::Truncate),
+            other => Err(SqlError::new("unsupported", format!("journalMode `{other}` is not supported (use preserve|delete|truncate)"))),
+        }
+    }
+
+    /// 选项名称,与 [`JournalMode::parse`] 互逆。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Delete => "delete",
+            Self::Truncate => "truncate",
+        }
+    }
+}
+
 /// 打开连接的方式。
 #[derive(Clone, Debug)]
 pub struct ConnectionOptions {
@@ -117,6 +157,8 @@ pub struct ConnectionOptions {
     pub page_size: Option<u32>,
     /// `PRAGMA synchronous`;`false` 时落盘跳过持久化刷新。
     pub synchronous: bool,
+    /// 提交时如何发布新镜像与处理回滚日志。
+    pub journal_mode: JournalMode,
     /// 写连接在锁被另一个写连接占用时的重试时长(毫秒),`0` 表示只尝试一次。
     ///
     /// 只读连接、纯内存连接与字节镜像连接不参与加锁,该值对它们无意义。
@@ -125,7 +167,16 @@ pub struct ConnectionOptions {
 
 impl Default for ConnectionOptions {
     fn default() -> Self {
-        Self { filename: None, data: None, read_only: false, create: true, page_size: None, synchronous: true, busy_timeout_ms: 0 }
+        Self {
+            filename: None,
+            data: None,
+            read_only: false,
+            create: true,
+            page_size: None,
+            synchronous: true,
+            journal_mode: JournalMode::Preserve,
+            busy_timeout_ms: 0,
+        }
     }
 }
 
@@ -194,7 +245,8 @@ impl Prepared {
 /// 文件写连接在打开时取得跨进程写锁并持有到 [`Connection::close`] 或句柄
 /// 释放;只读连接不参与加锁,打开时把文件一次性读进内存,因此不会被写连接
 /// 阻塞。写连接发布镜像时先写同目录临时文件再改名覆盖,读连接要么读到旧的
-/// 完整镜像,要么读到新的完整镜像。
+/// 完整镜像,要么读到新的完整镜像。`delete`/`truncate` 模式在改名前进写出
+/// 回滚日志,提交中断后重新打开会回滚到旧镜像。
 pub struct Connection {
     /// 底层执行引擎,持有 format-3 写者与目录。
     engine: Engine,
@@ -208,6 +260,23 @@ pub struct Connection {
     lock: Option<WriterLock>,
     /// `close` 之后不再接受语句。
     closed: bool,
+    /// 提交时如何发布新镜像并处理回滚日志。
+    journal_mode: JournalMode,
+    /// 落盘时是否 `fsync`;回滚日志与恢复写回共用同一强度。
+    synchronous: bool,
+    /// 仅测试使用的发布失败注入,用于在真实崩溃窗口上取证。
+    #[cfg(test)]
+    fail_point: Option<FailPoint>,
+}
+
+/// 测试用的发布失败点,模拟进程在对应步骤后立刻退出。
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailPoint {
+    /// 回滚日志已落盘、主文件尚未发布。
+    AfterJournal,
+    /// 主文件已发布、日志尚未清理。
+    AfterPublish,
 }
 
 impl Connection {
@@ -219,6 +288,9 @@ impl Connection {
     /// 文件写连接先取得跨进程写锁再读文件,因此两个写连接不可能同时以同一份
     /// 旧镜像起步;锁被占用时按 `busy_timeout_ms` 重试,超时以 `busy` 拒绝。
     /// 只读连接与字节镜像连接不加锁。
+    ///
+    /// 打开已有文件时先回放热 `-journal`:写连接把回滚结果写回主文件后再清理
+    /// 日志,只读连接只在内存里使用回滚结果、不改动磁盘。
     pub fn open(options: ConnectionOptions) -> Result<Self, SqlError> {
         let mut created = false;
         let mut lock = None;
@@ -230,7 +302,8 @@ impl Connection {
                 lock = Some(WriterLock::acquire(path, Duration::from_millis(options.busy_timeout_ms))?);
             }
             if path.exists() {
-                SqliteWriter::open(path).map_err(storage_error)?
+                let pages = load_recovered(path, options.read_only, options.journal_mode, options.synchronous)?;
+                SqliteWriter::from_pages(pages).map_err(storage_error)?
             }
             else if options.create && !options.read_only {
                 created = true;
@@ -245,8 +318,25 @@ impl Connection {
         };
         let mut engine = Engine::from_writer(writer)?;
         engine.set_synchronous(options.synchronous);
-        let mut connection = Self { engine, filename: options.filename, read_only: options.read_only, dirty: false, lock, closed: false };
+        let journal_mode = options.journal_mode;
+        let synchronous = options.synchronous;
+        let mut connection = Self {
+            engine,
+            filename: options.filename,
+            read_only: options.read_only,
+            dirty: false,
+            lock,
+            closed: false,
+            journal_mode,
+            synchronous,
+            #[cfg(test)]
+            fail_point: None,
+        };
         if created {
+            // 新建库没有旧镜像可回滚;残留日志只可能来自更早的失败创建,先清掉。
+            if let Some(path) = &connection.filename {
+                journal::finish(path, false).map_err(storage_error)?;
+            }
             connection.publish()?;
         }
         Ok(connection)
@@ -381,7 +471,13 @@ impl Connection {
 
     /// `PRAGMA synchronous` 透传。
     pub fn set_synchronous(&mut self, on: bool) {
+        self.synchronous = on;
         self.engine.set_synchronous(on);
+    }
+
+    /// 本连接提交时使用的日志模式。
+    pub fn journal_mode(&self) -> JournalMode {
+        self.journal_mode
     }
 
     /// 只读连接拒绝任何会写镜像的语句,在执行前拒绝。
@@ -421,14 +517,87 @@ impl Connection {
 
     /// 把当前镜像写到本连接的文件。纯内存连接为空操作。
     ///
-    /// 文件连接走原子发布:先写同目录临时文件,再改名覆盖目标,读连接不会
-    /// 观察到写了一半的镜像。
+    /// `preserve` 只走原子发布:先写同目录临时文件,再改名覆盖目标,读连接
+    /// 不会观察到写了一半的镜像。`delete`/`truncate` 先把将被替换的旧镜像
+    /// 写成 `<db>-journal`,再发布新镜像,最后删除或截断日志。
     fn publish(&mut self) -> Result<(), SqlError> {
-        if let Some(path) = &self.filename {
-            self.engine.save_atomic(path)?;
+        let Some(path) = self.filename.clone()
+        else {
+            return Ok(());
+        };
+        match self.journal_mode {
+            JournalMode::Preserve => self.engine.save_atomic(&path),
+            JournalMode::Delete | JournalMode::Truncate => self.publish_journaled(&path),
+        }
+    }
+
+    /// 写日志 → 发布 → 清日志。任何一步失败都保留前一阶段已落盘的产物,
+    /// 让下一次打开按日志回滚。
+    fn publish_journaled(&mut self, path: &Path) -> Result<(), SqlError> {
+        let journaled = path.exists();
+        if journaled {
+            let previous = fs::read(path).map_err(storage_error)?;
+            journal::write(path, &previous, self.synchronous).map_err(storage_error)?;
+        }
+        #[cfg(test)]
+        if self.fail_point == Some(FailPoint::AfterJournal) {
+            return Err(SqlError::new("injected", "failure point after journal"));
+        }
+        self.engine.save_atomic(path)?;
+        #[cfg(test)]
+        if self.fail_point == Some(FailPoint::AfterPublish) {
+            return Err(SqlError::new("injected", "failure point after publish"));
+        }
+        if journaled {
+            journal::finish(path, self.journal_mode == JournalMode::Truncate).map_err(storage_error)?;
         }
         Ok(())
     }
+}
+
+/// 读取主文件并回放热日志。
+///
+/// 写连接把回滚后的镜像原子写回主文件,再按模式清理日志;只读连接只在内存
+/// 里返回回滚结果,不改动磁盘上的任何文件。
+fn load_recovered(path: &Path, read_only: bool, journal_mode: JournalMode, synchronous: bool) -> Result<Vec<u8>, SqlError> {
+    let main = fs::read(path).map_err(storage_error)?;
+    let journal_path = journal::sidecar(path);
+    let journal_bytes = match fs::read(&journal_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(main),
+        Err(error) => return Err(storage_error(error)),
+    };
+    let Some(recovered) = journal::apply(&main, &journal_bytes)
+    else {
+        return Ok(main);
+    };
+    if !read_only {
+        restore_atomic(path, &recovered, synchronous)?;
+        journal::finish(path, journal_mode == JournalMode::Truncate).map_err(storage_error)?;
+    }
+    Ok(recovered)
+}
+
+/// 把回滚结果原子写回主文件,使清理日志前的磁盘状态已是旧镜像。
+fn restore_atomic(path: &Path, image: &[u8], synchronous: bool) -> Result<(), SqlError> {
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(format!(".{}.recover", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    let result = (|| -> std::io::Result<()> {
+        if synchronous {
+            let mut file = File::create(&temporary)?;
+            file.write_all(image)?;
+            file.sync_all()?;
+        }
+        else {
+            fs::write(&temporary, image)?;
+        }
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(storage_error)
 }
 
 impl std::fmt::Debug for Connection {
@@ -778,6 +947,198 @@ mod tests {
         assert_eq!(insert.columns(), Some(vec!["a".to_string()]));
         assert_eq!(reader.run(&insert, &[]).expect_err("write rejected").code, "read-only");
         fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
+    }
+
+    #[test]
+    fn journal_mode_parses_only_the_supported_names() {
+        assert_eq!(JournalMode::parse("preserve").expect("preserve"), JournalMode::Preserve);
+        assert_eq!(JournalMode::parse("DELETE").expect("delete"), JournalMode::Delete);
+        assert_eq!(JournalMode::parse(" truncate ").expect("truncate"), JournalMode::Truncate);
+        assert_eq!(JournalMode::parse("wal").expect_err("wal is not implemented").code, "unsupported");
+        assert_eq!(JournalMode::parse("off").expect_err("off is not a rollback journal").code, "unsupported");
+        assert_eq!(JournalMode::Delete.as_str(), "delete");
+    }
+
+    /// 目录里不得留下发布或恢复用的临时文件。
+    fn assert_no_temporary_files(path: &Path) {
+        for entry in fs::read_dir(path.parent().expect("parent directory")).expect("list directory") {
+            let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+            assert!(!name.contains(".tmp") && !name.contains(".recover"), "leftover temporary file: {name}");
+        }
+    }
+
+    #[test]
+    fn delete_journal_is_removed_after_every_commit() {
+        let path = temp_path("journal-delete");
+        let mut connection = Connection::open(ConnectionOptions {
+            filename: Some(path.clone()),
+            journal_mode: JournalMode::Delete,
+            ..Default::default()
+        })
+        .expect("file connection");
+        let journal = database_storage::sqlite::journal::sidecar(&path);
+        connection.execute("CREATE TABLE t (a INTEGER)", &[]).expect("create publishes");
+        assert!(!journal.exists(), "a finished commit leaves no journal in delete mode");
+        connection.execute("INSERT INTO t VALUES (1)", &[]).expect("insert publishes");
+        assert!(!journal.exists(), "a finished commit leaves no journal in delete mode");
+        assert_eq!(rows_on_disk(&path, "SELECT a FROM t"), vec![vec![Cell::Integer(1)]]);
+        connection.close().expect("close");
+        assert_no_temporary_files(&path);
+        fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
+    }
+
+    #[test]
+    fn truncate_journal_stays_as_a_zero_byte_file_after_commit() {
+        let path = temp_path("journal-truncate");
+        let mut connection = Connection::open(ConnectionOptions {
+            filename: Some(path.clone()),
+            journal_mode: JournalMode::Truncate,
+            ..Default::default()
+        })
+        .expect("file connection");
+        let journal = database_storage::sqlite::journal::sidecar(&path);
+        connection.execute("CREATE TABLE t (a INTEGER)", &[]).expect("create publishes");
+        connection.execute("INSERT INTO t VALUES (7)", &[]).expect("insert publishes");
+        assert!(journal.exists(), "truncate mode keeps a zero-byte sidecar");
+        assert_eq!(fs::metadata(&journal).expect("journal metadata").len(), 0);
+        assert_eq!(rows_on_disk(&path, "SELECT a FROM t"), vec![vec![Cell::Integer(7)]]);
+        connection.close().expect("close");
+        assert_no_temporary_files(&path);
+        fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
+    }
+
+    /// 主文件已发布、日志尚未清理时崩溃:重新打开必须回滚到旧镜像。
+    #[test]
+    fn a_hot_journal_rolls_back_a_published_commit_on_reopen() {
+        let path = temp_path("journal-after-publish");
+        let mut connection = Connection::open(ConnectionOptions {
+            filename: Some(path.clone()),
+            journal_mode: JournalMode::Delete,
+            ..Default::default()
+        })
+        .expect("file connection");
+        connection.execute("CREATE TABLE t (a INTEGER)", &[]).expect("create publishes");
+        connection.execute("INSERT INTO t VALUES (1)", &[]).expect("insert publishes");
+        let before = fs::read(&path).expect("previous image");
+        let journal = database_storage::sqlite::journal::sidecar(&path);
+
+        connection.fail_point = Some(FailPoint::AfterPublish);
+        let error = connection.execute("INSERT INTO t VALUES (2)", &[]).expect_err("injected crash");
+        assert_eq!(error.code, "injected");
+        drop(connection);
+
+        assert!(journal.exists(), "the journal outlives the interrupted commit");
+        assert_ne!(fs::read(&path).expect("published image"), before, "the publish really replaced the main file");
+
+        // A read-only reopen replays the journal in memory and leaves the disk alone.
+        let mut reader = Connection::open(ConnectionOptions { filename: Some(path.clone()), read_only: true, ..Default::default() })
+            .expect("read-only reopen");
+        assert_eq!(reader.execute("SELECT a FROM t", &[]).expect("read")[0].rows, vec![vec![Cell::Integer(1)]]);
+        drop(reader);
+        assert!(journal.exists(), "a read-only connection must not delete the journal");
+
+        // A writable reopen restores the old image first, then clears the journal.
+        let mut reopened = Connection::open(ConnectionOptions {
+            filename: Some(path.clone()),
+            journal_mode: JournalMode::Delete,
+            ..Default::default()
+        })
+        .expect("writable reopen");
+        assert_eq!(reopened.execute("SELECT a FROM t", &[]).expect("read")[0].rows, vec![vec![Cell::Integer(1)]]);
+        assert!(!journal.exists(), "recovery clears the journal before the next commit");
+        assert_eq!(fs::read(&path).expect("restored image"), before);
+        reopened.close().expect("close");
+        assert_no_temporary_files(&path);
+        fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
+    }
+
+    /// 日志已落盘、主文件尚未发布时崩溃:主文件保持旧镜像,恢复不产生半镜像。
+    #[test]
+    fn a_journal_without_a_published_image_keeps_the_old_main_file() {
+        let path = temp_path("journal-after-journal");
+        let mut connection = Connection::open(ConnectionOptions {
+            filename: Some(path.clone()),
+            journal_mode: JournalMode::Truncate,
+            ..Default::default()
+        })
+        .expect("file connection");
+        connection.execute("CREATE TABLE t (a INTEGER)", &[]).expect("create publishes");
+        connection.execute("INSERT INTO t VALUES (1)", &[]).expect("insert publishes");
+        let before = fs::read(&path).expect("previous image");
+
+        connection.fail_point = Some(FailPoint::AfterJournal);
+        assert_eq!(connection.execute("INSERT INTO t VALUES (2)", &[]).expect_err("injected crash").code, "injected");
+        drop(connection);
+
+        let journal = database_storage::sqlite::journal::sidecar(&path);
+        assert!(fs::metadata(&journal).expect("journal exists").len() > 0, "the journal holds the old page images");
+        assert_eq!(fs::read(&path).expect("main file untouched"), before, "no half image reached the main file");
+
+        let mut reopened = Connection::open(ConnectionOptions {
+            filename: Some(path.clone()),
+            journal_mode: JournalMode::Truncate,
+            ..Default::default()
+        })
+        .expect("writable reopen");
+        assert_eq!(reopened.execute("SELECT a FROM t", &[]).expect("read")[0].rows, vec![vec![Cell::Integer(1)]]);
+        assert_eq!(fs::metadata(&journal).expect("journal exists").len(), 0, "recovery honours truncate mode");
+        reopened.close().expect("close");
+        assert_no_temporary_files(&path);
+        fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
+    }
+
+    /// 外部 SQLite 引擎必须能识别本绑定写出的 rollback journal 并完成回滚。
+    #[test]
+    fn the_reference_engine_rolls_back_a_hot_journal_written_by_this_binding() {
+        let python = reference_python().expect("a Python interpreter with sqlite3 is required for the interop test");
+        let path = temp_path("journal-interop");
+        let mut connection = Connection::open(ConnectionOptions {
+            filename: Some(path.clone()),
+            journal_mode: JournalMode::Delete,
+            ..Default::default()
+        })
+        .expect("file connection");
+        connection.execute("CREATE TABLE t (a INTEGER)", &[]).expect("create publishes");
+        connection.execute("INSERT INTO t VALUES (1)", &[]).expect("insert publishes");
+        connection.fail_point = Some(FailPoint::AfterPublish);
+        assert_eq!(connection.execute("INSERT INTO t VALUES (2)", &[]).expect_err("injected crash").code, "injected");
+        drop(connection);
+
+        let script = r#"
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",), "integrity_check"
+assert db.execute("SELECT count(*) FROM t").fetchone() == (1,), "the hot journal restores the previous image"
+db.close()
+"#;
+        let output = std::process::Command::new(python)
+            .args(["-c", script, path.to_str().expect("utf-8 path")])
+            .output()
+            .expect("spawn upstream sqlite");
+        assert!(output.status.success(), "upstream SQLite rejected the rollback journal: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(!database_storage::sqlite::journal::sidecar(&path).exists(), "SQLite removes the journal after rollback");
+
+        let mut reopened = Connection::open(ConnectionOptions {
+            filename: Some(path.clone()),
+            journal_mode: JournalMode::Delete,
+            ..Default::default()
+        })
+        .expect("reopen after the external rollback");
+        assert_eq!(reopened.execute("SELECT a FROM t", &[]).expect("read")[0].rows, vec![vec![Cell::Integer(1)]]);
+        fs::remove_dir_all(path.parent().expect("parent directory")).expect("cleanup");
+    }
+
+    /// 第一个装有 `sqlite3` 模块的解释器，与 facade 其他互操作用例同一探测口径。
+    fn reference_python() -> Option<String> {
+        ["python3", "python"].into_iter().find_map(|candidate| {
+            std::process::Command::new(candidate)
+                .args(["-c", "import sqlite3"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+                .then(|| candidate.to_string())
+        })
     }
 
     #[test]
