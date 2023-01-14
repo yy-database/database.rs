@@ -17,7 +17,7 @@ use database_udf::{Budget as UdfBudget, HostMicroDefinition, HostRuntimeAdapter,
 
 use crate::{
     Affinity, Collation, ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TableRow, TextEncoding,
-    UpdateValue, affinity_of, decode_library_version, decode_record, read_index_table_with, read_table, validate_database,
+    UpdateValue, affinity_of, decode_library_version, decode_record, decode_varint, read_index_table_with, read_table, validate_database,
 };
 
 use super::{
@@ -1143,10 +1143,10 @@ pub struct Engine {
     /// Memoized uncorrelated subquery results for the running statement, keyed
     /// by the resolved subquery node address. Cleared before every statement.
     subquery_cache: std::cell::RefCell<HashMap<usize, SubqueryCache>>,
-    /// 单条语句内已解码的整表行,按小写表名索引。只缓存主库普通 rowid 表的
-    /// 无提示全表扫描,让自连接与同表内外层子查询共享一次解码。语句开始与
-    /// 结束都清空,不跨语句保留。
-    statement_scans: std::cell::RefCell<HashMap<String, Rc<Vec<Vec<Cell>>>>>,
+    /// 单条语句内已解码的整表行,按小写表名与该次解码所需的列掩码索引。只缓存
+    /// 主库普通 rowid 表的无提示全表扫描,让自连接与同表内外层子查询在读取同一
+    /// 批列时共享一次解码。语句开始与结束都清空,不跨语句保留。
+    statement_scans: std::cell::RefCell<HashMap<(String, Option<Vec<bool>>), Rc<Vec<Vec<Cell>>>>>,
     /// Set whenever an `OuterColumn` is read, so a subquery can tell whether it
     /// depended on the enclosing row and therefore must not be memoized.
     outer_read: std::cell::Cell<bool>,
@@ -4165,7 +4165,7 @@ impl Engine {
                     let mut offset = width + usize::from(!def.without_rowid);
                     let mut from_tables: Vec<Rc<Vec<Vec<Cell>>>> = Vec::with_capacity(from.len());
                     for entry in &from {
-                        let (columns, rows) = self.select_source(entry, &budget, None, None)?;
+                        let (columns, rows) = self.select_source(entry, &budget, None, None, None)?;
                         let visible = columns.width();
                         let width = visible + usize::from(columns.hidden_rowid());
                         sources.push(Source {
@@ -6598,11 +6598,17 @@ impl Engine {
         // `ORDER BY <rowid order> LIMIT n` reads only the leading rows, because
         // the scan order already satisfies that sort.
         let scan = scan.or_else(|| self.rowid_head_bound(first, &order, limit).map(ScanHint::Head));
+        // Columns the statement never reads are skipped while decoding the base
+        // table, so a `count(*)` join or an aggregate does not materialize every
+        // text cell. The mask is derived from the raw expressions; any shape it
+        // cannot attribute confidently falls back to decoding every column.
+        let masks = self.read_column_masks(first, &order);
         let mut sources = Vec::with_capacity(from.len());
         let mut tables: Vec<Rc<Vec<Vec<Cell>>>> = Vec::with_capacity(from.len());
         let mut offset = 0;
-        for table in from {
-            let (columns, rows) = self.select_source(table, budget, ctes, scan.as_ref())?;
+        for (index, table) in from.iter().enumerate() {
+            let keep = masks.as_ref().and_then(|masks| masks.get(index)).and_then(|mask| mask.as_deref());
+            let (columns, rows) = self.select_source(table, budget, ctes, scan.as_ref(), keep)?;
             let width = columns.width();
             let source = Source {
                 label: table.label().to_string(),
@@ -8308,6 +8314,97 @@ impl Engine {
         Some(offset.saturating_add(count))
     }
 
+    /// Per-`FROM` column masks for the projected read, or `None` when the shape
+    /// is not safe to prune.
+    ///
+    /// A mask marks the declared columns the statement can observe. Positions
+    /// outside the mask decode as [`Cell::Null`] and are never read, which keeps
+    /// text and blob cells out of memory for `count(*)`, single-column
+    /// projections and aggregates. Only main-schema rowid tables qualify; CTEs,
+    /// views, derived tables, WITHOUT ROWID tables and attached schemas keep
+    /// their full decode, and `USING` / `NATURAL` joins read coalesced slots
+    /// that the raw expressions never mention.
+    fn read_column_masks(&self, first: &SelectCore, order: &[OrderKey]) -> Option<Vec<Option<Vec<bool>>>> {
+        if first.from.is_empty()
+            || matches!(first.items, SelectItems::Star)
+            || !first.windows.is_empty()
+            || first.from.iter().any(|entry| entry.using.is_some() || entry.natural)
+        {
+            return None;
+        }
+        let defs: Vec<Option<&TableDef>> = first.from.iter().map(|entry| self.prunable_def(entry)).collect();
+        if defs.iter().all(Option::is_none) {
+            return None;
+        }
+        let mut masks: Vec<Option<Vec<bool>>> = defs.iter().map(|def| def.map(|def| vec![false; def.columns.len()])).collect();
+        let mut refs: Vec<&ColumnRef> = Vec::new();
+        let collected = match &first.items {
+            SelectItems::Named(items) => items.iter().all(|expr| collect_unmasked_columns(expr, &mut refs)),
+            _ => true,
+        } && first.filter.as_ref().is_none_or(|expr| collect_unmasked_columns(expr, &mut refs))
+            && first.group.iter().all(|expr| collect_unmasked_columns(expr, &mut refs))
+            && first.having.as_ref().is_none_or(|expr| collect_unmasked_columns(expr, &mut refs))
+            && order.iter().all(|key| collect_unmasked_columns(&key.expr, &mut refs))
+            && first.from.iter().all(|entry| entry.on.as_ref().is_none_or(|expr| collect_unmasked_columns(expr, &mut refs)));
+        if !collected {
+            return None;
+        }
+        for column in refs {
+            let matched: Vec<usize> = match column.qualifier.as_deref() {
+                Some(qualifier) => (0..first.from.len()).filter(|index| first.from[*index].label().eq_ignore_ascii_case(qualifier)).collect(),
+                None => {
+                    // An unqualified name over several sources cannot be
+                    // attributed without the resolver, so keep every column.
+                    if first.from.len() > 1 {
+                        return None;
+                    }
+                    vec![0]
+                }
+            };
+            for index in matched {
+                let Some(mask) = masks[index].as_mut()
+                else {
+                    continue;
+                };
+                let def = defs[index].expect("a mask only exists for a prunable table");
+                match def.columns.iter().position(|column_def| column_def.name.eq_ignore_ascii_case(&column.name)) {
+                    Some(position) => mask[position] = true,
+                    // The implicit rowid slots stay available whatever the mask.
+                    None if is_rowid_alias(&column.name) => {}
+                    None => masks[index] = None,
+                }
+            }
+        }
+        Some(masks)
+    }
+
+    /// The definition of a plain main-schema rowid table, or `None` when the
+    /// `FROM` entry can resolve to a view, CTE, temp table or WITHOUT ROWID
+    /// table whose rows are materialized by another path.
+    fn prunable_def(&self, entry: &TableRef) -> Option<&TableDef> {
+        if entry.query.is_some() {
+            return None;
+        }
+        let main = match entry.schema.as_deref() {
+            None => true,
+            Some(qualifier) => {
+                qualifier.eq_ignore_ascii_case("main") || self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+            }
+        };
+        if !main {
+            return None;
+        }
+        let key = entry.name.to_ascii_lowercase();
+        // Views and temp tables shadow the main table in the resolver, so any
+        // lookup they could win keeps the full decode.
+        if self.views.contains_key(&key) || self.temp_views.contains_key(&key) || self.temp_lookup.contains_key(&key) {
+            return None;
+        }
+        let position = self.table_lookup.get(&key).copied()?;
+        let def = &self.tables[position];
+        if def.without_rowid { None } else { Some(def) }
+    }
+
     /// 按候选 rowid 读取行,保持升序。
     ///
     /// 候选稠密时用一次 `[first, last]` 范围读后按集合过滤,避免对每个 rowid
@@ -8348,6 +8445,7 @@ impl Engine {
         budget: &Budget,
         ctes: Option<&CteEnv>,
         scan: Option<&ScanHint>,
+        keep: Option<&[bool]>,
     ) -> Result<(SourceColumns<'b>, Rc<Vec<Vec<Cell>>>), SqlError> {
         if let Some(query) = &table.query {
             let result = self.select_statement(query, &[], budget, ctes)?;
@@ -8440,9 +8538,10 @@ impl Engine {
                 return Ok((SourceColumns::Table(def), Rc::new(decoded)));
             }
             // 无扫描提示的普通全表扫描在本语句内只解码一次。自连接和内外层
-            // 同表子查询因此共享同一份行集,结果与逐次解码完全一致。
+            // 同表子查询因此共享同一份行集,结果与逐次解码完全一致。缓存键含
+            // 列掩码:同表的不同投影各自保留一份裁剪后的行集。
             if scan.is_none() {
-                let key = def.name.to_ascii_lowercase();
+                let key = (def.name.to_ascii_lowercase(), keep.map(<[bool]>::to_vec));
                 if let Some(cached) = self.statement_scans.borrow().get(&key) {
                     return Ok((SourceColumns::Table(def), Rc::clone(cached)));
                 }
@@ -8450,7 +8549,7 @@ impl Engine {
                     .writer
                     .table_rows(&def.name, TableLimits::default())
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
-                let decoded = Rc::new(decode_stored_rows(&stored, def)?);
+                let decoded = Rc::new(decode_stored_rows(&stored, def, keep)?);
                 self.statement_scans.borrow_mut().insert(key, Rc::clone(&decoded));
                 return Ok((SourceColumns::Table(def), decoded));
             }
@@ -8479,7 +8578,7 @@ impl Engine {
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
                 None => unreachable!("plain table scans are cached above"),
             };
-            return Ok((SourceColumns::Table(def), Rc::new(decode_stored_rows(&stored, def)?)));
+            return Ok((SourceColumns::Table(def), Rc::new(decode_stored_rows(&stored, def, keep)?)));
         }
         if table.schema.is_none() {
             // The attached databases come after temp and main in the search
@@ -8527,7 +8626,7 @@ impl Engine {
                 .writer
                 .table_rows(&def.name, TableLimits::default())
                 .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
-            return Ok((SourceColumns::Table(def), Rc::new(decode_stored_rows(&stored, def)?)));
+            return Ok((SourceColumns::Table(def), Rc::new(decode_stored_rows(&stored, def, None)?)));
         }
         Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{}", table.name)).in_statement("select"))
     }
@@ -11711,10 +11810,11 @@ fn count_join_level(
                 let position = right.partition_point(|row| matches!(&row[within], Cell::Integer(value) if *value < key));
                 if let Some(row) = right.get(position) {
                     if matches!(&row[within], Cell::Integer(value) if *value == key) {
+                        // The probe is the whole `ON` equality: an integer
+                        // rowid equal to the integer the probe produced makes
+                        // it true without re-evaluating the comparison.
                         merged[start..end].clone_from_slice(row);
-                        if truthiness(&on.eval(merged, ctx)?) == Some(true) {
-                            count_join_level(index + 1, relation, ons, tables, probes, conjuncts, ctx, merged, count)?;
-                        }
+                        count_join_level(index + 1, relation, ons, tables, probes, conjuncts, ctx, merged, count)?;
                     }
                 }
                 return Ok(());
@@ -11723,9 +11823,7 @@ fn count_join_level(
             for row in right {
                 if matches!(&row[within], Cell::Integer(value) if *value == key) {
                     merged[start..end].clone_from_slice(row);
-                    if truthiness(&on.eval(merged, ctx)?) == Some(true) {
-                        count_join_level(index + 1, relation, ons, tables, probes, conjuncts, ctx, merged, count)?;
-                    }
+                    count_join_level(index + 1, relation, ons, tables, probes, conjuncts, ctx, merged, count)?;
                 }
             }
             return Ok(());
@@ -11801,10 +11899,11 @@ fn join_rows(
                             for &position in positions {
                                 let mut merged = left.clone();
                                 merged[source.offset..source.offset + width].clone_from_slice(&tables[index][position]);
-                                if truthiness(&on.eval(&merged, ctx)?) == Some(true) {
-                                    ctx.budget.charge(1)?;
-                                    next.push(merged);
-                                }
+                                // The probe is the whole `ON` equality and the
+                                // matched rowid is the same integer, so the
+                                // comparison is already true.
+                                ctx.budget.charge(1)?;
+                                next.push(merged);
                             }
                         }
                     }
@@ -14683,13 +14782,29 @@ fn write_value_cell(value: &crate::WriteValue) -> Cell {
 }
 
 fn decode_row(payload: &[u8], def: &TableDef, rowid: i64) -> Result<Vec<Cell>, SqlError> {
-    let mut cells = decode_cells(payload)?;
+    decode_row_masked(payload, def, rowid, None)
+}
+
+/// Decodes one stored row, keeping only the declared columns `keep` flags.
+///
+/// A skipped position still walks its serial type and body bounds, so a corrupt
+/// payload fails exactly as in the full decode, but its text or blob value is
+/// never materialized. `None` keeps every column.
+fn decode_row_masked(payload: &[u8], def: &TableDef, rowid: i64, keep: Option<&[bool]>) -> Result<Vec<Cell>, SqlError> {
+    let mut cells = decode_cells_kept(payload, keep)?;
     // A record written before `ALTER TABLE ADD COLUMN` is short; SQLite reads
     // the missing trailing columns as their declared default.
     while cells.len() < def.columns.len() {
-        let column = &def.columns[cells.len()];
-        let value = column.default_value.clone().unwrap_or(crate::WriteValue::Null);
-        cells.push(write_value_cell(&crate::apply_write_affinity(&column.declared_type, value)));
+        let kept = keep.is_none_or(|mask| mask.get(cells.len()).copied().unwrap_or(false));
+        let value = if kept {
+            let column = &def.columns[cells.len()];
+            let value = column.default_value.clone().unwrap_or(crate::WriteValue::Null);
+            write_value_cell(&crate::apply_write_affinity(&column.declared_type, value))
+        }
+        else {
+            Cell::Null
+        };
+        cells.push(value);
     }
     cells.truncate(def.columns.len());
     if let Some(index) = def.rowid_alias {
@@ -14701,11 +14816,11 @@ fn decode_row(payload: &[u8], def: &TableDef, rowid: i64) -> Result<Vec<Cell>, S
 }
 
 /// Decodes stored row payloads into merged rows, appending each hidden rowid.
-fn decode_stored_rows(stored: &[TableRow], def: &TableDef) -> Result<Vec<Vec<Cell>>, SqlError> {
+fn decode_stored_rows(stored: &[TableRow], def: &TableDef, keep: Option<&[bool]>) -> Result<Vec<Vec<Cell>>, SqlError> {
     stored
         .iter()
         .map(|row| {
-            let mut cells = decode_row(&row.payload, def, row.rowid)?;
+            let mut cells = decode_row_masked(&row.payload, def, row.rowid, keep)?;
             // Rowid tables expose the implicit integer primary key through
             // `rowid`, `_rowid_` and `oid`.
             cells.push(Cell::Integer(row.rowid));
@@ -14713,6 +14828,129 @@ fn decode_stored_rows(stored: &[TableRow], def: &TableDef) -> Result<Vec<Vec<Cel
         })
         .collect()
 }
+
+/// Collects the column references one expression can read, refusing any node
+/// whose reads cannot be attributed from the raw AST.
+///
+/// Subqueries may read the enclosing row through a correlation, and window
+/// functions carry their own partition and order expressions; both keep the
+/// full decode instead of guessing.
+fn collect_unmasked_columns<'a>(expr: &'a Expr, out: &mut Vec<&'a ColumnRef>) -> bool {
+    match expr {
+        Expr::Column(column) => {
+            out.push(column);
+            true
+        }
+        Expr::Literal(_) | Expr::Parameter { .. } => true,
+        Expr::Unary { value, .. }
+        | Expr::IsNull { value, .. }
+        | Expr::IsTruth { value, .. }
+        | Expr::Not(value)
+        | Expr::Cast { value, .. }
+        | Expr::Collate { value, .. }
+        | Expr::Alias { value, .. } => collect_unmasked_columns(value, out),
+        Expr::Binary { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::IsDistinct { left, right, .. }
+        | Expr::Glob { value: left, pattern: right, .. } => collect_unmasked_columns(left, out) && collect_unmasked_columns(right, out),
+        Expr::And(left, right) | Expr::Or(left, right) => collect_unmasked_columns(left, out) && collect_unmasked_columns(right, out),
+        Expr::Case { operand, branches, otherwise } => {
+            operand.as_ref().is_none_or(|operand| collect_unmasked_columns(operand, out))
+                && branches.iter().all(|(condition, result)| collect_unmasked_columns(condition, out) && collect_unmasked_columns(result, out))
+                && otherwise.as_ref().is_none_or(|otherwise| collect_unmasked_columns(otherwise, out))
+        }
+        Expr::In { value, list, .. } => collect_unmasked_columns(value, out) && list.iter().all(|item| collect_unmasked_columns(item, out)),
+        Expr::Function { args, .. } | Expr::HostFunction { args, .. } => args.iter().all(|arg| collect_unmasked_columns(arg, out)),
+        Expr::Aggregate { argument, separator, filter, order, .. } => {
+            argument.as_ref().is_none_or(|argument| collect_unmasked_columns(argument, out))
+                && separator.as_ref().is_none_or(|separator| collect_unmasked_columns(separator, out))
+                && filter.as_ref().is_none_or(|filter| collect_unmasked_columns(filter, out))
+                && order.iter().all(|key| collect_unmasked_columns(&key.expr, out))
+        }
+        Expr::Like { value, pattern, escape, .. } => {
+            collect_unmasked_columns(value, out)
+                && collect_unmasked_columns(pattern, out)
+                && escape.as_ref().is_none_or(|escape| collect_unmasked_columns(escape, out))
+        }
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } | Expr::Window { .. } => false,
+    }
+}
+
+/// Decodes one record payload, materializing only the positions `keep` flags.
+///
+/// Mirrors the storage record decoder for layout validation (header and body
+/// bounds, reserved serial types, column limit, trailing bytes) while skipping
+/// the text and blob conversion of columns the statement never reads.
+fn decode_cells_kept(payload: &[u8], keep: Option<&[bool]>) -> Result<Vec<Cell>, SqlError> {
+    let limits = RecordLimits { max_columns: 1024, max_payload_bytes: 16 * 1024 * 1024 };
+    let storage = |message: &str| SqlError::new("storage", message).in_statement("select");
+    if payload.len() > limits.max_payload_bytes {
+        return Err(storage("sqlite record payload limit exceeded"));
+    }
+    let (header_size, mut header_offset) = decode_varint(payload).map_err(|error| storage(&error.to_string()))?;
+    let header_size = usize::try_from(header_size).map_err(|_| storage("sqlite record header size overflow"))?;
+    if header_size < header_offset || header_size > payload.len() {
+        return Err(storage("sqlite record header size invalid"));
+    }
+    let mut body_offset = header_size;
+    let mut cells = Vec::new();
+    while header_offset < header_size {
+        if cells.len() >= limits.max_columns {
+            return Err(storage("sqlite record column limit exceeded"));
+        }
+        let (serial, consumed) = decode_varint(&payload[header_offset..header_size]).map_err(|error| storage(&error.to_string()))?;
+        header_offset += consumed;
+        let length = match serial {
+            0 | 8 | 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 | 7 => 8,
+            10 | 11 => return Err(storage("sqlite reserved serial type")),
+            serial => usize::try_from((serial - 12) / 2).map_err(|_| storage("sqlite serial length overflow"))?,
+        };
+        let end = body_offset.checked_add(length).filter(|end| *end <= payload.len()).ok_or_else(|| storage("truncated sqlite record body"))?;
+        let bytes = &payload[body_offset..end];
+        let position = cells.len();
+        let kept = keep.is_none_or(|mask| mask.get(position).copied().unwrap_or(false));
+        cells.push(if kept {
+            match serial {
+                0 => Cell::Null,
+                1..=6 => Cell::Integer(signed_record_integer(bytes)),
+                7 => Cell::Real(f64::from_bits(u64::from_be_bytes(bytes.try_into().expect("eight-byte real")))),
+                8 => Cell::Integer(0),
+                9 => Cell::Integer(1),
+                serial if serial % 2 == 0 => Cell::Blob(bytes.to_vec()),
+                _ => Cell::Text(record_text(bytes)?),
+            }
+        }
+        else {
+            Cell::Null
+        });
+        body_offset = end;
+    }
+    if body_offset != payload.len() {
+        return Err(storage("sqlite record has trailing body bytes"));
+    }
+    Ok(cells)
+}
+
+/// Decodes one record text field exactly as the storage decoder does.
+fn record_text(bytes: &[u8]) -> Result<String, SqlError> {
+    std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| SqlError::new("storage", "sqlite non-unicode UTF-8 text").in_statement("select"))
+}
+
+/// Sign-extends a big-endian SQLite integer field of one to eight bytes.
+fn signed_record_integer(bytes: &[u8]) -> i64 {
+    let mut value = if bytes[0] & 0x80 != 0 { u64::MAX } else { 0 };
+    for byte in bytes {
+        value = (value << 8) | u64::from(*byte);
+    }
+    value as i64
+}
+
 /// Decodes a raw record into cells without expanding an implicit rowid alias.
 fn decode_cells(payload: &[u8]) -> Result<Vec<Cell>, SqlError> {
     let limits = RecordLimits { max_columns: 1024, max_payload_bytes: 16 * 1024 * 1024 };
@@ -17782,6 +18020,103 @@ db.close()
             std::env::temp_dir().join(format!("sqlite-{label}-{}-{stamp}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::SeqCst)));
         std::fs::create_dir_all(&directory).expect("create temp directory");
         directory
+    }
+
+    /// 只读一列的投影必须与整行解码得到同一批行:未读列的掩码只是不构造
+    /// `Cell`,不能改变 WHERE、ORDER BY、DISTINCT 或聚合看到的值。
+    #[test]
+    fn column_masks_preserve_projected_rows() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute_batch(&[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, score REAL, payload BLOB, note TEXT)".to_string(),
+                "INSERT INTO t VALUES (1, 'alpha', 1.5, x'0102', NULL), (2, 'beta', NULL, NULL, 'x'), (3, NULL, 2.25, x'ff', 'y')".to_string(),
+            ])
+            .expect("seed");
+        let full = engine.execute_one("SELECT id, label, score, payload, note FROM t").expect("full decode").rows;
+        assert_eq!(
+            engine.execute_one("SELECT id FROM t").expect("id projection").rows,
+            full.iter().map(|row| vec![row[0].clone()]).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            engine.execute_one("SELECT label FROM t ORDER BY id DESC").expect("label projection").rows,
+            full.iter().rev().map(|row| vec![row[1].clone()]).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            engine.execute_one("SELECT count(*), sum(score), min(score), max(score) FROM t").expect("aggregate").rows,
+            vec![vec![Cell::Integer(3), Cell::Real(3.75), Cell::Real(1.5), Cell::Real(2.25)]]
+        );
+        // An unprojected column still filters and sorts by its decoded value.
+        assert_eq!(engine.execute_one("SELECT id FROM t WHERE label = 'beta'").expect("filter").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(
+            engine.execute_one("SELECT id FROM t ORDER BY label DESC").expect("sort").rows,
+            vec![vec![Cell::Integer(2)], vec![Cell::Integer(1)], vec![Cell::Integer(3)]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT DISTINCT label FROM t ORDER BY label").expect("distinct").rows,
+            vec![vec![Cell::Null], vec![Cell::Text("alpha".to_string())], vec![Cell::Text("beta".to_string())]]
+        );
+        // A short record from `ALTER TABLE ADD COLUMN` reads its default through
+        // the same mask when the new column is the only projection.
+        engine.execute_one("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'd'").expect("add column");
+        assert_eq!(
+            engine.execute_one("SELECT extra FROM t ORDER BY id").expect("default").rows,
+            vec![vec![Cell::Text("d".to_string())]; 3]
+        );
+    }
+
+    /// 连接计数走裁剪后的行集与 rowid 探针时,行数必须与非连接的全扫描
+    /// `WHERE` 路径逐行一致。
+    #[test]
+    fn pruned_join_count_matches_nested_scan() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let mut batch = vec!["CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT, score REAL)".to_string()];
+        for row in 1..=200 {
+            batch.push(format!("INSERT INTO items VALUES ({row}, 'row-{row}', {})", row as f64 / 4.0));
+        }
+        engine.execute_batch(&batch).expect("seed");
+        let joined = engine.execute_one("SELECT count(*) FROM items JOIN items AS b ON b.id = items.id % 7").expect("join").rows;
+        let nested = engine.execute_one("SELECT count(*) FROM items, items AS b WHERE b.id = items.id % 7").expect("nested").rows;
+        assert_eq!(joined, nested);
+        // Rowids 7, 14, ..., 196 probe key 0, which has no row, so 200 - 28 remain.
+        assert_eq!(joined, vec![vec![Cell::Integer(172)]]);
+        // Materializing the join keeps the left-major order and both columns.
+        assert_eq!(
+            engine
+                .execute_one(
+                    "SELECT items.id, b.label FROM items JOIN items AS b ON b.id = items.id % 7 WHERE items.id <= 20 ORDER BY items.id"
+                )
+                .expect("join projection")
+                .rows,
+            engine
+                .execute_one("SELECT items.id, b.label FROM items, items AS b WHERE b.id = items.id % 7 AND items.id <= 20 ORDER BY items.id")
+                .expect("nested projection")
+                .rows
+        );
+    }
+
+    /// 索引区间读取只解码投影与谓词需要的列时,行集和按索引首列的顺序都
+    /// 必须与去掉索引后的全扫描一致。
+    #[test]
+    fn masked_index_range_matches_full_scan() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute_batch(&[
+                "CREATE TABLE words(id INTEGER PRIMARY KEY, label TEXT, score REAL)".to_string(),
+                "CREATE UNIQUE INDEX words_label ON words(label)".to_string(),
+                "INSERT INTO words VALUES (1, 'b', 1.0), (2, 'a', 2.0), (3, 'aa', 3.0), (4, 'ab', 4.0), (5, 'a10', 5.0), (6, 'b0', 6.0)"
+                    .to_string(),
+            ])
+            .expect("seed");
+        let sql = "SELECT id FROM words WHERE label BETWEEN 'a' AND 'b' ORDER BY label";
+        let indexed = engine.execute_one(sql).expect("index range").rows;
+        engine.execute_one("DROP INDEX words_label").expect("drop index");
+        let scanned = engine.execute_one(sql).expect("full scan").rows;
+        assert_eq!(indexed, scanned);
+        assert_eq!(
+            indexed,
+            vec![vec![Cell::Integer(2)], vec![Cell::Integer(5)], vec![Cell::Integer(3)], vec![Cell::Integer(4)], vec![Cell::Integer(1)]]
+        );
     }
 
     /// 第一个装有 `sqlite3` 模块的解释器,与互操作用例同一探测口径。
