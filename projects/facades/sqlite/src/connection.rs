@@ -12,6 +12,7 @@
 //!   再改名冒充备份。
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions, TryLockError},
     io::{ErrorKind, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -240,6 +241,41 @@ impl Prepared {
     }
 }
 
+/// 打开游标时返回的句柄与结果列标签。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorOpen {
+    /// 连接内的游标句柄;后续 [`Connection::cursor_next`] 与
+    /// [`Connection::cursor_close`] 都以它定位游标。
+    pub handle: u64,
+    /// 本次执行产生的结果列标签。
+    pub columns: Vec<String>,
+}
+
+/// 一次 [`Connection::cursor_next`] 返回的有界行窗口。
+#[derive(Clone, Debug, PartialEq)]
+pub struct CursorBatch {
+    /// 本窗口的行,保持结果顺序。
+    pub rows: Vec<Vec<Cell>>,
+    /// 游标是否已经到达结果集末尾。
+    pub done: bool,
+}
+
+/// 连接内的一个已执行结果集及其读取位置。
+///
+/// 行集在打开时由引擎一次性物化(引擎本身没有逐行执行接口),此后
+/// [`Connection::cursor_next`] 只按窗口切片,不重新执行 SQL。
+struct Cursor {
+    /// 完整结果集,按执行顺序。
+    rows: Vec<Vec<Cell>>,
+    /// 下一行要返回的下标。
+    position: usize,
+    /// 打开时所属事务的代数;`None` 表示在 autocommit 下打开。
+    ///
+    /// 事务结束时 [`Connection::transaction_epoch`] 前进,旧代数的游标随
+    /// 之以 `cursor-expired` 拒绝,与 SQLite 在事务结束后让语句失效一致。
+    transaction_epoch: Option<u64>,
+}
+
 /// 一个真实连接:引擎句柄、文件归属与提交边界都在这里。
 ///
 /// 文件写连接在打开时取得跨进程写锁并持有到 [`Connection::close`] 或句柄
@@ -264,6 +300,12 @@ pub struct Connection {
     journal_mode: JournalMode,
     /// 落盘时是否 `fsync`;回滚日志与恢复写回共用同一强度。
     synchronous: bool,
+    /// 本连接打开的结果游标表,以句柄为键。
+    cursors: BTreeMap<u64, Cursor>,
+    /// 下一个游标句柄。
+    next_cursor: u64,
+    /// 事务代数:每次事务结束(提交或回滚)前进一格。
+    transaction_epoch: u64,
     /// 仅测试使用的发布失败注入,用于在真实崩溃窗口上取证。
     #[cfg(test)]
     fail_point: Option<FailPoint>,
@@ -329,6 +371,9 @@ impl Connection {
             closed: false,
             journal_mode,
             synchronous,
+            cursors: BTreeMap::new(),
+            next_cursor: 0,
+            transaction_epoch: 0,
             #[cfg(test)]
             fail_point: None,
         };
@@ -391,7 +436,9 @@ impl Connection {
                 .in_statement(prepared.statement_name()));
         }
         let is_write = prepared.is_write();
+        let was_in_transaction = self.engine.in_transaction();
         let result = self.engine.execute_statement(&prepared.statement, parameters)?;
+        self.advance_epoch_if_transaction_ended(was_in_transaction);
         self.after_statement(is_write, &prepared.statement)?;
         Ok(result)
     }
@@ -409,11 +456,82 @@ impl Connection {
                 return Err(SqlError::new("bind-parameter", format!("statement expects {required} parameters, got {}", parameters.len()))
                     .in_statement(statement.name()));
             }
+            let was_in_transaction = self.engine.in_transaction();
             let result = self.engine.execute_statement(&statement, parameters)?;
+            self.advance_epoch_if_transaction_ended(was_in_transaction);
             self.after_statement(is_write, &statement)?;
             results.push(result);
         }
         Ok(results)
+    }
+
+    /// 执行一条预编译语句,把完整结果集放进连接内的游标表,返回句柄与表头。
+    ///
+    /// 与 [`Connection::run`] 共用同一条执行路径、只读拒绝、参数检查与提交
+    /// 边界;区别只在于结果集留给 [`Connection::cursor_next`] 按窗口消费。
+    /// 引擎没有逐行执行接口,所以行集在打开时仍一次性物化:句柄只做状态
+    /// 管理,不复制任何 SQL 语义。
+    ///
+    /// 事务内打开的游标记录当前事务代数;事务提交或回滚后调用
+    /// [`Connection::cursor_next`] 会以 `cursor-expired` 拒绝。
+    pub fn open_cursor(&mut self, prepared: &Prepared, parameters: &[Cell]) -> Result<CursorOpen, SqlError> {
+        self.guard_open()?;
+        self.guard_write(prepared.is_write())?;
+        let required = prepared.parameter_count();
+        if parameters.len() < required {
+            return Err(SqlError::new("bind-parameter", format!("statement expects {required} parameters, got {}", parameters.len()))
+                .in_statement(prepared.statement_name()));
+        }
+        let was_in_transaction = self.engine.in_transaction();
+        let ExecResult { columns, rows, .. } = self.engine.execute_statement(&prepared.statement, parameters)?;
+        self.advance_epoch_if_transaction_ended(was_in_transaction);
+        self.after_statement(prepared.is_write(), &prepared.statement)?;
+        let transaction_epoch = self.engine.in_transaction().then_some(self.transaction_epoch);
+        let handle = self.next_cursor;
+        self.next_cursor = self.next_cursor.wrapping_add(1);
+        self.cursors.insert(handle, Cursor { rows, position: 0, transaction_epoch });
+        Ok(CursorOpen { handle, columns })
+    }
+
+    /// 从游标读取至多 `limit` 行,返回本窗口与是否已到末尾。
+    ///
+    /// `done` 为真表示结果集已经取完,游标仍可调用 [`Connection::cursor_close`]
+    /// 释放。未知句柄以 `cursor-not-found` 拒绝,事务已结束的句柄以
+    /// `cursor-expired` 拒绝,已关闭的连接以 `db-closed` 拒绝。
+    pub fn cursor_next(&mut self, handle: u64, limit: usize) -> Result<CursorBatch, SqlError> {
+        self.guard_open()?;
+        let epoch = self.transaction_epoch;
+        let cursor = self.cursors.get_mut(&handle).ok_or_else(|| SqlError::new("cursor-not-found", format!("cursor {handle} is not open")))?;
+        if let Some(opened) = cursor.transaction_epoch {
+            if opened != epoch {
+                return Err(SqlError::new("cursor-expired", "cursor was opened inside a transaction that has already ended"));
+            }
+        }
+        let remaining = cursor.rows.len() - cursor.position;
+        let end = cursor.position + limit.min(remaining);
+        let rows = cursor.rows[cursor.position..end].to_vec();
+        cursor.position = end;
+        Ok(CursorBatch { rows, done: cursor.position == cursor.rows.len() })
+    }
+
+    /// 释放一个游标。未知句柄视为已释放,便于宿主在 `finally` 里安全清理。
+    pub fn cursor_close(&mut self, handle: u64) -> Result<(), SqlError> {
+        self.guard_open()?;
+        self.cursors.remove(&handle);
+        Ok(())
+    }
+
+    /// 当前连接仍持有的游标数量(测试与诊断用,不是作者面 API)。
+    #[doc(hidden)]
+    pub fn cursor_count(&self) -> usize {
+        self.cursors.len()
+    }
+
+    /// 事务结束时让代数前进,使事务内打开的游标失效。
+    fn advance_epoch_if_transaction_ended(&mut self, was_in_transaction: bool) {
+        if was_in_transaction && !self.engine.in_transaction() {
+            self.transaction_epoch = self.transaction_epoch.wrapping_add(1);
+        }
     }
 
     /// 把当前镜像完整写入 `path`,即真正的备份。
@@ -441,6 +559,7 @@ impl Connection {
             Ok(())
         };
         self.lock = None;
+        self.cursors.clear();
         published
     }
 
@@ -727,6 +846,114 @@ mod tests {
         assert_eq!(connection.run(&prepared, &[]).expect_err("write rejected").code, "read-only");
         let rows = connection.execute("SELECT 1", &[]).expect("reads still work").last().expect("result").rows.clone();
         assert_eq!(rows, vec![vec![Cell::Integer(1)]]);
+    }
+
+    /// 建表并一次性插入 `rows` 行 `(id, label)`,行内容可独立预言。
+    fn seed_rows(connection: &mut Connection, rows: usize) {
+        connection.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL)", &[]).expect("create");
+        let mut sql = String::from("INSERT INTO t (id, label) VALUES ");
+        for id in 1..=rows {
+            if id > 1 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({id}, 'row-{id}')"));
+        }
+        connection.execute(&sql, &[]).expect("seed");
+    }
+
+    #[test]
+    fn cursors_read_bounded_windows_in_order() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        seed_rows(&mut connection, 1000);
+        let prepared = connection.prepare("SELECT id, label FROM t ORDER BY id").expect("parses");
+        let opened = connection.open_cursor(&prepared, &[]).expect("cursor opens");
+        assert_eq!(opened.columns, vec!["id".to_string(), "label".to_string()]);
+
+        let mut seen = 0_i64;
+        loop {
+            let batch = connection.cursor_next(opened.handle, 256).expect("window");
+            assert!(batch.rows.len() <= 256, "the window is bounded");
+            for row in &batch.rows {
+                seen += 1;
+                assert_eq!(row, &vec![Cell::Integer(seen), Cell::Text(format!("row-{seen}"))]);
+            }
+            if batch.done {
+                break;
+            }
+        }
+        assert_eq!(seen, 1000);
+
+        connection.cursor_close(opened.handle).expect("close");
+        connection.cursor_close(opened.handle).expect("close is idempotent");
+        assert_eq!(connection.cursor_count(), 0);
+        assert_eq!(connection.cursor_next(opened.handle, 1).expect_err("released").code, "cursor-not-found");
+    }
+
+    #[test]
+    fn two_cursors_on_one_connection_read_independently() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        seed_rows(&mut connection, 10);
+        let ascending = connection.prepare("SELECT id FROM t ORDER BY id").expect("parses");
+        let descending = connection.prepare("SELECT id FROM t ORDER BY id DESC").expect("parses");
+        let first = connection.open_cursor(&ascending, &[]).expect("first cursor");
+        let second = connection.open_cursor(&descending, &[]).expect("second cursor");
+
+        assert_eq!(connection.cursor_next(first.handle, 3).expect("first window").rows, vec![
+            vec![Cell::Integer(1)],
+            vec![Cell::Integer(2)],
+            vec![Cell::Integer(3)]
+        ]);
+        assert_eq!(connection.cursor_next(second.handle, 3).expect("second window").rows, vec![
+            vec![Cell::Integer(10)],
+            vec![Cell::Integer(9)],
+            vec![Cell::Integer(8)]
+        ]);
+        assert_eq!(connection.cursor_next(first.handle, 3).expect("first continues").rows, vec![
+            vec![Cell::Integer(4)],
+            vec![Cell::Integer(5)],
+            vec![Cell::Integer(6)]
+        ]);
+        assert_eq!(connection.cursor_next(second.handle, 20).expect("second finishes").done, true);
+        connection.cursor_close(first.handle).expect("close first");
+        connection.cursor_close(second.handle).expect("close second");
+    }
+
+    #[test]
+    fn a_transaction_ending_invalidates_cursors_opened_inside_it() {
+        for control in ["ROLLBACK", "COMMIT"] {
+            let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+            seed_rows(&mut connection, 10);
+            let prepared = connection.prepare("SELECT id FROM t ORDER BY id").expect("parses");
+            connection.execute("BEGIN", &[]).expect("begin");
+            let opened = connection.open_cursor(&prepared, &[]).expect("cursor opens inside the transaction");
+            assert_eq!(connection.cursor_next(opened.handle, 2).expect("rows before the end").rows.len(), 2);
+            connection.execute(control, &[]).expect("transaction ends");
+            let error = connection.cursor_next(opened.handle, 2).expect_err("the cursor is stale");
+            assert_eq!(error.code, "cursor-expired");
+            connection.cursor_close(opened.handle).expect("the stale cursor still closes");
+            assert_eq!(connection.cursor_count(), 0);
+        }
+    }
+
+    #[test]
+    fn an_autocommit_cursor_survives_a_later_transaction() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        seed_rows(&mut connection, 10);
+        let prepared = connection.prepare("SELECT id FROM t ORDER BY id").expect("parses");
+        let opened = connection.open_cursor(&prepared, &[]).expect("autocommit cursor");
+        connection.execute("BEGIN", &[]).expect("begin");
+        connection.execute("COMMIT", &[]).expect("commit");
+        assert_eq!(connection.cursor_next(opened.handle, 3).expect("still valid").rows[0], vec![Cell::Integer(1)]);
+    }
+
+    #[test]
+    fn closing_the_connection_invalidates_open_cursors() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        seed_rows(&mut connection, 10);
+        let prepared = connection.prepare("SELECT id FROM t ORDER BY id").expect("parses");
+        let opened = connection.open_cursor(&prepared, &[]).expect("cursor opens");
+        connection.close().expect("close");
+        assert_eq!(connection.cursor_next(opened.handle, 1).expect_err("closed").code, "db-closed");
     }
 
     #[test]
