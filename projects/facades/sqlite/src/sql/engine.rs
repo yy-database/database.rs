@@ -15145,6 +15145,35 @@ mod tests {
         assert_eq!(result.rows, vec![vec![Cell::Text("ok".to_string())]]);
     }
 
+    /// 全表 `UPDATE` 会为每一行走一次删除加插入。删除留下的空洞由
+    /// `take_freeblock` 复用，剩余 1 到 3 字节记为页内碎片。多轮之后页头
+    /// 的 `nFrag`、指针数组与 cell content 边界必须仍然自洽，否则读取侧
+    /// 会报 “b-tree header invalid”。
+    #[test]
+    fn repeated_full_table_updates_keep_the_btree_valid() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute_one("CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT)").expect("create table");
+        for id in 1..=400 {
+            engine.execute_one(&format!("INSERT INTO t VALUES ({id}, 'aa')")).expect("insert row");
+        }
+        for round in 0..60u32 {
+            engine.execute_one("UPDATE t SET s = CASE WHEN s = 'aa' THEN 'a' ELSE 'aa' END").expect("update row");
+            let check = engine.execute_one("PRAGMA integrity_check").expect("check executes");
+            assert_eq!(check.rows, vec![vec![Cell::Text("ok".to_string())]], "integrity broke on round {round}");
+        }
+        let rows = engine.execute_one("SELECT id, s FROM t WHERE id <= 5").expect("read rows");
+        assert_eq!(
+            rows.rows,
+            vec![
+                vec![Cell::Integer(1), Cell::Text("aa".to_string())],
+                vec![Cell::Integer(2), Cell::Text("aa".to_string())],
+                vec![Cell::Integer(3), Cell::Text("aa".to_string())],
+                vec![Cell::Integer(4), Cell::Text("aa".to_string())],
+                vec![Cell::Integer(5), Cell::Text("aa".to_string())],
+            ]
+        );
+    }
+
     /// `EXPLAIN` reports the engine's own steps, `EXPLAIN QUERY PLAN` reports
     /// the accesses that will run, and neither executes the statement.
     #[test]

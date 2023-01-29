@@ -2329,11 +2329,23 @@ impl SqliteWriter {
     /// Reusing the hole a `DELETE` left behind keeps a `DELETE` + `INSERT`
     /// pair (an `UPDATE` row rewrite) from shifting the cell content area and
     /// eventually forcing a whole-leaf compaction. A remainder smaller than
-    /// the four-byte freeblock header is dropped, matching upstream
-    /// `allocateSpace`.
+    /// the four-byte freeblock header is counted as fragments, and the block
+    /// is ignored once those fragments would exceed the 60-byte page limit,
+    /// matching upstream `pageFindSlot`.
     fn take_freeblock(&mut self, page: u32, size: usize) -> Option<usize> {
         let offset = self.page_offset(page);
         let header_relative = Self::header_offset(page);
+        // 上游 `allocateSpace` 只在指针数组还能再放一项时才查 freeblock
+        // 链。少了这道检查，复用块里的新 cell 会让指针数组写进 cell
+        // content 区，页头的 content offset 与实际阵列重叠。
+        let kind = self.pages[offset + header_relative];
+        let header_size = if matches!(kind, PAGE_TABLE_INTERIOR | PAGE_INDEX_INTERIOR) { 12 } else { 8 };
+        let count = u16::from_be_bytes(self.pages[offset + header_relative + 3..offset + header_relative + 5].try_into().unwrap()) as usize;
+        let raw_start = u16::from_be_bytes(self.pages[offset + header_relative + 5..offset + header_relative + 7].try_into().unwrap());
+        let content_start = if raw_start == 0 { 65_536 } else { raw_start as usize };
+        if header_relative + header_size + count * 2 + 2 > content_start {
+            return None;
+        }
         let mut link = header_relative + 1;
         let mut cursor =
             u16::from_be_bytes(self.pages[offset + header_relative + 1..offset + header_relative + 3].try_into().unwrap()) as usize;
@@ -2341,8 +2353,14 @@ impl SqliteWriter {
             let next = u16::from_be_bytes(self.pages[offset + cursor..offset + cursor + 2].try_into().unwrap()) as usize;
             let block_size = u16::from_be_bytes(self.pages[offset + cursor + 2..offset + cursor + 4].try_into().unwrap()) as usize;
             if block_size >= size {
-                self.touch_page(page);
                 let remainder = block_size - size;
+                // 一个页面的碎片总量不得超过 60 字节。上游 `pageFindSlot`
+                // 在 `nFrag` 已超过 57 时放弃整条链，由调用方整理整页或
+                // 从 content 区顶部另分配，剩余 1 到 3 字节才计入 `nFrag`。
+                if remainder > 0 && remainder < 4 && self.pages[offset + header_relative + 7] > 57 {
+                    return None;
+                }
+                self.touch_page(page);
                 if remainder >= 4 {
                     let split = cursor + size;
                     self.pages[offset + split..offset + split + 2].copy_from_slice(&(next as u16).to_be_bytes());
@@ -2357,7 +2375,7 @@ impl SqliteWriter {
                     if remainder > 0 {
                         let fragmented = offset + header_relative + 7;
                         let current = self.pages[fragmented] as usize;
-                        self.pages[fragmented] = current.saturating_add(remainder).min(255) as u8;
+                        self.pages[fragmented] = (current + remainder) as u8;
                     }
                 }
                 return Some(cursor);
