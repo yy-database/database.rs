@@ -1143,10 +1143,11 @@ pub struct Engine {
     /// Memoized uncorrelated subquery results for the running statement, keyed
     /// by the resolved subquery node address. Cleared before every statement.
     subquery_cache: std::cell::RefCell<HashMap<usize, SubqueryCache>>,
-    /// 单条语句内已解码的整表行,按小写表名与该次解码所需的列掩码索引。只缓存
-    /// 主库普通 rowid 表的无提示全表扫描,让自连接与同表内外层子查询在读取同一
-    /// 批列时共享一次解码。语句开始与结束都清空,不跨语句保留。
-    statement_scans: std::cell::RefCell<HashMap<(String, Option<Vec<bool>>), Rc<Vec<Vec<Cell>>>>>,
+    /// 单条语句内已解码的整表行,按小写表名索引,并记录该份行集覆盖的列掩码。
+    /// 只缓存主库普通 rowid 表的无提示全表扫描:新请求所需列若已被缓存掩码
+    /// 覆盖(全量解码覆盖任何裁剪),就复用同一份行集,让同表内外层子查询与
+    /// 自连接不必各自解码一遍。语句开始与结束都清空,不跨语句保留。
+    statement_scans: std::cell::RefCell<HashMap<String, (Option<Vec<bool>>, Rc<Vec<Vec<Cell>>>)>>,
     /// Set whenever an `OuterColumn` is read, so a subquery can tell whether it
     /// depended on the enclosing row and therefore must not be memoized.
     outer_read: std::cell::Cell<bool>,
@@ -8538,19 +8539,34 @@ impl Engine {
                 return Ok((SourceColumns::Table(def), Rc::new(decoded)));
             }
             // 无扫描提示的普通全表扫描在本语句内只解码一次。自连接和内外层
-            // 同表子查询因此共享同一份行集,结果与逐次解码完全一致。缓存键含
-            // 列掩码:同表的不同投影各自保留一份裁剪后的行集。
+            // 同表子查询因此共享同一份行集,结果与逐次解码完全一致。缓存按表名
+            // 保存该份行集覆盖的列掩码:新请求的列全被覆盖时直接复用,不重复
+            // 解码;新请求更宽时用更宽的那份替换(掩码无关列在行内是 NULL 占位)。
             if scan.is_none() {
-                let key = (def.name.to_ascii_lowercase(), keep.map(<[bool]>::to_vec));
-                if let Some(cached) = self.statement_scans.borrow().get(&key) {
-                    return Ok((SourceColumns::Table(def), Rc::clone(cached)));
+                let key = def.name.to_ascii_lowercase();
+                {
+                    let scans = self.statement_scans.borrow();
+                    if let Some((cached_mask, cached)) = scans.get(&key) {
+                        if mask_covers(cached_mask.as_deref(), keep) {
+                            return Ok((SourceColumns::Table(def), Rc::clone(cached)));
+                        }
+                    }
                 }
                 let stored = self
                     .writer
                     .table_rows(&def.name, TableLimits::default())
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
                 let decoded = Rc::new(decode_stored_rows(&stored, def, keep)?);
-                self.statement_scans.borrow_mut().insert(key, Rc::clone(&decoded));
+                let wider = {
+                    let scans = self.statement_scans.borrow();
+                    match scans.get(&key) {
+                        None => true,
+                        Some((cached_mask, _)) => cached_mask.as_deref() != keep && mask_covers(keep, cached_mask.as_deref()),
+                    }
+                };
+                if wider {
+                    self.statement_scans.borrow_mut().insert(key, (keep.map(<[bool]>::to_vec), Rc::clone(&decoded)));
+                }
                 return Ok((SourceColumns::Table(def), decoded));
             }
             let stored = match scan {
@@ -12232,6 +12248,26 @@ fn count_cross_product_rows(
             return Ok(0);
         }
     }
+    // A single source already occupies the whole merged row, so every conjunct
+    // can read the stored row slice directly; skipping the per-row copy avoids
+    // cloning text cells once per scanned row.
+    if relation.sources.len() == 1 && tables.len() == 1 {
+        let mut count = 0usize;
+        for values in tables[0].iter() {
+            let mut matched = true;
+            for conjunct in conjuncts {
+                if truthiness(&conjunct.eval(values, ctx)?) != Some(true) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                ctx.budget.charge(1)?;
+                count += 1;
+            }
+        }
+        return Ok(count);
+    }
     let mut count = 0usize;
     count_cross_level(0, tables, relation, &order, conjuncts, &depths, ctx, &mut merged, &mut count)?;
     Ok(count)
@@ -12308,6 +12344,27 @@ fn cross_product(
         if depth.is_none() && truthiness(&conjunct.eval(&merged, ctx)?) == Some(false) {
             return Ok(rows);
         }
+    }
+    // Same single-source elision as the count path: the stored row is already
+    // the merged row, so predicates and the emitted row can use it directly.
+    if relation.sources.len() == 1 && tables.len() == 1 {
+        for values in tables[0].iter() {
+            if rows.len() >= take {
+                break;
+            }
+            let mut matched = true;
+            for conjunct in conjuncts {
+                if truthiness(&conjunct.eval(values, ctx)?) != Some(true) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                ctx.budget.charge(1)?;
+                rows.push(values.clone());
+            }
+        }
+        return Ok(rows);
     }
     emit_rows(0, tables, relation, &order, conjuncts, &depths, take, ctx, &mut merged, &mut rows)?;
     Ok(rows)
@@ -14815,6 +14872,18 @@ fn decode_row_masked(payload: &[u8], def: &TableDef, rowid: i64, keep: Option<&[
     Ok(cells)
 }
 
+/// Whether a decoded row set made with `broad` already carries every column a
+/// `narrow` request needs. `None` is the full decode and covers any request.
+fn mask_covers(broad: Option<&[bool]>, narrow: Option<&[bool]>) -> bool {
+    match (broad, narrow) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(broad), Some(narrow)) => {
+            narrow.iter().enumerate().all(|(position, needed)| !*needed || broad.get(position).copied().unwrap_or(false))
+        }
+    }
+}
+
 /// Decodes stored row payloads into merged rows, appending each hidden rowid.
 fn decode_stored_rows(stored: &[TableRow], def: &TableDef, keep: Option<&[bool]>) -> Result<Vec<Vec<Cell>>, SqlError> {
     stored
@@ -16100,6 +16169,51 @@ mod tests {
         assert_eq!(
             engine.execute_one("SELECT count(*) AS n FROM t WHERE id IN (SELECT id FROM t WHERE score > 1.5)").expect("in subquery").rows,
             vec![vec![Cell::Integer(2)]]
+        );
+    }
+
+    #[test]
+    fn same_table_subqueries_reuse_a_covering_decode_and_redecode_narrower_masks() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, score REAL)",
+            "INSERT INTO t VALUES (1,'a',1.0),(2,'b',2.0),(3,'c',3.0)",
+        ]);
+        // 外层掩码为全量解码,内层只要 `score`:内层复用外层已解码的行。
+        assert_eq!(
+            engine
+                .execute_one("SELECT id, label, score FROM t WHERE id IN (SELECT id FROM t WHERE score > 1.5) ORDER BY id")
+                .expect("covering reuse")
+                .rows,
+            vec![
+                vec![Cell::Integer(2), Cell::Text("b".to_string()), Cell::Real(2.0)],
+                vec![Cell::Integer(3), Cell::Text("c".to_string()), Cell::Real(3.0)],
+            ]
+        );
+        // 两个互不覆盖的窄掩码各自解码,先落缓存的那份不能让后者读到 NULL 占位。
+        assert_eq!(
+            engine
+                .execute_one("SELECT (SELECT count(*) FROM t WHERE score > 1.5), (SELECT count(*) FROM t WHERE label = 'a')")
+                .expect("incomparable masks")
+                .rows,
+            vec![vec![Cell::Integer(2), Cell::Integer(1)]]
+        );
+        // 窄掩码先落缓存后,同一语句里更宽的同表请求仍要重新解码。
+        assert_eq!(
+            engine
+                .execute_one(
+                    "SELECT (SELECT count(*) FROM t WHERE score > 1.5) + (SELECT count(*) FROM t WHERE id IN (SELECT id FROM t WHERE label = 'a'))"
+                )
+                .expect("wider after narrower")
+                .rows,
+            vec![vec![Cell::Integer(3)]]
+        );
+        // 同表相关子查询:内层按外层当前行求值,共享行集不改变结果。
+        assert_eq!(
+            engine
+                .execute_one("SELECT id FROM t AS o WHERE EXISTS (SELECT 1 FROM t AS u WHERE u.score = o.score + 1.0)")
+                .expect("correlated same table")
+                .rows,
+            vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]
         );
     }
 
