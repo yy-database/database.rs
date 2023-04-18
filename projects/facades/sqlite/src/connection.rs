@@ -22,7 +22,7 @@ use std::{
 
 use crate::{
     SqliteWriter,
-    sql::{Cell, Engine, ExecResult, SqlError, Statement, TransactionAction, parameter_slots},
+    sql::{Cell, Engine, ExecResult, SqlError, Statement, TransactionAction, engine::LazyCursor, parameter_slots},
 };
 
 use database_storage::sqlite::journal;
@@ -249,6 +249,10 @@ pub struct CursorOpen {
     pub handle: u64,
     /// 本次执行产生的结果列标签。
     pub columns: Vec<String>,
+    /// `true` 表示游标按表 b-tree 页顺序惰性扫描,`false` 表示结果集在
+    /// 打开时已经全部物化。只有简单单表 `SELECT` 会走惰性路径,`JOIN`、
+    /// 聚合、`DISTINCT`、窗口、非 rowid 顺序的 `ORDER BY` 等仍是物化的。
+    pub lazy: bool,
 }
 
 /// 一次 [`Connection::cursor_next`] 返回的有界行窗口。
@@ -260,15 +264,21 @@ pub struct CursorBatch {
     pub done: bool,
 }
 
-/// 连接内的一个已执行结果集及其读取位置。
+/// 连接内的一个结果集来源。
 ///
-/// 行集在打开时由引擎一次性物化(引擎本身没有逐行执行接口),此后
-/// [`Connection::cursor_next`] 只按窗口切片,不重新执行 SQL。
-struct Cursor {
+/// 简单单表扫描走 [`CursorRows::Lazy`],按 b-tree 页顺序从打开时的整页
+/// 快照分批解码;其余语句在打开时一次性物化,`cursor_next` 只按窗口切片。
+enum CursorRows {
     /// 完整结果集,按执行顺序。
-    rows: Vec<Vec<Cell>>,
-    /// 下一行要返回的下标。
-    position: usize,
+    Materialized { rows: Vec<Vec<Cell>>, position: usize },
+    /// 打开时固定的页快照上的惰性表扫描。
+    Lazy(LazyCursor),
+}
+
+/// 连接内的一个已执行结果集及其读取位置。
+struct Cursor {
+    /// 行集来源:惰性扫描或打开时物化。
+    rows: CursorRows,
     /// 打开时所属事务的代数;`None` 表示在 autocommit 下打开。
     ///
     /// 事务结束时 [`Connection::transaction_epoch`] 前进,旧代数的游标随
@@ -465,12 +475,12 @@ impl Connection {
         Ok(results)
     }
 
-    /// 执行一条预编译语句,把完整结果集放进连接内的游标表,返回句柄与表头。
+    /// 执行一条预编译语句,把结果集放进连接内的游标表,返回句柄与表头。
     ///
-    /// 与 [`Connection::run`] 共用同一条执行路径、只读拒绝、参数检查与提交
-    /// 边界;区别只在于结果集留给 [`Connection::cursor_next`] 按窗口消费。
-    /// 引擎没有逐行执行接口,所以行集在打开时仍一次性物化:句柄只做状态
-    /// 管理,不复制任何 SQL 语义。
+    /// 简单单表扫描在打开时只固定一份整页快照,后续 [`Connection::cursor_next`]
+    /// 按 b-tree 页顺序分批解码,`CursorOpen::lazy` 为 `true`。其余语句与
+    /// [`Connection::run`] 共用同一条执行路径、只读拒绝、参数检查与提交
+    /// 边界,结果集在打开时一次性物化,`CursorOpen::lazy` 为 `false`。
     ///
     /// 事务内打开的游标记录当前事务代数;事务提交或回滚后调用
     /// [`Connection::cursor_next`] 会以 `cursor-expired` 拒绝。
@@ -482,15 +492,21 @@ impl Connection {
             return Err(SqlError::new("bind-parameter", format!("statement expects {required} parameters, got {}", parameters.len()))
                 .in_statement(prepared.statement_name()));
         }
+        let transaction_epoch = self.engine.in_transaction().then_some(self.transaction_epoch);
+        let handle = self.next_cursor;
+        self.next_cursor = self.next_cursor.wrapping_add(1);
+        if let Some(lazy) = self.engine.open_lazy_cursor(&prepared.statement, parameters)? {
+            let columns = lazy.columns().to_vec();
+            self.cursors.insert(handle, Cursor { rows: CursorRows::Lazy(lazy), transaction_epoch });
+            return Ok(CursorOpen { handle, columns, lazy: true });
+        }
         let was_in_transaction = self.engine.in_transaction();
         let ExecResult { columns, rows, .. } = self.engine.execute_statement(&prepared.statement, parameters)?;
         self.advance_epoch_if_transaction_ended(was_in_transaction);
         self.after_statement(prepared.is_write(), &prepared.statement)?;
         let transaction_epoch = self.engine.in_transaction().then_some(self.transaction_epoch);
-        let handle = self.next_cursor;
-        self.next_cursor = self.next_cursor.wrapping_add(1);
-        self.cursors.insert(handle, Cursor { rows, position: 0, transaction_epoch });
-        Ok(CursorOpen { handle, columns })
+        self.cursors.insert(handle, Cursor { rows: CursorRows::Materialized { rows, position: 0 }, transaction_epoch });
+        Ok(CursorOpen { handle, columns, lazy: false })
     }
 
     /// 从游标读取至多 `limit` 行,返回本窗口与是否已到末尾。
@@ -502,16 +518,24 @@ impl Connection {
         self.guard_open()?;
         let epoch = self.transaction_epoch;
         let cursor = self.cursors.get_mut(&handle).ok_or_else(|| SqlError::new("cursor-not-found", format!("cursor {handle} is not open")))?;
-        if let Some(opened) = cursor.transaction_epoch {
-            if opened != epoch {
-                return Err(SqlError::new("cursor-expired", "cursor was opened inside a transaction that has already ended"));
+        if let Some(opened) = cursor.transaction_epoch
+            && opened != epoch
+        {
+            return Err(SqlError::new("cursor-expired", "cursor was opened inside a transaction that has already ended"));
+        }
+        match &mut cursor.rows {
+            CursorRows::Materialized { rows, position } => {
+                let remaining = rows.len() - *position;
+                let end = *position + limit.min(remaining);
+                let window = rows[*position..end].to_vec();
+                *position = end;
+                Ok(CursorBatch { rows: window, done: *position == rows.len() })
+            }
+            CursorRows::Lazy(lazy) => {
+                let batch = self.engine.lazy_cursor_next(lazy, limit)?;
+                Ok(CursorBatch { rows: batch.rows, done: batch.done })
             }
         }
-        let remaining = cursor.rows.len() - cursor.position;
-        let end = cursor.position + limit.min(remaining);
-        let rows = cursor.rows[cursor.position..end].to_vec();
-        cursor.position = end;
-        Ok(CursorBatch { rows, done: cursor.position == cursor.rows.len() })
     }
 
     /// 释放一个游标。未知句柄视为已释放,便于宿主在 `finally` 里安全清理。
@@ -748,6 +772,65 @@ mod tests {
         directory.join("db.sqlite")
     }
 
+    /// 当前进程的常驻内存字节数,用于对照物化与惰性扫描的内存增量。
+    ///
+    /// 测试只在能读到真实 RSS 的平台上比较;其他平台返回 `None`,行数与
+    /// 顺序断言仍然执行。
+    fn resident_bytes() -> Option<u64> {
+        #[cfg(windows)]
+        {
+            #[repr(C)]
+            struct ProcessMemoryCounters {
+                cb: u32,
+                page_fault_count: u32,
+                peak_working_set_size: usize,
+                working_set_size: usize,
+                quota_peak_paged_pool_usage: usize,
+                quota_paged_pool_usage: usize,
+                quota_peak_non_paged_pool_usage: usize,
+                quota_non_paged_pool_usage: usize,
+                pagefile_usage: usize,
+                peak_pagefile_usage: usize,
+            }
+            #[link(name = "psapi")]
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> isize;
+                fn GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
+            }
+            let mut counters = ProcessMemoryCounters {
+                cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+                page_fault_count: 0,
+                peak_working_set_size: 0,
+                working_set_size: 0,
+                quota_peak_paged_pool_usage: 0,
+                quota_paged_pool_usage: 0,
+                quota_peak_non_paged_pool_usage: 0,
+                quota_non_paged_pool_usage: 0,
+                pagefile_usage: 0,
+                peak_pagefile_usage: 0,
+            };
+            // SAFETY: `counters` is a valid, correctly sized writable buffer and
+            // `GetCurrentProcess` returns a pseudo handle for this process.
+            let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+            return (ok != 0).then_some(counters.working_set_size as u64);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let status = fs::read_to_string("/proc/self/status").ok()?;
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let kib = rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok()?;
+                    return Some(kib * 1024);
+                }
+            }
+            None
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            None
+        }
+    }
+
     /// 以只读连接重新打开文件,返回 `SELECT` 的行,验证磁盘上的真实内容。
     fn rows_on_disk(path: &Path, sql: &str) -> Vec<Vec<Cell>> {
         let mut reader = Connection::open(ConnectionOptions { filename: Some(path.to_path_buf()), read_only: true, ..Default::default() })
@@ -954,6 +1037,140 @@ mod tests {
         let opened = connection.open_cursor(&prepared, &[]).expect("cursor opens");
         connection.close().expect("close");
         assert_eq!(connection.cursor_next(opened.handle, 1).expect_err("closed").code, "db-closed");
+    }
+
+    /// 建表并分批插入 `rows` 行 `(id, row-id)`,供大表游标用例使用。
+    fn seed_large_rows(connection: &mut Connection, rows: usize) {
+        connection.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL)", &[]).expect("create");
+        let mut start = 1;
+        while start <= rows {
+            let end = (start + 999).min(rows);
+            let mut sql = String::from("INSERT INTO t (id, label) VALUES ");
+            for id in start..=end {
+                if id > start {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({id}, 'row-{id}')"));
+            }
+            connection.execute(&sql, &[]).expect("seed chunk");
+            start = end + 1;
+        }
+    }
+
+    /// 50k 行简单扫描:惰性游标逐批读取,行数/顺序与物化路径一致,常驻内存
+    /// 增量显著低于一次性 `all()`。
+    #[test]
+    fn a_large_simple_scan_streams_lazily_and_uses_less_memory_than_all() {
+        let rows = 50_000usize;
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        seed_large_rows(&mut connection, rows);
+        let prepared = connection.prepare("SELECT * FROM t").expect("parses");
+        let baseline = resident_bytes();
+
+        let opened = connection.open_cursor(&prepared, &[]).expect("lazy cursor opens");
+        assert!(opened.lazy, "a plain single-table scan must stream lazily");
+        assert_eq!(opened.columns, vec!["id".to_string(), "label".to_string()]);
+        let mut seen = 0usize;
+        loop {
+            let batch = connection.cursor_next(opened.handle, 256).expect("window");
+            assert!(batch.rows.len() <= 256, "the lazy window is bounded");
+            for row in &batch.rows {
+                seen += 1;
+                assert_eq!(row, &vec![Cell::Integer(seen as i64), Cell::Text(format!("row-{seen}"))]);
+            }
+            if batch.done {
+                break;
+            }
+        }
+        assert_eq!(seen, rows, "the lazy cursor returns every row in rowid order");
+        connection.cursor_close(opened.handle).expect("close");
+        let lazy_rss = resident_bytes();
+
+        // Oracle: the same statement through the materialized path.
+        let materialized = connection.execute("SELECT * FROM t", &[]).expect("materialized scan").pop().expect("one result");
+        assert_eq!(materialized.rows.len(), rows);
+        for (index, row) in materialized.rows.iter().enumerate() {
+            assert_eq!(row, &vec![Cell::Integer(index as i64 + 1), Cell::Text(format!("row-{}", index + 1))]);
+        }
+        let materialized_rss = resident_bytes();
+
+        if let (Some(baseline), Some(lazy), Some(materialized)) = (baseline, lazy_rss, materialized_rss) {
+            let lazy_delta = lazy.saturating_sub(baseline);
+            let materialized_delta = materialized.saturating_sub(baseline);
+            println!("cursor lazy RSS delta: {lazy_delta} bytes; all() RSS delta: {materialized_delta} bytes");
+            assert!(
+                lazy_delta < materialized_delta,
+                "the lazy cursor must use less resident memory than all(): lazy {lazy_delta}, materialized {materialized_delta}"
+            );
+        }
+    }
+
+    /// 打开游标后的写入不影响游标:它继续读打开时刻的一致快照。
+    #[test]
+    fn a_lazy_cursor_keeps_the_snapshot_taken_at_open() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        seed_rows(&mut connection, 20);
+        let prepared = connection.prepare("SELECT id, label FROM t").expect("parses");
+        let opened = connection.open_cursor(&prepared, &[]).expect("cursor opens");
+        assert!(opened.lazy);
+        assert_eq!(connection.cursor_next(opened.handle, 5).expect("first window").rows, (1..=5)
+            .map(|id| vec![Cell::Integer(id), Cell::Text(format!("row-{id}"))])
+            .collect::<Vec<_>>());
+
+        connection.execute("UPDATE t SET label = 'changed' WHERE id = 1", &[]).expect("update after open");
+        connection.execute("INSERT INTO t (id, label) VALUES (21, 'row-21')", &[]).expect("insert after open");
+
+        let mut seen = 5usize;
+        loop {
+            let batch = connection.cursor_next(opened.handle, 4).expect("snapshot window");
+            for row in &batch.rows {
+                seen += 1;
+                assert_eq!(row, &vec![Cell::Integer(seen as i64), Cell::Text(format!("row-{seen}"))]);
+            }
+            if batch.done {
+                break;
+            }
+        }
+        assert_eq!(seen, 20, "the cursor still sees exactly the rows present at open");
+        connection.cursor_close(opened.handle).expect("close");
+
+        let fresh = connection.execute("SELECT id, label FROM t", &[]).expect("fresh statement").pop().expect("one result").rows;
+        assert_eq!(fresh.len(), 21, "later statements see the writes");
+        assert_eq!(fresh[0], vec![Cell::Integer(1), Cell::Text("changed".to_string())]);
+    }
+
+    /// `JOIN`、`GROUP BY`、非 rowid 顺序的 `ORDER BY`、`DISTINCT` 与
+    /// `LIMIT` 一律走既有物化路径,结果与直接执行一致。
+    #[test]
+    fn complex_statements_stay_on_the_materialized_cursor_path() {
+        let mut connection = Connection::open(ConnectionOptions::default()).expect("in-memory connection");
+        seed_rows(&mut connection, 10);
+        connection.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, tag TEXT NOT NULL)", &[]).expect("create u");
+        connection
+            .execute("INSERT INTO u (id, tag) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'), (6, 'f'), (7, 'g'), (8, 'h'), (9, 'i'), (10, 'j')", &[])
+            .expect("seed u");
+        for sql in [
+            "SELECT t.id, u.tag FROM t JOIN u ON t.id = u.id",
+            "SELECT label, count(*) FROM t GROUP BY label",
+            "SELECT id FROM t ORDER BY label DESC",
+            "SELECT DISTINCT label FROM t",
+            "SELECT id FROM t LIMIT 5",
+        ] {
+            let prepared = connection.prepare(sql).unwrap_or_else(|error| panic!("prepare `{sql}`: {error}"));
+            let opened = connection.open_cursor(&prepared, &[]).unwrap_or_else(|error| panic!("open `{sql}`: {error}"));
+            assert!(!opened.lazy, "`{sql}` must stay on the materialized path");
+            let mut rows = Vec::new();
+            loop {
+                let batch = connection.cursor_next(opened.handle, 3).unwrap_or_else(|error| panic!("next `{sql}`: {error}"));
+                rows.extend(batch.rows);
+                if batch.done {
+                    break;
+                }
+            }
+            let expected = connection.execute(sql, &[]).unwrap_or_else(|error| panic!("run `{sql}`: {error}")).pop().expect("one result").rows;
+            assert_eq!(rows, expected, "cursor rows of `{sql}`");
+            connection.cursor_close(opened.handle).expect("close");
+        }
     }
 
     #[test]

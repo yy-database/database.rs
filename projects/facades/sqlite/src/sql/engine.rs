@@ -7,7 +7,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -8315,6 +8315,186 @@ impl Engine {
         Some(offset.saturating_add(count))
     }
 
+    /// 尝试为一个简单单表扫描建立惰性游标。
+    ///
+    /// 只有同时满足下列条件的 `SELECT` 才返回 `Some`:
+    ///
+    /// - 单表、无 `JOIN`、无派生表/子查询、无 CTE 与复合查询;
+    /// - 无 `DISTINCT`、`GROUP BY`、`HAVING`、窗口与聚合;
+    /// - 无 `LIMIT`/`OFFSET`;
+    /// - 无 `ORDER BY`,或排序键就是主键/rowid 升序,与 b-tree 扫描顺序一致;
+    /// - 投影是 `*` 或普通列引用/常量表达式,`WHERE` 可逐行求值。
+    ///
+    /// 打开时把当前整页镜像克隆成独立快照,后续写入只改引擎自己的页缓冲,
+    /// 游标因此始终读到打开时刻的一致状态。返回 `None` 表示语句不满足条件,
+    /// 调用方走既有的物化路径。
+    pub(crate) fn open_lazy_cursor(&mut self, statement: &Statement, parameters: &[Cell]) -> Result<Option<LazyCursor>, SqlError> {
+        let Some(plan) = self.plan_lazy_scan(statement)?
+        else {
+            return Ok(None);
+        };
+        let objects = match self.writer.schema_objects_with_rowids(TableLimits::default()) {
+            Ok(objects) => objects,
+            Err(_) => return Ok(None),
+        };
+        let root_page = objects
+            .iter()
+            .find(|(_, object)| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case(&plan.def.name))
+            .and_then(|(_, object)| object.root_page)
+            .filter(|root| *root != 0 && *root != 1);
+        let Some(root_page) = root_page
+        else {
+            return Ok(None);
+        };
+        let snapshot = Arc::new(self.writer.pages().to_vec());
+        let scan = LazyTableScan::new(snapshot, root_page)?;
+        Ok(Some(LazyCursor { plan, scan, budget: Budget::new(), parameters: parameters.to_vec(), finished: false }))
+    }
+
+    /// 从惰性游标读取至多 `limit` 行,保持 b-tree 扫描顺序。
+    pub(crate) fn lazy_cursor_next(&mut self, cursor: &mut LazyCursor, limit: usize) -> Result<LazyBatch, SqlError> {
+        if cursor.finished || limit == 0 {
+            return Ok(LazyBatch { rows: Vec::new(), done: cursor.finished });
+        }
+        let saved = std::mem::take(&mut self.parameters);
+        self.parameters = cursor.parameters.clone();
+        let result = self.lazy_cursor_next_inner(cursor, limit);
+        self.parameters = saved;
+        result
+    }
+
+    fn lazy_cursor_next_inner(&self, cursor: &mut LazyCursor, limit: usize) -> Result<LazyBatch, SqlError> {
+        let shape = ScopeShape { columns: cursor.plan.shape_columns.clone() };
+        let empty_aggregates: Vec<Cell> = Vec::new();
+        let mut rows = Vec::new();
+        while rows.len() < limit {
+            let stored = cursor.scan.next_rows(limit - rows.len())?;
+            if stored.is_empty() {
+                cursor.finished = true;
+                break;
+            }
+            let decoded = decode_stored_rows(&stored, &cursor.plan.def, cursor.plan.mask.as_deref())?;
+            for values in decoded {
+                let ctx = EvalContext {
+                    engine: self,
+                    outer: &[],
+                    current: &shape,
+                    aggregates: &empty_aggregates,
+                    windows: &[],
+                    window_row: 0,
+                    budget: &cursor.budget,
+                    ctes: None,
+                };
+                if let Some(predicate) = &cursor.plan.predicate
+                    && truthiness(&predicate.eval(&values, &ctx)?) != Some(true)
+                {
+                    continue;
+                }
+                cursor.budget.charge(1)?;
+                let out = match &cursor.plan.projection {
+                    Some(nodes) => nodes.iter().map(|node| node.eval(&values, &ctx)).collect::<Result<Vec<_>, _>>()?,
+                    None => values[..cursor.plan.visible_width].to_vec(),
+                };
+                rows.push(out);
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(LazyBatch { rows, done: cursor.finished })
+    }
+
+    /// 判定语句能否走惰性扫描,能把结果表达式解析成 owned 的执行计划。
+    fn plan_lazy_scan(&self, statement: &Statement) -> Result<Option<LazyPlan>, SqlError> {
+        let Statement::Select { with, first, compounds, order, limit, .. } = statement
+        else {
+            return Ok(None);
+        };
+        if !with.is_empty() || !compounds.is_empty() || limit.is_some() || first.from.len() != 1 {
+            return Ok(None);
+        }
+        let entry = &first.from[0];
+        if entry.query.is_some() || entry.join.is_some() || entry.on.is_some() || entry.using.is_some() || entry.natural {
+            return Ok(None);
+        }
+        if first.distinct || !first.group.is_empty() || first.having.is_some() || !first.windows.is_empty() {
+            return Ok(None);
+        }
+        if matches!(first.items, SelectItems::CountAll) {
+            return Ok(None);
+        }
+        let Some(def) = self.prunable_def(entry)
+        else {
+            return Ok(None);
+        };
+        // 子查询与窗口会读到本行之外的上下文,不能按批惰性求值。
+        let mut refs = Vec::new();
+        if let SelectItems::Named(exprs) = &first.items {
+            for expr in exprs {
+                if !collect_unmasked_columns(expr, &mut refs) {
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some(filter) = &first.filter
+            && !collect_unmasked_columns(filter, &mut refs)
+        {
+            return Ok(None);
+        }
+        if !lazy_order_matches_scan(def, entry, &first.items, order) {
+            return Ok(None);
+        }
+        let source = Source {
+            label: entry.label().to_string(),
+            columns: SourceColumns::Table(def),
+            offset: 0,
+            join: None,
+            star_hidden: vec![false; def.columns.len()],
+            unqualified_hidden: vec![false; def.columns.len()],
+            star_override: vec![None; def.columns.len()],
+        };
+        let mut relation =
+            Relation { sources: vec![source], using: vec![Vec::new()], using_slots: Vec::new(), trigger: None, excluded: false };
+        relation.plan_joins(&first.from)?;
+        let shape = relation.shape();
+        let outer_shapes: Vec<ScopeShape> = Vec::new();
+        let mut specs = Vec::new();
+        let mut windows = Vec::new();
+        let projection = match &first.items {
+            SelectItems::Named(exprs) => Some(
+                exprs
+                    .iter()
+                    .map(|expr| resolve_expr(expr, &relation, &outer_shapes, &first.windows, &mut windows, &mut specs, true, true))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            SelectItems::Star => None,
+            SelectItems::CountAll => unreachable!("count(*) is rejected above"),
+        };
+        // 聚合与窗口要么读到整组行,要么依赖排序后的位置,只能走物化路径。
+        if !specs.is_empty() || !windows.is_empty() {
+            return Ok(None);
+        }
+        let predicate = match &first.filter {
+            Some(expr) => {
+                let mut scratch_specs = Vec::new();
+                let mut scratch_windows = Vec::new();
+                Some(resolve_expr(expr, &relation, &outer_shapes, &[], &mut scratch_windows, &mut scratch_specs, false, false)?)
+            }
+            None => None,
+        };
+        let labels = core_output_labels(&relation, &first.items);
+        let mask = self.read_column_masks(first, order).and_then(|masks| masks.into_iter().next().flatten());
+        Ok(Some(LazyPlan {
+            def: def.clone(),
+            labels,
+            visible_width: def.columns.len(),
+            projection,
+            predicate,
+            shape_columns: shape.columns,
+            mask,
+        }))
+    }
+
     /// Per-`FROM` column masks for the projected read, or `None` when the shape
     /// is not safe to prune.
     ///
@@ -14882,6 +15062,337 @@ fn mask_covers(broad: Option<&[bool]>, narrow: Option<&[bool]>) -> bool {
             narrow.iter().enumerate().all(|(position, needed)| !*needed || broad.get(position).copied().unwrap_or(false))
         }
     }
+}
+
+/// 一次惰性游标读取返回的行窗口。
+pub(crate) struct LazyBatch {
+    /// 本窗口的行,保持扫描顺序。
+    pub(crate) rows: Vec<Vec<Cell>>,
+    /// 扫描是否已经到达表末尾。
+    pub(crate) done: bool,
+}
+
+/// 一个已经解析好的惰性单表扫描计划。
+///
+/// 计划里的表达式都已解析成 owned 形态,不借用引擎目录;执行期只需要逐行
+/// 求值。整页快照与 b-tree 遍历状态在 [`LazyTableScan`] 里。
+pub(crate) struct LazyCursor {
+    plan: LazyPlan,
+    scan: LazyTableScan,
+    budget: Budget,
+    parameters: Vec<Cell>,
+    finished: bool,
+}
+
+impl LazyCursor {
+    /// 打开时推导出的结果列标签。
+    pub(crate) fn columns(&self) -> &[String] {
+        &self.plan.labels
+    }
+}
+
+struct LazyPlan {
+    /// 被扫描的表定义,用于解码存储记录。
+    def: TableDef,
+    /// 结果列标签。
+    labels: Vec<String>,
+    /// `SELECT *` 暴露的列数,不含隐藏 rowid。
+    visible_width: usize,
+    /// 命名投影;`None` 表示 `SELECT *`。
+    projection: Option<Vec<ResolvedExpr>>,
+    /// 逐行 `WHERE` 谓词。
+    predicate: Option<ResolvedExpr>,
+    /// 求值上下文里的列目录。
+    shape_columns: Vec<(String, String)>,
+    /// 解码时只需保留的列。
+    mask: Option<Vec<bool>>,
+}
+
+/// 按表 b-tree 页顺序分批解码的扫描器。
+///
+/// `pages` 是打开游标时克隆的整页快照,后续写入只改引擎自己的页缓冲,因此
+/// 扫描期间看到的内容始终是打开时刻的一致状态。内部页只用来定位叶子页,
+/// 每片叶子页的载荷按行解码后进入队列,`next_rows` 每次只取要求的行数。
+struct LazyTableScan {
+    pages: Arc<Vec<u8>>,
+    page_size: usize,
+    usable: usize,
+    page_count: usize,
+    /// 尚未展开的页,栈顶是下一个要访问的子树。
+    pending: Vec<u32>,
+    /// 当前叶子页尚未返回的行。
+    leaf: VecDeque<TableRow>,
+    /// 页号→是否已访问,与存储层扫描同样的重复页检测。
+    visited: Vec<bool>,
+    visited_pages: usize,
+    limits: TableLimits,
+    total_payload: usize,
+    total_rows: usize,
+    last_rowid: Option<i64>,
+    done: bool,
+}
+
+impl LazyTableScan {
+    fn new(pages: Arc<Vec<u8>>, root_page: u32) -> Result<Self, SqlError> {
+        if pages.is_empty() {
+            return Err(storage_error("sqlite table root in empty database"));
+        }
+        let page_size = validate_database(&pages).map_err(storage_error)?;
+        let reserved = usize::from(*pages.get(20).ok_or_else(|| storage_error("sqlite header truncated"))?);
+        let usable = page_size.checked_sub(reserved).filter(|usable| *usable >= 257).ok_or_else(|| storage_error("sqlite page size invalid"))?;
+        let page_count = pages.len() / page_size;
+        if page_count == 0 || root_page == 0 || root_page as usize > page_count {
+            return Err(storage_error("sqlite table root page out of bounds"));
+        }
+        Ok(Self {
+            pages,
+            page_size,
+            usable,
+            page_count,
+            pending: vec![root_page],
+            leaf: VecDeque::new(),
+            visited: vec![false; page_count + 1],
+            visited_pages: 0,
+            limits: TableLimits::default(),
+            total_payload: 0,
+            total_rows: 0,
+            last_rowid: None,
+            done: false,
+        })
+    }
+
+    /// 取至多 `limit` 行,不足时继续展开后续叶子页。
+    fn next_rows(&mut self, limit: usize) -> Result<Vec<TableRow>, SqlError> {
+        let mut rows = Vec::new();
+        while rows.len() < limit {
+            match self.leaf.pop_front() {
+                Some(row) => rows.push(row),
+                None => {
+                    if !self.load_leaf()? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// 展开内部页直到拿到一片叶子页;整棵树读完时返回 `false`。
+    fn load_leaf(&mut self) -> Result<bool, SqlError> {
+        loop {
+            let Some(number) = self.pending.pop()
+            else {
+                self.done = true;
+                return Ok(false);
+            };
+            let pages = Arc::clone(&self.pages);
+            let page = lazy_page(&pages, self.page_size, self.page_count, number)?;
+            if self.visited_pages >= self.limits.max_pages {
+                return Err(storage_error("sqlite table page limit exceeded"));
+            }
+            if self.visited[number as usize] {
+                return Err(storage_error("sqlite repeated b-tree or overflow page"));
+            }
+            self.visited[number as usize] = true;
+            self.visited_pages += 1;
+            let header = if number == 1 { 100 } else { 0 };
+            let kind = *page.get(header).ok_or_else(|| storage_error("sqlite b-tree header truncated"))?;
+            let header_size = match kind {
+                13 => 8,
+                5 => 12,
+                _ => return Err(storage_error("sqlite table b-tree page type invalid")),
+            };
+            let count = lazy_read_u16(page, header + 3)?;
+            let pointers_end = header + header_size + count.saturating_mul(2);
+            if pointers_end > page.len() || *page.get(header + 7).ok_or_else(|| storage_error("sqlite b-tree header truncated"))? > 60 {
+                return Err(storage_error("sqlite b-tree header invalid"));
+            }
+            let raw_start = lazy_read_u16(page, header + 5)?;
+            let content_start = if raw_start == 0 { 65536 } else { raw_start };
+            if content_start < pointers_end || content_start > page.len() {
+                return Err(storage_error("sqlite b-tree content boundary invalid"));
+            }
+            let mut children = Vec::new();
+            let mut rows = Vec::new();
+            for index in 0..count {
+                let cell = lazy_read_u16(page, header + header_size + index.saturating_mul(2))?;
+                if cell < content_start || cell >= page.len() {
+                    return Err(storage_error("sqlite cell pointer out of bounds"));
+                }
+                if kind == 5 {
+                    let child = lazy_read_u32(page, cell)?;
+                    let tail = page.get(cell + 4..).ok_or_else(|| storage_error("sqlite interior cell truncated"))?;
+                    decode_varint(tail).map_err(storage_error)?;
+                    children.push(child);
+                    continue;
+                }
+                let (length, length_size) = decode_varint(&page[cell..]).map_err(storage_error)?;
+                let length = usize::try_from(length).map_err(|_| storage_error("sqlite payload size exceeds host"))?;
+                if length > self.limits.max_payload_bytes {
+                    return Err(storage_error("sqlite table payload limit exceeded"));
+                }
+                let total = self.total_payload.checked_add(length).ok_or_else(|| storage_error("sqlite table total payload overflow"))?;
+                if total > self.limits.max_total_payload_bytes {
+                    return Err(storage_error("sqlite table total payload limit exceeded"));
+                }
+                self.total_payload = total;
+                if self.total_rows >= self.limits.max_rows {
+                    return Err(storage_error("sqlite table row limit exceeded"));
+                }
+                let tail = page.get(cell + length_size..).ok_or_else(|| storage_error("sqlite table cell truncated"))?;
+                let (rowid, rowid_size) = decode_varint(tail).map_err(storage_error)?;
+                let rowid = rowid as i64;
+                if self.last_rowid.is_some_and(|last| rowid <= last) {
+                    return Err(storage_error("sqlite table rows out of order"));
+                }
+                self.last_rowid = Some(rowid);
+                self.total_rows += 1;
+                let start = cell.checked_add(length_size).and_then(|start| start.checked_add(rowid_size)).ok_or_else(|| storage_error("sqlite cell length overflow"))?;
+                let payload = lazy_cell_payload(
+                    &pages,
+                    self.page_size,
+                    self.page_count,
+                    self.usable,
+                    page,
+                    start,
+                    length,
+                    &mut self.visited,
+                    &mut self.visited_pages,
+                    &self.limits,
+                )?;
+                rows.push(TableRow { rowid, payload });
+            }
+            if kind == 5 {
+                // 内部页最后还有一个指向最右子树的指针,它不属于任何 cell。
+                children.push(lazy_read_u32(page, header + 8)?);
+                for child in children.into_iter().rev() {
+                    self.pending.push(child);
+                }
+            }
+            else {
+                self.leaf.extend(rows);
+                if !self.leaf.is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
+/// 判断 `ORDER BY` 是否与 b-tree 的 rowid 升序扫描完全一致。
+///
+/// 只接受 `*` 或裸列投影,避免投影别名改变 `ORDER BY` 的绑定目标;排序键
+/// 必须是隐式 rowid 或 `INTEGER PRIMARY KEY` 别名,且不能 `DESC` 或覆盖
+/// `NULLS` 顺序。
+fn lazy_order_matches_scan(def: &TableDef, entry: &TableRef, items: &SelectItems, order: &[OrderKey]) -> bool {
+    if order.is_empty() {
+        return true;
+    }
+    if !matches!(items, SelectItems::Star)
+        && !matches!(items, SelectItems::Named(exprs) if exprs.iter().all(|expr| matches!(expr, Expr::Column(_))))
+    {
+        return false;
+    }
+    let alias_name = def.rowid_alias.map(|index| def.columns[index].name.as_str());
+    let shadowed = |name: &str| def.columns.iter().any(|column| column.name.eq_ignore_ascii_case(name));
+    for key in order {
+        if key.descending || key.nulls_first.is_some() {
+            return false;
+        }
+        let Expr::Column(column) = &key.expr
+        else {
+            return false;
+        };
+        if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(entry.label())) {
+            return false;
+        }
+        let names_alias = alias_name.is_some_and(|name| column.name.eq_ignore_ascii_case(name));
+        let names_hidden_rowid = is_rowid_alias(&column.name) && !shadowed(&column.name);
+        if !names_alias && !names_hidden_rowid {
+            return false;
+        }
+    }
+    true
+}
+
+/// 取一页完整内容;页号越界按损坏处理。
+fn lazy_page(pages: &[u8], page_size: usize, page_count: usize, number: u32) -> Result<&[u8], SqlError> {
+    let index = number as usize;
+    if index == 0 || index > page_count {
+        return Err(storage_error("sqlite page reference out of bounds"));
+    }
+    let start = (index - 1) * page_size;
+    pages.get(start..start + page_size).ok_or_else(|| storage_error("sqlite page truncated"))
+}
+
+/// 与上游 SQLite 的 U 值公式一致,返回载荷在本页存放的本地字节数。
+fn lazy_local(usable: usize, length: usize) -> usize {
+    let maximum = usable - 35;
+    let minimum = ((usable - 12) * 32 / 255) - 23;
+    if length <= maximum {
+        return length;
+    }
+    let candidate = minimum + (length - minimum) % (usable - 4);
+    if candidate <= maximum { candidate } else { minimum }
+}
+
+/// 组装一行载荷,溢出页按链读取,并记录访问过的溢出页。
+#[allow(clippy::too_many_arguments)]
+fn lazy_cell_payload(
+    pages: &[u8],
+    page_size: usize,
+    page_count: usize,
+    usable: usize,
+    page: &[u8],
+    offset: usize,
+    length: usize,
+    visited: &mut [bool],
+    visited_pages: &mut usize,
+    limits: &TableLimits,
+) -> Result<Vec<u8>, SqlError> {
+    let local = lazy_local(usable, length);
+    let end = offset.checked_add(local).ok_or_else(|| storage_error("sqlite cell length overflow"))?;
+    let initial = page.get(offset..end).ok_or_else(|| storage_error("sqlite cell payload truncated"))?;
+    let mut payload = Vec::new();
+    payload.try_reserve_exact(length).map_err(|_| storage_error("sqlite payload allocation failed"))?;
+    payload.extend_from_slice(initial);
+    if local == length {
+        return Ok(payload);
+    }
+    let mut next = lazy_read_u32(page, end)?;
+    while payload.len() < length {
+        if *visited_pages >= limits.max_pages {
+            return Err(storage_error("sqlite table page limit exceeded"));
+        }
+        let index = next as usize;
+        if index == 0 || index > page_count {
+            return Err(storage_error("sqlite page reference out of bounds"));
+        }
+        if visited[index] {
+            return Err(storage_error("sqlite repeated b-tree or overflow page"));
+        }
+        visited[index] = true;
+        *visited_pages += 1;
+        let start = (index - 1) * page_size;
+        let overflow = pages.get(start..start + usable).ok_or_else(|| storage_error("sqlite page truncated"))?;
+        next = lazy_read_u32(overflow, 0)?;
+        let count = (length - payload.len()).min(usable - 4);
+        payload.extend_from_slice(overflow.get(4..4 + count).ok_or_else(|| storage_error("sqlite overflow payload truncated"))?);
+    }
+    if next != 0 {
+        return Err(storage_error("sqlite overflow chain exceeds payload"));
+    }
+    Ok(payload)
+}
+
+fn lazy_read_u16(bytes: &[u8], offset: usize) -> Result<usize, SqlError> {
+    let value = bytes.get(offset..offset + 2).ok_or_else(|| storage_error("sqlite b-tree field truncated"))?;
+    Ok(usize::from(u16::from_be_bytes(value.try_into().expect("two bytes"))))
+}
+
+fn lazy_read_u32(bytes: &[u8], offset: usize) -> Result<u32, SqlError> {
+    let value = bytes.get(offset..offset + 4).ok_or_else(|| storage_error("sqlite page field truncated"))?;
+    Ok(u32::from_be_bytes(value.try_into().expect("four bytes")))
 }
 
 /// Decodes stored row payloads into merged rows, appending each hidden rowid.
