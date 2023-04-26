@@ -1349,12 +1349,15 @@ impl SqliteWriter {
         if values.len() != meta.columns.len() {
             return Err(Error::Unsupported("sqlite update arity mismatch"));
         }
-        let Some(payload) = self.read_payload(meta.root_page, rowid)?
+        let Some(cell) = self.find_table_cell(meta.root_page, rowid)?
         else {
             return Ok(false);
         };
+        let payload = self.read_cell_payload(&cell)?;
         let decoded = decode_record(&payload, self.encoding, Default::default()).map_err(|_| Error::Corrupt("sqlite record decode failed"))?;
         let mut owned = expand_alias(&meta, rowid, &decoded);
+        // 旧值只用于索引键对比与回写路径的索引摘除,避免再读一次 payload。
+        let before = owned.clone();
         let mut next_rowid = rowid;
         for (index, slot) in values.iter().enumerate() {
             let UpdateValue::Set(value) = slot
@@ -1392,25 +1395,69 @@ impl SqliteWriter {
 
         // The alias slot travels as `next_rowid` through the delete/insert
         // bookkeeping, but the stored record keeps NULL like every insert.
-        self.delete(table, rowid)?;
         if let Some(index) = meta.rowid_alias {
             owned[index] = WriteValue::Null;
         }
         let payload = encode_record(&owned, self.encoding);
-        let meta = self.table_meta(table)?;
-        let root = self.table_insert(meta.root_page, next_rowid, &payload)?;
-        if root != meta.root_page {
-            self.set_master_root(meta.master_rowid, root)?;
-        }
-        let meta = self.table_meta(table)?;
+
+        // Only indexes whose key actually changed need their live entry
+        // rewritten. A rowid move always takes the delete/insert path.
+        let mut index_changes: Vec<(i64, Vec<u8>, Vec<u8>)> = Vec::new();
         for index_meta in meta.indexes.iter() {
             if index_meta.managed {
                 continue;
             }
-            let key = encode_index_key(&meta, index_meta, next_rowid, &owned, self.encoding)?;
+            let old_key = encode_index_key(&meta, index_meta, rowid, &before, self.encoding)?;
+            let new_key = encode_index_key(&meta, index_meta, next_rowid, &owned, self.encoding)?;
+            if old_key != new_key {
+                index_changes.push((index_meta.master_rowid, old_key, new_key));
+            }
+        }
+
+        if next_rowid == rowid && self.replace_cell_in_place(&cell, &payload)? {
+            for (master_rowid, old_key, new_key) in index_changes {
+                if let Some(entries) = self.index_entries.get_mut(&master_rowid) {
+                    entries.remove(&old_key);
+                }
+                self.index_entries.entry(master_rowid).or_default().insert(new_key);
+            }
+            return Ok(true);
+        }
+
+        self.remove_index_entries(&meta, rowid, &before)?;
+        let mut root = self.table_delete(meta.root_page, rowid)?;
+        root = self.table_insert(root, next_rowid, &payload)?;
+        if root != meta.root_page {
+            self.set_master_root(meta.master_rowid, root)?;
+        }
+        self.add_index_entries(&meta, next_rowid, &owned)?;
+        Ok(true)
+    }
+
+    /// 摘除一行在全部非托管索引里的活动键。
+    fn remove_index_entries(&mut self, meta: &TableMeta, rowid: i64, values: &[WriteValue]) -> Result<()> {
+        for index_meta in meta.indexes.iter() {
+            if index_meta.managed {
+                continue;
+            }
+            let key = encode_index_key(meta, index_meta, rowid, values, self.encoding)?;
+            if let Some(entries) = self.index_entries.get_mut(&index_meta.master_rowid) {
+                entries.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    /// 写入一行在全部非托管索引里的活动键。
+    fn add_index_entries(&mut self, meta: &TableMeta, rowid: i64, values: &[WriteValue]) -> Result<()> {
+        for index_meta in meta.indexes.iter() {
+            if index_meta.managed {
+                continue;
+            }
+            let key = encode_index_key(meta, index_meta, rowid, values, self.encoding)?;
             self.index_entries.entry(index_meta.master_rowid).or_default().insert(key);
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Removes one column slot from every stored row of a table.
@@ -2422,15 +2469,18 @@ impl SqliteWriter {
     }
 
     fn contains_rowid(&self, root: u32, rowid: i64) -> Result<bool> {
-        Ok(self.read_payload(root, rowid)?.is_some())
+        Ok(self.find_table_cell(root, rowid)?.is_some())
     }
 
-    fn read_payload(&self, root: u32, rowid: i64) -> Result<Option<Vec<u8>>> {
+    /// 沿 rowid b-tree 下降到叶页并定位 `rowid` 对应的 cell,只解析页内
+    /// cell 指针与 varint 前缀,不复制 payload。插入位置判定、原地改写与
+    /// payload 读取共用这一条下钻路径。
+    fn find_table_cell(&self, root: u32, rowid: i64) -> Result<Option<TableCell>> {
         let mut page = root;
         loop {
-            let offset = self.page_offset(page);
+            let page_offset = self.page_offset(page);
             let header_relative = Self::header_offset(page);
-            let page_bytes = &self.pages[offset..offset + self.page_size];
+            let page_bytes = &self.pages[page_offset..page_offset + self.page_size];
             let kind = page_bytes[header_relative];
             let count = u16::from_be_bytes(page_bytes[header_relative + 3..header_relative + 5].try_into().unwrap()) as usize;
             match kind {
@@ -2443,20 +2493,11 @@ impl SqliteWriter {
                         if candidate as i64 != rowid {
                             continue;
                         }
-                        let length = usize::try_from(length).map_err(|_| Error::Unsupported("sqlite payload too large"))?;
-                        let local = self.local_payload(length);
-                        let body_start = cell_offset + length_size + rowid_size;
-                        let mut payload = page_bytes[body_start..body_start + local].to_vec();
-                        if length > local {
-                            let mut next = u32::from_be_bytes(page_bytes[body_start + local..body_start + local + 4].try_into().unwrap());
-                            while payload.len() < length {
-                                let overflow_offset = self.page_offset(next);
-                                let chunk = (length - payload.len()).min(self.usable - 4);
-                                payload.extend_from_slice(&self.pages[overflow_offset + 4..overflow_offset + 4 + chunk]);
-                                next = u32::from_be_bytes(self.pages[overflow_offset..overflow_offset + 4].try_into().unwrap());
-                            }
-                        }
-                        return Ok(Some(payload));
+                        let payload_len = usize::try_from(length).map_err(|_| Error::Unsupported("sqlite payload too large"))?;
+                        let local = self.local_payload(payload_len);
+                        let prefix = length_size + rowid_size;
+                        let span = prefix + local + if payload_len > local { 4 } else { 0 };
+                        return Ok(Some(TableCell { page, rowid, offset: cell_offset, prefix, payload_len, local, span }));
                     }
                     return Ok(None);
                 }
@@ -2477,6 +2518,86 @@ impl SqliteWriter {
                 _ => return Err(Error::Corrupt("sqlite table b-tree page type invalid")),
             }
         }
+    }
+
+    /// 读取 [`TableCell`] 指到的 payload;本地部分与溢出链的拼装规则与
+    /// 原来的单遍读取完全一致。
+    fn read_cell_payload(&self, cell: &TableCell) -> Result<Vec<u8>> {
+        let page_offset = self.page_offset(cell.page);
+        let body_start = page_offset + cell.offset + cell.prefix;
+        let mut payload = self.pages[body_start..body_start + cell.local].to_vec();
+        if cell.payload_len > cell.local {
+            let mut next = u32::from_be_bytes(self.pages[body_start + cell.local..body_start + cell.local + 4].try_into().unwrap());
+            while payload.len() < cell.payload_len {
+                let overflow_offset = self.page_offset(next);
+                let chunk = (cell.payload_len - payload.len()).min(self.usable - 4);
+                payload.extend_from_slice(&self.pages[overflow_offset + 4..overflow_offset + 4 + chunk]);
+                next = u32::from_be_bytes(self.pages[overflow_offset..overflow_offset + 4].try_into().unwrap());
+            }
+        }
+        Ok(payload)
+    }
+
+    fn read_payload(&self, root: u32, rowid: i64) -> Result<Option<Vec<u8>>> {
+        let Some(cell) = self.find_table_cell(root, rowid)?
+        else {
+            return Ok(None);
+        };
+        self.read_cell_payload(&cell).map(Some)
+    }
+
+    /// 当新 payload 编成的 cell 仍装得进旧 cell 的页内跨度时,在原偏移
+    /// 就地改写,并把余量归还给页内空闲空间。装不下时返回 `false` 且不改动
+    /// 镜像,由调用方回退到 delete + insert。
+    ///
+    /// 原地路径不改 cell 指针数组、content offset 与原 freeblock 的位置;
+    /// 只有新 cell 短于旧跨度时才向 freeblock 链追加余量(不足 4 字节时
+    /// 按上游 `pageFindSlot` 语义累加页头 `nFrag`),否则重写后的页在
+    /// `integrity_check` 里会报“Fragmentation ... reported as 0”。
+    fn replace_cell_in_place(&mut self, cell: &TableCell, payload: &[u8]) -> Result<bool> {
+        let local = self.local_payload(payload.len());
+        let mut prefix = Vec::with_capacity(10);
+        encode_varint_into(&mut prefix, payload.len() as u64);
+        encode_varint_into(&mut prefix, cell.rowid as u64);
+        let span = prefix.len() + local + if payload.len() > local { 4 } else { 0 };
+        if span > cell.span {
+            return Ok(false);
+        }
+        let remainder = cell.span - span;
+        let fragment_position = self.page_offset(cell.page) + Self::header_offset(cell.page) + 7;
+        let fragments = self.pages[fragment_position] as usize;
+        // 1 到 3 字节的余量只能记作碎片。累计将超过 60 字节时退回整行
+        // 复写,把余量并入 freeblock,避免页头 nFrag 超出上游上限。
+        if remainder > 0 && remainder < 4 && fragments + remainder > 60 {
+            return Ok(false);
+        }
+
+        self.touch_page(cell.page);
+        if cell.payload_len > cell.local {
+            let body_start = self.page_offset(cell.page) + cell.offset + cell.prefix;
+            let head = u32::from_be_bytes(self.pages[body_start + cell.local..body_start + cell.local + 4].try_into().unwrap());
+            self.free_overflow_chain(head);
+        }
+        // `free_overflow_chain` 与 `write_overflow` 都可能分配/回收页并
+        // 触发镜像扩容,因此每次写之前按页号重新计算偏移。
+        let mut body = self.page_offset(cell.page) + cell.offset;
+        self.pages[body..body + prefix.len()].copy_from_slice(&prefix);
+        body += prefix.len();
+        self.pages[body..body + local].copy_from_slice(&payload[..local]);
+        if payload.len() > local {
+            let head = self.write_overflow(payload, local)?;
+            let pointer = self.page_offset(cell.page) + cell.offset + prefix.len() + local;
+            self.pages[pointer..pointer + 4].copy_from_slice(&head.to_be_bytes());
+        }
+        if remainder >= 4 {
+            self.add_freeblock(cell.page, cell.offset + span, remainder);
+        }
+        else if remainder > 0 {
+            let fragments = self.page_offset(cell.page) + Self::header_offset(cell.page) + 7;
+            let current = self.pages[fragments] as usize;
+            self.pages[fragments] = (current + remainder) as u8;
+        }
+        Ok(true)
     }
 
     fn table_insert(&mut self, page: u32, rowid: i64, payload: &[u8]) -> Result<u32> {
@@ -3332,6 +3453,19 @@ struct CellInfo {
     rowid: i64,
     prefix: usize,
     length: usize,
+}
+
+/// 表叶页上一个 cell 的定位信息:所在页、页内起始偏移、payload 之前的
+/// 前缀长度(长度 varint + rowid varint)、payload 长度、本地字节数,以及
+/// cell 在页内占用的总跨度(含溢出页指针)。
+struct TableCell {
+    page: u32,
+    rowid: i64,
+    offset: usize,
+    prefix: usize,
+    payload_len: usize,
+    local: usize,
+    span: usize,
 }
 
 struct IndexSplit {
