@@ -226,6 +226,150 @@ fn updates_rewrite_records_and_move_rowid_aliases() {
     assert_eq!(rows[0].rowid, 42);
 }
 
+/// Counts the freeblock headers reachable from every table-leaf page. Pure
+/// inserts leave none, so a non-zero count proves the update path returned its
+/// leftover cell bytes to the page rather than leaking them.
+fn leaf_freeblocks(pages: &[u8], page_size: usize) -> usize {
+    let mut count = 0;
+    for (index, page) in pages.chunks_exact(page_size).enumerate() {
+        let header = if index == 0 { 100 } else { 0 };
+        if page[header] != 13 {
+            continue;
+        }
+        let mut cursor = u16::from_be_bytes([page[header + 1], page[header + 2]]) as usize;
+        while cursor != 0 {
+            count += 1;
+            cursor = u16::from_be_bytes([page[cursor], page[cursor + 1]]) as usize;
+        }
+    }
+    count
+}
+
+#[test]
+fn same_size_updates_rewrite_cells_in_place_across_interior_leaves() {
+    // 512-byte pages force an interior root with many leaf children, so the
+    // in-place path must locate the target cell through the full descent.
+    let mut writer = SqliteWriter::create(512).expect("create database");
+    let mut id = column("id", "INTEGER");
+    id.primary_key = true;
+    writer.create_table("items", &[id, column("label", "TEXT"), column("score", "REAL")]).expect("create table");
+    for row in 1..=200i64 {
+        writer.insert("items", &[integer(row), text(&format!("row-{row}")), Some(WriteValue::Real(row as f64))]).expect("insert");
+    }
+    let pages_before = writer.pages().len();
+    for row in (1..=200i64).step_by(17) {
+        assert!(
+            writer.update("items", row, &[UpdateValue::Keep, UpdateValue::Keep, UpdateValue::Set(WriteValue::Real(7.25))]).expect("update")
+        );
+    }
+    assert_eq!(writer.pages().len(), pages_before, "same-size updates must not allocate or split pages");
+    assert_eq!(leaf_freeblocks(writer.pages(), 512), 0, "same-size updates must not fragment the page");
+    let rows = writer.table_rows("items", limits()).expect("read rows");
+    assert_eq!(rows.len(), 200);
+    for row in &rows {
+        let values = decode_record(&row.payload, TextEncoding::Utf8, RecordLimits::default()).expect("decode");
+        let expected = if (row.rowid - 1) % 17 == 0 { 7.25 } else { row.rowid as f64 };
+        assert_eq!(values[2], RecordValue::Real(expected), "row {} value", row.rowid);
+    }
+}
+
+#[test]
+fn shorter_updates_return_the_old_cell_tail_to_the_page_free_space() {
+    let mut writer = SqliteWriter::create(512).expect("create database");
+    writer.create_table("notes", &[column("id", "INTEGER"), column("body", "TEXT")]).expect("create table");
+    writer.insert("notes", &[integer(1), text("abcdefghijklmnopqrstuvwxyz0123456789")]).expect("insert");
+    assert_eq!(leaf_freeblocks(writer.pages(), 512), 0, "pure inserts leave no freeblocks");
+    let pages_before = writer.pages().len();
+
+    assert!(writer.update("notes", 1, &[UpdateValue::Keep, UpdateValue::Set(WriteValue::Text("short".to_string()))]).expect("shorten"));
+    assert!(leaf_freeblocks(writer.pages(), 512) > 0, "the shortened tail must enter the freeblock chain");
+    let rows = writer.table_rows("notes", limits()).expect("read rows");
+    let values = decode_record(&rows[0].payload, TextEncoding::Utf8, RecordLimits::default()).expect("decode");
+    assert_eq!(values[1], RecordValue::Text("short".to_string()));
+
+    // Growing past the shortened span takes delete + insert, which must reuse
+    // the freeblock the in-place path left behind instead of growing the file.
+    assert!(
+        writer
+            .update("notes", 1, &[UpdateValue::Keep, UpdateValue::Set(WriteValue::Text("abcdefghijklmnopqrstuvwxyz0123".to_string()))])
+            .expect("grow")
+    );
+    assert_eq!(writer.pages().len(), pages_before);
+    let rows = writer.table_rows("notes", limits()).expect("read rows after grow");
+    let values = decode_record(&rows[0].payload, TextEncoding::Utf8, RecordLimits::default()).expect("decode after grow");
+    assert_eq!(values[1], RecordValue::Text("abcdefghijklmnopqrstuvwxyz0123".to_string()));
+}
+
+#[test]
+fn updates_refresh_only_the_index_keys_that_changed() {
+    let mut writer = SqliteWriter::create(4096).expect("create database");
+    writer.create_table("users", &[column("id", "INTEGER"), column("email", "TEXT"), column("note", "TEXT")]).expect("create table");
+    writer.create_index("users_email", "users", &["email".to_string()], true).expect("create index");
+    writer.insert("users", &[integer(1), text("alice@example.com"), text("a")]).expect("insert 1");
+    writer.insert("users", &[integer(2), text("bob@example.com"), text("b")]).expect("insert 2");
+
+    let before = writer.index_entries_decoded("users_email").expect("index entries");
+    assert!(
+        writer
+            .update("users", 1, &[UpdateValue::Keep, UpdateValue::Keep, UpdateValue::Set(WriteValue::Text("changed".to_string()))])
+            .expect("update non-indexed column")
+    );
+    assert_eq!(
+        writer.index_entries_decoded("users_email").expect("index entries after note update"),
+        before,
+        "an update that touches no indexed column must not rewrite index keys"
+    );
+
+    assert!(
+        writer
+            .update("users", 2, &[UpdateValue::Keep, UpdateValue::Set(WriteValue::Text("carol@example.com".to_string())), UpdateValue::Keep])
+            .expect("update indexed column")
+    );
+    let after = writer.index_entries_decoded("users_email").expect("index entries after email update");
+    assert!(after.iter().any(|(key, rowid)| *rowid == 2 && key[0] == WriteValue::Text("carol@example.com".to_string())));
+    assert!(!after.iter().any(|(key, rowid)| *rowid == 2 && key[0] == WriteValue::Text("bob@example.com".to_string())));
+
+    assert!(
+        writer
+            .update("users", 2, &[UpdateValue::Keep, UpdateValue::Set(WriteValue::Text("alice@example.com".to_string())), UpdateValue::Keep])
+            .is_err(),
+        "unique index probe must still reject a duplicate after an in-place update"
+    );
+}
+
+#[test]
+fn rollback_undoes_an_in_place_update_and_its_index_refresh() {
+    let mut writer = SqliteWriter::create(4096).expect("create database");
+    writer.create_table("txn", &[column("id", "INTEGER"), column("note", "TEXT")]).expect("create table");
+    writer.create_index("txn_note", "txn", &["note".to_string()], false).expect("create index");
+    writer.insert("txn", &[integer(1), text("before")]).expect("insert");
+
+    writer.begin().expect("begin");
+    assert!(writer.update("txn", 1, &[UpdateValue::Keep, UpdateValue::Set(WriteValue::Text("after".to_string()))]).expect("update"));
+    let during_rows = writer.table_rows("txn", limits()).expect("rows");
+    let during = decode_record(&during_rows[0].payload, TextEncoding::Utf8, RecordLimits::default()).expect("decode");
+    assert_eq!(during[1], RecordValue::Text("after".to_string()));
+    assert!(
+        writer
+            .index_entries_decoded("txn_note")
+            .expect("entries")
+            .iter()
+            .any(|(key, rowid)| *rowid == 1 && key[0] == WriteValue::Text("after".to_string()))
+    );
+    writer.rollback().expect("rollback");
+
+    let rows = writer.table_rows("txn", limits()).expect("rows after rollback");
+    let after = decode_record(&rows[0].payload, TextEncoding::Utf8, RecordLimits::default()).expect("decode after rollback");
+    assert_eq!(after[1], RecordValue::Text("before".to_string()), "rollback must restore the original cell bytes");
+    assert!(
+        writer
+            .index_entries_decoded("txn_note")
+            .expect("entries after rollback")
+            .iter()
+            .any(|(key, rowid)| *rowid == 1 && key[0] == WriteValue::Text("before".to_string()))
+    );
+}
+
 #[test]
 fn repeated_updates_reuse_the_freed_cell_instead_of_growing_the_page() {
     let mut writer = SqliteWriter::create(4096).expect("create database");
