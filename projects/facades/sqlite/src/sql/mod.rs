@@ -23,6 +23,17 @@ pub use error::SqlError;
 pub use host::HostFunctionTable;
 pub use sql::{ColumnRef, IndexColumn, Literal, SelectItems, Statement, TableRef, TransactionAction, parameter_slots, parse, parse_with_host_functions};
 
+/// Maps a storage rejection onto the facade's stable error code.
+///
+/// Corruption keeps its own code instead of collapsing into `storage`.
+pub(crate) fn storage_failure(error: database_types::Error) -> SqlError {
+    let code = match &error {
+        database_types::Error::Corrupt(_) | database_types::Error::CorruptReason { .. } => "corrupt",
+        _ => "storage",
+    };
+    SqlError::new(code, error.to_string())
+}
+
 pub(crate) fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');

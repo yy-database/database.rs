@@ -22,7 +22,7 @@ use std::{
 
 use crate::{
     SqliteWriter,
-    sql::{Cell, Engine, ExecResult, SqlError, Statement, TransactionAction, engine::LazyCursor, parameter_slots},
+    sql::{Cell, Engine, ExecResult, SqlError, Statement, TransactionAction, engine::LazyCursor, parameter_slots, storage_failure},
 };
 
 use database_storage::sqlite::journal;
@@ -347,7 +347,7 @@ impl Connection {
         let mut created = false;
         let mut lock = None;
         let writer = if let Some(pages) = &options.data {
-            SqliteWriter::from_pages(pages.clone()).map_err(storage_error)?
+            SqliteWriter::from_pages(pages.clone()).map_err(storage_failure)?
         }
         else if let Some(path) = &options.filename {
             if !options.read_only && (path.exists() || options.create) {
@@ -355,18 +355,18 @@ impl Connection {
             }
             if path.exists() {
                 let pages = load_recovered(path, options.read_only, options.journal_mode, options.synchronous)?;
-                SqliteWriter::from_pages(pages).map_err(storage_error)?
+                SqliteWriter::from_pages(pages).map_err(storage_failure)?
             }
             else if options.create && !options.read_only {
                 created = true;
-                SqliteWriter::create(options.page_size.unwrap_or(4096) as usize).map_err(storage_error)?
+                SqliteWriter::create(options.page_size.unwrap_or(4096) as usize).map_err(storage_failure)?
             }
             else {
                 return Err(SqlError::new("not-found", format!("database file `{}` does not exist", path.display())));
             }
         }
         else {
-            SqliteWriter::create(options.page_size.unwrap_or(4096) as usize).map_err(storage_error)?
+            SqliteWriter::create(options.page_size.unwrap_or(4096) as usize).map_err(storage_failure)?
         };
         let mut engine = Engine::from_writer(writer)?;
         engine.set_synchronous(options.synchronous);
@@ -390,7 +390,7 @@ impl Connection {
         if created {
             // 新建库没有旧镜像可回滚;残留日志只可能来自更早的失败创建,先清掉。
             if let Some(path) = &connection.filename {
-                journal::finish(path, false).map_err(storage_error)?;
+                journal::finish(path, false).map_err(storage_failure)?;
             }
             connection.publish()?;
         }
@@ -680,7 +680,7 @@ impl Connection {
         let journaled = path.exists();
         if journaled {
             let previous = fs::read(path).map_err(storage_error)?;
-            journal::write(path, &previous, self.synchronous).map_err(storage_error)?;
+            journal::write(path, &previous, self.synchronous).map_err(storage_failure)?;
         }
         #[cfg(test)]
         if self.fail_point == Some(FailPoint::AfterJournal) {
@@ -692,7 +692,7 @@ impl Connection {
             return Err(SqlError::new("injected", "failure point after publish"));
         }
         if journaled {
-            journal::finish(path, self.journal_mode == JournalMode::Truncate).map_err(storage_error)?;
+            journal::finish(path, self.journal_mode == JournalMode::Truncate).map_err(storage_failure)?;
         }
         Ok(())
     }
@@ -716,7 +716,7 @@ fn load_recovered(path: &Path, read_only: bool, journal_mode: JournalMode, synch
     };
     if !read_only {
         restore_atomic(path, &recovered, synchronous)?;
-        journal::finish(path, journal_mode == JournalMode::Truncate).map_err(storage_error)?;
+        journal::finish(path, journal_mode == JournalMode::Truncate).map_err(storage_failure)?;
     }
     Ok(recovered)
 }
@@ -1703,5 +1703,43 @@ db.close()
             .expect("a crashed holder must not keep the database locked");
         drop(writer);
         fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    /// 打开损坏镜像时原生层不得 panic;索引 cell 指针越界与表根页类型损坏
+    /// 都要以 `corrupt` 结构化拒绝返回。
+    #[test]
+    fn corrupt_pages_surface_as_structured_corrupt_errors() {
+        use crate::{SchemaObjectKind, TableLimits, read_schema, validate_database};
+
+        let mut source = Connection::open(ConnectionOptions::default()).expect("in-memory source");
+        source.execute("CREATE TABLE t(x INTEGER)", &[]).expect("create table");
+        source.execute("CREATE INDEX i ON t(x)", &[]).expect("create index");
+        source.execute("INSERT INTO t VALUES (1)", &[]).expect("insert");
+        let image = source.snapshot().to_vec();
+        let objects = read_schema(&image, TableLimits::default()).expect("schema rows");
+        let root_of = |kind: SchemaObjectKind| {
+            objects.iter().find(|object| object.kind == kind).and_then(|object| object.root_page).expect("catalog root") as usize
+        };
+        let page_size = validate_database(&image).expect("page size");
+        let header = |root: usize| if root == 1 { 100 } else { 0 };
+
+        // The index root's single cell pointer sits past the page.
+        let mut bad_index = image.clone();
+        let root = root_of(SchemaObjectKind::Index);
+        let base = (root - 1) * page_size + header(root);
+        bad_index[base + 3..base + 5].copy_from_slice(&1u16.to_be_bytes());
+        bad_index[base + 8..base + 10].copy_from_slice(&5000u16.to_be_bytes());
+        let error = Connection::open(ConnectionOptions { data: Some(bad_index), ..Default::default() }).err().expect("corrupt index");
+        assert_eq!(error.code, "corrupt");
+
+        // The table root carries an invalid page type; opening tolerates it, the
+        // first scan reports corruption instead of panicking.
+        let mut bad_table = image;
+        let root = root_of(SchemaObjectKind::Table);
+        let base = (root - 1) * page_size + header(root);
+        bad_table[base] = 0;
+        let mut connection = Connection::open(ConnectionOptions { data: Some(bad_table), ..Default::default() }).expect("open defers table reads");
+        let error = connection.execute("SELECT x FROM t", &[]).expect_err("corrupt table root");
+        assert_eq!(error.code, "corrupt");
     }
 }

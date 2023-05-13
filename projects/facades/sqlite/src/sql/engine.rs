@@ -25,6 +25,7 @@ use super::{
     error::SqlError,
     host::{cell_to_udf_value, udf_error_to_sql_error, udf_value_to_cell, HostFunctionTable},
     json_string,
+    storage_failure,
     sql::{
         AggregateFunction, AlterAction, Assignment, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp,
         CompoundTerm, ConflictAction, ConflictClause, DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge,
@@ -1047,6 +1048,11 @@ fn storage_error(error: impl std::fmt::Display) -> SqlError {
     SqlError::new("storage", error.to_string()).in_statement("select")
 }
 
+/// A malformed on-disk structure found by the lazy scan.
+fn corrupt_error(message: &'static str) -> SqlError {
+    SqlError::new("corrupt", message).in_statement("select")
+}
+
 /// The schema tables are read-only for user writes.
 fn check_readonly_table(name: &str, statement: &'static str) -> Result<(), SqlError> {
     if is_schema_table(name) || name.eq_ignore_ascii_case("sqlite_sequence") {
@@ -1167,7 +1173,7 @@ impl Engine {
     /// Creates a blank in-memory database image.
     pub fn new(page_size: Option<u32>) -> Result<Self, SqlError> {
         let page_size = page_size.unwrap_or(4096) as usize;
-        let writer = SqliteWriter::create(page_size).map_err(|error| SqlError::new("storage", error.to_string()))?;
+        let writer = SqliteWriter::create(page_size).map_err(|error| storage_failure(error))?;
         Self::from_writer(writer)
     }
 
@@ -1225,9 +1231,9 @@ impl Engine {
                 if self.transaction.is_some() {
                     return Err(SqlError::new("transaction-active", "cannot start a transaction within a transaction").in_statement("begin"));
                 }
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("begin"))?;
+                self.writer.begin().map_err(|error| storage_failure(error).in_statement("begin"))?;
                 for attached in &mut self.attached {
-                    attached.engine.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("begin"))?;
+                    attached.engine.writer.begin().map_err(|error| storage_failure(error).in_statement("begin"))?;
                 }
                 self.transaction = Some(TransactionState { from_begin: true, savepoints: Vec::new() });
             }
@@ -1240,9 +1246,9 @@ impl Engine {
                     attached.engine.check_deferred_foreign_keys()?;
                 }
                 self.transaction.take();
-                self.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
+                self.writer.commit_all().map_err(|error| storage_failure(error).in_statement("commit"))?;
                 for attached in &mut self.attached {
-                    attached.engine.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
+                    attached.engine.writer.commit_all().map_err(|error| storage_failure(error).in_statement("commit"))?;
                 }
                 self.persist_attached_databases()?;
             }
@@ -1250,14 +1256,14 @@ impl Engine {
                 if self.transaction.take().is_none() {
                     return Err(SqlError::new("transaction-missing", "cannot rollback - no transaction is active").in_statement("rollback"));
                 }
-                self.writer.rollback_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback"))?;
+                self.writer.rollback_all().map_err(|error| storage_failure(error).in_statement("rollback"))?;
                 self.reload_catalog()?;
                 for index in 0..self.attached.len() {
                     self.attached[index]
                         .engine
                         .writer
                         .rollback_all()
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback"))?;
+                        .map_err(|error| storage_failure(error).in_statement("rollback"))?;
                     self.attached[index].dirty = false;
                     self.attached[index].engine.reload_catalog()?;
                 }
@@ -1265,23 +1271,23 @@ impl Engine {
             TransactionAction::Savepoint(name) => {
                 if self.transaction.is_none() {
                     // A savepoint outside `BEGIN` opens its own transaction.
-                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                    self.writer.begin().map_err(|error| storage_failure(error).in_statement("savepoint"))?;
                     for attached in &mut self.attached {
                         attached
                             .engine
                             .writer
                             .begin()
-                            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                            .map_err(|error| storage_failure(error).in_statement("savepoint"))?;
                     }
                     self.transaction = Some(TransactionState { from_begin: false, savepoints: Vec::new() });
                 }
-                self.writer.savepoint(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                self.writer.savepoint(&name).map_err(|error| storage_failure(error).in_statement("savepoint"))?;
                 for attached in &mut self.attached {
                     attached
                         .engine
                         .writer
                         .savepoint(&name)
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                        .map_err(|error| storage_failure(error).in_statement("savepoint"))?;
                 }
                 self.transaction.as_mut().expect("savepoint opened a transaction").savepoints.push(name);
             }
@@ -1302,13 +1308,13 @@ impl Engine {
                         attached.engine.check_deferred_foreign_keys()?;
                     }
                 }
-                self.writer.release(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
+                self.writer.release(&name).map_err(|error| storage_failure(error).in_statement("release"))?;
                 for attached in &mut self.attached {
                     attached
                         .engine
                         .writer
                         .release(&name)
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
+                        .map_err(|error| storage_failure(error).in_statement("release"))?;
                 }
                 let closing = {
                     let state = self.transaction.as_mut().expect("an open savepoint implies a transaction");
@@ -1318,21 +1324,21 @@ impl Engine {
                 if closing {
                     // Releasing the last savepoint of a transaction that no
                     // `BEGIN` opened commits it, as in SQLite.
-                    self.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
+                    self.writer.commit_all().map_err(|error| storage_failure(error).in_statement("release"))?;
                     self.transaction = None;
                     self.persist_attached_databases()?;
                 }
             }
             TransactionAction::RollbackTo(name) => {
                 let index = self.savepoint_position(&name, "rollback-to")?;
-                self.writer.rollback_to(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback-to"))?;
+                self.writer.rollback_to(&name).map_err(|error| storage_failure(error).in_statement("rollback-to"))?;
                 self.reload_catalog()?;
                 for index in 0..self.attached.len() {
                     self.attached[index]
                         .engine
                         .writer
                         .rollback_to(&name)
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback-to"))?;
+                        .map_err(|error| storage_failure(error).in_statement("rollback-to"))?;
                     self.attached[index].engine.reload_catalog()?;
                 }
                 self.transaction.as_mut().expect("an open savepoint implies a transaction").savepoints.truncate(index + 1);
@@ -2111,14 +2117,14 @@ impl Engine {
     /// Reads of an existing file go through [`Engine::from_writer`]; this is
     /// the matching write-back so a file-backed session survives reopening.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<(), SqlError> {
-        self.writer.save(path).map_err(|error| SqlError::new("storage", error.to_string()))
+        self.writer.save(path).map_err(|error| storage_failure(error))
     }
 
     /// Flushes the current database image to `path` without ever exposing a
     /// half-written file, by renaming a complete sibling temporary file over
     /// it.
     pub fn save_atomic(&mut self, path: impl AsRef<Path>) -> Result<(), SqlError> {
-        self.writer.save_atomic(path).map_err(|error| SqlError::new("storage", error.to_string()))
+        self.writer.save_atomic(path).map_err(|error| storage_failure(error))
     }
 
     /// Configured page size.
@@ -2128,7 +2134,7 @@ impl Engine {
 
     /// Format-3 library version stamped in the image header.
     pub fn sqlite_version(&self) -> Result<String, SqlError> {
-        decode_library_version(self.writer.pages()).map_err(|error| SqlError::new("storage", error.to_string()))
+        decode_library_version(self.writer.pages()).map_err(|error| storage_failure(error))
     }
 
     /// Materializes one reserved table with the labels and row order SQLite
@@ -2245,7 +2251,7 @@ impl Engine {
         // A trigger that fails has to undo the statement that fired it, like
         // SQLite's per-statement rollback, so the whole statement runs inside
         // one writer level owned here.
-        self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("trigger"))?;
+        self.writer.begin().map_err(|error| storage_failure(error).in_statement("trigger"))?;
         let outcome = match self.run_statement(statement) {
             Ok(result) => {
                 let events = std::mem::take(&mut self.pending_events);
@@ -2262,7 +2268,7 @@ impl Engine {
                         Err(error)
                     }
                     None => {
-                        self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("trigger"))?;
+                        self.writer.commit().map_err(|error| storage_failure(error).in_statement("trigger"))?;
                         Ok(result)
                     }
                 }
@@ -2861,7 +2867,7 @@ impl Engine {
             return Ok(());
         }
         if let Some(path) = self.attached[index].file.clone() {
-            self.attached[index].engine.save(&path).map_err(|error| SqlError::new("storage", error.to_string()))?;
+            self.attached[index].engine.save(&path)?;
         }
         self.attached[index].dirty = false;
         Ok(())
@@ -2935,7 +2941,7 @@ impl Engine {
                     .truncate(false)
                     .open(&requested)
                     .map_err(|_| SqlError::new("unable-to-open", format!("unable to open database: {file}")))?;
-                SqliteWriter::create(self.page_size() as usize).map_err(|error| SqlError::new("storage", error.to_string()))?
+                SqliteWriter::create(self.page_size() as usize).map_err(|error| storage_failure(error))?
             };
             let engine = Engine::from_writer(writer)?;
             (engine, Some(path.clone()), path.to_string_lossy().into_owned())
@@ -2990,7 +2996,7 @@ impl Engine {
             if let Some(expression) = into {
                 let target = self.vacuum_target(expression)?;
                 let empty = SqliteWriter::create(self.writer.page_size())
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+                    .map_err(|error| storage_failure(error).in_statement("vacuum"))?;
                 self.write_vacuum_image(&target, empty.pages())?;
             }
             return Ok(ExecResult { statement: "vacuum", columns: Vec::new(), rows: Vec::new(), affected: 0 });
@@ -3003,7 +3009,7 @@ impl Engine {
         else {
             let synchronous = self.writer.synchronous();
             let mut writer =
-                SqliteWriter::from_pages(image).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+                SqliteWriter::from_pages(image).map_err(|error| storage_failure(error).in_statement("vacuum"))?;
             writer.set_synchronous(synchronous);
             self.writer = writer;
             self.reload_catalog()?;
@@ -3063,9 +3069,9 @@ impl Engine {
         let user_version = self.writer.user_version();
         let application_id = self.writer.application_id();
         let limits = TableLimits::default();
-        let objects = self.writer.schema_objects(limits).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+        let objects = self.writer.schema_objects(limits).map_err(|error| storage_failure(error).in_statement("vacuum"))?;
         let writer = SqliteWriter::create_with_encoding(page_size, encoding)
-            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+            .map_err(|error| storage_failure(error).in_statement("vacuum"))?;
         let mut fresh = Engine::from_writer(writer)?;
         for object in &objects {
             if object.kind != SchemaObjectKind::Table || object.name.eq_ignore_ascii_case("sqlite_sequence") {
@@ -3083,7 +3089,7 @@ impl Engine {
             let fresh_present = fresh
                 .writer
                 .schema_objects(limits)
-                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?
+                .map_err(|error| storage_failure(error).in_statement("vacuum"))?
                 .iter()
                 .any(|object| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case("sqlite_sequence"));
             if !fresh_present {
@@ -3106,16 +3112,16 @@ impl Engine {
                 fresh
                     .writer
                     .create_table_with_primary_key_sql("sqlite_sequence", &columns, &[], Some("CREATE TABLE sqlite_sequence(name,seq)"))
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+                    .map_err(|error| storage_failure(error).in_statement("vacuum"))?;
             }
             let limits = TableLimits::default();
             for row in self
                 .writer
                 .table_rows("sqlite_sequence", limits)
-                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?
+                .map_err(|error| storage_failure(error).in_statement("vacuum"))?
             {
                 let values = decode_record(&row.payload, encoding, RecordLimits { max_columns: 1024, max_payload_bytes: 16 * 1024 * 1024 })
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+                    .map_err(|error| storage_failure(error).in_statement("vacuum"))?;
                 let cells: Vec<Cell> = values
                     .iter()
                     .map(|value| match value {
@@ -3130,7 +3136,7 @@ impl Engine {
                 fresh
                     .writer
                     .insert("sqlite_sequence", &slots)
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+                    .map_err(|error| storage_failure(error).in_statement("vacuum"))?;
             }
         }
         for def in self.tables.clone() {
@@ -3139,10 +3145,10 @@ impl Engine {
             }
             for (_, cells) in self.live_rows(&def, "vacuum")? {
                 let slots: Vec<Option<crate::WriteValue>> = cells.iter().map(|cell| Some(cell_write_value(cell))).collect();
-                fresh.writer.insert(&def.name, &slots).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+                fresh.writer.insert(&def.name, &slots).map_err(|error| storage_failure(error).in_statement("vacuum"))?;
             }
         }
-        fresh.writer.materialize_without_rowid().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+        fresh.writer.materialize_without_rowid().map_err(|error| storage_failure(error).in_statement("vacuum"))?;
         for kind in [SchemaObjectKind::Index, SchemaObjectKind::View, SchemaObjectKind::Trigger] {
             for object in &objects {
                 if object.kind != kind {
@@ -3153,8 +3159,8 @@ impl Engine {
                 }
             }
         }
-        fresh.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
-        fresh.writer.materialize_without_rowid().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("vacuum"))?;
+        fresh.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("vacuum"))?;
+        fresh.writer.materialize_without_rowid().map_err(|error| storage_failure(error).in_statement("vacuum"))?;
         fresh.writer.set_user_version(user_version);
         fresh.writer.set_application_id(application_id);
         Ok(fresh.writer.pages().to_vec())
@@ -3240,17 +3246,17 @@ impl Engine {
         }
         self.writer
             .create_table_with_primary_key_sql(&name, &columns, &[], Some(&sql))
-            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+            .map_err(|error| storage_failure(error).in_statement("create-table"))?;
         if !selected.rows.is_empty() {
-            self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+            self.writer.begin().map_err(|error| storage_failure(error).in_statement("create-table"))?;
             for row in &selected.rows {
                 let slots: Vec<Option<crate::WriteValue>> = row.iter().map(|cell| Some(cell_write_value(cell))).collect();
                 if let Err(error) = self.writer.insert(&name, &slots) {
                     let _ = self.writer.rollback();
-                    return Err(SqlError::new("storage", error.to_string()).in_statement("create-table"));
+                    return Err(storage_failure(error).in_statement("create-table"));
                 }
             }
-            self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+            self.writer.commit().map_err(|error| storage_failure(error).in_statement("create-table"))?;
         }
         let position = self.tables.len();
         self.table_lookup.insert(key, position);
@@ -3425,12 +3431,12 @@ impl Engine {
                 if without_rowid {
                     self.writer
                         .create_table_without_rowid_sql(&name, &columns, &without_rowid_keys, Some(&sql))
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+                        .map_err(|error| storage_failure(error).in_statement("create-table"))?;
                 }
                 else {
                     self.writer
                         .create_table_with_primary_key_sql(&name, &columns, &primary_key, Some(&sql))
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+                        .map_err(|error| storage_failure(error).in_statement("create-table"))?;
                 }
                 // Appending keeps the catalog in creation order, which is the
                 // order `sqlite_master` reports.
@@ -3479,7 +3485,7 @@ impl Engine {
                 }
                 self.writer
                     .create_view(&name, &sql)
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-view"))?;
+                    .map_err(|error| storage_failure(error).in_statement("create-view"))?;
                 self.views.insert(key, ViewDef { name, columns, query: *query });
                 Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
@@ -3518,7 +3524,7 @@ impl Engine {
                     }
                     return Err(SqlError::new("unknown-view", format!("no such view: {name}")).in_statement("drop-view"));
                 }
-                self.writer.drop_view(&name).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-view"))?;
+                self.writer.drop_view(&name).map_err(|error| storage_failure(error).in_statement("drop-view"))?;
                 self.triggers.retain(|_, trigger| trigger.table != key);
                 Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
@@ -3567,7 +3573,7 @@ impl Engine {
                 else {
                     self.writer
                         .create_trigger(&name, &table, &sql)
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-trigger"))?;
+                        .map_err(|error| storage_failure(error).in_statement("create-trigger"))?;
                     0
                 };
                 self.triggers.insert(key, TriggerDef { name, table: table_key, timing, event, when, body, order, temp, sql, master_rowid });
@@ -3585,7 +3591,7 @@ impl Engine {
                 if !trigger.temp {
                     self.writer
                         .drop_trigger(&trigger.name)
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-trigger"))?;
+                        .map_err(|error| storage_failure(error).in_statement("drop-trigger"))?;
                 }
                 Ok(ExecResult { statement: "drop-trigger", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
@@ -3695,7 +3701,7 @@ impl Engine {
                 // Temp tables snapshot their row map instead of opening one.
                 let temp_snapshot = temp_position.map(|position| self.temp_tables[position].rows.clone());
                 if temp_position.is_none() {
-                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                    self.writer.begin().map_err(|error| storage_failure(error).in_statement("insert"))?;
                 }
                 let temp_keys = if temp_position.is_some() { self.unique_keys(def, &key) } else { Vec::new() };
                 let check_shape = ScopeShape { columns: Vec::new() };
@@ -3816,7 +3822,7 @@ impl Engine {
                                 else {
                                     self.writer
                                         .insert(&table, slots)
-                                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))
+                                        .map_err(|error| storage_failure(error).in_statement("insert"))
                                 };
                                 match inserted {
                                     Ok(rowid) => UpsertOutcome::Inserted(rowid),
@@ -3949,19 +3955,19 @@ impl Engine {
                         let _ = self.writer.rollback();
                         return Err(error);
                     }
-                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                    self.writer.commit().map_err(|error| storage_failure(error).in_statement("insert"))?;
                 }
                 // Explicit indexes and the automatic ones built for any
                 // `PRIMARY KEY` / `UNIQUE` constraint live only as key sets
                 // until they are materialized into b-tree pages, so a write to
                 // an indexed table has to rebuild them before the image is read.
                 if temp_position.is_none() && (self.has_indexes(def, &key) || replace_index_needed) {
-                    self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                    self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("insert"))?;
                 }
                 if temp_position.is_none() && (def.without_rowid || replace_without_needed) {
                     self.writer
                         .materialize_without_rowid()
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                        .map_err(|error| storage_failure(error).in_statement("insert"))?;
                 }
                 if let Some(plan) = &returning {
                     return Ok(ExecResult { statement: "insert", columns: plan.columns.clone(), rows: returned, affected });
@@ -4060,7 +4066,7 @@ impl Engine {
                     }
                     self.writer
                         .create_managed_index(&name, &table, unique, &sql, &entries)
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-index"))?;
+                        .map_err(|error| storage_failure(error).in_statement("create-index"))?;
                     let order = self.index_sequence;
                     self.index_sequence += 1;
                     self.indexes.insert(
@@ -4099,7 +4105,7 @@ impl Engine {
                 let names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
                 self.writer
                     .create_index_with_sql(&name, &table, &names, unique, Some(&sql))
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-index"))?;
+                    .map_err(|error| storage_failure(error).in_statement("create-index"))?;
                 let order = self.index_sequence;
                 self.index_sequence += 1;
                 self.indexes.insert(
@@ -4299,7 +4305,7 @@ impl Engine {
                     }
                 }
                 else {
-                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
+                    self.writer.begin().map_err(|error| storage_failure(error).in_statement("update"))?;
                     for (rowid, values) in &plan.writes {
                         let mut new_cells = old_lookup.get(rowid).cloned().unwrap_or_default();
                         if new_cells.len() < def.columns.len() {
@@ -4378,15 +4384,15 @@ impl Engine {
                         let _ = self.writer.rollback();
                         return Err(error);
                     }
-                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
+                    self.writer.commit().map_err(|error| storage_failure(error).in_statement("update"))?;
                 }
                 if temp_position.is_none() && needs_index {
-                    self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
+                    self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("update"))?;
                 }
                 if needs_without_rowid {
                     self.writer
                         .materialize_without_rowid()
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
+                        .map_err(|error| storage_failure(error).in_statement("update"))?;
                 }
                 Ok(ExecResult {
                     statement: "update",
@@ -4455,7 +4461,7 @@ impl Engine {
                     }
                 }
                 else {
-                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
+                    self.writer.begin().map_err(|error| storage_failure(error).in_statement("delete"))?;
                     for rowid in &plan.removed {
                         if queue_triggers {
                             let old_cells = old_lookup.get(rowid).cloned().unwrap_or_default();
@@ -4512,15 +4518,15 @@ impl Engine {
                         let _ = self.writer.rollback();
                         return Err(error);
                     }
-                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
+                    self.writer.commit().map_err(|error| storage_failure(error).in_statement("delete"))?;
                 }
                 if temp_position.is_none() && needs_index {
-                    self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
+                    self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("delete"))?;
                 }
                 if needs_without_rowid {
                     self.writer
                         .materialize_without_rowid()
-                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
+                        .map_err(|error| storage_failure(error).in_statement("delete"))?;
                 }
                 Ok(ExecResult {
                     statement: "delete",
@@ -4665,7 +4671,7 @@ impl Engine {
                     .table_lookup
                     .get(&key)
                     .ok_or_else(|| SqlError::new("unknown-table", format!("no such table: {name}")).in_statement("drop-table"))?;
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-table"))?;
+                self.writer.begin().map_err(|error| storage_failure(error).in_statement("drop-table"))?;
                 match self.writer.drop_table(&name) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -4674,10 +4680,10 @@ impl Engine {
                     }
                     Err(error) => {
                         let _ = self.writer.rollback();
-                        return Err(SqlError::new("storage", error.to_string()).in_statement("drop-table"));
+                        return Err(storage_failure(error).in_statement("drop-table"));
                     }
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-table"))?;
+                self.writer.commit().map_err(|error| storage_failure(error).in_statement("drop-table"))?;
                 self.tables.remove(position);
                 self.reindex_tables();
                 self.indexes.retain(|_, index| index.table != key);
@@ -4685,12 +4691,12 @@ impl Engine {
                 Ok(ExecResult { statement: "drop-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             Statement::DropIndex { schema: _, name, if_exists } => {
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-index"))?;
+                self.writer.begin().map_err(|error| storage_failure(error).in_statement("drop-index"))?;
                 let outcome = match self.writer.drop_index(&name) {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         let _ = self.writer.rollback();
-                        return Err(SqlError::new("storage", error.to_string()).in_statement("drop-index"));
+                        return Err(storage_failure(error).in_statement("drop-index"));
                     }
                 };
                 match outcome {
@@ -4711,7 +4717,7 @@ impl Engine {
                         .in_statement("drop-index"));
                     }
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-index"))?;
+                self.writer.commit().map_err(|error| storage_failure(error).in_statement("drop-index"))?;
                 self.indexes.remove(&name.to_ascii_lowercase());
                 Ok(ExecResult { statement: "drop-index", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
@@ -4728,7 +4734,7 @@ impl Engine {
 
     /// Reads the live schema rows with a statement-tagged storage error.
     fn schema_objects(&self, statement: &'static str) -> Result<Vec<crate::SchemaObject>, SqlError> {
-        self.writer.schema_objects(TableLimits::default()).map_err(|error| SqlError::new("storage", error.to_string()).in_statement(statement))
+        self.writer.schema_objects(TableLimits::default()).map_err(|error| storage_failure(error).in_statement(statement))
     }
 
     /// Rebuilds the lowercase name to position map after a table is removed.
@@ -4817,21 +4823,21 @@ impl Engine {
                         pending_views.push((view.name.clone(), rewritten));
                     }
                 }
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                self.writer.begin().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 if let Err(error) = self.writer.rename_table_schema(&old_name, &new_name, &new_sql, &pending) {
                     let _ = self.writer.rollback();
-                    return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                    return Err(storage_failure(error).in_statement("alter-table"));
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                self.writer.commit().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 if !pending_views.is_empty() {
-                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                    self.writer.begin().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                     for (name, text) in &pending_views {
                         if let Err(error) = self.writer.rewrite_view_sql(name, text) {
                             let _ = self.writer.rollback();
-                            return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                            return Err(storage_failure(error).in_statement("alter-table"));
                         }
                     }
-                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                    self.writer.commit().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 }
                 self.tables[position].name = new_name;
                 self.reindex_tables();
@@ -4904,21 +4910,21 @@ impl Engine {
                         pending_views.push((view.name.clone(), rewritten));
                     }
                 }
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                self.writer.begin().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 if let Err(error) = self.writer.rename_column_schema(&name, &new_sql, &pending) {
                     let _ = self.writer.rollback();
-                    return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                    return Err(storage_failure(error).in_statement("alter-table"));
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                self.writer.commit().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 if !pending_views.is_empty() {
-                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                    self.writer.begin().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                     for (view, text) in &pending_views {
                         if let Err(error) = self.writer.rewrite_view_sql(view, text) {
                             let _ = self.writer.rollback();
-                            return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                            return Err(storage_failure(error).in_statement("alter-table"));
                         }
                     }
-                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                    self.writer.commit().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 }
                 for (view, text) in pending_views {
                     if let Some(Statement::CreateView { query, .. }) = parse(&text).ok().and_then(|statements| statements.into_iter().next()) {
@@ -4952,7 +4958,7 @@ impl Engine {
                 let has_rows = !self
                     .writer
                     .table_rows(&def.name, TableLimits::default())
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?
+                    .map_err(|error| storage_failure(error).in_statement("alter-table"))?
                     .is_empty();
                 if column.not_null && matches!(column.default_value, None | Some(crate::WriteValue::Null)) && has_rows {
                     return Err(
@@ -4967,12 +4973,12 @@ impl Engine {
                     .rfind(')')
                     .ok_or_else(|| SqlError::new("storage", "sqlite stored table text has no column list").in_statement("alter-table"))?;
                 let new_sql = format!("{}, {}{}", &stored[..open], sql, &stored[open..]);
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                self.writer.begin().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 if let Err(error) = self.writer.rewrite_table_sql(&def.name, &new_sql) {
                     let _ = self.writer.rollback();
-                    return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                    return Err(storage_failure(error).in_statement("alter-table"));
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                self.writer.commit().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 self.tables[position].columns.push(column);
                 self.tables[position].checks.extend(resolved);
                 self.tables[position].foreign_keys.extend(resolved_foreign_keys);
@@ -5055,16 +5061,16 @@ impl Engine {
                     return Err(SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"));
                 };
                 let derived = Self::catalog_table(name, columns, primary_key, table_constraints, checks, foreign_keys, strict, without_rowid)?;
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                self.writer.begin().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 if let Err(error) = self.writer.drop_column(&def.name, column_position) {
                     let _ = self.writer.rollback();
-                    return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                    return Err(storage_failure(error).in_statement("alter-table"));
                 }
                 if let Err(error) = self.writer.rewrite_table_sql(&def.name, &new_sql) {
                     let _ = self.writer.rollback();
-                    return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                    return Err(storage_failure(error).in_statement("alter-table"));
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                self.writer.commit().map_err(|error| storage_failure(error).in_statement("alter-table"))?;
                 for index in self.indexes.values_mut() {
                     if index.table != key {
                         continue;
@@ -5104,7 +5110,7 @@ impl Engine {
         for row in self
             .writer
             .table_rows(table, TableLimits::default())
-            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-index"))?
+            .map_err(|error| storage_failure(error).in_statement("create-index"))?
         {
             rows.push(decode_row(&row.payload, def, row.rowid)?);
         }
@@ -5170,7 +5176,7 @@ impl Engine {
             let stored = self
                 .writer
                 .without_rowid_rows(&def.name, TableLimits::default())
-                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement(statement))?;
+                .map_err(|error| storage_failure(error).in_statement(statement))?;
             let mut rows = Vec::with_capacity(stored.len());
             for (position, payload) in stored.iter().enumerate() {
                 rows.push((position as i64, def.decode_without_rowid(payload)?));
@@ -5180,7 +5186,7 @@ impl Engine {
         let stored = self
             .writer
             .table_rows(&def.name, TableLimits::default())
-            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement(statement))?;
+            .map_err(|error| storage_failure(error).in_statement(statement))?;
         let mut rows = Vec::with_capacity(stored.len());
         for row in &stored {
             rows.push((row.rowid, decode_row(&row.payload, def, row.rowid)?));
@@ -5449,13 +5455,13 @@ impl Engine {
         let payload = self
             .writer
             .row_payload(table, rowid)
-            .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+            .map_err(|error| storage_failure(error).in_statement("insert"))?;
         let Some(payload) = payload
         else {
             let inserted = self
                 .writer
                 .insert(table, slots)
-                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                .map_err(|error| storage_failure(error).in_statement("insert"))?;
             return Ok(Some(UpsertOutcome::Inserted(inserted)));
         };
         if matches!(plan.action, UpsertAction::Nothing) {
@@ -5575,7 +5581,7 @@ impl Engine {
                 temp_insert_row(def, &mut table_state.rows, slots, &keys)?
             }
             else {
-                self.writer.insert(table, slots).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?
+                self.writer.insert(table, slots).map_err(|error| storage_failure(error).in_statement("insert"))?
             };
             live.push((inserted, candidate[..width].to_vec()));
             return Ok(UpsertOutcome::Inserted(inserted));
@@ -5699,10 +5705,10 @@ impl Engine {
                 .collect();
             let (index_needed, without_needed) = self.apply_foreign_key_actions(def, &changes, "insert", 0)?;
             if index_needed {
-                self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("insert"))?;
             }
             if without_needed {
-                self.writer.materialize_without_rowid().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                self.writer.materialize_without_rowid().map_err(|error| storage_failure(error).in_statement("insert"))?;
             }
         }
         if self.foreign_keys {
@@ -5838,7 +5844,7 @@ impl Engine {
             temp_insert_row(def, &mut table_state.rows, slots, &keys)
         }
         else {
-            self.writer.insert(table, slots).map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))
+            self.writer.insert(table, slots).map_err(|error| storage_failure(error).in_statement("insert"))
         }
     }
 
@@ -5894,7 +5900,7 @@ impl Engine {
             let entries = self.managed_index_entries(def, &index.terms, index.predicate.as_ref(), &rows)?;
             self.writer
                 .replace_managed_index_entries(&index.name, &entries)
-                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement(statement))?;
+                .map_err(|error| storage_failure(error).in_statement(statement))?;
         }
         Ok(())
     }
@@ -8600,7 +8606,7 @@ impl Engine {
             let stored = self
                 .writer
                 .table_range(table, rowids[0], rowids[rowids.len() - 1], TableLimits::default())
-                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+                .map_err(|error| storage_failure(error).in_statement("select"))?;
             let wanted: HashSet<i64> = rowids.iter().copied().collect();
             return Ok(stored.into_iter().filter(|row| wanted.contains(&row.rowid)).collect());
         }
@@ -8609,7 +8615,7 @@ impl Engine {
             stored.extend(
                 self.writer
                     .table_range(table, *rowid, *rowid, TableLimits::default())
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+                    .map_err(|error| storage_failure(error).in_statement("select"))?,
             );
         }
         Ok(stored)
@@ -8714,7 +8720,7 @@ impl Engine {
                 let stored = self
                     .writer
                     .without_rowid_rows(&def.name, TableLimits::default())
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+                    .map_err(|error| storage_failure(error).in_statement("select"))?;
                 let decoded = stored.iter().map(|payload| def.decode_without_rowid(payload)).collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
                 return Ok((SourceColumns::Table(def), Rc::new(decoded)));
             }
@@ -8735,7 +8741,7 @@ impl Engine {
                 let stored = self
                     .writer
                     .table_rows(&def.name, TableLimits::default())
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+                    .map_err(|error| storage_failure(error).in_statement("select"))?;
                 let decoded = Rc::new(decode_stored_rows(&stored, def, keep)?);
                 let wider = {
                     let scans = self.statement_scans.borrow();
@@ -8758,7 +8764,7 @@ impl Engine {
                 Some(ScanHint::Pin(rowid)) => self
                     .writer
                     .table_range(&def.name, *rowid, *rowid, TableLimits::default())
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+                    .map_err(|error| storage_failure(error).in_statement("select"))?,
                 // A `WHERE <indexed column> = <literal>` covering every key
                 // column of a plain index: fetch just the probe's rowids. They
                 // arrive ascending, which is both the index order under one
@@ -8771,7 +8777,7 @@ impl Engine {
                 Some(ScanHint::Head(max_rows)) => self
                     .writer
                     .table_head(&def.name, *max_rows, TableLimits::default())
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?,
+                    .map_err(|error| storage_failure(error).in_statement("select"))?,
                 None => unreachable!("plain table scans are cached above"),
             };
             return Ok((SourceColumns::Table(def), Rc::new(decode_stored_rows(&stored, def, keep)?)));
@@ -8821,7 +8827,7 @@ impl Engine {
             let stored = engine
                 .writer
                 .table_rows(&def.name, TableLimits::default())
-                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+                .map_err(|error| storage_failure(error).in_statement("select"))?;
             return Ok((SourceColumns::Table(def), Rc::new(decode_stored_rows(&stored, def, None)?)));
         }
         Err(SqlError::new("unknown-table", format!("no such table: {qualifier}.{}", table.name)).in_statement("select"))
@@ -15135,14 +15141,14 @@ struct LazyTableScan {
 impl LazyTableScan {
     fn new(pages: Arc<Vec<u8>>, root_page: u32) -> Result<Self, SqlError> {
         if pages.is_empty() {
-            return Err(storage_error("sqlite table root in empty database"));
+            return Err(corrupt_error("sqlite table root in empty database"));
         }
-        let page_size = validate_database(&pages).map_err(storage_error)?;
-        let reserved = usize::from(*pages.get(20).ok_or_else(|| storage_error("sqlite header truncated"))?);
-        let usable = page_size.checked_sub(reserved).filter(|usable| *usable >= 257).ok_or_else(|| storage_error("sqlite page size invalid"))?;
+        let page_size = validate_database(&pages).map_err(storage_failure)?;
+        let reserved = usize::from(*pages.get(20).ok_or_else(|| corrupt_error("sqlite header truncated"))?);
+        let usable = page_size.checked_sub(reserved).filter(|usable| *usable >= 257).ok_or_else(|| corrupt_error("sqlite page size invalid"))?;
         let page_count = pages.len() / page_size;
         if page_count == 0 || root_page == 0 || root_page as usize > page_count {
-            return Err(storage_error("sqlite table root page out of bounds"));
+            return Err(corrupt_error("sqlite table root page out of bounds"));
         }
         Ok(Self {
             pages,
@@ -15191,42 +15197,42 @@ impl LazyTableScan {
                 return Err(storage_error("sqlite table page limit exceeded"));
             }
             if self.visited[number as usize] {
-                return Err(storage_error("sqlite repeated b-tree or overflow page"));
+                return Err(corrupt_error("sqlite repeated b-tree or overflow page"));
             }
             self.visited[number as usize] = true;
             self.visited_pages += 1;
             let header = if number == 1 { 100 } else { 0 };
-            let kind = *page.get(header).ok_or_else(|| storage_error("sqlite b-tree header truncated"))?;
+            let kind = *page.get(header).ok_or_else(|| corrupt_error("sqlite b-tree header truncated"))?;
             let header_size = match kind {
                 13 => 8,
                 5 => 12,
-                _ => return Err(storage_error("sqlite table b-tree page type invalid")),
+                _ => return Err(corrupt_error("sqlite table b-tree page type invalid")),
             };
             let count = lazy_read_u16(page, header + 3)?;
             let pointers_end = header + header_size + count.saturating_mul(2);
-            if pointers_end > page.len() || *page.get(header + 7).ok_or_else(|| storage_error("sqlite b-tree header truncated"))? > 60 {
-                return Err(storage_error("sqlite b-tree header invalid"));
+            if pointers_end > page.len() || *page.get(header + 7).ok_or_else(|| corrupt_error("sqlite b-tree header truncated"))? > 60 {
+                return Err(corrupt_error("sqlite b-tree header invalid"));
             }
             let raw_start = lazy_read_u16(page, header + 5)?;
             let content_start = if raw_start == 0 { 65536 } else { raw_start };
             if content_start < pointers_end || content_start > page.len() {
-                return Err(storage_error("sqlite b-tree content boundary invalid"));
+                return Err(corrupt_error("sqlite b-tree content boundary invalid"));
             }
             let mut children = Vec::new();
             let mut rows = Vec::new();
             for index in 0..count {
                 let cell = lazy_read_u16(page, header + header_size + index.saturating_mul(2))?;
                 if cell < content_start || cell >= page.len() {
-                    return Err(storage_error("sqlite cell pointer out of bounds"));
+                    return Err(corrupt_error("sqlite cell pointer out of bounds"));
                 }
                 if kind == 5 {
                     let child = lazy_read_u32(page, cell)?;
-                    let tail = page.get(cell + 4..).ok_or_else(|| storage_error("sqlite interior cell truncated"))?;
-                    decode_varint(tail).map_err(storage_error)?;
+                    let tail = page.get(cell + 4..).ok_or_else(|| corrupt_error("sqlite interior cell truncated"))?;
+                    decode_varint(tail).map_err(storage_failure)?;
                     children.push(child);
                     continue;
                 }
-                let (length, length_size) = decode_varint(&page[cell..]).map_err(storage_error)?;
+                let (length, length_size) = decode_varint(&page[cell..]).map_err(storage_failure)?;
                 let length = usize::try_from(length).map_err(|_| storage_error("sqlite payload size exceeds host"))?;
                 if length > self.limits.max_payload_bytes {
                     return Err(storage_error("sqlite table payload limit exceeded"));
@@ -15239,15 +15245,15 @@ impl LazyTableScan {
                 if self.total_rows >= self.limits.max_rows {
                     return Err(storage_error("sqlite table row limit exceeded"));
                 }
-                let tail = page.get(cell + length_size..).ok_or_else(|| storage_error("sqlite table cell truncated"))?;
-                let (rowid, rowid_size) = decode_varint(tail).map_err(storage_error)?;
+                let tail = page.get(cell + length_size..).ok_or_else(|| corrupt_error("sqlite table cell truncated"))?;
+                let (rowid, rowid_size) = decode_varint(tail).map_err(storage_failure)?;
                 let rowid = rowid as i64;
                 if self.last_rowid.is_some_and(|last| rowid <= last) {
-                    return Err(storage_error("sqlite table rows out of order"));
+                    return Err(corrupt_error("sqlite table rows out of order"));
                 }
                 self.last_rowid = Some(rowid);
                 self.total_rows += 1;
-                let start = cell.checked_add(length_size).and_then(|start| start.checked_add(rowid_size)).ok_or_else(|| storage_error("sqlite cell length overflow"))?;
+                let start = cell.checked_add(length_size).and_then(|start| start.checked_add(rowid_size)).ok_or_else(|| corrupt_error("sqlite cell length overflow"))?;
                 let payload = lazy_cell_payload(
                     &pages,
                     self.page_size,
@@ -15319,10 +15325,10 @@ fn lazy_order_matches_scan(def: &TableDef, entry: &TableRef, items: &SelectItems
 fn lazy_page(pages: &[u8], page_size: usize, page_count: usize, number: u32) -> Result<&[u8], SqlError> {
     let index = number as usize;
     if index == 0 || index > page_count {
-        return Err(storage_error("sqlite page reference out of bounds"));
+        return Err(corrupt_error("sqlite page reference out of bounds"));
     }
     let start = (index - 1) * page_size;
-    pages.get(start..start + page_size).ok_or_else(|| storage_error("sqlite page truncated"))
+    pages.get(start..start + page_size).ok_or_else(|| corrupt_error("sqlite page truncated"))
 }
 
 /// 与上游 SQLite 的 U 值公式一致,返回载荷在本页存放的本地字节数。
@@ -15351,8 +15357,8 @@ fn lazy_cell_payload(
     limits: &TableLimits,
 ) -> Result<Vec<u8>, SqlError> {
     let local = lazy_local(usable, length);
-    let end = offset.checked_add(local).ok_or_else(|| storage_error("sqlite cell length overflow"))?;
-    let initial = page.get(offset..end).ok_or_else(|| storage_error("sqlite cell payload truncated"))?;
+    let end = offset.checked_add(local).ok_or_else(|| corrupt_error("sqlite cell length overflow"))?;
+    let initial = page.get(offset..end).ok_or_else(|| corrupt_error("sqlite cell payload truncated"))?;
     let mut payload = Vec::new();
     payload.try_reserve_exact(length).map_err(|_| storage_error("sqlite payload allocation failed"))?;
     payload.extend_from_slice(initial);
@@ -15366,32 +15372,32 @@ fn lazy_cell_payload(
         }
         let index = next as usize;
         if index == 0 || index > page_count {
-            return Err(storage_error("sqlite page reference out of bounds"));
+            return Err(corrupt_error("sqlite page reference out of bounds"));
         }
         if visited[index] {
-            return Err(storage_error("sqlite repeated b-tree or overflow page"));
+            return Err(corrupt_error("sqlite repeated b-tree or overflow page"));
         }
         visited[index] = true;
         *visited_pages += 1;
         let start = (index - 1) * page_size;
-        let overflow = pages.get(start..start + usable).ok_or_else(|| storage_error("sqlite page truncated"))?;
+        let overflow = pages.get(start..start + usable).ok_or_else(|| corrupt_error("sqlite page truncated"))?;
         next = lazy_read_u32(overflow, 0)?;
         let count = (length - payload.len()).min(usable - 4);
-        payload.extend_from_slice(overflow.get(4..4 + count).ok_or_else(|| storage_error("sqlite overflow payload truncated"))?);
+        payload.extend_from_slice(overflow.get(4..4 + count).ok_or_else(|| corrupt_error("sqlite overflow payload truncated"))?);
     }
     if next != 0 {
-        return Err(storage_error("sqlite overflow chain exceeds payload"));
+        return Err(corrupt_error("sqlite overflow chain exceeds payload"));
     }
     Ok(payload)
 }
 
 fn lazy_read_u16(bytes: &[u8], offset: usize) -> Result<usize, SqlError> {
-    let value = bytes.get(offset..offset + 2).ok_or_else(|| storage_error("sqlite b-tree field truncated"))?;
+    let value = bytes.get(offset..offset + 2).ok_or_else(|| corrupt_error("sqlite b-tree field truncated"))?;
     Ok(usize::from(u16::from_be_bytes(value.try_into().expect("two bytes"))))
 }
 
 fn lazy_read_u32(bytes: &[u8], offset: usize) -> Result<u32, SqlError> {
-    let value = bytes.get(offset..offset + 4).ok_or_else(|| storage_error("sqlite page field truncated"))?;
+    let value = bytes.get(offset..offset + 4).ok_or_else(|| corrupt_error("sqlite page field truncated"))?;
     Ok(u32::from_be_bytes(value.try_into().expect("four bytes")))
 }
 
@@ -15463,22 +15469,23 @@ fn collect_unmasked_columns<'a>(expr: &'a Expr, out: &mut Vec<&'a ColumnRef>) ->
 /// the text and blob conversion of columns the statement never reads.
 fn decode_cells_kept(payload: &[u8], keep: Option<&[bool]>) -> Result<Vec<Cell>, SqlError> {
     let limits = RecordLimits { max_columns: 1024, max_payload_bytes: 16 * 1024 * 1024 };
-    let storage = |message: &str| SqlError::new("storage", message).in_statement("select");
+    let corrupt = |message: &str| SqlError::new("corrupt", message).in_statement("select");
+    let limit = |message: &str| SqlError::new("unsupported", message).in_statement("select");
     if payload.len() > limits.max_payload_bytes {
-        return Err(storage("sqlite record payload limit exceeded"));
+        return Err(limit("sqlite record payload limit exceeded"));
     }
-    let (header_size, mut header_offset) = decode_varint(payload).map_err(|error| storage(&error.to_string()))?;
-    let header_size = usize::try_from(header_size).map_err(|_| storage("sqlite record header size overflow"))?;
+    let (header_size, mut header_offset) = decode_varint(payload).map_err(|error| corrupt(&error.to_string()))?;
+    let header_size = usize::try_from(header_size).map_err(|_| corrupt("sqlite record header size overflow"))?;
     if header_size < header_offset || header_size > payload.len() {
-        return Err(storage("sqlite record header size invalid"));
+        return Err(corrupt("sqlite record header size invalid"));
     }
     let mut body_offset = header_size;
     let mut cells = Vec::new();
     while header_offset < header_size {
         if cells.len() >= limits.max_columns {
-            return Err(storage("sqlite record column limit exceeded"));
+            return Err(limit("sqlite record column limit exceeded"));
         }
-        let (serial, consumed) = decode_varint(&payload[header_offset..header_size]).map_err(|error| storage(&error.to_string()))?;
+        let (serial, consumed) = decode_varint(&payload[header_offset..header_size]).map_err(|error| corrupt(&error.to_string()))?;
         header_offset += consumed;
         let length = match serial {
             0 | 8 | 9 => 0,
@@ -15488,10 +15495,10 @@ fn decode_cells_kept(payload: &[u8], keep: Option<&[bool]>) -> Result<Vec<Cell>,
             4 => 4,
             5 => 6,
             6 | 7 => 8,
-            10 | 11 => return Err(storage("sqlite reserved serial type")),
-            serial => usize::try_from((serial - 12) / 2).map_err(|_| storage("sqlite serial length overflow"))?,
+            10 | 11 => return Err(corrupt("sqlite reserved serial type")),
+            serial => usize::try_from((serial - 12) / 2).map_err(|_| corrupt("sqlite serial length overflow"))?,
         };
-        let end = body_offset.checked_add(length).filter(|end| *end <= payload.len()).ok_or_else(|| storage("truncated sqlite record body"))?;
+        let end = body_offset.checked_add(length).filter(|end| *end <= payload.len()).ok_or_else(|| corrupt("truncated sqlite record body"))?;
         let bytes = &payload[body_offset..end];
         let position = cells.len();
         let kept = keep.is_none_or(|mask| mask.get(position).copied().unwrap_or(false));
@@ -15512,14 +15519,14 @@ fn decode_cells_kept(payload: &[u8], keep: Option<&[bool]>) -> Result<Vec<Cell>,
         body_offset = end;
     }
     if body_offset != payload.len() {
-        return Err(storage("sqlite record has trailing body bytes"));
+        return Err(corrupt("sqlite record has trailing body bytes"));
     }
     Ok(cells)
 }
 
 /// Decodes one record text field exactly as the storage decoder does.
 fn record_text(bytes: &[u8]) -> Result<String, SqlError> {
-    std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| SqlError::new("storage", "sqlite non-unicode UTF-8 text").in_statement("select"))
+    std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| SqlError::new("corrupt", "sqlite non-unicode UTF-8 text").in_statement("select"))
 }
 
 /// Sign-extends a big-endian SQLite integer field of one to eight bytes.
@@ -15535,7 +15542,7 @@ fn signed_record_integer(bytes: &[u8]) -> i64 {
 fn decode_cells(payload: &[u8]) -> Result<Vec<Cell>, SqlError> {
     let limits = RecordLimits { max_columns: 1024, max_payload_bytes: 16 * 1024 * 1024 };
     let values = decode_record(payload, TextEncoding::Utf8, limits)
-        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+        .map_err(|error| storage_failure(error).in_statement("select"))?;
     // 文本字段直接移交解码结果里的 `String`,不再多复制一次。
     Ok(values
         .into_iter()

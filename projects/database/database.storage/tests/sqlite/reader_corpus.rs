@@ -13,7 +13,9 @@ use std::{
 
 use database_formats::sqlite::{RecordLimits, RecordValue, TextEncoding, blank_database, decode_record};
 
-use database_storage::sqlite::{SchemaObjectKind, SqliteDatabase, TableLimits, read_existing, read_named_table, read_schema, read_table};
+use database_storage::sqlite::{
+    SchemaObjectKind, SqliteDatabase, SqliteWriter, TableLimits, read_existing, read_index_table, read_named_table, read_schema, read_table,
+};
 
 const PAGE: usize = 4096;
 
@@ -288,6 +290,53 @@ fn schema_corpus_returns_structured_errors() {
     let unnamed = schema_database(&[schema_record("table", "t", "t", Some(2), Some("CREATE TABLE t(x)"))]);
     let schema_name = read_named_table(&unnamed, "t", TableLimits::default());
     assert_eq!(schema_name.expect_err("page 2 is absent").code(), "database.corrupt");
+}
+
+#[test]
+fn corrupt_table_root_and_index_cell_pointer_are_structured_errors() {
+    let rows = [
+        schema_record("table", "t", "t", Some(2), Some("CREATE TABLE t(x)")),
+        schema_record("index", "i", "t", Some(3), Some("CREATE INDEX i ON t(x)")),
+    ];
+    let mut pages = schema_database(&rows);
+    pages.resize(3 * PAGE, 0);
+    write_u32(&mut pages, 24, 3);
+    write_u32(&mut pages, 28, 3);
+    write_u32(&mut pages, 92, 3);
+
+    // The table root page carries an invalid page type.
+    pages[PAGE] = 0;
+    // The index root page is a leaf whose only cell pointer sits past the page.
+    let index = &mut pages[2 * PAGE..];
+    index[0] = 10;
+    write_u16(index, 3, 1);
+    write_u16(index, 5, PAGE as u16);
+    write_u16(index, 8, 5000);
+
+    let opened = SqliteWriter::from_pages(pages.clone()).err().expect("corrupt index cell pointer");
+    assert_eq!(opened.code(), "database.corrupt");
+    let index_error = read_index_table(&pages, 3, TableLimits::default()).expect_err("cell pointer out of bounds");
+    assert_eq!(index_error.code(), "database.corrupt");
+    let table_error = read_table(&pages, 2, TableLimits::default()).expect_err("corrupt table root");
+    assert_eq!(table_error.code(), "database.corrupt");
+
+    // A child page outside the file is corruption, not a panic or a hang.
+    let mut bad_index_child = pages.clone();
+    let index = &mut bad_index_child[2 * PAGE..];
+    index[0] = 2;
+    write_u16(index, 3, 0);
+    write_u16(index, 5, PAGE as u16);
+    write_u32(index, 8, 99);
+    assert_eq!(SqliteWriter::from_pages(bad_index_child.clone()).err().expect("index child").code(), "database.corrupt");
+    assert_eq!(read_index_table(&bad_index_child, 3, TableLimits::default()).expect_err("index child").code(), "database.corrupt");
+
+    let mut bad_table_child = pages;
+    let table = &mut bad_table_child[PAGE..];
+    table[0] = 5;
+    write_u16(table, 3, 0);
+    write_u16(table, 5, PAGE as u16);
+    write_u32(table, 8, 99);
+    assert_eq!(read_table(&bad_table_child, 2, TableLimits::default()).expect_err("table child").code(), "database.corrupt");
 }
 
 #[test]
