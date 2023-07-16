@@ -3873,7 +3873,7 @@ impl Engine {
                         // NULL result passes.
                         if truthiness(&value) == Some(false) {
                             let mut error = SqlError::new(
-                                "constraint-failed",
+                                "check-constraint",
                                 format!("CHECK constraint failed: {}", check.name.clone().unwrap_or_else(|| check.text.clone())),
                             )
                             .in_statement("insert");
@@ -6250,7 +6250,7 @@ impl Engine {
                             };
                             if matches!(value, Cell::Null) && column.not_null {
                                 return Err(SqlError::new(
-                                    "constraint-failed",
+                                    "not-null-constraint",
                                     format!("NOT NULL constraint failed: {}.{}", child.name, column.name),
                                 )
                                 .in_statement(statement));
@@ -6478,7 +6478,7 @@ impl Engine {
                     match cell {
                         Cell::Null => {
                             return Err(if column.not_null {
-                                SqlError::new("constraint-failed", format!("NOT NULL constraint failed: {}.{}", def.name, column.name))
+                                SqlError::new("not-null-constraint", format!("NOT NULL constraint failed: {}.{}", def.name, column.name))
                             }
                             else {
                                 SqlError::new("datatype-mismatch", "datatype mismatch")
@@ -6494,7 +6494,7 @@ impl Engine {
                 }
                 else {
                     if matches!(cell, Cell::Null) && column.not_null {
-                        return Err(SqlError::new("constraint-failed", format!("NOT NULL constraint failed: {}.{}", def.name, column.name))
+                        return Err(SqlError::new("not-null-constraint", format!("NOT NULL constraint failed: {}.{}", def.name, column.name))
                             .in_statement("update"));
                     }
                     next[*index] = cell;
@@ -6506,7 +6506,7 @@ impl Engine {
             for check in &def.checks {
                 if truthiness(&check.expr.eval(&check_cells, &ctx)?) == Some(false) {
                     let name = check.name.clone().unwrap_or_else(|| check.text.clone());
-                    return Err(SqlError::new("constraint-failed", format!("CHECK constraint failed: {name}"))
+                    return Err(SqlError::new("check-constraint", format!("CHECK constraint failed: {name}"))
                         .in_clause("CHECK")
                         .in_statement("update"));
                 }
@@ -14873,7 +14873,7 @@ fn temp_insert_row(
     for (position, column) in def.columns.iter().enumerate() {
         if column.not_null && matches!(cells[position], Cell::Null) {
             return Err(
-                SqlError::new("constraint-failed", format!("NOT NULL constraint failed: {}.{}", def.name, column.name)).in_statement("insert")
+                SqlError::new("not-null-constraint", format!("NOT NULL constraint failed: {}.{}", def.name, column.name)).in_statement("insert")
             );
         }
     }
@@ -14975,21 +14975,21 @@ fn unique_conflict(keys: &[UniqueKey], candidate: &[Cell], rowid: i64, live: &[(
 
 /// Converts a storage rejection of an `UPDATE` / `DELETE` into a structured
 /// error, naming the table when the writer does not say which key failed.
-fn write_failure(error: impl std::fmt::Display, statement: &'static str, def: &TableDef) -> SqlError {
-    let message = error.to_string();
-    if message.contains("UNIQUE constraint failed") {
-        SqlError::new("unique-constraint", format!("UNIQUE constraint failed in table `{}`", def.name))
+fn write_failure(error: database_types::Error, statement: &'static str, def: &TableDef) -> SqlError {
+    let mapped = storage_failure(error);
+    let message = if mapped.code == "unique-constraint" {
+        format!("UNIQUE constraint failed in table `{}`", def.name)
     }
-    else if message.contains("NOT NULL") {
-        SqlError::new("constraint-failed", format!("NOT NULL constraint failed in table `{}`", def.name))
+    else if mapped.code == "not-null-constraint" || mapped.message.contains("NOT NULL") {
+        format!("NOT NULL constraint failed in table `{}`", def.name)
     }
-    else if message.contains("integer") || message.contains("datatype") {
-        SqlError::new("datatype-mismatch", "datatype mismatch")
+    else if mapped.message.contains("integer") || mapped.message.contains("datatype") {
+        return SqlError::new("datatype-mismatch", "datatype mismatch").in_statement(statement);
     }
     else {
-        SqlError::new("storage", message)
-    }
-    .in_statement(statement)
+        mapped.message
+    };
+    SqlError::new(mapped.code, message).in_statement(statement)
 }
 
 /// 管理型索引键里是否存在按排序规则等价的重复项，`NULL` 键不算冲突。
@@ -16031,7 +16031,7 @@ mod tests {
         // The key is an automatic unique index, not the rowid.
         assert_eq!(engine.execute_one("SELECT rowid FROM tp").expect("rowid").rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)]]);
         let error = engine.execute_one("INSERT INTO tp VALUES ('a', 3)").expect_err("duplicate text key");
-        assert_eq!(error.code, "storage");
+        assert_eq!(error.code, "unique-constraint");
     }
 
     #[test]
@@ -16044,7 +16044,7 @@ mod tests {
             vec![vec![Cell::Integer(1), Cell::Integer(1)], vec![Cell::Integer(2), Cell::Integer(2)]]
         );
         let error = engine.execute_one("INSERT INTO pkab VALUES (1, 1)").expect_err("duplicate composite key");
-        assert_eq!(error.code, "storage");
+        assert_eq!(error.code, "unique-constraint");
         // A lone declared INTEGER key is still the rowid alias.
         engine.execute_one("CREATE TABLE ta(a INTEGER, PRIMARY KEY (a))").expect("alias key");
         engine.execute_one("INSERT INTO ta VALUES (5)").expect("insert alias");
@@ -16112,7 +16112,7 @@ mod tests {
         // `NOT NULL` without a default cannot be satisfied by a default row.
         engine.execute_one("CREATE TABLE nn(a TEXT NOT NULL, b)").expect("not null");
         let failed = engine.execute_one("INSERT INTO nn DEFAULT VALUES").expect_err("not null violation");
-        assert_eq!(failed.code, "storage");
+        assert_eq!(failed.code, "not-null-constraint");
         // An explicit column list may not be combined with `DEFAULT VALUES`.
         assert_eq!(engine.execute_one("INSERT INTO dv(a) DEFAULT VALUES").expect_err("column list").code, "syntax");
     }
@@ -17309,9 +17309,30 @@ mod tests {
         engine.execute_one("INSERT INTO t VALUES (1,5),(2,6),(3,7)").expect("insert");
         let before = engine.execute_one("SELECT id, v FROM t").expect("select").rows;
         let error = engine.execute_one("UPDATE t SET v = v - 10").expect_err("check must fail");
-        assert_eq!(error.code, "constraint-failed");
+        assert_eq!(error.code, "check-constraint");
         assert_eq!(error.clause.as_deref(), Some("CHECK"));
         assert_eq!(engine.execute_one("SELECT id, v FROM t").expect("select").rows, before);
+    }
+
+    #[test]
+    fn insert_constraint_failures_keep_distinct_codes() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute_one("CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE, n TEXT NOT NULL, c INTEGER CHECK(c > 0))")
+            .expect("create");
+        engine.execute_one("INSERT INTO t VALUES (1, 'a', 'x', 1)").expect("insert");
+
+        assert_eq!(engine.execute_one("INSERT INTO t VALUES (1, 'b', 'y', 2)").expect_err("rowid").code, "unique-constraint");
+        assert_eq!(engine.execute_one("INSERT INTO t VALUES (2, 'a', 'y', 2)").expect_err("unique column").code, "unique-constraint");
+        assert_eq!(engine.execute_one("INSERT INTO t VALUES (3, 'c', NULL, 3)").expect_err("not null").code, "not-null-constraint");
+        assert_eq!(engine.execute_one("INSERT INTO t VALUES (4, 'd', 'z', 0)").expect_err("check").code, "check-constraint");
+
+        engine.execute_one("CREATE TABLE parent(id INTEGER PRIMARY KEY)").expect("parent");
+        engine.execute_one("CREATE TABLE child(pid INTEGER REFERENCES parent(id))").expect("child");
+        assert_eq!(
+            engine.execute_one("INSERT INTO child VALUES (7)").expect_err("foreign key").code,
+            "SQLITE_CONSTRAINT_FOREIGNKEY"
+        );
     }
 
     #[test]
@@ -17524,7 +17545,7 @@ mod tests {
         assert_eq!(rows[1], vec![text("ix"), text("CREATE INDEX ix ON t(x, tt)")]);
         assert_eq!(engine.execute_one("SELECT tt FROM t").expect("select").rows, Vec::<Vec<Cell>>::new());
         engine.execute_one("INSERT INTO t(tt) VALUES (1)").expect("insert");
-        assert_eq!(engine.execute_one("INSERT INTO t(tt) VALUES (-1)").expect_err("check").code, "constraint-failed");
+        assert_eq!(engine.execute_one("INSERT INTO t(tt) VALUES (-1)").expect_err("check").code, "check-constraint");
         assert_eq!(engine.execute_one("ALTER TABLE t RENAME COLUMN nope TO x").expect_err("missing col").code, "unknown-column");
         assert_eq!(engine.execute_one("ALTER TABLE t RENAME COLUMN tt TO x").expect_err("duplicate").code, "duplicate-column");
     }

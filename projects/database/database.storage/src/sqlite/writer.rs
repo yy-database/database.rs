@@ -962,7 +962,7 @@ impl SqliteWriter {
                 None => column.default_value.clone().unwrap_or(WriteValue::Null),
             };
             if matches!(value, WriteValue::Null) && column.not_null {
-                return Err(Error::Unsupported("sqlite NOT NULL constraint failed"));
+                return Err(Error::Constraint { kind: "not-null", message: "sqlite NOT NULL constraint failed" });
             }
             resolved.push(value);
         }
@@ -977,7 +977,7 @@ impl SqliteWriter {
         let key = encode_record(&layout_values[..meta.primary_key_len], self.encoding);
         let unique = self.without_rowid_keys.entry(meta.master_rowid).or_default().insert(key);
         if !unique {
-            return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+            return Err(Error::Constraint { kind: "unique", message: "sqlite UNIQUE constraint failed" });
         }
         self.without_rowid_entries.entry(meta.master_rowid).or_default().insert(payload);
         Ok(0)
@@ -1038,7 +1038,7 @@ impl SqliteWriter {
         }
         self.without_rowid_keys.entry(meta.master_rowid).or_default().remove(&old_key);
         if self.without_rowid_keys.entry(meta.master_rowid).or_default().contains(&new_key) {
-            return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+            return Err(Error::Constraint { kind: "unique", message: "sqlite UNIQUE constraint failed" });
         }
         self.without_rowid_keys.entry(meta.master_rowid).or_default().insert(new_key);
         entries.insert(new_payload);
@@ -1164,7 +1164,7 @@ impl SqliteWriter {
             let mut signatures = std::collections::BTreeSet::new();
             for (values, _) in entries {
                 if !signatures.insert(encode_record(&normalized_index_values(values, &collations), self.encoding)) {
-                    return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+                    return Err(Error::Constraint { kind: "unique", message: "sqlite UNIQUE constraint failed" });
                 }
             }
         }
@@ -1199,7 +1199,7 @@ impl SqliteWriter {
             let mut signatures = std::collections::BTreeSet::new();
             for (values, _) in entries {
                 if !signatures.insert(encode_record(&normalized_index_values(values, &collations), self.encoding)) {
-                    return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+                    return Err(Error::Constraint { kind: "unique", message: "sqlite UNIQUE constraint failed" });
                 }
             }
         }
@@ -1232,7 +1232,7 @@ impl SqliteWriter {
             };
             let value = apply_affinity(value, affinity_of(&column.declared_type));
             if matches!(value, WriteValue::Null) && column.not_null && Some(index) != meta.rowid_alias {
-                return Err(Error::Unsupported("sqlite NOT NULL constraint failed"));
+                return Err(Error::Constraint { kind: "not-null", message: "sqlite NOT NULL constraint failed" });
             }
             resolved.push(value);
         }
@@ -1283,7 +1283,7 @@ impl SqliteWriter {
             if index_meta.unique && index_key_has_no_null(&resolved, &index_meta.columns) {
                 let key = encode_index_key(&meta, index_meta, rowid, &resolved, self.encoding)?;
                 if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), None, &index_meta.collations)? {
-                    return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+                    return Err(Error::Constraint { kind: "unique", message: "sqlite UNIQUE constraint failed" });
                 }
             }
         }
@@ -1367,7 +1367,7 @@ impl SqliteWriter {
             let column = &meta.columns[index];
             let value = apply_affinity(value.clone(), affinity_of(&column.declared_type));
             if matches!(value, WriteValue::Null) && column.not_null && Some(index) != meta.rowid_alias {
-                return Err(Error::Unsupported("sqlite NOT NULL constraint failed"));
+                return Err(Error::Constraint { kind: "not-null", message: "sqlite NOT NULL constraint failed" });
             }
             if Some(index) == meta.rowid_alias {
                 let WriteValue::Integer(rowid_value) = value
@@ -1379,7 +1379,7 @@ impl SqliteWriter {
             owned[index] = value.clone();
         }
         if next_rowid != rowid && self.contains_rowid(meta.root_page, next_rowid)? {
-            return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+            return Err(Error::Constraint { kind: "unique", message: "sqlite UNIQUE constraint failed" });
         }
         for index_meta in meta.indexes.iter() {
             if index_meta.managed {
@@ -1388,7 +1388,7 @@ impl SqliteWriter {
             if index_meta.unique && index_key_has_no_null(&owned, &index_meta.columns) {
                 let key = encode_index_key(&meta, index_meta, next_rowid, &owned, self.encoding)?;
                 if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), Some(rowid), &index_meta.collations)? {
-                    return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+                    return Err(Error::Constraint { kind: "unique", message: "sqlite UNIQUE constraint failed" });
                 }
             }
         }
@@ -2779,7 +2779,7 @@ impl SqliteWriter {
                 let position = rowids.partition_point(|candidate| *candidate < rowid);
                 if rowids.get(position).is_some_and(|candidate| *candidate == rowid) {
                     // 重复 rowid 在插入下钻到叶子时就判定，不再先做一次独立查找。
-                    return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
+                    return Err(Error::Constraint { kind: "unique", message: "sqlite UNIQUE constraint failed" });
                 }
                 let cell = self.build_cell(PAGE_TABLE_LEAF, Some(rowid), payload)?;
                 if let Some(start) = self.take_freeblock(page, cell.len()) {

@@ -286,6 +286,15 @@ pub enum Error {
         /// Columns covered by the constraint.
         columns: Vec<String>,
     },
+    /// A write violates a declared non-unique constraint (`NOT NULL`, `CHECK`,
+    /// `FOREIGN KEY`). `kind` is one of `not-null`, `check` or `foreign-key`, so
+    /// hosts keep the constraint families distinguishable.
+    Constraint {
+        /// Constraint family.
+        kind: &'static str,
+        /// Human-readable rejection detail.
+        message: &'static str,
+    },
     /// A result row cannot be rendered in the requested format without
     /// inventing a representation for the value.
     ResultFormat {
@@ -364,6 +373,7 @@ impl fmt::Display for Error {
             Self::UniqueViolation { table, constraint, columns } => {
                 write!(f, "unique constraint `{constraint}` violated on table `{table}` (columns: {})", columns.join(", "))
             }
+            Self::Constraint { message, .. } => write!(f, "{message}"),
             Self::ResultFormat { column, kind } => {
                 write!(f, "result format: column `{column}` carries `{kind}` values that the requested format cannot represent")
             }
@@ -413,6 +423,7 @@ impl Error {
             Self::Remote { code, .. } => code,
             Self::Scalar { .. } => "database.scalar.invalid",
             Self::UniqueViolation { .. } => "database.unique.violation",
+            Self::Constraint { .. } => "database.constraint",
             Self::ResultFormat { .. } => "database.result.format",
             Self::VectorDimensionExceeded { .. } => "database.schema.vector_dimension_exceeded",
         }
@@ -483,7 +494,7 @@ impl Error {
             | Self::AuthConfigMissing { .. }
             | Self::AuthInsufficientPermission { .. } => "auth",
             Self::SchemaInvalidated { .. } => "query",
-            Self::Scalar { .. } | Self::UniqueViolation { .. } => "query",
+            Self::Scalar { .. } | Self::UniqueViolation { .. } | Self::Constraint { .. } => "query",
             Self::ResultFormat { .. } => "query",
             Self::VectorDimensionExceeded { .. } => "schema",
             Self::Remote { .. } => "remote",
@@ -547,6 +558,7 @@ impl Error {
             Self::UniqueViolation { table, constraint, columns } => {
                 vec![("table", table.clone()), ("constraint", constraint.clone()), ("columns", columns.join(","))]
             }
+            Self::Constraint { kind, message } => vec![("kind", (*kind).to_owned()), ("message", (*message).to_owned())],
             Self::ResultFormat { column, kind } => vec![("column", column.clone()), ("kind", (*kind).to_owned())],
             Self::VectorDimensionExceeded { dimension, max } => {
                 vec![("dimension", dimension.to_string()), ("max", max.to_string())]
