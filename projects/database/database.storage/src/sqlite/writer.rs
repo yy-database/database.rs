@@ -2228,32 +2228,44 @@ impl SqliteWriter {
         })
     }
 
-    /// 只解析表叶页各 cell 的 rowid 序列，不物化任何 cell 字节。
-    /// 插入下钻的重复判定与插入位置只需要有序键序列；cell 字节只在
-    /// 分裂路径才需要，由调用方另行走 [`Self::leaf_cells`]。
-    /// 页内 cell 指针数组按 rowid 升序排列，返回的序列同样升序。
-    fn leaf_rowids(&self, page: u32) -> Result<Vec<i64>> {
-        let page_bytes = self.checked_page(page)?;
+    /// 写路径下钻用的叶子 rowid 读取。
+    ///
+    /// 页号来自写入器自己维护的 b-tree（非外部文件解析），但在 `open` 之后仍可能
+    /// 指向损坏文件里的页，因此页级不变量（页范围、页类型、cell 指针数组）在此一次
+    /// 校验，循环内只做已校验范围内的直接索引。这样既保留损坏输入的结构化 `Corrupt`，
+    /// 又不必像读取路径那样逐格付 `checked_*` 守卫开销。插入下钻每行都要重建整页
+    /// rowid 向量，正是 `insert_multi`/`batch` 的基准热点。
+    fn leaf_rowids_for_write(&self, page: u32) -> Result<Vec<i64>> {
+        if page == 0 {
+            return Err(Error::Corrupt("sqlite table page reference out of bounds"));
+        }
+        let offset = self.page_offset(page);
+        let end = offset.checked_add(self.page_size).ok_or(Error::Corrupt("sqlite page offset overflow"))?;
+        if end > self.pages.len() {
+            return Err(Error::Corrupt("sqlite table page reference out of bounds"));
+        }
+        let page_bytes = &self.pages[offset..end];
         let header_relative = Self::header_offset(page);
-        if *page_bytes.get(header_relative).ok_or(Error::Corrupt("sqlite page header truncated"))? != PAGE_TABLE_LEAF {
+        if page_bytes[header_relative] != PAGE_TABLE_LEAF {
             return Err(Error::Corrupt("sqlite page type invalid"));
         }
-        let count = Self::page_u16(page_bytes, header_relative + 3, "sqlite page header truncated")?;
+        let count = u16::from_be_bytes(page_bytes[header_relative + 3..header_relative + 5].try_into().unwrap()) as usize;
         if header_relative + 8 + count * 2 > self.usable {
             return Err(Error::Corrupt("sqlite cell pointer array out of bounds"));
         }
         let mut out = Vec::with_capacity(count);
         for index in 0..count {
             let pointer = header_relative + 8 + index * 2;
-            let cell_offset = Self::page_u16(page_bytes, pointer, "sqlite cell pointer truncated")?;
+            let cell_offset = u16::from_be_bytes(page_bytes[pointer..pointer + 2].try_into().unwrap()) as usize;
             if cell_offset >= self.usable {
                 return Err(Error::Corrupt("sqlite cell pointer out of bounds"));
             }
-            let tail = page_bytes.get(cell_offset..).ok_or(Error::Corrupt("sqlite cell pointer out of bounds"))?;
-            let (_, length_size) = decode_varint(tail)?;
-            let rowid_start = cell_offset.checked_add(length_size).ok_or(Error::Corrupt("sqlite cell offset overflow"))?;
-            let rowid_tail = page_bytes.get(rowid_start..).ok_or(Error::Corrupt("sqlite rowid truncated"))?;
-            let (rowid, _) = decode_varint(rowid_tail)?;
+            let (_, length_size) = decode_varint(&page_bytes[cell_offset..])?;
+            let rowid_start = cell_offset + length_size;
+            if rowid_start >= self.usable {
+                return Err(Error::Corrupt("sqlite rowid truncated"));
+            }
+            let (rowid, _) = decode_varint(&page_bytes[rowid_start..])?;
             out.push(rowid as i64);
         }
         Ok(out)
@@ -2775,7 +2787,7 @@ impl SqliteWriter {
         let kind = self.pages[offset + header_relative];
         match kind {
             PAGE_TABLE_LEAF => {
-                let rowids = self.leaf_rowids(page)?;
+                let rowids = self.leaf_rowids_for_write(page)?;
                 let position = rowids.partition_point(|candidate| *candidate < rowid);
                 if rowids.get(position).is_some_and(|candidate| *candidate == rowid) {
                     // 重复 rowid 在插入下钻到叶子时就判定，不再先做一次独立查找。
@@ -2923,7 +2935,7 @@ impl SqliteWriter {
         let kind = self.pages[offset + header_relative];
         match kind {
             PAGE_TABLE_LEAF => {
-                let rowids = self.leaf_rowids(page)?;
+                let rowids = self.leaf_rowids_for_write(page)?;
                 let position = rowids.partition_point(|candidate| *candidate < rowid);
                 if !rowids.get(position).is_some_and(|candidate| *candidate == rowid) {
                     return Err(Error::Unsupported("sqlite rowid not found"));
