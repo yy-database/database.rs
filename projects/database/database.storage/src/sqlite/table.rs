@@ -230,11 +230,6 @@ enum IndexTask {
     Key(Vec<u8>),
 }
 
-/// SQLite BINARY order: NULL, numbers, text, then blob, with byte-wise ties.
-fn compare_records(left: &[u8], right: &[u8], encoding: TextEncoding) -> Result<Ordering> {
-    compare_records_with(left, right, encoding, &[])
-}
-
 /// 按每个键位的排序规则比较两条索引记录，缺省位置按 `BINARY`。
 pub(crate) fn compare_records_with(
     left: &[u8],
