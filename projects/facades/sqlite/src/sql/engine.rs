@@ -3674,6 +3674,20 @@ impl Engine {
                         slots_by_row.push(select_arity(def, &table, columns.as_deref(), &resolved)?);
                     }
                 }
+                // SQLite applies column affinity to every supplied value before
+                // the row reaches conflict detection: a `REAL` bound to an
+                // `INTEGER`-affinity column with no fractional part becomes an
+                // integer. Normalize the slots here so the upsert rowid probe and
+                // the scanning conflict path compare the same storage class the
+                // writer will store, instead of missing the conflict and surfacing
+                // a spurious `UNIQUE` error.
+                for slots in &mut slots_by_row {
+                    for (position, slot) in slots.iter_mut().enumerate() {
+                        if let Some(value) = slot.take() {
+                            *slot = Some(crate::apply_write_affinity(&def.columns[position].declared_type, value));
+                        }
+                    }
+                }
                 // A `STRICT` table rejects a value whose post-affinity storage
                 // class differs from the declared type, before any row is
                 // written. `INSERT OR IGNORE` skips the offending row instead.
@@ -5466,6 +5480,33 @@ impl Engine {
         };
         if matches!(plan.action, UpsertAction::Nothing) {
             return Ok(Some(UpsertOutcome::Skipped));
+        }
+        // Lean rewrite: every assignment is a direct `excluded.<column>` with no
+        // `DO UPDATE WHERE`, no `RETURNING` and no `CHECK` constraints. The stored
+        // row keeps its unassigned columns and the assigned ones take the
+        // supplied (already affinity-normalized) values, so the expression-eval
+        // machinery, the joined-row map and `plan_update` are skipped entirely.
+        let lean = returning.is_none()
+            && plan.filter.is_none()
+            && def.checks.is_empty()
+            && plan.assignments.iter().all(|(_, expr)| matches!(expr, ResolvedExpr::ExcludedColumn { .. }));
+        if lean {
+            let candidate = check_row(def, slots, rowid);
+            let mut values: Vec<UpdateValue> = vec![UpdateValue::Keep; width];
+            for (index, expr) in &plan.assignments {
+                let ResolvedExpr::ExcludedColumn { index: supplied } = expr else {
+                    unreachable!("lean upsert assignments are all excluded-column references")
+                };
+                let value = cell_write_value(&candidate[*supplied]);
+                if let Some(error) = strict_value_violation(def, *index, &value, "insert") {
+                    return Err(error);
+                }
+                values[*index] = UpdateValue::Set(value);
+            }
+            if let Err(error) = self.writer.update(table, rowid, &values) {
+                return Err(write_failure(error, "insert", def));
+            }
+            return Ok(Some(UpsertOutcome::Updated { rowid, rows: Vec::new() }));
         }
         let stored = decode_row(&payload, def, rowid)?;
         let candidate = check_row(def, slots, rowid);
@@ -16910,6 +16951,44 @@ mod tests {
             .execute_one("INSERT INTO t (id,label) VALUES (2,'a') ON CONFLICT(id) DO UPDATE SET label = excluded.label")
             .expect_err("a column UNIQUE constraint outside the conflict target must still abort");
         assert_eq!(error.code, "unique-constraint");
+    }
+
+    #[test]
+    fn real_bound_rowid_upsert_takes_integer_affinity_before_conflict_detection() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, score REAL)",
+            "INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.5)",
+        ]);
+        // SQLite applies the column affinity to a bound value before conflict
+        // detection: `2.0` into the rowid alias becomes the integer `2`, so the
+        // upsert rewrites row 2 instead of colliding and surfacing `UNIQUE`.
+        engine
+            .execute_with_parameters(
+                "INSERT INTO t (id,label,score) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET score = excluded.score",
+                &[Cell::Real(2.0), text("bee"), Cell::Real(30.0)],
+            )
+            .expect("real rowid upsert");
+        assert_eq!(
+            engine.execute_one("SELECT id, label, score FROM t ORDER BY id").expect("rows").rows,
+            vec![vec![Cell::Integer(1), text("a"), Cell::Real(1.5)], vec![Cell::Integer(2), text("b"), Cell::Real(30.0)]]
+        );
+    }
+
+    #[test]
+    fn lean_upsert_uses_defaults_for_excluded_columns_outside_the_insert_list() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT DEFAULT 'd', score REAL)",
+            "INSERT INTO t VALUES (1,'a',1.5)",
+        ]);
+        // `excluded.label` is the would-be-inserted row, so an unsupplied column
+        // reads its default: the rewrite sets `label` to the default `'d'`.
+        engine
+            .execute_one("INSERT INTO t (id,score) VALUES (1,9.5) ON CONFLICT(id) DO UPDATE SET label = excluded.label, score = excluded.score")
+            .expect("excluded default");
+        assert_eq!(
+            engine.execute_one("SELECT label, score FROM t WHERE id = 1").expect("row").rows,
+            vec![vec![text("d"), Cell::Real(9.5)]]
+        );
     }
 
     #[test]
