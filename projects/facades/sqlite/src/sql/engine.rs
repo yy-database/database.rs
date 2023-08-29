@@ -8015,23 +8015,30 @@ impl Engine {
             return None;
         }
         let alias_name = def.rowid_alias.map(|index| def.columns[index].name.clone());
-        Self::rowid_eq_conjunct(filter.as_ref()?, alias_name.as_deref(), table.label())
+        Self::rowid_eq_conjunct(filter.as_ref()?, alias_name.as_deref(), table.label(), &self.parameters)
     }
 
     /// Walks the top-level `AND` chain of a predicate for a `rowid = <int>` (or
     /// `<int> = rowid`) comparison on the rowid-alias column or an implicit
     /// `rowid` / `_rowid_` / `oid` name. Anything outside a plain `AND` of
     /// `=` comparisons yields `None`.
-    fn rowid_eq_conjunct(expr: &Expr, alias_name: Option<&str>, label: &str) -> Option<i64> {
+    ///
+    /// The right-hand side may be an integer literal or a bound parameter whose
+    /// value is already known at execution time; a non-integer binding keeps the
+    /// full scan, exactly like a non-integer literal.
+    fn rowid_eq_conjunct(expr: &Expr, alias_name: Option<&str>, label: &str, parameters: &[Cell]) -> Option<i64> {
         match expr {
-            Expr::And(left, right) => {
-                Self::rowid_eq_conjunct(left, alias_name, label).or_else(|| Self::rowid_eq_conjunct(right, alias_name, label))
-            }
+            Expr::And(left, right) => Self::rowid_eq_conjunct(left, alias_name, label, parameters)
+                .or_else(|| Self::rowid_eq_conjunct(right, alias_name, label, parameters)),
             Expr::Compare { left, op, right } if *op == CompareOp::Eq => {
                 let (column, value) = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column(column), Expr::Literal(Literal::Integer(value))) => (column, *value),
-                    (Expr::Literal(Literal::Integer(value)), Expr::Column(column)) => (column, *value),
+                    (Expr::Column(column), value) => (column, known_cell(value, parameters)?),
+                    (value, Expr::Column(column)) => (column, known_cell(value, parameters)?),
                     _ => return None,
+                };
+                let Cell::Integer(value) = value
+                else {
+                    return None;
                 };
                 if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(label)) {
                     return None;
@@ -8112,7 +8119,7 @@ impl Engine {
     /// the caller must fall back to the full scan.
     fn index_probe_rows(&self, index: &IndexDef, def: &TableDef, filter: &Expr, label: &str) -> Option<Vec<i64>> {
         let mut equalities: Vec<(usize, Cell)> = Vec::new();
-        collect_index_equalities(filter, def, label, &mut equalities);
+        collect_index_equalities(filter, def, label, &self.parameters, &mut equalities);
         if equalities.is_empty() {
             return None;
         }
@@ -8163,7 +8170,7 @@ impl Engine {
         let position = *index.columns.first()?;
         let mut lower: Option<IndexBound> = None;
         let mut upper: Option<IndexBound> = None;
-        collect_range_bounds(filter, def, label, position, &mut lower, &mut upper);
+        collect_range_bounds(filter, def, label, position, &self.parameters, &mut lower, &mut upper);
         if lower.is_none() && upper.is_none() {
             return None;
         }
@@ -12364,24 +12371,28 @@ fn binding_order(relation: &Relation, conjuncts: &[ResolvedExpr]) -> Vec<usize> 
 /// to one source, so it waits for the complete row instead of pruning early.
 /// Collects the `AND` conjuncts of the form `<column> = <literal>` (or the
 /// mirrored shape) that name a column of one base table, as `(position, cell)`
-/// pairs. Anything outside a plain `AND` of `=` comparisons contributes
-/// nothing, so a missed equality only costs the pushdown, never a row.
-fn collect_index_equalities(expr: &Expr, def: &TableDef, label: &str, out: &mut Vec<(usize, Cell)>) {
+/// pairs. A bound parameter counts as a literal once its value is known.
+/// Anything outside a plain `AND` of `=` comparisons contributes nothing, so a
+/// missed equality only costs the pushdown, never a row.
+fn collect_index_equalities(expr: &Expr, def: &TableDef, label: &str, parameters: &[Cell], out: &mut Vec<(usize, Cell)>) {
     match expr {
         Expr::And(left, right) => {
-            collect_index_equalities(left, def, label, out);
-            collect_index_equalities(right, def, label, out);
+            collect_index_equalities(left, def, label, parameters, out);
+            collect_index_equalities(right, def, label, parameters, out);
         }
         Expr::Compare { left, op, right } if *op == CompareOp::Eq => {
             let (column, value) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(column), Expr::Literal(value)) | (Expr::Literal(value), Expr::Column(column)) => (column, value),
+                (Expr::Column(column), value) => (column, known_cell(value, parameters)),
+                (value, Expr::Column(column)) => (column, known_cell(value, parameters)),
                 _ => return,
             };
             if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(label)) {
                 return;
             }
-            if let Some(position) = def.columns.iter().position(|entry| entry.name.eq_ignore_ascii_case(&column.name)) {
-                out.push((position, literal_cell(value)));
+            if let Some(cell) = value
+                && let Some(position) = def.columns.iter().position(|entry| entry.name.eq_ignore_ascii_case(&column.name))
+            {
+                out.push((position, cell));
             }
         }
         _ => {}
@@ -12391,7 +12402,8 @@ fn collect_index_equalities(expr: &Expr, def: &TableDef, label: &str, out: &mut 
 /// Collects the lower and upper bounds of an `AND` conjunction on one column.
 ///
 /// Only a plain `AND` of `<column> <op> <literal>` (or the mirrored shape)
-/// contributes; any other shape is ignored, so a missed bound only costs the
+/// contributes, where a bound parameter counts as a literal once its value is
+/// known; any other shape is ignored, so a missed bound only costs the
 /// pushdown. When several bounds name the same side, the last one wins, which
 /// stays a superset of the true result because the full predicate still runs.
 fn collect_range_bounds(
@@ -12399,19 +12411,24 @@ fn collect_range_bounds(
     def: &TableDef,
     label: &str,
     position: usize,
+    parameters: &[Cell],
     lower: &mut Option<IndexBound>,
     upper: &mut Option<IndexBound>,
 ) {
     match expr {
         Expr::And(left, right) => {
-            collect_range_bounds(left, def, label, position, lower, upper);
-            collect_range_bounds(right, def, label, position, lower, upper);
+            collect_range_bounds(left, def, label, position, parameters, lower, upper);
+            collect_range_bounds(right, def, label, position, parameters, lower, upper);
         }
         Expr::Compare { left, op, right } => {
             let (column, value, flipped) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(column), Expr::Literal(value)) => (column, value, false),
-                (Expr::Literal(value), Expr::Column(column)) => (column, value, true),
+                (Expr::Column(column), value) => (column, known_cell(value, parameters), false),
+                (value, Expr::Column(column)) => (column, known_cell(value, parameters), true),
                 _ => return,
+            };
+            let Some(cell) = value
+            else {
+                return;
             };
             if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(label)) {
                 return;
@@ -12420,7 +12437,7 @@ fn collect_range_bounds(
                 return;
             }
             let op = if flipped { flip_range_op(*op) } else { *op };
-            let bound = IndexBound { cell: literal_cell(value), inclusive: matches!(op, CompareOp::GtEq | CompareOp::LtEq) };
+            let bound = IndexBound { cell, inclusive: matches!(op, CompareOp::GtEq | CompareOp::LtEq) };
             match op {
                 CompareOp::Gt | CompareOp::GtEq => *lower = Some(bound),
                 CompareOp::Lt | CompareOp::LtEq => *upper = Some(bound),
@@ -12643,6 +12660,19 @@ fn emit_rows(
         }
     }
     Ok(())
+}
+
+/// 下推键的执行期取值：字面量，或绑定到该位置的参数。
+///
+/// 参数在语句执行前已经绑定，形态与字面量等价，所以把「仅字面量」放宽到「执行期
+/// 已知的值」不改变结果：下推只收窄候选行，全量谓词照旧在下游执行。缺失的绑定
+/// 退化为 `NULL`，既不会被当成可下推的整数键，也不会改变求值结果。
+fn known_cell(expr: &Expr, parameters: &[Cell]) -> Option<Cell> {
+    match expr {
+        Expr::Literal(literal) => Some(literal_cell(literal)),
+        Expr::Parameter { index, .. } => Some(parameters.get(*index).cloned().unwrap_or(Cell::Null)),
+        _ => None,
+    }
 }
 
 fn literal_cell(literal: &Literal) -> Cell {
@@ -16989,6 +17019,50 @@ mod tests {
             engine.execute_one("SELECT label, score FROM t WHERE id = 1").expect("row").rows,
             vec![vec![text("d"), Cell::Real(9.5)]]
         );
+    }
+
+    #[test]
+    fn bound_point_lookups_return_the_same_rows_as_their_literal_forms() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, n INTEGER)",
+            "INSERT INTO t VALUES (1,'a',10),(2,'b',20),(3,'c',30),(4,'d',40)",
+            "CREATE INDEX tl ON t (label)",
+            "CREATE INDEX tn ON t (n)",
+        ]);
+        // 下推键既可以是字面量，也可以是执行期已知的参数；两条路径必须给出同一行集，
+        // 只是参数形态不再退化成整表扫描。
+        for (literal, bound) in [
+            ("SELECT label FROM t WHERE id = 3", "SELECT label FROM t WHERE id = ?"),
+            ("SELECT id FROM t WHERE label = 'c'", "SELECT id FROM t WHERE label = ?"),
+            ("SELECT id FROM t WHERE n >= 20 AND n <= 30", "SELECT id FROM t WHERE n >= ? AND n <= ?"),
+        ] {
+            let expected = engine.execute_one(literal).expect("literal form").rows;
+            let parameters: &[Cell] = if literal.contains("id = 3") {
+                &[Cell::Integer(3)]
+            }
+            else if literal.contains("label") {
+                &[text("c")]
+            }
+            else {
+                &[Cell::Integer(20), Cell::Integer(30)]
+            };
+            let actual = engine.execute_with_parameters(bound, parameters).expect("bound form").remove(0).rows;
+            assert_eq!(actual, expected, "`{bound}` must match `{literal}`");
+        }
+    }
+
+    #[test]
+    fn bound_lookup_keeps_the_full_scan_result_for_a_mixed_storage_class() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)",
+            "INSERT INTO t VALUES (1,'5'),(2,'6')",
+            "CREATE INDEX tl ON t (label)",
+        ]);
+        // 文本列与整数比较时亲和类不符，探针必须放弃下推。此处只锁定「下推不改变
+        // 结果」：字面量形态与绑定形态必须给出同一行集，具体行集由全表谓词决定。
+        let literal = engine.execute_one("SELECT id FROM t WHERE label = 5").expect("literal form").rows;
+        let bound = engine.execute_with_parameters("SELECT id FROM t WHERE label = ?", &[Cell::Integer(5)]).expect("bound form").remove(0).rows;
+        assert_eq!(bound, literal, "the probe must not narrow a mixed storage-class comparison");
     }
 
     #[test]
