@@ -893,6 +893,8 @@ struct UpdatePlan {
     /// `RETURNING` rows, evaluated against the new row values.
     returning: Vec<Vec<Cell>>,
     affected: usize,
+    /// 规划期读到的行集快照。处理阶段直接复用它，不再重复整表解码。
+    live: Vec<(i64, Vec<Cell>)>,
 }
 
 /// Everything a `DELETE` will remove.
@@ -900,6 +902,8 @@ struct DeletePlan {
     removed: Vec<i64>,
     /// `RETURNING` rows, evaluated against the row as it was.
     returning: Vec<Vec<Cell>>,
+    /// 规划期读到的行集快照（以 `removed` 为子集），供触发器与外键动作复用。
+    live: Vec<(i64, Vec<Cell>)>,
 }
 
 /// One engine-managed unique index an `ON CONFLICT` target matched.
@@ -4271,11 +4275,29 @@ impl Engine {
                     Some(joined)
                 };
                 let mut needs_index = self.has_indexes(def, &key);
-                let plan =
-                    self.plan_update(def, &key, &targets, predicate.as_ref(), joined.as_ref(), returning.as_ref(), &shape.scope, &budget, None)?;
+                // `UPDATE ... WHERE <rowid> = <key>` 只可能命中一行时，扫描不必整表解码。
+                let candidate = if from.is_empty() {
+                    self.update_candidate(def, &key, &table, alias.as_deref(), filter.as_ref(), &targets)
+                }
+                else {
+                    None
+                };
+                let plan = self.plan_update(
+                    def,
+                    &key,
+                    &targets,
+                    predicate.as_ref(),
+                    joined.as_ref(),
+                    returning.as_ref(),
+                    &shape.scope,
+                    &budget,
+                    None,
+                    candidate,
+                )?;
                 // Old row values are needed to tell which referenced keys this
-                // statement rewrites, so they are read before the transaction.
-                let old_rows = self.live_rows(def, "update")?;
+                // statement rewrites, so they come from the plan's pre-statement
+                // snapshot instead of decoding the table a second time.
+                let old_rows = &plan.live;
                 let assigned: Vec<bool> =
                     def.columns.iter().enumerate().map(|(index, _)| targets.iter().any(|(target, _)| *target == index)).collect();
                 for (_, values) in &plan.writes {
@@ -4290,7 +4312,8 @@ impl Engine {
                 let queue_triggers = self.table_has_triggers(&key);
                 let trigger_columns = trigger_frame_columns(def);
                 let assigned_names: Vec<String> = assignments.iter().map(|assignment| assignment.column.clone()).collect();
-                let old_lookup: BTreeMap<i64, Vec<Cell>> = old_rows.iter().cloned().collect();
+                let old_lookup: BTreeMap<i64, Vec<Cell>> =
+                    if queue_triggers || def.without_rowid || self.foreign_keys { old_rows.iter().cloned().collect() } else { BTreeMap::new() };
                 // The `AFTER` events wait until referential actions and checks
                 // have run, matching SQLite's `BEFORE`, cascade, `AFTER` order.
                 let mut after_events: Vec<(i64, Vec<Cell>, Vec<Cell>)> = Vec::new();
@@ -4448,17 +4471,20 @@ impl Engine {
                 };
                 let budget = Budget::new();
                 let mut needs_index = self.has_indexes(def, &key);
-                let plan = self.plan_delete(def, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget)?;
-                // The deleted rows' referenced keys are only visible before the
-                // removal, so the snapshot is taken ahead of the transaction.
-                let old_rows = self.live_rows(def, "delete")?;
+                // `DELETE FROM t WHERE <rowid> = <key>` 只可能删一行，扫描不必整表解码。
+                let candidate = self.delete_candidate(def, &table, alias.as_deref(), filter.as_ref());
+                let plan = self.plan_delete(def, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget, candidate)?;
                 // A temp table snapshots its row map instead of opening a
                 // writer transaction, so a failing referential check undoes the
                 // removal exactly like a rollback would.
                 let temp_snapshot = temp_position.map(|position| self.temp_tables[position].rows.clone());
                 let queue_triggers = self.table_has_triggers(&key);
                 let trigger_columns = trigger_frame_columns(def);
-                let old_lookup: BTreeMap<i64, Vec<Cell>> = old_rows.iter().cloned().collect();
+                // The deleted rows' referenced keys are only visible before the
+                // removal, so the snapshot comes from the plan; 只有触发器和外键
+                // 动作需要按 rowid 查旧行，其余路径不建这张表。
+                let old_lookup: BTreeMap<i64, Vec<Cell>> =
+                    if queue_triggers || self.foreign_keys { plan.live.iter().cloned().collect() } else { BTreeMap::new() };
                 let mut after_events: Vec<(i64, Vec<Cell>)> = Vec::new();
                 if let Some(position) = temp_position {
                     {
@@ -4512,7 +4538,7 @@ impl Engine {
                     }
                 }
                 if self.foreign_keys {
-                    if let Err(error) = self.check_delete_foreign_keys(def, &old_rows, &plan.removed, "delete") {
+                    if let Err(error) = self.check_delete_foreign_keys(def, &plan.live, &plan.removed, "delete") {
                         match (temp_position, temp_snapshot) {
                             (Some(position), Some(snapshot)) => self.temp_tables[position].rows = snapshot,
                             _ => {
@@ -5209,6 +5235,70 @@ impl Engine {
         Ok(rows)
     }
 
+    /// Reads one stored row by rowid; an absent rowid yields an empty set.
+    ///
+    /// Used when a statement is already pinned to one candidate row, so the
+    /// whole table is never decoded for the common `where <rowid> = <key>` form.
+    fn live_row(&self, def: &TableDef, statement: &'static str, rowid: i64) -> Result<Vec<(i64, Vec<Cell>)>, SqlError> {
+        if def.temp {
+            return Ok(self
+                .live_rows(def, statement)?
+                .into_iter()
+                .filter(|(candidate, _)| *candidate == rowid)
+                .collect());
+        }
+        let stored = self
+            .writer
+            .table_range(&def.name, rowid, rowid, TableLimits::default())
+            .map_err(|error| storage_failure(error).in_statement(statement))?;
+        let mut rows = Vec::with_capacity(stored.len());
+        for row in &stored {
+            rows.push((row.rowid, decode_row(&row.payload, def, row.rowid)?));
+        }
+        Ok(rows)
+    }
+
+    /// `DELETE FROM t WHERE <rowid> = <key>` 只可能删一行时的候选 rowid。
+    ///
+    /// 与 SELECT 的 `rowid_pin` 同一判定：只认裸 `AND` 链上的等值比较，键可以是
+    /// 整数字面量或执行期已绑定的整数参数。谓词仍会在候选行上重跑一遍，因此命中
+    /// 与否都不会改变删除集合，只决定是否省掉整表解码。
+    fn delete_candidate(&self, def: &TableDef, table: &str, alias: Option<&str>, filter: Option<&Expr>) -> Option<i64> {
+        if def.without_rowid || def.temp {
+            return None;
+        }
+        let alias_name = def.rowid_alias.map(|index| def.columns[index].name.clone());
+        Self::rowid_eq_conjunct(filter?, alias_name.as_deref(), alias.unwrap_or(table), &self.parameters)
+    }
+
+    /// `UPDATE t SET ... WHERE <rowid> = <key>` 只可能命中一行时的候选 rowid。
+    ///
+    /// 与 `DELETE` 不同，`UPDATE` 还要用整表做唯一性冲突判定，因此只在「唯一键只有
+    /// rowid，且没有任何赋值改动 rowid」时才收窄。这两条成立时，收窄后的行集与整表
+    /// 在冲突判定上等价；外键检查只看被写入的行，因此不需要整表。`WITHOUT ROWID`
+    /// 表一律走整表读取。
+    fn update_candidate(
+        &self,
+        def: &TableDef,
+        table_key: &str,
+        table: &str,
+        alias: Option<&str>,
+        filter: Option<&Expr>,
+        targets: &[(usize, ResolvedExpr)],
+    ) -> Option<i64> {
+        if def.without_rowid || def.temp {
+            return None;
+        }
+        if targets.iter().any(|(index, _)| Some(*index) == def.rowid_alias) {
+            return None;
+        }
+        if self.unique_keys(def, table_key).iter().any(|key| !matches!(key, UniqueKey::Rowid(_))) {
+            return None;
+        }
+        let alias_name = def.rowid_alias.map(|index| def.columns[index].name.clone());
+        Self::rowid_eq_conjunct(filter?, alias_name.as_deref(), alias.unwrap_or(table), &self.parameters)
+    }
+
     /// Resolves one `ON CONFLICT` clause against the insert target: the
     /// uniqueness rules its target names, plus the `DO UPDATE` assignments
     /// evaluated against the stored row and the supplied (`excluded`) row.
@@ -5525,7 +5615,7 @@ impl Engine {
         let mut joined = BTreeMap::new();
         joined.insert(rowid, eval_cells);
         let state = vec![(rowid, stored)];
-        let planned = self.plan_update(def, table_key, &plan.assignments, None, Some(&joined), returning, shape, budget, Some(&state));
+        let planned = self.plan_update(def, table_key, &plan.assignments, None, Some(&joined), returning, shape, budget, Some(&state), None);
         self.upsert_excluded.clear();
         let planned = planned?;
         if planned.writes.is_empty() {
@@ -5649,7 +5739,7 @@ impl Engine {
             predicate = ResolvedExpr::And(Box::new(predicate), Box::new(filter.clone()));
         }
         self.upsert_excluded = candidate[..width].to_vec();
-        let planned = self.plan_update(def, table_key, &plan.assignments, Some(&predicate), None, returning, shape, budget, None);
+        let planned = self.plan_update(def, table_key, &plan.assignments, Some(&predicate), None, returning, shape, budget, None, None);
         self.upsert_excluded.clear();
         let planned = planned?;
         if planned.writes.is_empty() {
@@ -6472,16 +6562,20 @@ impl Engine {
         shape: &ScopeShape,
         budget: &Budget,
         state_override: Option<&[(i64, Vec<Cell>)]>,
+        candidate: Option<i64>,
     ) -> Result<UpdatePlan, SqlError> {
         let width = def.columns.len();
         let keys = self.unique_keys(def, table_key);
-        let owned_live;
+        let owned_live = match state_override {
+            Some(_) => None,
+            None => Some(match candidate {
+                Some(rowid) => self.live_row(def, "update", rowid)?,
+                None => self.live_rows(def, "update")?,
+            }),
+        };
         let live: &[(i64, Vec<Cell>)] = match state_override {
             Some(rows) => rows,
-            None => {
-                owned_live = self.live_rows(def, "update")?;
-                &owned_live
-            }
+            None => owned_live.as_deref().unwrap_or_default(),
         };
         let mut state = live.to_vec();
         let mut writes = Vec::new();
@@ -6573,11 +6667,21 @@ impl Engine {
             writes.push((*rowid, values));
             affected += 1;
         }
-        Ok(UpdatePlan { writes, returning: returned, affected })
+        // 复用的快照优先直接交出所有权，避免再复制一份整表。
+        let live_snapshot = match owned_live {
+            Some(rows) => rows,
+            None => live.to_vec(),
+        };
+        Ok(UpdatePlan { writes, returning: returned, affected, live: live_snapshot })
     }
 
     /// Plans one `DELETE`: the matching rowids in ascending order, plus any
     /// `RETURNING` rows, which see the row as it was before removal.
+    ///
+    /// `candidate` narrows the scan to one rowid when the predicate is exactly a
+    /// `WHERE <rowid> = <key>` equality on the target table. The predicate still
+    /// runs over the candidate, so a stale or mismatched pin only costs the
+    /// pushdown and never changes the removed set.
     fn plan_delete(
         &self,
         def: &TableDef,
@@ -6585,8 +6689,12 @@ impl Engine {
         returning: Option<&ReturningPlan>,
         shape: &ScopeShape,
         budget: &Budget,
+        candidate: Option<i64>,
     ) -> Result<DeletePlan, SqlError> {
-        let live = self.live_rows(def, "delete")?;
+        let live = match candidate {
+            Some(rowid) => self.live_row(def, "delete", rowid)?,
+            None => self.live_rows(def, "delete")?,
+        };
         let mut removed = Vec::new();
         let mut returned = Vec::new();
         for (rowid, cells) in &live {
@@ -6604,7 +6712,7 @@ impl Engine {
             }
             removed.push(*rowid);
         }
-        Ok(DeletePlan { removed, returning: returned })
+        Ok(DeletePlan { removed, returning: returned, live })
     }
 
     /// Executes one `SELECT` over the comma-separated `FROM` list.
@@ -17063,6 +17171,36 @@ mod tests {
         let literal = engine.execute_one("SELECT id FROM t WHERE label = 5").expect("literal form").rows;
         let bound = engine.execute_with_parameters("SELECT id FROM t WHERE label = ?", &[Cell::Integer(5)]).expect("bound form").remove(0).rows;
         assert_eq!(bound, literal, "the probe must not narrow a mixed storage-class comparison");
+    }
+
+    #[test]
+    fn narrowed_update_still_sees_conflicts_outside_the_pinned_row() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT UNIQUE)",
+            "INSERT INTO t VALUES (1,'a'),(2,'b')",
+        ]);
+        // 收窄只对「唯一键仅 rowid」生效；带额外唯一键的表保留整表判定，冲突照常报出。
+        let error = engine
+            .execute_with_parameters("UPDATE t SET label = ? WHERE id = ?", &[text("b"), Cell::Integer(1)])
+            .expect_err("a UNIQUE conflict outside the narrowed row must still abort");
+        assert_eq!(error.code, "unique-constraint");
+    }
+
+    #[test]
+    fn narrowed_update_never_applies_when_the_rowid_changes() {
+        let mut engine = joined_engine(&["CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)", "INSERT INTO t VALUES (1,'a'),(2,'b')"]);
+        let error = engine
+            .execute_with_parameters("UPDATE t SET id = ? WHERE id = ?", &[Cell::Integer(2), Cell::Integer(1)])
+            .expect_err("moving a rowid onto an existing row must conflict");
+        assert_eq!(error.code, "unique-constraint");
+    }
+
+    #[test]
+    fn narrowed_delete_only_narrows_a_rowid_equality() {
+        let mut engine = joined_engine(&["CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)", "INSERT INTO t VALUES (1,5),(2,5),(3,6)"]);
+        // 非 rowid 谓词必须删掉全部匹配行，不能被单行候选截断。
+        engine.execute_one("DELETE FROM t WHERE n = 5").expect("delete every match");
+        assert_eq!(engine.execute_one("SELECT id FROM t").expect("rows").rows, vec![vec![Cell::Integer(3)]]);
     }
 
     #[test]
