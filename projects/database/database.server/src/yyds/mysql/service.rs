@@ -2,7 +2,7 @@
 
 use std::{
     io,
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -36,8 +36,9 @@ impl MysqlService {
                 "MySQL requires loopback until authentication and TLS are implemented",
             ));
         }
+        // 阻塞 `accept`：新连接一到达内核立刻唤醒监听线程。历史上用非阻塞轮询
+        // 加固定 5ms 睡眠，会把每次连接建立的延迟钉在 0-5ms，而握手本身更便宜。
         let listener = TcpListener::bind(address)?;
-        listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let stopping = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&stopping);
@@ -103,6 +104,9 @@ impl MysqlService {
 
     fn shutdown(&mut self) -> io::Result<()> {
         self.stopping.store(true, Ordering::Release);
+        // 监听线程阻塞在 `accept`，用一个自身的空连接把它唤醒；唤醒连接随后
+        // 在循环顶部看到停机标志被丢弃，不影响已建立的会话。
+        let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(500));
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| io::Error::other("MySQL accept worker panicked"))??;
         }
@@ -166,7 +170,6 @@ fn listen(listener: TcpListener, stopping: Arc<AtomicBool>, runtime: Option<Arc<
                 })?;
                 clients.workers.push(worker);
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }

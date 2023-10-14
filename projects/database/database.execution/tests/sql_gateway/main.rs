@@ -224,6 +224,22 @@ fn aggregate_over_primary_key_equality_falls_back_to_scan() {
     assert_eq!(gateway.scalar_integer("SELECT COUNT(*) FROM nums WHERE id = 999"), 0);
 }
 
+/// 等值连接只产出匹配组合，基表谓词剪枝不改变结果集。
+#[test]
+fn equality_join_matches_every_paired_row() {
+    let gateway = Gateway::new("join-equality");
+    gateway.expect_sql("CREATE TABLE lside (id INT NOT NULL PRIMARY KEY, grp INT)");
+    gateway.expect_sql("CREATE TABLE rside (id INT NOT NULL PRIMARY KEY, name TEXT)");
+    gateway.expect_sql("INSERT INTO lside (id, grp) VALUES (1, 0), (2, 0), (3, 1)");
+    gateway.expect_sql("INSERT INTO rside (id, name) VALUES (1, 'a'), (2, 'b'), (4, 'd')");
+    // 基表谓词 `grp = 0` 先剪枝，连接只应产出 2 条匹配。
+    assert_eq!(gateway.scalar_integer("SELECT COUNT(*) FROM lside l JOIN rside r ON r.id = l.id WHERE l.grp = 0"), 2);
+    let names = gateway.expect_sql("SELECT r.name FROM lside l JOIN rside r ON r.id = l.id ORDER BY r.id");
+    assert_eq!(names.rows, vec![vec![SqlValue::String("a".into())], vec![SqlValue::String("b".into())]]);
+    // LEFT JOIN：未匹配的左侧行保留，共 3 行。
+    assert_eq!(gateway.scalar_integer("SELECT COUNT(*) FROM lside l LEFT JOIN rside r ON r.id = l.id"), 3);
+}
+
 /// 绑定层形状冒烟：确认 bind 产出的 Update 语句进入计划器而不是被更早的层拒绝。
 #[test]
 fn update_statement_binds_to_update_variant() {

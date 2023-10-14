@@ -654,7 +654,7 @@ where
         }
 
         // K-way merge — each shard's slice is already sorted by key bytes.
-        Ok(merge_sorted(&shard_results, limit))
+        Ok(merge_sorted(shard_results, limit))
     }
 
     fn execute(&self, fence: Option<&FenceToken>, command: KeyValueCommand) -> database_types::cluster::Result<KeyValueResult> {
@@ -821,7 +821,16 @@ fn parse_integer(bytes: &[u8]) -> database_types::cluster::Result<i64> {
 }
 
 /// K-way merge of already-sorted slices, returning up to `limit` pairs keyed by key bytes.
-fn merge_sorted(slices: &[Vec<(Vec<u8>, Vec<u8>)>], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn merge_sorted(mut slices: Vec<Vec<(Vec<u8>, Vec<u8>)>>, limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    // 单分片是最常见形态（本机单节点）：直接接管这一份结果，既不复制也不做
+    // 逐行取最小。历史上这里无条件 clone 每一行，把整表扫描的常数抬高一倍。
+    if slices.len() == 1 {
+        let mut rows = slices.pop().unwrap_or_default();
+        if limit > 0 {
+            rows.truncate(limit);
+        }
+        return rows;
+    }
     if slices.is_empty() {
         return Vec::new();
     }
@@ -841,7 +850,8 @@ fn merge_sorted(slices: &[Vec<(Vec<u8>, Vec<u8>)>], limit: usize) -> Vec<(Vec<u8
         match best_idx {
             None => break,
             Some(i) => {
-                out.push(slices[i][cursors[i]].clone());
+                // 取走而非复制：合并结果独占这些行，源分片切片随本函数结束释放。
+                out.push(std::mem::take(&mut slices[i][cursors[i]]));
                 cursors[i] += 1;
                 if limit > 0 && out.len() >= limit {
                     break;

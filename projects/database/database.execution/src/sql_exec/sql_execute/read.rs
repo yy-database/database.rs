@@ -77,25 +77,87 @@ pub(crate) fn execute_join(
         return Ok(SqlResult { columns, rows: Vec::new(), affected_rows: 0 });
     }
     let mut rows = scan_join_source(executor, transaction, &plan.base)?;
+    // 只引用基表列的 `WHERE` 合取项先在基表行上过滤：连接前的行数降一个量级，
+    // 后续嵌套/哈希连接的成本随之下降。这些合取项在合并行上仍会再判一次，
+    // 因此这里只是提前剪枝，不改变最终语义。
+    if !plan.joins.is_empty() {
+        if let Some(predicate) = &plan.remaining_predicate {
+            let mut conjuncts = Vec::new();
+            split_conjuncts(predicate, &mut conjuncts);
+            let base_row_ids: Vec<u64> = plan.base.row_ids.clone();
+            let pushable: Vec<&SqlCatalogBoundExpression> = conjuncts
+                .iter()
+                .filter(|conjunct| {
+                    let mut columns = Vec::new();
+                    database_query::catalog_bind::collect_column_ids(conjunct, &mut columns);
+                    !columns.is_empty() && columns.iter().all(|column| base_row_ids.contains(column))
+                })
+                .copied()
+                .collect();
+            if !pushable.is_empty() {
+                let mut kept = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let mut matches = true;
+                    for conjunct in &pushable {
+                        if !truthy(&eval_row_expression(conjunct, &row, &plan.field_types, dialect, executor, transaction)?) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if matches {
+                        kept.push(row);
+                    }
+                }
+                rows = kept;
+            }
+        }
+    }
     for source in &plan.joins {
         let right_rows = scan_join_source(executor, transaction, source)?;
         let keep_left = matches!(source.kind, database_query::sql::SqlBoundJoinKind::Left | database_query::sql::SqlBoundJoinKind::Full);
         let keep_right = matches!(source.kind, database_query::sql::SqlBoundJoinKind::Right | database_query::sql::SqlBoundJoinKind::Full);
         let mut right_matched = vec![false; right_rows.len()];
         let mut merged = Vec::new();
+        // `ON <左侧列> = <右侧列>` 是连接里最常见的形态。命中时先按右行建一次
+        // 等值索引，左行只探针候选桶，候选再走完整 `ON` 求值，因此多出来的
+        // `AND` 分支与 NULL 三值逻辑仍由原判定负责，不会被索引放宽。
+        let hash_columns = source.on.as_ref().map(|on| join_hash_columns(on, &source.row_ids, &plan.field_types)).unwrap_or_default();
+        let hash_index = (!hash_columns.is_empty()).then(|| build_join_hash_index(&right_rows, &hash_columns, plan));
         for left in &rows {
             let mut matched_any = false;
-            for (index, right) in right_rows.iter().enumerate() {
-                let mut row = left.clone();
-                row.merge(right);
-                if let Some(on) = &source.on {
-                    if !truthy(&eval_row_expression(on, &row, &plan.field_types, dialect, executor, transaction)?) {
-                        continue;
+            match &hash_index {
+                Some(index) => {
+                    if let Some(key) = join_hash_key(left, &hash_columns, plan) {
+                        if let Some(candidates) = index.get(&key) {
+                            for candidate in candidates {
+                                let mut row = left.clone();
+                                row.merge(&right_rows[*candidate]);
+                                if let Some(on) = &source.on {
+                                    if !truthy(&eval_row_expression(on, &row, &plan.field_types, dialect, executor, transaction)?) {
+                                        continue;
+                                    }
+                                }
+                                merged.push(row);
+                                matched_any = true;
+                                right_matched[*candidate] = true;
+                            }
+                        }
                     }
                 }
-                merged.push(row);
-                matched_any = true;
-                right_matched[index] = true;
+                None => {
+                    for (index, right) in right_rows.iter().enumerate() {
+                        let mut row = left.clone();
+                        row.merge(right);
+                        if let Some(on) = &source.on {
+                            if !truthy(&eval_row_expression(on, &row, &plan.field_types, dialect, executor, transaction)?) {
+                                continue;
+                            }
+                        }
+                        merged.push(row);
+                        matched_any = true;
+                        right_matched[index] = true;
+                    }
+                }
             }
             if keep_left && !matched_any {
                 // LEFT / FULL JOIN: 左行未匹配任何右行时仍然保留，右表字段缺失 → NULL
@@ -231,6 +293,104 @@ pub(crate) fn execute_join(
     Ok(SqlResult { columns, rows, affected_rows: 0 })
 }
 
+/// 把顶层 `AND` 条件拆成合取项；非 `AND` 节点自身算一个合取项。
+fn split_conjuncts<'a>(expression: &'a SqlCatalogBoundExpression, out: &mut Vec<&'a SqlCatalogBoundExpression>) {
+    match expression {
+        SqlCatalogBoundExpression::Binary { left, operator: SqlBoundBinaryOperator::And, right } => {
+            split_conjuncts(left, out);
+            split_conjuncts(right, out);
+        }
+        _ => out.push(expression),
+    }
+}
+
+/// 从 JOIN 的 `ON` 条件里收集可以下推成哈希探针的等值列对。
+///
+/// 只接受「两侧都是 catalog 列、两侧字段类型完全相同、其中一侧属于本次连接来源」的
+/// `=`，并沿 `AND` 递归。类型不同或任一侧是表达式时不参与索引：SQL 的隐式转换会让
+/// 等值判断跳出原始字节，这类情况仍走完整的嵌套循环与 `ON` 求值。
+fn join_hash_columns(
+    on: &database_query::catalog_bind::SqlCatalogBoundExpression,
+    right_row_ids: &[u64],
+    field_types: &std::collections::BTreeMap<u64, database_query::catalog_bind::SqlFieldType>,
+) -> Vec<(u64, u64)> {
+    use database_query::catalog_bind::SqlCatalogBoundExpression;
+    use database_query::sql::SqlBoundBinaryOperator;
+    let mut pairs = Vec::new();
+    fn collect(
+        expression: &SqlCatalogBoundExpression,
+        right_row_ids: &[u64],
+        field_types: &std::collections::BTreeMap<u64, database_query::catalog_bind::SqlFieldType>,
+        pairs: &mut Vec<(u64, u64)>,
+    ) {
+        match expression {
+            SqlCatalogBoundExpression::Binary { left, operator: SqlBoundBinaryOperator::And, right } => {
+                collect(left, right_row_ids, field_types, pairs);
+                collect(right, right_row_ids, field_types, pairs);
+            }
+            SqlCatalogBoundExpression::Binary { left, operator: SqlBoundBinaryOperator::Equal, right } => {
+                let (SqlCatalogBoundExpression::Column(left_column), SqlCatalogBoundExpression::Column(right_column)) =
+                    (left.as_ref(), right.as_ref())
+                else {
+                    return;
+                };
+                let left_is_right = right_row_ids.contains(&left_column.row_id);
+                let right_is_right = right_row_ids.contains(&right_column.row_id);
+                if left_is_right == right_is_right {
+                    return;
+                }
+                let (left_row_id, right_row_id) =
+                    if left_is_right { (right_column.row_id, left_column.row_id) } else { (left_column.row_id, right_column.row_id) };
+                let (Some(left_type), Some(right_type)) = (field_types.get(&left_row_id), field_types.get(&right_row_id)) else {
+                    return;
+                };
+                if left_type == right_type {
+                    pairs.push((left_row_id, right_row_id));
+                }
+            }
+            _ => {}
+        }
+    }
+    collect(on, right_row_ids, field_types, &mut pairs);
+    pairs
+}
+
+/// 按右行的等值列建一次哈希桶，桶内保留右行下标以维持与嵌套循环一致的输出顺序。
+fn build_join_hash_index(
+    right_rows: &[RowFieldValues],
+    columns: &[(u64, u64)],
+    plan: &JoinPlan,
+) -> std::collections::HashMap<String, Vec<usize>> {
+    let mut index: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::with_capacity(right_rows.len());
+    for (row_index, row) in right_rows.iter().enumerate() {
+        if let Some(key) = join_hash_row_key(row, columns.iter().map(|(_, right)| *right), plan) {
+            index.entry(key).or_default().push(row_index);
+        }
+    }
+    index
+}
+
+/// 左行的探针键；任一列是 SQL `NULL` 时不可能等于任何右行，直接跳过。
+fn join_hash_key(row: &RowFieldValues, columns: &[(u64, u64)], plan: &JoinPlan) -> Option<String> {
+    join_hash_row_key(row, columns.iter().map(|(left, _)| *left), plan)
+}
+
+fn join_hash_row_key(
+    row: &RowFieldValues,
+    row_ids: impl Iterator<Item = u64>,
+    plan: &JoinPlan,
+) -> Option<String> {
+    let mut values = Vec::new();
+    for row_id in row_ids {
+        let value = projected_value(row, row_id, &plan.field_types, &plan.field_defaults);
+        if matches!(value, SqlValue::Null) {
+            return None;
+        }
+        values.push(value);
+    }
+    Some(serialize_group_key(&values))
+}
+
 /// 整表扫描一个 JOIN 来源，只解码该表参与的字段，并按来源的 row id 存进合并行。
 pub(crate) fn scan_join_source(
     executor: &dyn KeyValueExecutor,
@@ -359,8 +519,15 @@ pub(crate) fn execute_scan(
     if plan.has_aggregate && plan.group_by.is_none() {
         // —— 全局聚合路径（无 GROUP BY）：需要访问所有 post-filter rows，无 heap 收益 ——
         let mut all_rows: Vec<RowFieldValues> = Vec::new();
+        // `COUNT(*)` 一类不读任何列的聚合不需要解码行；只有带 WHERE 时才必须解码。
+        let decode_needed = !needed_ids.is_empty() || plan.remaining_predicate.is_some();
         for (_rowid, value_bytes) in scanned {
-            let row = decode_row_fields(&value_bytes, &needed_ids)?;
+            let row = if decode_needed {
+                decode_row_fields(&value_bytes, &needed_ids)?
+            }
+            else {
+                RowFieldValues::new()
+            };
             if let Some(ref predicate) = plan.remaining_predicate {
                 let v = eval_row_expression(predicate, &row, &plan.field_types, dialect, executor, transaction)?;
                 if !truthy(&v) {
