@@ -261,10 +261,11 @@ fn lower_expression(
         SqlCatalogBoundExpression::Unary { operator, expression } => {
             SqlCatalogBoundExpression::Unary { operator, expression: Box::new(lower_expression(*expression, executor, transaction, dialect)?) }
         }
-        SqlCatalogBoundExpression::InValues { expression, values, negated } => SqlCatalogBoundExpression::InValues {
+        SqlCatalogBoundExpression::InValues { expression, values, negated, sorted_integers } => SqlCatalogBoundExpression::InValues {
             expression: Box::new(lower_expression(*expression, executor, transaction, dialect)?),
             values,
             negated,
+            sorted_integers,
         },
         SqlCatalogBoundExpression::InSubquery { expression, plan, negated } => {
             let expression = Box::new(lower_expression(*expression, executor, transaction, dialect)?);
@@ -279,9 +280,11 @@ fn lower_expression(
             if result.columns.len() != 1 {
                 return Err(SqlFrontendError::new(SqlErrorKind::OperandColumns, "IN subquery must select exactly one column"));
             }
-            let values =
+            let mut values: Vec<SqlBoundLiteral> =
                 result.rows.into_iter().map(|row| row.into_iter().next().map(value_to_literal).unwrap_or(SqlBoundLiteral::Null)).collect();
-            SqlCatalogBoundExpression::InValues { expression, values, negated }
+            // 物化结果只算一次，归一化成本相对逐行求值可以忽略。
+            let sorted_integers = database_query::sql_execute::normalize_integer_values(&mut values);
+            SqlCatalogBoundExpression::InValues { expression, values, negated, sorted_integers }
         }
         SqlCatalogBoundExpression::ScalarSubquery { plan } => {
             let mut plan = *plan;

@@ -426,6 +426,9 @@ pub enum SqlCatalogBoundExpression {
         values: Vec<SqlBoundLiteral>,
         /// Whether the predicate is spelled `NOT IN`.
         negated: bool,
+        /// `values` 是否已归一化为「NULL 在前、整数升序」。归一化后逐行求值可走
+        /// 二分查找，不必每行重建集合；非整数列表保持原顺序与通用比较路径。
+        sorted_integers: bool,
     },
     /// `CASE WHEN cond THEN result ... [ELSE fallback] END`.
     Case {
@@ -1145,6 +1148,25 @@ fn bind_projection(
     }
 }
 
+/// 收集「左结合 `OR` 链」里的全部等值项 `(左侧表达式, 右侧字面量)`。
+///
+/// 任一节点不是 `OR`、或某个等值项右侧不是字面量时返回 `false`，调用方保留原树。
+fn collect_or_equalities(expression: &SqlBoundExpression, out: &mut Vec<(SqlBoundExpression, SqlBoundLiteral)>) -> bool {
+    match expression {
+        SqlBoundExpression::Binary { left, operator: SqlBoundBinaryOperator::Or, right } => {
+            collect_or_equalities(left, out) && collect_or_equalities(right, out)
+        }
+        SqlBoundExpression::Binary { left, operator: SqlBoundBinaryOperator::Equal, right } => match right.as_ref() {
+            SqlBoundExpression::Literal(value) => {
+                out.push((left.as_ref().clone(), value.clone()));
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn bind_expression(
     expression: SqlBoundExpression,
     sources: &[SqlCatalogBoundTable],
@@ -1188,11 +1210,34 @@ fn bind_expression(
         }
         SqlBoundExpression::Literal(literal) => Ok(SqlCatalogBoundExpression::Literal(literal)),
         SqlBoundExpression::Wildcard => Ok(SqlCatalogBoundExpression::Wildcard),
-        SqlBoundExpression::Binary { left, operator, right } => Ok(SqlCatalogBoundExpression::Binary {
-            left: Box::new(bind_expression(*left, sources, ctes, scope, catalog, variables)?),
-            operator,
-            right: Box::new(bind_expression(*right, sources, ctes, scope, catalog, variables)?),
-        }),
+        SqlBoundExpression::Binary { left, operator, right } => {
+            // 绑定阶段把 `expr IN (v1, …, vN)` 展开成左结合等值 `OR` 链。这里把
+            // 「同一左侧、右侧全是字面量」的等值链还原成 `InValues`：逐行求值从
+            // N 次比较降为一次集合匹配，也避免 N 较大时递归求值耗尽线程栈。
+            if operator == SqlBoundBinaryOperator::Or {
+                let chain = SqlBoundExpression::Binary { left: left.clone(), operator, right: right.clone() };
+                let mut equalities = Vec::new();
+                if collect_or_equalities(&chain, &mut equalities)
+                    && equalities.len() > 1
+                    && equalities.windows(2).all(|window| window[0].0 == window[1].0)
+                {
+                    let target = equalities[0].0.clone();
+                    let mut values: Vec<SqlBoundLiteral> = equalities.into_iter().map(|(_, value)| value).collect();
+                    let sorted_integers = crate::sql_execute::normalize_integer_values(&mut values);
+                    return Ok(SqlCatalogBoundExpression::InValues {
+                        expression: Box::new(bind_expression(target, sources, ctes, scope, catalog, variables)?),
+                        values,
+                        negated: false,
+                        sorted_integers,
+                    });
+                }
+            }
+            Ok(SqlCatalogBoundExpression::Binary {
+                left: Box::new(bind_expression(*left, sources, ctes, scope, catalog, variables)?),
+                operator,
+                right: Box::new(bind_expression(*right, sources, ctes, scope, catalog, variables)?),
+            })
+        }
         SqlBoundExpression::Unary { operator, expression } => Ok(SqlCatalogBoundExpression::Unary {
             operator,
             expression: Box::new(bind_expression(*expression, sources, ctes, scope, catalog, variables)?),

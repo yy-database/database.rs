@@ -571,9 +571,9 @@ pub(crate) fn eval_having(
             let r = eval_having(right, bucket_rows, group_exprs, field_types, dialect)?;
             eval_binary(*operator, &l, &r, dialect)?
         }
-        SqlCatalogBoundExpression::InValues { expression, values, negated } => {
+        SqlCatalogBoundExpression::InValues { expression, values, negated, sorted_integers } => {
             let target = eval_having(expression, bucket_rows, group_exprs, field_types, dialect)?;
-            eval_in_values(target, values, *negated, dialect)?
+            eval_in_values(target, values, *negated, *sorted_integers, dialect)?
         }
         SqlCatalogBoundExpression::InSubquery { .. } => return Err(internal_error("IN subquery was not materialized before execution")),
         SqlCatalogBoundExpression::Exists { .. } => return Err(internal_error("EXISTS predicate was not materialized before execution")),

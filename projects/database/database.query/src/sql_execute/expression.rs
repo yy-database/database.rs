@@ -50,9 +50,9 @@ pub fn eval_expression(
             }
             eval_scalar_function(scalar, &values, dialect)?
         }
-        SqlCatalogBoundExpression::InValues { expression, values, negated } => {
+        SqlCatalogBoundExpression::InValues { expression, values, negated, sorted_integers } => {
             let target = eval_expression(expression, row, field_types, dialect)?;
-            eval_in_values(target, values, *negated, dialect)?
+            eval_in_values(target, values, *negated, *sorted_integers, dialect)?
         }
         // 子查询应当在执行前被 materialize 成 `InValues`；走到这里说明内部计划漏了 lowering。
         SqlCatalogBoundExpression::InSubquery { .. } => return Err(internal_error("IN subquery was not materialized before execution")),
@@ -171,10 +171,54 @@ fn mysql_integer_prefix(text: &str) -> i64 {
     trimmed[..end].parse::<i64>().unwrap_or(if trimmed.starts_with('-') { i64::MIN } else { i64::MAX })
 }
 
+/// 把「全部为整数或 NULL」的 `IN` 列表归一化为「NULL 在前、整数升序」。
+///
+/// 返回是否已归一化；非整数列表保持原顺序并返回 `false`，调用方继续走通用比较。
+/// 归一化之后逐行求值可用 [`slice::partition_point`] 与二分查找，避免每行重建集合。
+pub fn normalize_integer_values(values: &mut Vec<SqlBoundLiteral>) -> bool {
+    if !values.iter().all(|value| matches!(value, SqlBoundLiteral::Integer(_) | SqlBoundLiteral::Null)) {
+        return false;
+    }
+    values.sort_by_key(|value| match value {
+        SqlBoundLiteral::Null => (0u8, 0i64),
+        SqlBoundLiteral::Integer(number) => (1u8, *number),
+        _ => (2u8, 0),
+    });
+    true
+}
+
 /// Evaluates `expr IN (...)` with SQL three-valued logic.
-pub fn eval_in_values(target: SqlValue, values: &[SqlBoundLiteral], negated: bool, dialect: SqlDialect) -> Result<SqlValue, SqlFrontendError> {
+pub fn eval_in_values(
+    target: SqlValue,
+    values: &[SqlBoundLiteral],
+    negated: bool,
+    sorted_integers: bool,
+    dialect: SqlDialect,
+) -> Result<SqlValue, SqlFrontendError> {
     if matches!(target, SqlValue::Null) {
         return Ok(SqlValue::Null);
+    }
+    // `IN (<整数子查询>)` 在逐行过滤里是最热的形态。列表已归一化为「NULL 在前、
+    // 整数升序」时直接二分查找，逐行成本从 O(N) 降到 O(log N)。
+    if sorted_integers {
+        if let SqlValue::Integer(target_value) = target {
+            let integers = &values[values.partition_point(|value| matches!(value, SqlBoundLiteral::Null))..];
+            let found = integers
+                .binary_search_by(|probe| match probe {
+                    SqlBoundLiteral::Integer(candidate) => candidate.cmp(&target_value),
+                    _ => std::cmp::Ordering::Greater,
+                })
+                .is_ok();
+            return Ok(if found {
+                SqlValue::Boolean(!negated)
+            }
+            else if integers.len() < values.len() {
+                SqlValue::Null
+            }
+            else {
+                SqlValue::Boolean(negated)
+            });
+        }
     }
     let mut found = false;
     let mut saw_null = false;

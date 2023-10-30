@@ -224,6 +224,22 @@ fn aggregate_over_primary_key_equality_falls_back_to_scan() {
     assert_eq!(gateway.scalar_integer("SELECT COUNT(*) FROM nums WHERE id = 999"), 0);
 }
 
+/// `IN (值列表)` 必须命中列表里的每一个值，且大列表不能因为逐值展开的 `OR`
+/// 链过深而耗尽线程栈。历史缺陷：折叠成等值集合时丢掉了第一个字面量。
+#[test]
+fn in_list_matches_every_listed_value() {
+    let gateway = gateway_with_hundred_rows("in-list");
+    let ids = gateway.expect_sql("SELECT id FROM nums WHERE id IN (1, 3) ORDER BY id");
+    assert_eq!(ids.rows, vec![vec![SqlValue::Integer(1)], vec![SqlValue::Integer(3)]]);
+    // 含 NULL 的列表：命中返回 TRUE，未命中返回 NULL（COUNT 不计），`NOT IN` 同口径。
+    assert_eq!(gateway.scalar_integer("SELECT COUNT(*) FROM nums WHERE id IN (1, NULL)"), 1);
+    assert_eq!(gateway.scalar_integer("SELECT COUNT(*) FROM nums WHERE id NOT IN (1, NULL)"), 0);
+    // 500 个值：覆盖旧实现在这个规模上栈溢出的形态，结果按表内 100 行计。
+    let values: Vec<String> = (1..=500).map(|id| id.to_string()).collect();
+    let result = gateway.expect_sql(&format!("SELECT COUNT(*) FROM nums WHERE id IN ({})", values.join(", ")));
+    assert_eq!(result.rows[0][0], SqlValue::Integer(100));
+}
+
 /// 等值连接只产出匹配组合，基表谓词剪枝不改变结果集。
 #[test]
 fn equality_join_matches_every_paired_row() {

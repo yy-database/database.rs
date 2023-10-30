@@ -233,13 +233,20 @@ pub fn decode_row_fields(data: &[u8], needed_ids: &[u64]) -> Result<RowFieldValu
     if needed_ids.is_empty() {
         return decode_row(data);
     }
-    let needed: std::collections::HashSet<u64> = needed_ids.iter().copied().collect();
+    // 逐行扫描里 `needed_ids` 通常只有 1-8 个字段，线性包含判断比每行新建
+    // `HashSet` 更便宜；字段数很大时才退回集合，避免 O(字段数 × 列数)。
+    let needed_set: Option<std::collections::HashSet<u64>> =
+        (needed_ids.len() > 16).then(|| needed_ids.iter().copied().collect());
     let mut cursor = Cursor::new(data);
     let count = cursor.read_u16()?;
     for _ in 0..count {
         let field_id = cursor.read_u64()?;
         let len = cursor.read_u32()? as usize;
-        if needed.contains(&field_id) {
+        let needed = match &needed_set {
+            Some(set) => set.contains(&field_id),
+            None => needed_ids.contains(&field_id),
+        };
+        if needed {
             let bytes = cursor.read_bytes(len)?;
             row.insert(field_id, bytes);
         }

@@ -47,7 +47,9 @@ pub(crate) fn substitute_outer(expr: SqlCatalogBoundExpression, row: &RowFieldVa
         InSubquery { expression, plan, negated } => {
             InSubquery { expression: Box::new(substitute_outer(*expression, row)), plan: Box::new(substitute_outer_plan(*plan, row)), negated }
         }
-        InValues { expression, values, negated } => InValues { expression: Box::new(substitute_outer(*expression, row)), values, negated },
+        InValues { expression, values, negated, sorted_integers } => {
+            InValues { expression: Box::new(substitute_outer(*expression, row)), values, negated, sorted_integers }
+        }
         Case { branches, else_branch } => Case {
             branches: branches
                 .into_iter()
