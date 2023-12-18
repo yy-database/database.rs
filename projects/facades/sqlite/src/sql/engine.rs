@@ -8144,9 +8144,13 @@ impl Engine {
                     (value, Expr::Column(column)) => (column, known_cell(value, parameters)?),
                     _ => return None,
                 };
-                let Cell::Integer(value) = value
-                else {
-                    return None;
+                // JS 绑定的数字默认是 REAL 存储类，而 rowid 列是 INTEGER 亲和。
+                // SQLite 比较前会做亲和转换，`id = 3.0` 与 `id = 3` 命中同一行；
+                // 这里把无小数部分的 REAL 折成 INTEGER 才不丢掉这条下推。
+                let value = match value {
+                    Cell::Integer(value) => value,
+                    Cell::Real(real) => integral_rowid(real)?,
+                    _ => return None,
                 };
                 if column.qualifier.as_deref().is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(label)) {
                     return None;
@@ -8234,12 +8238,19 @@ impl Engine {
         let mut key = Vec::with_capacity(index.columns.len());
         for (slot, position) in index.columns.iter().enumerate() {
             let (_, cell) = equalities.iter().find(|(column, _)| column == position)?;
-            match (affinity_of(&def.columns[*position].declared_type), cell) {
+            let affinity = affinity_of(&def.columns[*position].declared_type);
+            // INTEGER 亲和列上的绑定数字是 REAL 存储类；无小数部分时折成
+            // INTEGER，索引键的规范签名才会与存储键一致。
+            let cell = match (affinity, cell) {
+                (Affinity::Integer, Cell::Real(real)) => Cell::Integer(integral_rowid(*real)?),
+                _ => cell.clone(),
+            };
+            match (affinity, &cell) {
                 (Affinity::Text, Cell::Text(_)) | (Affinity::Real, Cell::Real(_)) | (Affinity::Integer, Cell::Integer(_)) => {}
                 _ => return None,
             }
             let collation = index.collations.get(slot).copied().unwrap_or_default();
-            key.push(probe_key(cell, collation)?);
+            key.push(probe_key(&cell, collation)?);
         }
         if key.iter().any(|part| matches!(part, ProbeKey::Wide(_))) {
             return None;
@@ -8283,7 +8294,15 @@ impl Engine {
             return None;
         }
         let affinity = affinity_of(&def.columns[position].declared_type);
-        for bound in [lower.as_ref(), upper.as_ref()].into_iter().flatten() {
+        for bound in [lower.as_mut(), upper.as_mut()].into_iter().flatten() {
+            // 绑定数字是 REAL 存储类，INTEGER 亲和列的等值 / 范围比较会先做亲和
+            // 转换；无小数部分的 REAL 折成 INTEGER 才能继续用索引探针。
+            if let (Affinity::Integer, Cell::Real(real)) = (&affinity, &bound.cell) {
+                match integral_rowid(*real) {
+                    Some(value) => bound.cell = Cell::Integer(value),
+                    None => return None,
+                }
+            }
             match (&affinity, &bound.cell) {
                 (Affinity::Text, Cell::Text(_)) | (Affinity::Real, Cell::Real(_)) | (Affinity::Integer, Cell::Integer(_)) => {}
                 _ => return None,
@@ -12783,6 +12802,18 @@ fn known_cell(expr: &Expr, parameters: &[Cell]) -> Option<Cell> {
     }
 }
 
+/// 把可精确表示整数的 REAL 折成 rowid 键，供等值下推使用。
+///
+/// 只接受有限、无小数部分且落在 `2^53` 内的值：这个范围内 f64 能精确表示每个
+/// 整数，折算不会改变比较结果。超出范围或带小数时返回 `None`，调用方保持整表
+/// 扫描，让通用比较逻辑按亲和规则处理。
+fn integral_rowid(value: f64) -> Option<i64> {
+    if !value.is_finite() || value.fract() != 0.0 || value.abs() > 9_007_199_254_740_992.0 {
+        return None;
+    }
+    Some(value as i64)
+}
+
 fn literal_cell(literal: &Literal) -> Cell {
     match literal {
         Literal::Null => Cell::Null,
@@ -17171,6 +17202,32 @@ mod tests {
         let literal = engine.execute_one("SELECT id FROM t WHERE label = 5").expect("literal form").rows;
         let bound = engine.execute_with_parameters("SELECT id FROM t WHERE label = ?", &[Cell::Integer(5)]).expect("bound form").remove(0).rows;
         assert_eq!(bound, literal, "the probe must not narrow a mixed storage-class comparison");
+    }
+
+    #[test]
+    fn integral_real_keys_match_their_literal_forms() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, n INTEGER)",
+            "INSERT INTO t VALUES (1,'a',10),(2,'b',20),(3,'c',30)",
+            "CREATE INDEX tn ON t (n)",
+        ]);
+        // JS 绑定的数字是 REAL 存储类；无小数部分时亲和转换后应命中同一行集。
+        for (bound_sql, parameters, literal_sql) in [
+            ("SELECT label FROM t WHERE id = ?", vec![Cell::Real(3.0)], "SELECT label FROM t WHERE id = 3.0"),
+            ("SELECT label FROM t WHERE id = ?", vec![Cell::Real(3.5)], "SELECT label FROM t WHERE id = 3.5"),
+            ("SELECT id FROM t WHERE n = ?", vec![Cell::Real(20.0)], "SELECT id FROM t WHERE n = 20.0"),
+            (
+                "SELECT id FROM t WHERE n BETWEEN ? AND ?",
+                vec![Cell::Real(10.0), Cell::Real(20.0)],
+                "SELECT id FROM t WHERE n BETWEEN 10.0 AND 20.0",
+            ),
+        ] {
+            let bound = engine.execute_with_parameters(bound_sql, &parameters).expect("bound form").remove(0).rows;
+            let literal = engine.execute_one(literal_sql).expect("literal form").rows;
+            assert_eq!(bound, literal, "`{bound_sql}` must match `{literal_sql}`");
+        }
+        // 整数索引探针确实吃到了 REAL 键：缓存里应留下该索引的键集。
+        assert!(!engine.index_probes.borrow().is_empty(), "an integral REAL key must still use the index probe");
     }
 
     #[test]
