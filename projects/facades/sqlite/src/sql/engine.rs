@@ -1163,6 +1163,13 @@ pub struct Engine {
     outer_read: std::cell::Cell<bool>,
     /// 会话宿主函数表,按折叠小写名索引;解析期与求值期共用同一份。
     host_functions: HostFunctionTable,
+    /// 显式事务内被推迟的索引 b-tree 重建。
+    ///
+    /// 索引页是整树重建出来的,单条语句重建一次会让事务内的第 n 条写入花掉
+    /// O(n) 的重建成本。事务内只置位,提交或读镜像前统一重建一次。
+    pending_indexes: bool,
+    /// 同 [`Engine::pending_indexes`],针对 WITHOUT ROWID 表的聚簇树。
+    pending_without_rowid: bool,
 }
 
 /// Explicit transaction bookkeeping, mirroring the writer's snapshot levels.
@@ -1220,6 +1227,8 @@ impl Engine {
             statement_scans: std::cell::RefCell::new(HashMap::new()),
             outer_read: std::cell::Cell::new(false),
             host_functions: HostFunctionTable::default(),
+            pending_indexes: false,
+            pending_without_rowid: false,
         };
         engine.load_catalog()?;
         Ok(engine)
@@ -1249,6 +1258,11 @@ impl Engine {
                 for attached in &self.attached {
                     attached.engine.check_deferred_foreign_keys()?;
                 }
+                // 事务内推迟的索引重建在提交前一次落下,失败则事务保持打开。
+                self.flush_pending_materialization("commit")?;
+                for attached in &mut self.attached {
+                    attached.engine.flush_pending_materialization("commit")?;
+                }
                 self.transaction.take();
                 self.writer.commit_all().map_err(|error| storage_failure(error).in_statement("commit"))?;
                 for attached in &mut self.attached {
@@ -1261,6 +1275,9 @@ impl Engine {
                     return Err(SqlError::new("transaction-missing", "cannot rollback - no transaction is active").in_statement("rollback"));
                 }
                 self.writer.rollback_all().map_err(|error| storage_failure(error).in_statement("rollback"))?;
+                // 整事务回滚把镜像退回事务前,推迟的索引重建也不再需要。
+                self.pending_indexes = false;
+                self.pending_without_rowid = false;
                 self.reload_catalog()?;
                 for index in 0..self.attached.len() {
                     self.attached[index]
@@ -1269,6 +1286,8 @@ impl Engine {
                         .rollback_all()
                         .map_err(|error| storage_failure(error).in_statement("rollback"))?;
                     self.attached[index].dirty = false;
+                    self.attached[index].engine.pending_indexes = false;
+                    self.attached[index].engine.pending_without_rowid = false;
                     self.attached[index].engine.reload_catalog()?;
                 }
             }
@@ -1328,6 +1347,10 @@ impl Engine {
                 if closing {
                     // Releasing the last savepoint of a transaction that no
                     // `BEGIN` opened commits it, as in SQLite.
+                    self.flush_pending_materialization("release")?;
+                    for attached in &mut self.attached {
+                        attached.engine.flush_pending_materialization("release")?;
+                    }
                     self.writer.commit_all().map_err(|error| storage_failure(error).in_statement("release"))?;
                     self.transaction = None;
                     self.persist_attached_databases()?;
@@ -2093,11 +2116,52 @@ impl Engine {
 
     /// Current database image, suitable for writing to a `.sqlite3` file.
     ///
-    /// Index b-trees are rebuilt after every insert that touches an indexed
-    /// table, so the exported image stays consistent with its `sqlite_master`
-    /// entries without calling `SqliteWriter::save`.
-    pub fn snapshot(&self) -> &[u8] {
-        self.writer.pages()
+    /// Index b-trees are rebuilt before the image is handed out, so the exported
+    /// bytes stay consistent with their `sqlite_master` entries without calling
+    /// [`SqliteWriter::save`]. Inside an explicit transaction the rebuild of the
+    /// writes made so far happens here, which is why the receiver is mutable and
+    /// the rebuild can fail.
+    pub fn snapshot(&mut self) -> Result<&[u8], SqlError> {
+        self.flush_pending_materialization("snapshot")?;
+        Ok(self.writer.pages())
+    }
+
+    /// 写完一条语句后按需重建索引 b-tree。
+    ///
+    /// 索引 b-tree 只能整树重建,单条语句重建一次会让事务内第 n 条写入付掉
+    /// O(n) 的重建成本。显式事务内只置位,提交或读取镜像前一次重建;autocommit
+    /// 下立即重建,保持「语句结束后镜像即可读出」的既有语义。
+    fn materialize_indexes_after_write(&mut self, statement: &'static str) -> Result<(), SqlError> {
+        if self.in_transaction() {
+            self.pending_indexes = true;
+            return Ok(());
+        }
+        self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement(statement))
+    }
+
+    /// 同 [`Engine::materialize_indexes_after_write`],针对 WITHOUT ROWID 表的聚簇树。
+    fn materialize_without_rowid_after_write(&mut self, statement: &'static str) -> Result<(), SqlError> {
+        if self.in_transaction() {
+            self.pending_without_rowid = true;
+            return Ok(());
+        }
+        self.writer.materialize_without_rowid().map_err(|error| storage_failure(error).in_statement(statement))
+    }
+
+    /// 把推迟的索引 / 聚簇树重建落进当前镜像。
+    ///
+    /// 只在事务提交、写盘或读取镜像时调用;重建完成后清位,失败则保留标记让
+    /// 调用方还能重试或回滚。
+    fn flush_pending_materialization(&mut self, statement: &'static str) -> Result<(), SqlError> {
+        if self.pending_indexes {
+            self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement(statement))?;
+            self.pending_indexes = false;
+        }
+        if self.pending_without_rowid {
+            self.writer.materialize_without_rowid().map_err(|error| storage_failure(error).in_statement(statement))?;
+            self.pending_without_rowid = false;
+        }
+        Ok(())
     }
 
     /// Rowid of the last row this connection inserted successfully, mirroring
@@ -2121,6 +2185,7 @@ impl Engine {
     /// Reads of an existing file go through [`Engine::from_writer`]; this is
     /// the matching write-back so a file-backed session survives reopening.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<(), SqlError> {
+        self.flush_pending_materialization("save")?;
         self.writer.save(path).map_err(|error| storage_failure(error))
     }
 
@@ -2128,6 +2193,7 @@ impl Engine {
     /// half-written file, by renaming a complete sibling temporary file over
     /// it.
     pub fn save_atomic(&mut self, path: impl AsRef<Path>) -> Result<(), SqlError> {
+        self.flush_pending_materialization("save")?;
         self.writer.save_atomic(path).map_err(|error| storage_failure(error))
     }
 
@@ -3980,12 +4046,10 @@ impl Engine {
                 // until they are materialized into b-tree pages, so a write to
                 // an indexed table has to rebuild them before the image is read.
                 if temp_position.is_none() && (self.has_indexes(def, &key) || replace_index_needed) {
-                    self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("insert"))?;
+                    self.materialize_indexes_after_write("insert")?;
                 }
                 if temp_position.is_none() && (def.without_rowid || replace_without_needed) {
-                    self.writer
-                        .materialize_without_rowid()
-                        .map_err(|error| storage_failure(error).in_statement("insert"))?;
+                    self.materialize_without_rowid_after_write("insert")?;
                 }
                 if let Some(plan) = &returning {
                     return Ok(ExecResult { statement: "insert", columns: plan.columns.clone(), rows: returned, affected });
@@ -4424,12 +4488,10 @@ impl Engine {
                     self.writer.commit().map_err(|error| storage_failure(error).in_statement("update"))?;
                 }
                 if temp_position.is_none() && needs_index {
-                    self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("update"))?;
+                    self.materialize_indexes_after_write("update")?;
                 }
                 if needs_without_rowid {
-                    self.writer
-                        .materialize_without_rowid()
-                        .map_err(|error| storage_failure(error).in_statement("update"))?;
+                    self.materialize_without_rowid_after_write("update")?;
                 }
                 Ok(ExecResult {
                     statement: "update",
@@ -4561,12 +4623,10 @@ impl Engine {
                     self.writer.commit().map_err(|error| storage_failure(error).in_statement("delete"))?;
                 }
                 if temp_position.is_none() && needs_index {
-                    self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("delete"))?;
+                    self.materialize_indexes_after_write("delete")?;
                 }
                 if needs_without_rowid {
-                    self.writer
-                        .materialize_without_rowid()
-                        .map_err(|error| storage_failure(error).in_statement("delete"))?;
+                    self.materialize_without_rowid_after_write("delete")?;
                 }
                 Ok(ExecResult {
                     statement: "delete",
@@ -5836,10 +5896,10 @@ impl Engine {
                 .collect();
             let (index_needed, without_needed) = self.apply_foreign_key_actions(def, &changes, "insert", 0)?;
             if index_needed {
-                self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement("insert"))?;
+                self.materialize_indexes_after_write("insert")?;
             }
             if without_needed {
-                self.writer.materialize_without_rowid().map_err(|error| storage_failure(error).in_statement("insert"))?;
+                self.materialize_without_rowid_after_write("insert")?;
             }
         }
         if self.foreign_keys {
@@ -15884,7 +15944,7 @@ mod tests {
                 "INSERT INTO child (id, parent_id) VALUES (1, 1)".to_string(),
             ])
             .expect("seed image");
-        let image = engine.snapshot().to_vec();
+        let image = engine.snapshot().expect("image").to_vec();
         std::fs::write(&path, &image).expect("write image");
         drop(engine);
 
@@ -15902,7 +15962,7 @@ mod tests {
             "FOREIGN KEY constraint failed"
         );
         // Reading a reopened image never rewrites it.
-        assert_eq!(reopened.snapshot(), image.as_slice());
+        assert_eq!(reopened.snapshot().expect("image"), image.as_slice());
         std::fs::remove_file(&path).expect("cleanup image");
     }
 
@@ -16408,7 +16468,7 @@ mod tests {
 
         // A reopened image is a fresh connection, so the value starts over.
         let path = std::env::temp_dir().join(format!("sqlite-engine-rowid-{}.db", std::process::id()));
-        std::fs::write(&path, engine.snapshot()).expect("write image");
+        std::fs::write(&path, engine.snapshot().expect("image")).expect("write image");
         drop(engine);
         let writer = SqliteWriter::open(&path).expect("open image");
         let reopened = Engine::from_writer(writer).expect("rebuild catalog");
@@ -16964,6 +17024,47 @@ mod tests {
         ] {
             assert_eq!(plain.execute_one(sql).expect("plain").rows, indexed.execute_one(sql).expect("indexed").rows, "{sql}");
         }
+    }
+
+    /// 事务内的索引重建推迟到提交或读镜像时执行,读镜像前必须先落下。
+    ///
+    /// 这里在事务内取镜像并直接重开索引树,确认写语句本身没有把半成品的
+    /// 索引页交出去,提交也不再改动镜像。
+    #[test]
+    fn deferred_index_rebuilds_land_before_the_image_is_read() {
+        let mut engine = Engine::new(None).expect("blank");
+        engine.execute_one("CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)").expect("create");
+        engine.execute_one("CREATE INDEX tl ON t (label)").expect("index");
+        engine.execute_one("BEGIN").expect("begin");
+        for row in 1..=32i64 {
+            engine.execute_one(&format!("INSERT INTO t VALUES ({row}, 'row-{row}')")).expect("insert");
+        }
+        let image = engine.snapshot().expect("image").to_vec();
+        let objects = crate::read_schema(&image, TableLimits::default()).expect("schema");
+        let index = objects.iter().find(|object| object.kind == SchemaObjectKind::Index).expect("index object");
+        let root = u32::try_from(index.root_page.expect("index root")).expect("root page");
+        let entries = read_index_table_with(&image, root, TableLimits::default(), &[Collation::Binary]).expect("index tree");
+        assert_eq!(entries.len(), 32, "the index tree must already hold the inserts made so far");
+        engine.execute_one("COMMIT").expect("commit");
+        assert_eq!(engine.snapshot().expect("image"), image.as_slice(), "commit must not add work of its own");
+    }
+
+    /// 整事务回滚丢掉推迟的重建,镜像退回事务前的索引树。
+    #[test]
+    fn deferred_index_rebuilds_are_dropped_on_rollback() {
+        let mut engine = Engine::new(None).expect("blank");
+        engine.execute_one("CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)").expect("create");
+        engine.execute_one("CREATE INDEX tl ON t (label)").expect("index");
+        engine.execute_one("INSERT INTO t VALUES (1, 'kept')").expect("seed");
+        let before = engine.snapshot().expect("image").to_vec();
+        engine.execute_one("BEGIN").expect("begin");
+        engine.execute_one("INSERT INTO t VALUES (2, 'dropped')").expect("insert");
+        engine.execute_one("ROLLBACK").expect("rollback");
+        assert_eq!(engine.snapshot().expect("image"), before.as_slice(), "rollback restores the pre-transaction image");
+        // autocommit 仍然立即重建,事务外的镜像不进入待重建状态。
+        engine.execute_one("INSERT INTO t VALUES (3, 'later')").expect("autocommit insert");
+        assert_eq!(engine.execute_one("SELECT count(*) FROM t").expect("rows").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(engine.execute_one("PRAGMA integrity_check").expect("check").rows, vec![vec![text("ok")]]);
     }
 
     #[test]
@@ -18806,11 +18907,11 @@ mod tests {
             .execute("PRAGMA user_version = 7; PRAGMA application_id = 42; CREATE TEMP TABLE tt(x); INSERT INTO tt VALUES (1)")
             .expect("session state");
         engine.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.v); END").expect("trigger");
-        let before = engine.snapshot().to_vec();
+        let before = engine.snapshot().expect("image").to_vec();
         assert!(database_formats::sqlite::read_freelist_count(&before) > 0, "the drop must leave freelist pages");
 
         engine.execute_one("VACUUM").expect("vacuum");
-        let after = engine.snapshot().to_vec();
+        let after = engine.snapshot().expect("image").to_vec();
         assert_eq!(database_formats::sqlite::read_freelist_count(&after), 0);
         assert!(after.len() < before.len(), "vacuum must compact the image: {} -> {}", before.len(), after.len());
         assert_eq!(engine.execute_one("PRAGMA integrity_check").expect("check").rows, vec![vec![text("ok")]]);
@@ -18869,9 +18970,9 @@ mod tests {
             engine.execute(&format!("INSERT INTO t VALUES ({value}, 'v{value}')")).expect("row");
         }
         engine.execute("INSERT INTO wo VALUES ('a'); DROP TABLE discarded").expect("free pages");
-        let before = engine.snapshot().to_vec();
+        let before = engine.snapshot().expect("image").to_vec();
         engine.execute_one(&format!("VACUUM INTO '{}'", target.display())).expect("vacuum into");
-        assert_eq!(engine.snapshot(), before.as_slice(), "VACUUM INTO must leave the source image alone");
+        assert_eq!(engine.snapshot().expect("image"), before.as_slice(), "VACUUM INTO must leave the source image alone");
 
         let bytes = std::fs::read(&target).expect("target written");
         assert_eq!(database_formats::sqlite::read_freelist_count(&bytes), 0);
@@ -18915,7 +19016,7 @@ mod tests {
 
         // 与源同路径同样按“已存在”拒绝,源文件一个字节都不改。
         let source = directory.join("source.db");
-        let original = engine.snapshot().to_vec();
+        let original = engine.snapshot().expect("image").to_vec();
         std::fs::write(&source, &original).expect("seed source");
         let same = engine.execute_one(&format!("VACUUM INTO '{}'", source.display())).expect_err("same source");
         assert_eq!(same.message, "output file already exists");

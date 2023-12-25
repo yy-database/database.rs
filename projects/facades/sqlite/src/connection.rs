@@ -398,7 +398,10 @@ impl Connection {
     }
 
     /// 当前数据库镜像,可直接写成 `.sqlite3` 文件。
-    pub fn snapshot(&self) -> &[u8] {
+    ///
+    /// 显式事务内推迟的索引重建会在这里先落下,所以镜像永远与目录一致;重建
+    /// 失败按 `storage` 家庭错误返回,不交出半成品的字节。
+    pub fn snapshot(&mut self) -> Result<&[u8], SqlError> {
         self.engine.snapshot()
     }
 
@@ -1715,7 +1718,7 @@ db.close()
         source.execute("CREATE TABLE t(x INTEGER)", &[]).expect("create table");
         source.execute("CREATE INDEX i ON t(x)", &[]).expect("create index");
         source.execute("INSERT INTO t VALUES (1)", &[]).expect("insert");
-        let image = source.snapshot().to_vec();
+        let image = source.snapshot().expect("image").to_vec();
         let objects = read_schema(&image, TableLimits::default()).expect("schema rows");
         let root_of = |kind: SchemaObjectKind| {
             objects.iter().find(|object| object.kind == kind).and_then(|object| object.root_page).expect("catalog root") as usize
