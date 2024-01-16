@@ -448,6 +448,12 @@ struct PendingTriggerEvent {
 /// recursion` when `PRAGMA recursive_triggers` is on.
 const MAX_TRIGGER_DEPTH: usize = 100;
 
+/// 写语句候选 rowid 合并成区间读的最大缝隙。
+///
+/// 候选按 rowid 升序,缝隙不超过这个值的相邻候选交给同一次 `table_range`,用少量
+/// 多余行换掉一次 b-tree 下降。
+const CANDIDATE_GAP: i64 = 8;
+
 /// Sentinel source indexes that mark a `NEW` / `OLD` reference in a resolved
 /// expression. They never collide with a `FROM` source position.
 const TRIGGER_SOURCE_NEW: usize = usize::MAX;
@@ -4339,9 +4345,9 @@ impl Engine {
                     Some(joined)
                 };
                 let mut needs_index = self.has_indexes(def, &key);
-                // `UPDATE ... WHERE <rowid> = <key>` 只可能命中一行时，扫描不必整表解码。
-                let candidate = if from.is_empty() {
-                    self.update_candidate(def, &key, &table, alias.as_deref(), filter.as_ref(), &targets)
+                // `WHERE <rowid> = <key>` 或普通列索引谓词命中时，扫描不必整表解码。
+                let candidates = if from.is_empty() {
+                    self.update_candidates(def, &key, &table, alias.as_deref(), filter.as_ref(), &targets)
                 }
                 else {
                     None
@@ -4356,7 +4362,7 @@ impl Engine {
                     &shape.scope,
                     &budget,
                     None,
-                    candidate,
+                    candidates.as_deref(),
                 )?;
                 // Old row values are needed to tell which referenced keys this
                 // statement rewrites, so they come from the plan's pre-statement
@@ -4533,9 +4539,9 @@ impl Engine {
                 };
                 let budget = Budget::new();
                 let mut needs_index = self.has_indexes(def, &key);
-                // `DELETE FROM t WHERE <rowid> = <key>` 只可能删一行，扫描不必整表解码。
-                let candidate = self.delete_candidate(def, &table, alias.as_deref(), filter.as_ref());
-                let plan = self.plan_delete(def, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget, candidate)?;
+                // `WHERE <rowid> = <key>` 或普通列索引谓词命中时，删除不必整表解码。
+                let candidates = self.delete_candidates(def, &key, &table, alias.as_deref(), filter.as_ref());
+                let plan = self.plan_delete(def, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget, candidates.as_deref())?;
                 // A temp table snapshots its row map instead of opening a
                 // writer transaction, so a failing referential check undoes the
                 // removal exactly like a rollback would.
@@ -5295,49 +5301,59 @@ impl Engine {
         Ok(rows)
     }
 
-    /// Reads one stored row by rowid; an absent rowid yields an empty set.
+    /// 按候选 rowid 读行,候选升序取回。
     ///
-    /// Used when a statement is already pinned to one candidate row, so the
-    /// whole table is never decoded for the common `where <rowid> = <key>` form.
-    fn live_row(&self, def: &TableDef, statement: &'static str, rowid: i64) -> Result<Vec<(i64, Vec<Cell>)>, SqlError> {
+    /// 相邻间隔不超过 [`CANDIDATE_GAP`] 的候选合并成一次区间读,避免逐行下降。
+    /// 区间读会带回缝隙里的少量非候选行,谓词与唯一性判定照旧处理,因此只是多读
+    /// 几行,不会改变语句结果。
+    fn live_rows_at(&self, def: &TableDef, statement: &'static str, rowids: &[i64]) -> Result<Vec<(i64, Vec<Cell>)>, SqlError> {
         if def.temp {
-            return Ok(self
-                .live_rows(def, statement)?
-                .into_iter()
-                .filter(|(candidate, _)| *candidate == rowid)
-                .collect());
+            return Ok(self.live_rows(def, statement)?.into_iter().filter(|(rowid, _)| rowids.contains(rowid)).collect());
         }
-        let stored = self
-            .writer
-            .table_range(&def.name, rowid, rowid, TableLimits::default())
-            .map_err(|error| storage_failure(error).in_statement(statement))?;
-        let mut rows = Vec::with_capacity(stored.len());
-        for row in &stored {
-            rows.push((row.rowid, decode_row(&row.payload, def, row.rowid)?));
+        let mut sorted = rowids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut rows = Vec::with_capacity(sorted.len());
+        let mut position = 0;
+        while position < sorted.len() {
+            let start = sorted[position];
+            let mut end = start;
+            let mut next = position + 1;
+            while next < sorted.len() && sorted[next] - end <= CANDIDATE_GAP {
+                end = sorted[next];
+                next += 1;
+            }
+            let stored = self
+                .writer
+                .table_range(&def.name, start, end, TableLimits::default())
+                .map_err(|error| storage_failure(error).in_statement(statement))?;
+            for row in &stored {
+                rows.push((row.rowid, decode_row(&row.payload, def, row.rowid)?));
+            }
+            position = next;
         }
+        rows.sort_by_key(|(rowid, _)| *rowid);
         Ok(rows)
     }
 
-    /// `DELETE FROM t WHERE <rowid> = <key>` 只可能删一行时的候选 rowid。
+    /// `DELETE` 的候选 rowid:裸 `<rowid> = <键>` 等值,或普通列索引的探针结果。
     ///
-    /// 与 SELECT 的 `rowid_pin` 同一判定：只认裸 `AND` 链上的等值比较，键可以是
-    /// 整数字面量或执行期已绑定的整数参数。谓词仍会在候选行上重跑一遍，因此命中
-    /// 与否都不会改变删除集合，只决定是否省掉整表解码。
-    fn delete_candidate(&self, def: &TableDef, table: &str, alias: Option<&str>, filter: Option<&Expr>) -> Option<i64> {
+    /// 与 SELECT 的 `rowid_pin` / `index_pin` 同一判定:只认裸 `AND` 链上的等值与
+    /// 首列范围比较,键可以是字面量或执行期已绑定的参数,索引必须是未被托管改造的
+    /// 普通列索引。谓词仍会在候选行上重跑一遍,所以候选只是超集,不会改变删除集合。
+    fn delete_candidates(&self, def: &TableDef, table_key: &str, table: &str, alias: Option<&str>, filter: Option<&Expr>) -> Option<Vec<i64>> {
         if def.without_rowid || def.temp {
             return None;
         }
-        let alias_name = def.rowid_alias.map(|index| def.columns[index].name.clone());
-        Self::rowid_eq_conjunct(filter?, alias_name.as_deref(), alias.unwrap_or(table), &self.parameters)
+        self.write_candidates(def, table_key, alias.unwrap_or(table), filter)
     }
 
-    /// `UPDATE t SET ... WHERE <rowid> = <key>` 只可能命中一行时的候选 rowid。
+    /// `UPDATE` 的候选 rowid,约束与 [`Engine::delete_candidates`] 相同。
     ///
-    /// 与 `DELETE` 不同，`UPDATE` 还要用整表做唯一性冲突判定，因此只在「唯一键只有
-    /// rowid，且没有任何赋值改动 rowid」时才收窄。这两条成立时，收窄后的行集与整表
-    /// 在冲突判定上等价；外键检查只看被写入的行，因此不需要整表。`WITHOUT ROWID`
-    /// 表一律走整表读取。
-    fn update_candidate(
+    /// `UPDATE` 还要用整表做唯一性冲突判定,因此只在「唯一键只有 rowid,且没有任何
+    /// 赋值改动 rowid」时才收窄。这两条成立时,收窄后的行集与整表在冲突判定上等价;
+    /// 外键检查只看被写入的行,因此不需要整表。`WITHOUT ROWID` 表一律走整表读取。
+    fn update_candidates(
         &self,
         def: &TableDef,
         table_key: &str,
@@ -5345,7 +5361,7 @@ impl Engine {
         alias: Option<&str>,
         filter: Option<&Expr>,
         targets: &[(usize, ResolvedExpr)],
-    ) -> Option<i64> {
+    ) -> Option<Vec<i64>> {
         if def.without_rowid || def.temp {
             return None;
         }
@@ -5355,8 +5371,29 @@ impl Engine {
         if self.unique_keys(def, table_key).iter().any(|key| !matches!(key, UniqueKey::Rowid(_))) {
             return None;
         }
+        self.write_candidates(def, table_key, alias.unwrap_or(table), filter)
+    }
+
+    /// 按谓词取写语句的候选 rowid:先认裸 `<rowid> = <键>`,再逐个普通列索引试
+    /// 全键等值与首列范围。返回的 rowid 升序,可能含谓词不成立的行。
+    fn write_candidates(&self, def: &TableDef, table_key: &str, label: &str, filter: Option<&Expr>) -> Option<Vec<i64>> {
+        let filter = filter?;
         let alias_name = def.rowid_alias.map(|index| def.columns[index].name.clone());
-        Self::rowid_eq_conjunct(filter?, alias_name.as_deref(), alias.unwrap_or(table), &self.parameters)
+        if let Some(rowid) = Self::rowid_eq_conjunct(filter, alias_name.as_deref(), label, &self.parameters) {
+            return Some(vec![rowid]);
+        }
+        for index in self.indexes.values() {
+            if index.managed || index.table != table_key || index.columns.is_empty() {
+                continue;
+            }
+            if let Some(rowids) = self.index_probe_rows(index, def, filter, label) {
+                return Some(rowids);
+            }
+            if let Some(rowids) = self.index_range_rows(index, def, filter, label) {
+                return Some(rowids);
+            }
+        }
+        None
     }
 
     /// Resolves one `ON CONFLICT` clause against the insert target: the
@@ -6622,14 +6659,14 @@ impl Engine {
         shape: &ScopeShape,
         budget: &Budget,
         state_override: Option<&[(i64, Vec<Cell>)]>,
-        candidate: Option<i64>,
+        candidates: Option<&[i64]>,
     ) -> Result<UpdatePlan, SqlError> {
         let width = def.columns.len();
         let keys = self.unique_keys(def, table_key);
         let owned_live = match state_override {
             Some(_) => None,
-            None => Some(match candidate {
-                Some(rowid) => self.live_row(def, "update", rowid)?,
+            None => Some(match candidates {
+                Some(rowids) => self.live_rows_at(def, "update", rowids)?,
                 None => self.live_rows(def, "update")?,
             }),
         };
@@ -6738,10 +6775,10 @@ impl Engine {
     /// Plans one `DELETE`: the matching rowids in ascending order, plus any
     /// `RETURNING` rows, which see the row as it was before removal.
     ///
-    /// `candidate` narrows the scan to one rowid when the predicate is exactly a
-    /// `WHERE <rowid> = <key>` equality on the target table. The predicate still
-    /// runs over the candidate, so a stale or mismatched pin only costs the
-    /// pushdown and never changes the removed set.
+    /// `candidates` narrows the scan to the rowids a `WHERE <rowid> = <key>`
+    /// equality or an index probe can reach. The predicate still runs over every
+    /// candidate, so a stale or mismatched probe only costs the pushdown and
+    /// never changes the removed set.
     fn plan_delete(
         &self,
         def: &TableDef,
@@ -6749,10 +6786,10 @@ impl Engine {
         returning: Option<&ReturningPlan>,
         shape: &ScopeShape,
         budget: &Budget,
-        candidate: Option<i64>,
+        candidates: Option<&[i64]>,
     ) -> Result<DeletePlan, SqlError> {
-        let live = match candidate {
-            Some(rowid) => self.live_row(def, "delete", rowid)?,
+        let live = match candidates {
+            Some(rowids) => self.live_rows_at(def, "delete", rowids)?,
             None => self.live_rows(def, "delete")?,
         };
         let mut removed = Vec::new();
@@ -17359,6 +17396,53 @@ mod tests {
         // 非 rowid 谓词必须删掉全部匹配行，不能被单行候选截断。
         engine.execute_one("DELETE FROM t WHERE n = 5").expect("delete every match");
         assert_eq!(engine.execute_one("SELECT id FROM t").expect("rows").rows, vec![vec![Cell::Integer(3)]]);
+    }
+
+    #[test]
+    fn indexed_delete_reads_only_the_probed_rows() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, n INTEGER)",
+            "INSERT INTO t VALUES (1,'a',5),(2,'a',6),(3,'b',7),(4,'c',8),(5,'c',9)",
+            "CREATE INDEX tl ON t (label)",
+        ]);
+        // 非唯一索引等值:两行同键都要删掉,不能只删候选里的第一行。
+        assert_eq!(engine.execute_one("DELETE FROM t WHERE label = 'a'").expect("delete by index").affected, 2);
+        assert_eq!(
+            engine.execute_one("SELECT id FROM t").expect("rows").rows,
+            vec![vec![Cell::Integer(3)], vec![Cell::Integer(4)], vec![Cell::Integer(5)]]
+        );
+        // 首列范围同样走索引候选,并且只删命中范围的行。
+        assert_eq!(engine.execute_one("DELETE FROM t WHERE label >= 'c'").expect("delete range").affected, 2);
+        assert_eq!(engine.execute_one("SELECT id FROM t").expect("rows").rows, vec![vec![Cell::Integer(3)]]);
+        // 索引列之外的谓词没有候选,仍按整表判定正确。
+        assert_eq!(engine.execute_one("DELETE FROM t WHERE n > 0").expect("delete by column").affected, 1);
+        assert!(engine.execute_one("SELECT id FROM t").expect("rows").rows.is_empty());
+    }
+
+    #[test]
+    fn indexed_update_narrows_only_when_rowid_is_the_only_key() {
+        let mut engine = joined_engine(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, n INTEGER)",
+            "INSERT INTO t VALUES (1,'a',1),(2,'a',2),(3,'b',3)",
+            "CREATE INDEX tl ON t (label)",
+        ]);
+        // 唯一键只有 rowid 且不改 rowid:按索引谓词收窄,两个同键行都更新。
+        assert_eq!(engine.execute_one("UPDATE t SET n = 9 WHERE label = 'a'").expect("update by index").affected, 2);
+        assert_eq!(
+            engine.execute_one("SELECT id, n FROM t").expect("rows").rows,
+            vec![vec![Cell::Integer(1), Cell::Integer(9)], vec![Cell::Integer(2), Cell::Integer(9)], vec![Cell::Integer(3), Cell::Integer(3)]]
+        );
+        // 带额外唯一键的表不收窄,冲突判定仍然看得到整表。
+        let mut unique = joined_engine(&[
+            "CREATE TABLE u(id INTEGER PRIMARY KEY, label TEXT UNIQUE, n INTEGER)",
+            "INSERT INTO u VALUES (1,'a',1),(2,'b',2)",
+            "CREATE INDEX ul ON u (label)",
+        ]);
+        let error = unique.execute_one("UPDATE u SET label = 'b' WHERE label = 'a'").expect_err("unique conflict");
+        assert_eq!(error.code, "unique-constraint");
+        // 不冲突的按索引更新照常生效。
+        assert_eq!(unique.execute_one("UPDATE u SET n = 5 WHERE label = 'b'").expect("plain update").affected, 1);
+        assert_eq!(unique.execute_one("SELECT n FROM u WHERE id = 2").expect("row").rows, vec![vec![Cell::Integer(5)]]);
     }
 
     #[test]

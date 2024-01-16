@@ -233,9 +233,24 @@ struct Snapshot {
     /// 漏接 `touch_page` 的写点;release 构建零额外成本。
     #[cfg(debug_assertions)]
     check: Vec<u8>,
-    index_entries: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
+    /// 本层对 [`SqliteWriter::index_entries`] 的逐项改动,回滚时逆序撤销。
+    ///
+    /// 旧实现每层克隆整份索引键集,带索引的表在事务里第 n 条写要付 O(n) 的
+    /// 克隆成本;键集本身就是增量维护的,记下本层真正改过的键即可。
+    index_changes: Vec<IndexEntryChange>,
     without_rowid_entries: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
     without_rowid_keys: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
+}
+
+/// 一个事务层对索引键集做过的单项改动,回滚时按逆序取反。
+#[derive(Clone)]
+enum IndexEntryChange {
+    /// 键被加入,回滚时移除。
+    Inserted { master_rowid: i64, key: Vec<u8> },
+    /// 键被移除,回滚时加回。
+    Removed { master_rowid: i64, key: Vec<u8> },
+    /// 某个索引的整组键被替换或整组删除,回滚时恢复旧组。
+    Replaced { master_rowid: i64, previous: Option<std::collections::BTreeSet<Vec<u8>>> },
 }
 
 /// 表元数据缓存，以 `sqlite_master` 的 schema cookie 为纪元。
@@ -489,6 +504,43 @@ impl SqliteWriter {
         for (page, bytes) in level.dirty {
             parent.dirty.entry(page).or_insert(bytes);
         }
+        // 内层的键集改动发生在外层之后,回滚外层时按完整逆序撤销即可。
+        parent.index_changes.extend(level.index_changes);
+    }
+
+    /// 记录一次索引键集改动;没有打开的事务层时无需日志。
+    fn record_index_change(&mut self, change: IndexEntryChange) {
+        if let Some(level) = self.snapshots.last_mut() {
+            level.index_changes.push(change);
+        }
+    }
+
+    /// 往某个索引的键集加入一个键,并记入当前事务层。
+    fn index_entry_insert(&mut self, master_rowid: i64, key: Vec<u8>) {
+        if self.index_entries.entry(master_rowid).or_default().insert(key.clone()) {
+            self.record_index_change(IndexEntryChange::Inserted { master_rowid, key });
+        }
+    }
+
+    /// 从某个索引的键集移除一个键,并记入当前事务层。
+    fn index_entry_remove(&mut self, master_rowid: i64, key: &[u8]) {
+        let removed = self.index_entries.get_mut(&master_rowid).is_some_and(|entries| entries.remove(key));
+        if removed {
+            self.record_index_change(IndexEntryChange::Removed { master_rowid, key: key.to_vec() });
+        }
+    }
+
+    /// 整组替换某个索引的键集,并记下旧组。
+    fn index_entry_replace(&mut self, master_rowid: i64, entries: std::collections::BTreeSet<Vec<u8>>) {
+        let previous = self.index_entries.insert(master_rowid, entries);
+        self.record_index_change(IndexEntryChange::Replaced { master_rowid, previous });
+    }
+
+    /// 整组删除某个索引的键集,并记下旧组。
+    fn index_entry_drop(&mut self, master_rowid: i64) {
+        if let Some(previous) = self.index_entries.remove(&master_rowid) {
+            self.record_index_change(IndexEntryChange::Replaced { master_rowid, previous: Some(previous) });
+        }
     }
 
     /// Rolls the image back to the state before the innermost `begin`.
@@ -550,7 +602,7 @@ impl SqliteWriter {
             len: self.pages.len(),
             #[cfg(debug_assertions)]
             check: self.pages.clone(),
-            index_entries: self.index_entries.clone(),
+            index_changes: Vec::new(),
             without_rowid_entries: self.without_rowid_entries.clone(),
             without_rowid_keys: self.without_rowid_keys.clone(),
         });
@@ -587,7 +639,28 @@ impl SqliteWriter {
                 self.pages[offset..offset + self.page_size].copy_from_slice(bytes);
             }
         }
-        self.index_entries = snapshot.index_entries.clone();
+        // 索引键集的改动要逆序撤销,先把本层日志取出来再动键集。
+        let changes = snapshot.index_changes.clone();
+        for change in changes.iter().rev() {
+            match change {
+                IndexEntryChange::Inserted { master_rowid, key } => {
+                    if let Some(entries) = self.index_entries.get_mut(master_rowid) {
+                        entries.remove(key);
+                    }
+                }
+                IndexEntryChange::Removed { master_rowid, key } => {
+                    self.index_entries.entry(*master_rowid).or_default().insert(key.clone());
+                }
+                IndexEntryChange::Replaced { master_rowid, previous } => match previous {
+                    Some(entries) => {
+                        self.index_entries.insert(*master_rowid, entries.clone());
+                    }
+                    None => {
+                        self.index_entries.remove(master_rowid);
+                    }
+                },
+            }
+        }
         self.without_rowid_entries = snapshot.without_rowid_entries.clone();
         self.without_rowid_keys = snapshot.without_rowid_keys.clone();
         #[cfg(debug_assertions)]
@@ -1137,7 +1210,7 @@ impl SqliteWriter {
         if index.root_page != initial_root {
             self.set_master_root(master_rowid, index.root_page)?;
         }
-        self.index_entries.insert(master_rowid, entries);
+        self.index_entry_replace(master_rowid, entries);
         std::sync::Arc::make_mut(&mut meta.indexes).push(index);
         Ok(())
     }
@@ -1177,7 +1250,7 @@ impl SqliteWriter {
         if index.root_page != root_page {
             self.set_master_root(master_rowid, index.root_page)?;
         }
-        self.index_entries.insert(master_rowid, keys);
+        self.index_entry_replace(master_rowid, keys);
         Ok(())
     }
 
@@ -1205,7 +1278,7 @@ impl SqliteWriter {
         }
         let keys: std::collections::BTreeSet<Vec<u8>> =
             entries.iter().map(|(values, rowid)| managed_index_key(values, *rowid, self.encoding)).collect();
-        self.index_entries.insert(row.rowid, keys);
+        self.index_entry_replace(row.rowid, keys);
         Ok(())
     }
 
@@ -1298,7 +1371,7 @@ impl SqliteWriter {
                 continue;
             }
             let key = encode_index_key(&meta, index_meta, rowid, &resolved, self.encoding)?;
-            self.index_entries.entry(index_meta.master_rowid).or_default().insert(key);
+            self.index_entry_insert(index_meta.master_rowid, key);
         }
         // An explicit rowid only raises the high-water mark; a lower one never
         // lowers it.
@@ -1325,9 +1398,7 @@ impl SqliteWriter {
                 continue;
             }
             let key = encode_index_key(&meta, index_meta, rowid, &owned, self.encoding)?;
-            if let Some(entries) = self.index_entries.get_mut(&index_meta.master_rowid) {
-                entries.remove(&key);
-            }
+            self.index_entry_remove(index_meta.master_rowid, &key);
         }
         let root = self.table_delete(meta.root_page, rowid)?;
         if root != meta.root_page {
@@ -1416,10 +1487,8 @@ impl SqliteWriter {
 
         if next_rowid == rowid && self.replace_cell_in_place(&cell, &payload)? {
             for (master_rowid, old_key, new_key) in index_changes {
-                if let Some(entries) = self.index_entries.get_mut(&master_rowid) {
-                    entries.remove(&old_key);
-                }
-                self.index_entries.entry(master_rowid).or_default().insert(new_key);
+                self.index_entry_remove(master_rowid, &old_key);
+                self.index_entry_insert(master_rowid, new_key);
             }
             return Ok(true);
         }
@@ -1441,9 +1510,7 @@ impl SqliteWriter {
                 continue;
             }
             let key = encode_index_key(meta, index_meta, rowid, values, self.encoding)?;
-            if let Some(entries) = self.index_entries.get_mut(&index_meta.master_rowid) {
-                entries.remove(&key);
-            }
+            self.index_entry_remove(index_meta.master_rowid, &key);
         }
         Ok(())
     }
@@ -1455,7 +1522,7 @@ impl SqliteWriter {
                 continue;
             }
             let key = encode_index_key(meta, index_meta, rowid, values, self.encoding)?;
-            self.index_entries.entry(index_meta.master_rowid).or_default().insert(key);
+            self.index_entry_insert(index_meta.master_rowid, key);
         }
         Ok(())
     }
@@ -1640,7 +1707,7 @@ impl SqliteWriter {
             return Ok(DropIndexOutcome::Automatic);
         }
         self.free_subtree(row.root_page)?;
-        self.index_entries.remove(&row.rowid);
+        self.index_entry_drop(row.rowid);
         self.table_delete(1, row.rowid)?;
         self.bump_cookie();
         Ok(DropIndexOutcome::Dropped)
@@ -1716,7 +1783,7 @@ impl SqliteWriter {
             rows.iter().filter(|row| row.kind == "index" && eq_ignore_ascii_case(&row.table_name, &table.table_name)).cloned().collect();
         for index in &indexes {
             self.free_subtree(index.root_page)?;
-            self.index_entries.remove(&index.rowid);
+            self.index_entry_drop(index.rowid);
         }
         let without_rowid = table.sql.as_deref().is_some_and(is_without_rowid);
         if table.root_page != 0 {
