@@ -11872,12 +11872,50 @@ fn truncate_rows(rows: &mut Vec<Vec<Cell>>, limit: Option<(usize, Option<usize>)
 /// Values are compared with `Cell`'s own equality, the same semantics grouping
 /// uses, so integers and reals stay distinct exactly as SQLite keeps them.
 fn retain_first_distinct(rows: Vec<Vec<Cell>>, collations: &[Collation]) -> Vec<Vec<Cell>> {
+    // Single-column output needs one signature, not a `Vec<ProbeKey>` per row.
+    if rows.first().is_some_and(|row| row.len() == 1) {
+        let collation = collations.first().copied().unwrap_or_default();
+        let mut buckets: HashSet<ProbeKey> = HashSet::with_capacity(rows.len());
+        // 保留下标而不是整行副本:线性回退时直接与已保留的行比较,
+        // 命中哈希的常见路径不再为每行复制一份 `Vec<Cell>`。
+        let mut seen: Vec<usize> = Vec::with_capacity(rows.len());
+        let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+        let mut linear = false;
+        for row in rows {
+            let signature = if linear {
+                None
+            }
+            else {
+                match probe_key(&row[0], collation) {
+                    Some(part) if !matches!(part, ProbeKey::Wide(_)) => Some(part),
+                    _ => None,
+                }
+            };
+            let duplicate = match &signature {
+                Some(signature) => buckets.contains(signature),
+                None => {
+                    linear = true;
+                    seen.iter()
+                        .any(|index| compare_cells_with(&out[*index][0], &row[0], collation) == Ordering::Equal)
+                }
+            };
+            if !duplicate {
+                if let Some(signature) = signature {
+                    buckets.insert(signature);
+                }
+                seen.push(out.len());
+                out.push(row);
+            }
+        }
+        return out;
+    }
     // Canonical signatures give a hash lookup for the common case; once a row
     // has no signature, the rest of the run falls back to the engine's linear
     // comparison so semantics never change.
     let mut buckets: HashSet<Vec<ProbeKey>> = HashSet::with_capacity(rows.len());
-    let mut seen: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
-    let mut out = Vec::with_capacity(rows.len());
+    // 保留下标而不是整行副本,避免哈希命中路径上每行多一次行克隆。
+    let mut seen: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
     let mut linear = false;
     for row in rows {
         let signature = if linear { None } else { row_signature(&row, collations) };
@@ -11885,14 +11923,14 @@ fn retain_first_distinct(rows: Vec<Vec<Cell>>, collations: &[Collation]) -> Vec<
             Some(signature) => buckets.contains(signature),
             None => {
                 linear = true;
-                seen.iter().any(|existing| rows_equal_with(existing, &row, collations))
+                seen.iter().any(|index| rows_equal_with(&out[*index], &row, collations))
             }
         };
         if !duplicate {
             if let Some(signature) = signature {
                 buckets.insert(signature);
             }
-            seen.push(row.clone());
+            seen.push(out.len());
             out.push(row);
         }
     }
@@ -11903,6 +11941,55 @@ fn retain_first_distinct(rows: Vec<Vec<Cell>>, collations: &[Collation]) -> Vec<
 ///
 /// Empty input follows SQLite: `count` is `0`, every other aggregate is `NULL`.
 fn compute_aggregate(spec: &AggregateSpec, rows: &[Vec<Cell>], ctx: &EvalContext) -> Result<Cell, SqlError> {
+    // `count(*)` 只数行,不需要为每行物化一个占位值。
+    if !spec.distinct && spec.order.is_empty() && matches!(spec.function, AggregateFunction::CountStar) {
+        let count = match &spec.filter {
+            None => rows.len(),
+            Some(filter) => {
+                let mut count = 0usize;
+                for row in rows {
+                    if truthiness(&filter.eval(row, ctx)?) == Some(true) {
+                        count += 1;
+                    }
+                }
+                count
+            }
+        };
+        return Ok(Cell::Integer(count as i64));
+    }
+    // `min` / `max` 逐行折叠即可,不必先把整列参数收进一个向量。
+    if !spec.distinct && spec.order.is_empty() && spec.separator.is_none() && matches!(spec.function, AggregateFunction::Min | AggregateFunction::Max) {
+        let Some(argument) = &spec.argument
+        else {
+            return Ok(Cell::Null);
+        };
+        let function = spec.function;
+        let mut best: Option<Cell> = None;
+        for row in rows {
+            if let Some(filter) = &spec.filter {
+                if truthiness(&filter.eval(row, ctx)?) != Some(true) {
+                    continue;
+                }
+            }
+            let value = argument.eval(row, ctx)?;
+            if matches!(value, Cell::Null) {
+                continue;
+            }
+            best = Some(match best {
+                None => value,
+                Some(current) => {
+                    let ordering = compare_cells(&value, &current);
+                    let replace = match function {
+                        AggregateFunction::Min => ordering == Ordering::Less,
+                        AggregateFunction::Max => ordering == Ordering::Greater,
+                        _ => false,
+                    };
+                    if replace { value } else { current }
+                }
+            });
+        }
+        return Ok(best.unwrap_or(Cell::Null));
+    }
     // 无 `DISTINCT`、无参数内 `ORDER BY` 时不需要物化 (value, separator, key)
     // 三元组,直接按行收集参数值,省掉每组一次分配与二次装载。
     if !spec.distinct && spec.order.is_empty() {
@@ -12110,6 +12197,60 @@ fn build_groups(
 ) -> Result<Vec<Vec<Vec<Cell>>>, SqlError> {
     if group_keys.is_empty() {
         return Ok(vec![rows]);
+    }
+    // 单键分组不需要每行一份 `Vec<ProbeKey>`:一个键签名就足以定位分组,
+    // 桶里直接存首次出现的分组下标。分桶与线性回退的判定和多键路径一致。
+    if group_keys.len() == 1 {
+        let group_key = &group_keys[0];
+        let collation = match group_key {
+            GroupKey::Projected(_, collation) | GroupKey::Expression(_, collation) => *collation,
+        };
+        let mut groups: Vec<(Cell, Vec<Vec<Cell>>)> = Vec::new();
+        let mut buckets: HashMap<ProbeKey, usize> = HashMap::new();
+        let mut linear = false;
+        for row in rows {
+            let value = match group_key {
+                GroupKey::Projected(index, _) => match projection {
+                    Some(nodes) => match nodes.get(*index) {
+                        Some(node) => node.eval(&row, ctx)?,
+                        None => Cell::Null,
+                    },
+                    None => row.get(*index).cloned().unwrap_or(Cell::Null),
+                },
+                GroupKey::Expression(expr, _) => expr.eval(&row, ctx)?,
+            };
+            let signature = if linear {
+                None
+            }
+            else {
+                match probe_key(&value, collation) {
+                    Some(part) if !matches!(part, ProbeKey::Wide(_)) => Some(part),
+                    _ => None,
+                }
+            };
+            let matched = match &signature {
+                Some(signature) => buckets.get(signature).copied(),
+                None => {
+                    linear = true;
+                    groups.iter().position(|(existing, _)| compare_cells_with(existing, &value, collation) == Ordering::Equal)
+                }
+            };
+            match matched {
+                Some(index) => {
+                    budget.charge(1)?;
+                    groups[index].1.push(row);
+                }
+                None => {
+                    budget.charge(1)?;
+                    let index = groups.len();
+                    if let Some(signature) = signature {
+                        buckets.insert(signature, index);
+                    }
+                    groups.push((value, vec![row]));
+                }
+            }
+        }
+        return Ok(groups.into_iter().map(|(_, rows)| rows).collect());
     }
     let mut groups: Vec<(Vec<Cell>, Vec<Vec<Cell>>)> = Vec::new();
     // Hash buckets over the canonical key signatures, so a row finds its
