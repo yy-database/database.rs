@@ -1163,7 +1163,7 @@ pub struct Engine {
     /// 只缓存主库普通 rowid 表的无提示全表扫描:新请求所需列若已被缓存掩码
     /// 覆盖(全量解码覆盖任何裁剪),就复用同一份行集,让同表内外层子查询与
     /// 自连接不必各自解码一遍。语句开始与结束都清空,不跨语句保留。
-    statement_scans: std::cell::RefCell<HashMap<String, (Option<Vec<bool>>, Rc<Vec<Vec<Cell>>>)>>,
+    statement_scans: std::cell::RefCell<HashMap<String, (Option<Vec<bool>>, std::rc::Weak<Vec<Vec<Cell>>>)>>,
     /// Set whenever an `OuterColumn` is read, so a subquery can tell whether it
     /// depended on the enclosing row and therefore must not be memoized.
     outer_read: std::cell::Cell<bool>,
@@ -7090,7 +7090,7 @@ impl Engine {
             join_rows(&relation, &ons, &tables, &conjuncts, take, &ctx)?
         }
         else {
-            cross_product(&tables, &relation, &conjuncts, take, &ctx)?
+            cross_product(tables, &relation, &conjuncts, take, &ctx)?
         };
         if grouped {
             // One group per distinct key; without `GROUP BY` there is exactly
@@ -9004,10 +9004,13 @@ impl Engine {
                 let key = def.name.to_ascii_lowercase();
                 {
                     let scans = self.statement_scans.borrow();
-                    if let Some((cached_mask, cached)) = scans.get(&key) {
-                        if mask_covers(cached_mask.as_deref(), keep) {
-                            return Ok((SourceColumns::Table(def), Rc::clone(cached)));
-                        }
+                    // 缓存持弱引用:同一行集若已没有使用方存活,就重新解码;仍有
+                    // 使用方(自连接、内外层同表子查询)时正常复用。
+                    if let Some((cached_mask, cached)) = scans.get(&key)
+                        && let Some(cached) = cached.upgrade()
+                        && mask_covers(cached_mask.as_deref(), keep)
+                    {
+                        return Ok((SourceColumns::Table(def), cached));
                     }
                 }
                 let stored = self
@@ -9023,7 +9026,9 @@ impl Engine {
                     }
                 };
                 if wider {
-                    self.statement_scans.borrow_mut().insert(key, (keep.map(<[bool]>::to_vec), Rc::clone(&decoded)));
+                    self.statement_scans
+                        .borrow_mut()
+                        .insert(key, (keep.map(<[bool]>::to_vec), Rc::downgrade(&decoded)));
                 }
                 return Ok((SourceColumns::Table(def), decoded));
             }
@@ -12922,7 +12927,7 @@ fn count_cross_level(
 }
 
 fn cross_product(
-    tables: &[Rc<Vec<Vec<Cell>>>],
+    tables: Vec<Rc<Vec<Vec<Cell>>>>,
     relation: &Relation,
     conjuncts: &[ResolvedExpr],
     take: usize,
@@ -12956,26 +12961,64 @@ fn cross_product(
     }
     // Same single-source elision as the count path: the stored row is already
     // the merged row, so predicates and the emitted row can use it directly.
+    // 单源查询独占这份行集时直接按值消费,命中的行移动进结果而不是再复制一份;
+    // 行集仍被其它源共享(自连接、同表子查询)时才退回复制。
     if relation.sources.len() == 1 && tables.len() == 1 {
-        for values in tables[0].iter() {
-            if rows.len() >= take {
-                break;
-            }
-            let mut matched = true;
-            for conjunct in conjuncts {
-                if truthiness(&conjunct.eval(values, ctx)?) != Some(true) {
-                    matched = false;
-                    break;
+        let stored = tables.into_iter().next().expect("length checked");
+        let mut kept = Vec::with_capacity(stored.len().min(take));
+        match Rc::try_unwrap(stored) {
+            Ok(values) if conjuncts.is_empty() => {
+                let count = values.len().min(take);
+                for _ in 0..count {
+                    ctx.budget.charge(1)?;
+                }
+                if count == values.len() {
+                    kept = values;
+                }
+                else {
+                    kept.extend(values.into_iter().take(count));
                 }
             }
-            if matched {
-                ctx.budget.charge(1)?;
-                rows.push(values.clone());
+            Ok(values) => {
+                for values in values {
+                    if kept.len() >= take {
+                        break;
+                    }
+                    let mut matched = true;
+                    for conjunct in conjuncts {
+                        if truthiness(&conjunct.eval(&values, ctx)?) != Some(true) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        ctx.budget.charge(1)?;
+                        kept.push(values);
+                    }
+                }
+            }
+            Err(shared) => {
+                for values in shared.iter() {
+                    if kept.len() >= take {
+                        break;
+                    }
+                    let mut matched = true;
+                    for conjunct in conjuncts {
+                        if truthiness(&conjunct.eval(values, ctx)?) != Some(true) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        ctx.budget.charge(1)?;
+                        kept.push(values.clone());
+                    }
+                }
             }
         }
-        return Ok(rows);
+        return Ok(kept);
     }
-    emit_rows(0, tables, relation, &order, conjuncts, &depths, take, ctx, &mut merged, &mut rows)?;
+    emit_rows(0, &tables, relation, &order, conjuncts, &depths, take, ctx, &mut merged, &mut rows)?;
     Ok(rows)
 }
 
