@@ -359,6 +359,11 @@ struct IndexProbe {
     entries: Vec<(Vec<Cell>, i64)>,
     /// `entries` 按首列排序规则非递减,范围探针因此可以二分定位。
     sorted: bool,
+    /// 已从表中删除、但还没从 `entries` 里剔除的 rowid。
+    ///
+    /// 删除语句按行打补丁时只把 rowid 记到这里,避免每条删除都扫一遍整份
+    /// 索引项;条目累积到一半时再一次性压缩。
+    deleted: HashSet<i64>,
     /// A stored key the canonical form cannot reproduce; the probe is then
     /// never used and every query falls back to the full scan.
     poisoned: bool,
@@ -1150,11 +1155,18 @@ pub struct Engine {
     /// Open explicit transaction, or `None` in autocommit. Savepoint names are
     /// stored outermost first.
     transaction: Option<TransactionState>,
-    /// Statement counter bumped by every statement that could change rows or
-    /// schema, so cached index probes rebuild after any mutation.
+    /// 单调递增的时钟,给索引内容版本取号用。
+    ///
+    /// 只有真正改动了某个索引内容的语句才推进它,逐语句推进会让写循环里
+    /// 每次探针都重建整份索引键集。
     write_epoch: std::cell::Cell<u64>,
+    /// 索引内容版本:小写索引名 → 该索引内容最后变化时的 epoch。
+    ///
+    /// 探针缓存的 `epoch` 与这里一致时才可复用。`INSERT` / 改动索引列的
+    /// `UPDATE` / `DELETE` 之外的语句(DDL、`VACUUM` 等)一律全量失效。
+    index_versions: std::cell::RefCell<HashMap<String, u64>>,
     /// Live key sets of plain column indexes, keyed by lowercase index name,
-    /// valid only while the stored epoch matches [`Engine::write_epoch`].
+    /// valid only while the stored epoch matches the index's content version.
     index_probes: std::cell::RefCell<HashMap<String, IndexProbe>>,
     /// Memoized uncorrelated subquery results for the running statement, keyed
     /// by the resolved subquery node address. Cleared before every statement.
@@ -1228,6 +1240,7 @@ impl Engine {
             last_insert_rowid: 0,
             transaction: None,
             write_epoch: std::cell::Cell::new(0),
+            index_versions: std::cell::RefCell::new(HashMap::new()),
             index_probes: std::cell::RefCell::new(HashMap::new()),
             subquery_cache: std::cell::RefCell::new(HashMap::new()),
             statement_scans: std::cell::RefCell::new(HashMap::new()),
@@ -1264,11 +1277,8 @@ impl Engine {
                 for attached in &self.attached {
                     attached.engine.check_deferred_foreign_keys()?;
                 }
-                // 事务内推迟的索引重建在提交前一次落下,失败则事务保持打开。
-                self.flush_pending_materialization("commit")?;
-                for attached in &mut self.attached {
-                    attached.engine.flush_pending_materialization("commit")?;
-                }
+                // 推迟的索引重建留到读取镜像的入口再落下:提交本身不读镜像,
+                // 在这里重建会让每个写事务都付一次整树重建成本。
                 self.transaction.take();
                 self.writer.commit_all().map_err(|error| storage_failure(error).in_statement("commit"))?;
                 for attached in &mut self.attached {
@@ -1281,9 +1291,8 @@ impl Engine {
                     return Err(SqlError::new("transaction-missing", "cannot rollback - no transaction is active").in_statement("rollback"));
                 }
                 self.writer.rollback_all().map_err(|error| storage_failure(error).in_statement("rollback"))?;
-                // 整事务回滚把镜像退回事务前,推迟的索引重建也不再需要。
-                self.pending_indexes = false;
-                self.pending_without_rowid = false;
+                // 回滚把内存键集退回事务前,但推迟标记可能来自事务开始之前
+                // 的 autocommit 写入,这里只保留标记,不因回滚丢弃。
                 self.reload_catalog()?;
                 for index in 0..self.attached.len() {
                     self.attached[index]
@@ -1292,8 +1301,6 @@ impl Engine {
                         .rollback_all()
                         .map_err(|error| storage_failure(error).in_statement("rollback"))?;
                     self.attached[index].dirty = false;
-                    self.attached[index].engine.pending_indexes = false;
-                    self.attached[index].engine.pending_without_rowid = false;
                     self.attached[index].engine.reload_catalog()?;
                 }
             }
@@ -1352,11 +1359,8 @@ impl Engine {
                 };
                 if closing {
                     // Releasing the last savepoint of a transaction that no
-                    // `BEGIN` opened commits it, as in SQLite.
-                    self.flush_pending_materialization("release")?;
-                    for attached in &mut self.attached {
-                        attached.engine.flush_pending_materialization("release")?;
-                    }
+                    // `BEGIN` opened commits it, as in SQLite. 索引重建同样
+                    // 推迟到读取镜像的入口。
                     self.writer.commit_all().map_err(|error| storage_failure(error).in_statement("release"))?;
                     self.transaction = None;
                     self.persist_attached_databases()?;
@@ -1409,7 +1413,16 @@ impl Engine {
     /// being answered with a hard-coded `ok`. Page-reachability accounting
     /// (detecting a page shared by two b-trees) is outside this walk because
     /// the reader API validates each tree in isolation.
-    fn pragma_integrity_check(&self, argument: &str) -> ExecResult {
+    fn pragma_integrity_check(&mut self, argument: &str) -> ExecResult {
+        // 检查走的是镜像页,先把推迟的索引重建落下,否则会把旧索引页判成问题。
+        if let Err(error) = self.flush_pending_materialization("integrity-check") {
+            return ExecResult {
+                statement: "pragma",
+                columns: vec!["integrity_check".to_string()],
+                rows: vec![vec![Cell::Text(error.to_string())]],
+                affected: 0,
+            };
+        }
         let mut problems = Vec::new();
         let pages = self.writer.pages();
         let limits = TableLimits::default();
@@ -2132,26 +2145,23 @@ impl Engine {
         Ok(self.writer.pages())
     }
 
-    /// 写完一条语句后按需重建索引 b-tree。
+    /// 写完一条语句后标记索引 b-tree 需要重建。
     ///
     /// 索引 b-tree 只能整树重建,单条语句重建一次会让事务内第 n 条写入付掉
-    /// O(n) 的重建成本。显式事务内只置位,提交或读取镜像前一次重建;autocommit
-    /// 下立即重建,保持「语句结束后镜像即可读出」的既有语义。
-    fn materialize_indexes_after_write(&mut self, statement: &'static str) -> Result<(), SqlError> {
-        if self.in_transaction() {
-            self.pending_indexes = true;
-            return Ok(());
-        }
-        self.writer.materialize_indexes().map_err(|error| storage_failure(error).in_statement(statement))
+    /// O(n) 的重建成本,所以任何写语句都只置位。重建推迟到真正读取镜像的
+    /// 入口(提交不再重建,`snapshot` / `save` / `VACUUM` /
+    /// `PRAGMA integrity_check` / 惰性游标打开),这些入口都会先调用
+    /// [`Engine::flush_pending_materialization`],因此读到的镜像仍然与内存
+    /// 键集一致。
+    fn materialize_indexes_after_write(&mut self, _statement: &'static str) -> Result<(), SqlError> {
+        self.pending_indexes = true;
+        Ok(())
     }
 
     /// 同 [`Engine::materialize_indexes_after_write`],针对 WITHOUT ROWID 表的聚簇树。
-    fn materialize_without_rowid_after_write(&mut self, statement: &'static str) -> Result<(), SqlError> {
-        if self.in_transaction() {
-            self.pending_without_rowid = true;
-            return Ok(());
-        }
-        self.writer.materialize_without_rowid().map_err(|error| storage_failure(error).in_statement(statement))
+    fn materialize_without_rowid_after_write(&mut self, _statement: &'static str) -> Result<(), SqlError> {
+        self.pending_without_rowid = true;
+        Ok(())
     }
 
     /// 把推迟的索引 / 聚簇树重建落进当前镜像。
@@ -2851,10 +2861,18 @@ impl Engine {
     }
 
     fn run_statement_dispatch(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
-        // Any statement other than a plain read can change rows or schema, so
-        // the cached index probes stop being valid from this statement on.
+        // 读语句不动索引;`UPDATE` / `DELETE` 在自己的执行分支里按实际改动
+        // 的索引精确失效(见 `invalidate_indexes_after_update` 与
+        // `patch_index_probes_after_delete`),其余会改行或改 schema 的语句
+        // 在这里一刀切,让相关索引的缓存整体作废。
         if !matches!(statement, Statement::Select { .. } | Statement::Explain { .. }) {
-            self.write_epoch.set(self.write_epoch.get() + 1);
+            match &statement {
+                Statement::Update { .. } | Statement::Delete { .. } => {}
+                _ => match self.statement_table_key(&statement) {
+                    Some(key) => self.invalidate_table_indexes(&key),
+                    None => self.invalidate_all_indexes(),
+                },
+            }
         }
         let Some(schema) = leading_schema(&statement).map(str::to_owned)
         else {
@@ -3130,6 +3148,7 @@ impl Engine {
     /// 之后的显式 rowid 只会上抬、不会覆盖。`rowid` 表按 rowid 升序复制,
     /// 没有 `INTEGER PRIMARY KEY` 的表因此像上游一样重新编号。
     fn vacuum_image(&mut self) -> Result<Vec<u8>, SqlError> {
+        self.flush_pending_materialization("vacuum")?;
         let page_size = self.writer.page_size();
         let encoding = match u32::from_be_bytes(
             self.writer
@@ -4499,6 +4518,16 @@ impl Engine {
                 if needs_without_rowid {
                     self.materialize_without_rowid_after_write("update")?;
                 }
+                // 外键动作会直接改写子表行,索引内容不再只由本表语句决定;
+                // 其余情况按被赋值的列精确失效,只改非索引列时缓存原样保留。
+                let foreign_actions =
+                    self.foreign_keys && (!def.foreign_keys.is_empty() || !self.referencing_foreign_keys(&def.name).is_empty());
+                if foreign_actions {
+                    self.invalidate_all_indexes();
+                }
+                else {
+                    self.invalidate_indexes_after_update(def, &key, &assigned);
+                }
                 Ok(ExecResult {
                     statement: "update",
                     columns: returning.as_ref().map(|plan| plan.columns.clone()).unwrap_or_default(),
@@ -4633,6 +4662,16 @@ impl Engine {
                 }
                 if needs_without_rowid {
                     self.materialize_without_rowid_after_write("delete")?;
+                }
+                // 同 `UPDATE`:外键级联删除会改动子表,只能全量失效;否则
+                // 把被删行从整份索引快照里精确剔除。
+                let foreign_actions =
+                    self.foreign_keys && (!def.foreign_keys.is_empty() || !self.referencing_foreign_keys(&def.name).is_empty());
+                if foreign_actions {
+                    self.invalidate_all_indexes();
+                }
+                else {
+                    self.patch_index_probes_after_delete(&key, &plan);
                 }
                 Ok(ExecResult {
                     statement: "delete",
@@ -8358,17 +8397,17 @@ impl Engine {
     /// Returns the rowids stored under one probe key, rebuilding the cached
     /// key set first when the write epoch moved on.
     fn index_probe_rowids(&self, index: &IndexDef, key: &[ProbeKey]) -> Option<Vec<i64>> {
-        let epoch = self.write_epoch.get();
+        let version = self.index_version(&index.name);
         let name = index.name.to_ascii_lowercase();
         {
             let cache = self.index_probes.borrow();
             if let Some(probe) = cache.get(&name) {
-                if probe.epoch == epoch {
+                if probe.epoch == version {
                     return if probe.poisoned { None } else { probe.map.get(key).cloned() };
                 }
             }
         }
-        let probe = self.build_index_probe(index, epoch);
+        let probe = self.build_index_probe(index, version);
         let rowids = if probe.poisoned { None } else { probe.map.get(key).cloned() };
         self.index_probes.borrow_mut().insert(name, probe);
         rowids
@@ -8418,7 +8457,7 @@ impl Engine {
         upper: &Option<IndexBound>,
         collation: Collation,
     ) -> Option<Vec<i64>> {
-        let epoch = self.write_epoch.get();
+        let version = self.index_version(&index.name);
         let name = index.name.to_ascii_lowercase();
         let select = |probe: &IndexProbe| -> Option<Vec<i64>> {
             if probe.poisoned {
@@ -8450,12 +8489,19 @@ impl Engine {
                 if lower_start >= upper_end {
                     return Some(Vec::new());
                 }
-                let mut rowids: Vec<i64> = probe.entries[lower_start..upper_end].iter().map(|(_, rowid)| *rowid).collect();
+                let mut rowids: Vec<i64> = probe.entries[lower_start..upper_end]
+                    .iter()
+                    .map(|(_, rowid)| *rowid)
+                    .filter(|rowid| !probe.deleted.contains(rowid))
+                    .collect();
                 rowids.sort_unstable();
                 return Some(rowids);
             }
             let mut rowids = Vec::new();
             for (key, rowid) in &probe.entries {
+                if probe.deleted.contains(rowid) {
+                    continue;
+                }
                 let Some(cell) = key.first() else {
                     continue;
                 };
@@ -8479,12 +8525,12 @@ impl Engine {
         {
             let cache = self.index_probes.borrow();
             if let Some(probe) = cache.get(&name) {
-                if probe.epoch == epoch {
+                if probe.epoch == version {
                     return select(probe);
                 }
             }
         }
-        let probe = self.build_index_probe(index, epoch);
+        let probe = self.build_index_probe(index, version);
         let rowids = select(&probe);
         self.index_probes.borrow_mut().insert(name, probe);
         rowids
@@ -8494,7 +8540,8 @@ impl Engine {
     /// key outside the canonical form (a NaN or a wide integer) poisons the
     /// probe so every later query keeps the full scan.
     fn build_index_probe(&self, index: &IndexDef, epoch: u64) -> IndexProbe {
-        let mut probe = IndexProbe { epoch, map: HashMap::new(), entries: Vec::new(), sorted: false, poisoned: false };
+        let mut probe =
+            IndexProbe { epoch, map: HashMap::new(), entries: Vec::new(), sorted: false, deleted: HashSet::new(), poisoned: false };
         let entries = match self.writer.index_entries_decoded(&index.name) {
             Ok(entries) => entries,
             Err(_) => {
@@ -8539,6 +8586,185 @@ impl Engine {
             });
         }
         probe
+    }
+
+    /// 一条索引的内容版本:从未登记过的索引视为 `0`。
+    fn index_version(&self, name: &str) -> u64 {
+        self.index_versions.borrow().get(&name.to_ascii_lowercase()).copied().unwrap_or(0)
+    }
+
+    /// 推进时钟并返回新 epoch。
+    fn next_epoch(&self) -> u64 {
+        let next = self.write_epoch.get().wrapping_add(1);
+        self.write_epoch.set(next);
+        next
+    }
+
+    /// 取出一条写语句的目标表名(小写)。
+    ///
+    /// 只有裸表名或 `main` / 本库别名限定的 DML 才能精确到单表;其余形态
+    /// (其它 attached schema、DDL 等)返回 `None`,调用方按全量失效处理。
+    fn statement_table_key(&self, statement: &Statement) -> Option<String> {
+        let (schema, table) = match statement {
+            Statement::Insert { schema, table, .. }
+            | Statement::Update { schema, table, .. }
+            | Statement::Delete { schema, table, .. } => (schema.as_deref(), table),
+            _ => return None,
+        };
+        match schema {
+            None => Some(table.to_ascii_lowercase()),
+            Some(qualifier) => {
+                let lower = qualifier.to_ascii_lowercase();
+                if lower == "main" || self.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(&lower)) {
+                    Some(table.to_ascii_lowercase())
+                }
+                else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// 让一张表上的全部索引缓存失效。
+    fn invalidate_table_indexes(&self, table_key: &str) {
+        let epoch = self.next_epoch();
+        let mut versions = self.index_versions.borrow_mut();
+        for index in self.indexes.values() {
+            if index.table == table_key {
+                versions.insert(index.name.to_ascii_lowercase(), epoch);
+            }
+        }
+    }
+
+    /// 让全部索引缓存失效。
+    fn invalidate_all_indexes(&self) {
+        let epoch = self.next_epoch();
+        let mut versions = self.index_versions.borrow_mut();
+        for index in self.indexes.values() {
+            versions.insert(index.name.to_ascii_lowercase(), epoch);
+        }
+    }
+
+    /// `UPDATE` 执行后只让真正被改动的索引失效。
+    ///
+    /// 索引项只由被索引列的值和行 rowid 决定:赋值没有碰到任何索引列、也没改
+    /// rowid 时,索引内容与语句执行前逐项一致,缓存可以继续复用。托管索引
+    /// (表达式、`COLLATE`、部分索引)的键可能依赖任意列,一律按失效处理。
+    fn invalidate_indexes_after_update(&self, def: &TableDef, table_key: &str, assigned: &[bool]) {
+        let rowid_moved = def.rowid_alias.is_some_and(|position| assigned.get(position).copied().unwrap_or(false));
+        let mut dirty: Vec<String> = Vec::new();
+        for index in self.indexes.values() {
+            if index.table != table_key {
+                continue;
+            }
+            let affected = rowid_moved
+                || index.managed
+                || index.columns.is_empty()
+                || index.columns.iter().any(|position| assigned.get(*position).copied().unwrap_or(true));
+            if affected {
+                dirty.push(index.name.to_ascii_lowercase());
+            }
+        }
+        if dirty.is_empty() {
+            return;
+        }
+        let epoch = self.next_epoch();
+        let mut versions = self.index_versions.borrow_mut();
+        for name in dirty {
+            versions.insert(name, epoch);
+        }
+    }
+
+    /// `DELETE` 执行后把被删行从已缓存的索引探针里摘掉。
+    ///
+    /// 缓存是整份索引的快照,按 rowid 精确剔除与整树重建等价,因此不必让
+    /// 每次删除都重付一遍全索引解码。托管索引与已过期的缓存退化为常规失效,
+    /// 由下一次探针重建。
+    fn patch_index_probes_after_delete(&self, table_key: &str, plan: &DeletePlan) {
+        let removed: HashSet<i64> = plan.removed.iter().copied().collect();
+        let mut stale: Vec<String> = Vec::new();
+        let mut patched: Vec<String> = Vec::new();
+        {
+            let mut probes = self.index_probes.borrow_mut();
+            for index in self.indexes.values() {
+                if index.table != table_key {
+                    continue;
+                }
+                let name = index.name.to_ascii_lowercase();
+                let version = self.index_version(&index.name);
+                let Some(probe) = probes.get_mut(&name) else {
+                    continue;
+                };
+                if index.managed || index.columns.is_empty() || probe.poisoned || probe.epoch != version {
+                    stale.push(name);
+                    continue;
+                }
+                for (rowid, cells) in &plan.live {
+                    if !removed.contains(rowid) {
+                        continue;
+                    }
+                    let mut key = Vec::with_capacity(index.columns.len());
+                    let mut canonical = true;
+                    for (slot, position) in index.columns.iter().enumerate() {
+                        let collation = index.collations.get(slot).copied().unwrap_or_default();
+                        match cells.get(*position).and_then(|cell| probe_key(cell, collation)) {
+                            Some(part) if !matches!(part, ProbeKey::Wide(_)) => key.push(part),
+                            _ => {
+                                canonical = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !canonical {
+                        probe.poisoned = true;
+                        break;
+                    }
+                    let emptied = match probe.map.get_mut(&key) {
+                        Some(rowids) => {
+                            rowids.retain(|id| id != rowid);
+                            rowids.is_empty()
+                        }
+                        None => false,
+                    };
+                    if emptied {
+                        probe.map.remove(&key);
+                    }
+                }
+                if probe.poisoned {
+                    stale.push(name);
+                    continue;
+                }
+                if !removed.is_empty() {
+                    // 只记墓碑;条目累积到一半时再一次性压缩,单条删除不再
+                    // 扫整份索引项。
+                    probe.deleted.extend(removed.iter().copied());
+                    if probe.deleted.len() * 2 > probe.entries.len() {
+                        let deleted = std::mem::take(&mut probe.deleted);
+                        probe.entries.retain(|(_, rowid)| !deleted.contains(rowid));
+                    }
+                }
+                patched.push(name);
+            }
+        }
+        if stale.is_empty() && patched.is_empty() {
+            return;
+        }
+        let epoch = self.next_epoch();
+        {
+            let mut versions = self.index_versions.borrow_mut();
+            for name in stale.iter().chain(patched.iter()) {
+                versions.insert(name.clone(), epoch);
+            }
+        }
+        // 打过补丁的探针内容仍然准确,只把版本对齐到新 epoch 继续复用。
+        if !patched.is_empty() {
+            let mut probes = self.index_probes.borrow_mut();
+            for name in &patched {
+                if let Some(probe) = probes.get_mut(name) {
+                    probe.epoch = epoch;
+                }
+            }
+        }
     }
 
     /// Detects `ORDER BY <rowid order> LIMIT n` over a single base rowid table
@@ -8611,6 +8837,8 @@ impl Engine {
         else {
             return Ok(None);
         };
+        // 游标快照直接克隆镜像页,推迟的索引重建必须先落下。
+        self.flush_pending_materialization("cursor")?;
         let objects = match self.writer.schema_objects_with_rowids(TableLimits::default()) {
             Ok(objects) => objects,
             Err(_) => return Ok(None),
