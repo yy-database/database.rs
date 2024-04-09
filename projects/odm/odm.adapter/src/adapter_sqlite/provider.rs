@@ -259,9 +259,9 @@ impl SqliteProvider {
 
     /// Inspects live catalog metadata.
     pub fn inspect_catalog(&self) -> Result<CatalogSnapshot, SqliteError> {
-        let engine = self.engine.lock().expect("sqlite mutex");
-        let objects =
-            read_schema(engine.snapshot(), TableLimits::default()).map_err(|error| SqliteError::policy(format!("sqlite facade: {error}")))?;
+        let mut engine = self.engine.lock().expect("sqlite mutex");
+        let objects = read_schema(engine.snapshot().map_err(map_sql_error)?, TableLimits::default())
+            .map_err(|error| SqliteError::policy(format!("sqlite facade: {error}")))?;
         let mut tables = Vec::new();
         for object in objects {
             if object.kind != SchemaObjectKind::Table || object.name.starts_with("sqlite_") {
