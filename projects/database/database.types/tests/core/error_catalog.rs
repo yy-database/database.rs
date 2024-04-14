@@ -21,7 +21,7 @@ fn engine_codes() -> BTreeSet<String> {
 #[test]
 fn engine_codes_are_unique_and_unbranded() {
     let codes = engine_codes();
-    assert_eq!(codes.len(), 31, "code count changed: {codes:?}");
+    assert_eq!(codes.len(), 32, "code count changed: {codes:?}");
     for code in &codes {
         assert!(code.starts_with("database."), "`{code}` must stay inside the `database.` namespace");
         assert!(!code.starts_with("yydb."), "`{code}` must not use product-branded prefix");
