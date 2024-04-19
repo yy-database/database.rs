@@ -183,6 +183,9 @@ pub fn serve_connection(stream: TcpStream, runtime: Option<Arc<MysqlSqlRuntime>>
     if !stream.peer_addr()?.ip().is_loopback() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "MySQL requires loopback until authentication and TLS are implemented"));
     }
+    // 结果集由多个小包依次写出，关闭 Nagle 让每包立即发出。留着 Nagle 时
+    // Linux 会与对端的延迟 ACK 叠加出约 40ms 的往返停顿。
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     serve_session(stream, runtime)
@@ -197,6 +200,9 @@ pub fn serve_cancellable(stream: TcpStream, stopping: Arc<AtomicBool>, runtime: 
     if !stream.peer_addr()?.ip().is_loopback() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "MySQL requires loopback until authentication and TLS are implemented"));
     }
+    // 同 `serve_connection`：结果集的小包必须立即发出，否则延迟 ACK 会带来
+    // 约 40ms 的往返地板，把取消检查节拍之外的延迟也一并抬高。
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(CANCELLABLE_READ_TIMEOUT))?;
     stream.set_write_timeout(Some(CANCELLABLE_WRITE_TIMEOUT))?;
     serve_session(CancellableSocket { stream, stopping }, runtime)
