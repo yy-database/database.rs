@@ -3,7 +3,7 @@
 本仓是 YY 数据库家族的 **聚合 Rust 内核**。产品壳（`yydb` / `yyds` / `iris-orm` / `SQLite`）只依赖对应门面 crate，不直接钉内部角色
 crate。
 
-工作区根目录另有全局索引；本文件只写本仓实现约定。用户向产品故事见 [`readme.md`](./readme.md)；目录角色与维护者命令见 [`scripts/README.md`](./scripts/README.md)。
+工作区根目录另有全局索引；本文件只写本仓实现约定。用户向产品故事见 [`readme.md`](./readme.md)；目录角色与维护者命令见 `scripts/`。
 
 ## 语言
 
