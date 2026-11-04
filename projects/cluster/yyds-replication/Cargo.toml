@@ -1,0 +1,13 @@
+[package]
+name = "yyds-replication"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Replica log apply, quorum, and shard replication for YYDS"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"

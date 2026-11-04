@@ -1,0 +1,17 @@
+[package]
+name = "yyds-formats"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "On-disk codecs for YYDS (.yyds catalog, .yykv shard, YYRL replication log)"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+vos = { workspace = true }
+yyds-types = { workspace = true }
