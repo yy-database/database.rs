@@ -1,0 +1,26 @@
+[package]
+name = "yyds-gateway-pgsql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PostgreSQL wire disguise gateway for YYDS"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yyds-gateway = { workspace = true }
+yyds-types = { workspace = true }
+yyds-control = { workspace = true }
+yyds-execution = { workspace = true }
+
+[dev-dependencies]
+boost-fs = { workspace = true }
+yyds-gateway-conformance = { workspace = true }
+vos = { workspace = true }
+yyds-execution = { workspace = true }
+yyds-gateway = { workspace = true }
+yyds-kv = { workspace = true }
+yyds-types = { workspace = true }

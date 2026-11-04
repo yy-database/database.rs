@@ -16,9 +16,23 @@ members = [
     "projects/sqlite-formats",
     "projects/sqlite-storage",
     "projects/sqlite",
+    "projects/yyds-types",
+    "projects/yyds-kv",
+    "projects/yyds-catalog",
+    "projects/yyds-control",
+    "projects/yyds-execution",
+    "projects/yyds-gateways/yyds-gateway",
+    "projects/yyds-gateways/yyds-gateway-redis",
+    "projects/yyds-gateways/yyds-gateway-mysql",
+    "projects/yyds-gateways/yyds-gateway-pgsql",
+    "projects/yyds-gateways/yyds-gateway-mongo",
+    "projects/yyds-gateways/yyds-gateway-conformance",
 ]
-default-members = ["projects/yydb"]
-exclude = ["projects/.DS_Store"]
+default-members = ["projects/yydb", "projects/yyds-types"]
+exclude = [
+    "projects/.DS_Store",
+    "projects/yyds-gateways",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -30,6 +44,8 @@ repository = "https://github.com/oovm/database.rs"
 [workspace.dependencies]
 vos = { git = "https://github.com/voml/vos-language.git", rev = "387d9fc3c9a556ddb8a433c627a866a2918d0186" }
 oak-sql = { git = "https://github.com/yggdrasil-language/oaks.git", rev = "f05abe2c9e99365553871ba152e45f82d72c12d7", package = "oak-sql" }
+oak-core = { git = "https://github.com/yggdrasil-language/oaks.git", rev = "f05abe2c9e99365553871ba152e45f82d72c12d7", package = "oak-core" }
+boost-fs = { git = "https://github.com/oovm/rust-boost", rev = "9aa52745d6eae2d7748c76e4e3e6555e1f6e4b86" }
 
 yydb-types = { path = "projects/yydb-types" }
 yydb-formats = { path = "projects/yydb-formats" }
@@ -46,6 +62,14 @@ yydb-bench = { path = "projects/yydb-bench" }
 sqlite-formats = { path = "projects/sqlite-formats" }
 sqlite-storage = { path = "projects/sqlite-storage" }
 sqlite = { path = "projects/sqlite" }
+
+yyds-types = { path = "projects/yyds-types" }
+yyds-kv = { path = "projects/yyds-kv" }
+yyds-catalog = { path = "projects/yyds-catalog" }
+yyds-control = { path = "projects/yyds-control" }
+yyds-execution = { path = "projects/yyds-execution" }
+yyds-gateway = { path = "projects/yyds-gateways/yyds-gateway" }
+yyds-gateway-conformance = { path = "projects/yyds-gateways/yyds-gateway-conformance" }
 
 blake3 = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }

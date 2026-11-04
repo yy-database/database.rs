@@ -1,0 +1,18 @@
+[package]
+name = "yyds-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "YYDS key-value routing and local shard execution"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yyds-types = { workspace = true }
+yyds-kv = { workspace = true }
+
+[dev-dependencies]
+boost-fs.workspace = true
