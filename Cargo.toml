@@ -1,22 +1,26 @@
 [workspace]
 resolver = "2"
 members = [
-    "projects/*",
-    "projects/yyds-gateways/yyds-gateway",
-    "projects/yyds-gateways/yyds-gateway-redis",
-    "projects/yyds-gateways/yyds-gateway-mysql",
-    "projects/yyds-gateways/yyds-gateway-pgsql",
-    "projects/yyds-gateways/yyds-gateway-mongo",
-    "projects/yyds-gateways/yyds-gateway-conformance",
+    "projects/types/*",
+    "projects/formats/*",
+    "projects/storage/*",
+    "projects/execution/*",
+    "projects/planning/*",
+    "projects/facades/*",
+    "projects/control/*",
+    "projects/cluster/*",
+    "projects/protocol/*",
+    "projects/gateways/*",
+    "projects/adapters/*",
+    "projects/connectors/*",
+    "projects/services/*",
+    "projects/tools/*",
+    "projects/conformance/*",
 ]
 default-members = [
-    "projects/yydb",
-    "projects/yyds-types",
-    "projects/iris",
-]
-exclude = [
-    "projects/.DS_Store",
-    "projects/yyds-gateways",
+    "projects/facades/yydb",
+    "projects/facades/yyds",
+    "projects/facades/iris",
 ]
 
 [workspace.package]
@@ -35,48 +39,89 @@ oak-sql = { git = "https://github.com/yggdrasil-language/oaks.git", rev = "f05ab
 oak-core = { git = "https://github.com/yggdrasil-language/oaks.git", rev = "f05abe2c9e99365553871ba152e45f82d72c12d7", package = "oak-core" }
 boost-fs = { git = "https://github.com/oovm/rust-boost", rev = "9aa52745d6eae2d7748c76e4e3e6555e1f6e4b86" }
 
-# YYDB
-yydb-types = { path = "projects/yydb-types" }
-yydb-formats = { path = "projects/yydb-formats" }
-yydb-execution = { path = "projects/yydb-execution" }
-yydb-udf = { path = "projects/yydb-udf" }
-yydb-query = { path = "projects/yydb-query" }
-yydb-storage = { path = "projects/yydb-storage" }
-yydb-engine = { path = "projects/yydb-engine" }
-yydb-protocol = { path = "projects/yydb-protocol" }
-yydb = { path = "projects/yydb" }
-yydb-client = { path = "projects/yydb-client" }
-yydb-server = { path = "projects/yydb-server" }
-yydb-bench = { path = "projects/yydb-bench" }
-sqlite-formats = { path = "projects/sqlite-formats" }
-sqlite-storage = { path = "projects/sqlite-storage" }
-sqlite = { path = "projects/sqlite" }
+# Types
+yydb-types = { path = "projects/types/yydb-types" }
+yyds-types = { path = "projects/types/yyds-types" }
+iris-types = { path = "projects/types/iris-types" }
+iris-ir = { path = "projects/types/iris-ir" }
 
-# YYDS
-yyds-types = { path = "projects/yyds-types" }
-yyds-kv = { path = "projects/yyds-kv" }
-yyds-catalog = { path = "projects/yyds-catalog" }
-yyds-control = { path = "projects/yyds-control" }
-yyds-execution = { path = "projects/yyds-execution" }
-yyds-gateway = { path = "projects/yyds-gateways/yyds-gateway" }
-yyds-gateway-conformance = { path = "projects/yyds-gateways/yyds-gateway-conformance" }
+# Formats — SQLite is embedded (parse foreign format); YYDS owns its own on-disk codecs.
+# MySQL / PostgreSQL / Redis / Mongo disguise gateways do not introduce foreign storage formats.
+yydb-formats = { path = "projects/formats/yydb-formats" }
+sqlite-formats = { path = "projects/formats/sqlite-formats" }
+yyds-formats = { path = "projects/formats/yyds-formats" }
 
-# Iris
-iris = { path = "projects/iris" }
-iris-types = { path = "projects/iris-types" }
-iris-ir = { path = "projects/iris-ir" }
-iris-generator = { path = "projects/iris-generator", default-features = false }
-iris-wasm = { path = "projects/iris-wasm" }
-iris-host = { path = "projects/iris-host" }
-iris-connector-yydb = { path = "projects/iris-connector-yydb" }
-iris-connector-yyds = { path = "projects/iris-connector-yyds" }
-iris-adapter-mysql = { path = "projects/iris-adapter-mysql" }
-iris-adapter-postgres = { path = "projects/iris-adapter-postgres" }
-iris-adapter-sqlite = { path = "projects/iris-adapter-sqlite" }
-iris-adapter-redis = { path = "projects/iris-adapter-redis" }
-iris-adapter-d1 = { path = "projects/iris-adapter-d1" }
+# Storage
+yydb-storage = { path = "projects/storage/yydb-storage" }
+sqlite-storage = { path = "projects/storage/sqlite-storage" }
+yyds-kv = { path = "projects/storage/yyds-storage" }
 
-# Third party
+# Execution (runtime kernels — not product facades)
+yydb-engine = { path = "projects/execution/yydb-engine" }
+yydb-execution = { path = "projects/execution/yydb-execution" }
+yydb-udf = { path = "projects/execution/yydb-udf" }
+yyds-execution = { path = "projects/execution/yyds-execution" }
+
+# Planning
+yydb-query = { path = "projects/planning/yydb-query" }
+yyds-query = { path = "projects/planning/yyds-query" }
+
+# Facades (product assembly / re-export only)
+yydb = { path = "projects/facades/yydb" }
+yyds = { path = "projects/facades/yyds" }
+sqlite = { path = "projects/facades/sqlite" }
+iris = { path = "projects/facades/iris" }
+iris-wasm = { path = "projects/facades/iris-wasm" }
+iris-host = { path = "projects/facades/iris-host" }
+
+# Control plane
+yyds-catalog = { path = "projects/control/yyds-catalog" }
+yyds-control = { path = "projects/control/yyds-control" }
+
+# Cluster
+yyds-coordinator = { path = "projects/cluster/yyds-coordinator" }
+yyds-exchange = { path = "projects/cluster/yyds-exchange" }
+yyds-replication = { path = "projects/cluster/yyds-replication" }
+
+# Protocol (own wire codecs — no third-party mysql/postgres/redis clients)
+yydb-protocol = { path = "projects/protocol/yydb-protocol" }
+yyds-protocol = { path = "projects/protocol/yyds-protocol" }
+
+# Gateways (dialect service compatibility + wire client/server)
+yyds-gateway = { path = "projects/gateways/yyds-gateway" }
+yyds-gateway-mysql = { path = "projects/gateways/yyds-gateway-mysql" }
+yyds-gateway-pgsql = { path = "projects/gateways/yyds-gateway-pgsql" }
+yyds-gateway-redis = { path = "projects/gateways/yyds-gateway-redis" }
+yyds-gateway-mongo = { path = "projects/gateways/yyds-gateway-mongo" }
+
+# Adapters
+iris-adapter-mysql = { path = "projects/adapters/iris-adapter-mysql" }
+iris-adapter-postgres = { path = "projects/adapters/iris-adapter-postgres" }
+iris-adapter-sqlite = { path = "projects/adapters/iris-adapter-sqlite" }
+iris-adapter-redis = { path = "projects/adapters/iris-adapter-redis" }
+iris-adapter-d1 = { path = "projects/adapters/iris-adapter-d1" }
+
+# Connectors
+iris-connector-yydb = { path = "projects/connectors/iris-connector-yydb" }
+iris-connector-yyds = { path = "projects/connectors/iris-connector-yyds" }
+
+# Services
+yydb-client = { path = "projects/services/yydb-client" }
+yydb-server = { path = "projects/services/yydb-server" }
+yyds-client = { path = "projects/services/yyds-client" }
+yyds-server = { path = "projects/services/yyds-server" }
+
+# Tools
+yydb-bench = { path = "projects/tools/yydb-benchmark" }
+yyds-bench = { path = "projects/tools/yyds-benchmark" }
+iris-generator = { path = "projects/tools/iris-generator", default-features = false }
+
+# Conformance
+yyds-gateway-conformance = { path = "projects/conformance/gateway-conformance" }
+yydb-conformance = { path = "projects/conformance/yydb-conformance" }
+iris-conformance = { path = "projects/conformance/iris-conformance" }
+
+# Third party — SQLite embedded only. Dialect wire is owned by gateways/*.
 blake3 = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha1 = "0.11.0"
@@ -87,11 +132,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 once_cell = "1"
 thiserror = "2"
-postgres = "0.19"
-r2d2 = "0.8"
-r2d2_postgres = "0.18"
-mysql = "25"
-redis = "0.27"
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
