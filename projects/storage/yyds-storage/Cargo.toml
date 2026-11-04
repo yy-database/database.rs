@@ -1,0 +1,20 @@
+[package]
+name = "yyds-kv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Distributed shard KV engine for YYDS (.yykv)"
+publish = false
+readme = "readme.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yyds-formats = { workspace = true }
+yyds-types = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
