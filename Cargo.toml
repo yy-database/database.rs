@@ -1,14 +1,63 @@
 [workspace]
 resolver = "2"
-members = ["projects/*"]
-default-members = [
-    "projects/sub_projects",
+members = [
+    "projects/yydb",
+    "projects/yydb-types",
+    "projects/yydb-formats",
+    "projects/yydb-execution",
+    "projects/yydb-udf",
+    "projects/yydb-query",
+    "projects/yydb-storage",
+    "projects/yydb-engine",
+    "projects/yydb-protocol",
+    "projects/yydb-client",
+    "projects/yydb-server",
+    "projects/yydb-bench",
+    "projects/sqlite-formats",
+    "projects/sqlite-storage",
+    "projects/sqlite",
 ]
-exclude = [
-    "projects/.DS_Store",
-]
+default-members = ["projects/yydb"]
+exclude = ["projects/.DS_Store"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+authors = ["Yggdrasill Team <192607617@qq.com>"]
+license = "MPL-2.0"
+repository = "https://github.com/oovm/database.rs"
 
 [workspace.dependencies]
+vos = { git = "https://github.com/voml/vos-language.git", rev = "387d9fc3c9a556ddb8a433c627a866a2918d0186" }
+oak-sql = { git = "https://github.com/yggdrasil-language/oaks.git", rev = "f05abe2c9e99365553871ba152e45f82d72c12d7", package = "oak-sql" }
+
+yydb-types = { path = "projects/yydb-types" }
+yydb-formats = { path = "projects/yydb-formats" }
+yydb-execution = { path = "projects/yydb-execution" }
+yydb-udf = { path = "projects/yydb-udf" }
+yydb-query = { path = "projects/yydb-query" }
+yydb-storage = { path = "projects/yydb-storage" }
+yydb-engine = { path = "projects/yydb-engine" }
+yydb-protocol = { path = "projects/yydb-protocol" }
+yydb = { path = "projects/yydb" }
+yydb-client = { path = "projects/yydb-client" }
+yydb-server = { path = "projects/yydb-server" }
+yydb-bench = { path = "projects/yydb-bench" }
+sqlite-formats = { path = "projects/sqlite-formats" }
+sqlite-storage = { path = "projects/sqlite-storage" }
+sqlite = { path = "projects/sqlite" }
+
+blake3 = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha1 = "0.11.0"
+sha2 = "0.10"
+base64 = "0.23.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
 
 [profile.release]
 lto = true
