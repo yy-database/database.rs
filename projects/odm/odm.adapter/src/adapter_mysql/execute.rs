@@ -9,7 +9,9 @@ use std::collections::HashSet;
 use database_query::ir::PhysicalPlan;
 use odm_types::{Row, RowWrite};
 
-use crate::{Error, Result, Session};
+use crate::{Error, Result};
+
+use super::Session;
 
 pub(crate) fn execute_plan(_conn: &mut Session, _plan: &PhysicalPlan, _uuid_fields: &HashSet<(String, String)>) -> Result<Vec<Row>> {
     Err(Error::Unsupported("MySQL adapter execute_plan awaits yyds-gateway-mysql::client COM_QUERY (third-party mysql crate removed)".into()))

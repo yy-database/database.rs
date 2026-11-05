@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use sqlite::{ENGINE_LIBRARY_VERSION, ENGINE_LIBRARY_VERSION_NUMBER};
+use database_formats::sqlite::{ENGINE_LIBRARY_VERSION, ENGINE_LIBRARY_VERSION_NUMBER};
 
 /// One SQLite storage-class value with lossless integer and binary payloads.
 #[derive(Debug, Clone, PartialEq)]

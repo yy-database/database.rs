@@ -15,6 +15,8 @@ use std::{
     time::Duration,
 };
 
+use crate::{Error, Result};
+
 use database_client::redis::Client;
 use database_query::ir::{CommitToken, ConsistencyIntent, DEFAULT_COMMIT_SHARD, IrVersion, OutboxRecord, PhysicalOp, PhysicalPlan};
 use odm_types::{AppliedWatermarkState, CacheWatermarkProbe, CapabilitySet, CompensationBudget, QueryCaps, WriteCaps};
@@ -286,44 +288,12 @@ pub fn parse_redis_url(url: &str) -> Result<(SocketAddr, Duration)> {
     let defaulted = if hostport.contains(':') { hostport.to_owned() } else { format!("{hostport}:6379") };
     let address = defaulted
         .to_socket_addrs()
-        .map_err(|e| Error::Wire(yyds_types::Error::Io(e)))?
+        .map_err(|e| Error::Wire(database_types::Error::Io(e)))?
         .next()
         .ok_or_else(|| Error::Policy(format!("redis URL host did not resolve: {url}")))?;
     let _ = timeout;
     Ok((address, timeout))
 }
-
-/// Adapter errors.
-#[derive(Debug)]
-pub enum Error {
-    /// YYDS Redis wire client failure.
-    Wire(yyds_types::Error),
-    /// Capability / mapping policy.
-    Policy(String),
-    /// Operation not supported on Redis keyspace adapter.
-    Unsupported(String),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Wire(e) => write!(f, "{e}"),
-            Self::Policy(s) | Self::Unsupported(s) => write!(f, "{s}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Wire(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-/// Result alias.
-pub type Result<T> = std::result::Result<T, Error>;
 
 impl CacheWatermarkProbe for RedisSource {
     fn probe_watermark(&self, shard: Option<&str>) -> std::result::Result<Option<AppliedWatermarkState>, String> {

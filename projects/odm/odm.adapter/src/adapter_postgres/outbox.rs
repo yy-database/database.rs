@@ -8,7 +8,9 @@ use database_client::pgsql::Session;
 use database_query::ir::{CommitToken, DEFAULT_COMMIT_SHARD, OutboxAppend, OutboxEffect, OutboxRecord};
 use odm_types::{RowWrite, Value};
 
-use crate::{Error, Result, execute};
+use crate::{Error, Result};
+
+use super::execute;
 
 /// True when a physical table is Iris authority meta.
 pub(crate) fn is_meta_table(name: &str) -> bool {

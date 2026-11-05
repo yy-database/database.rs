@@ -7,7 +7,9 @@
 use database_query::ir::PhysicalPlan;
 use odm_types::{Row, RowWrite, Value};
 
-use crate::{Error, Result, Session};
+use crate::{Error, Result};
+
+use super::Session;
 
 pub(crate) fn execute_plan(_client: &mut Session, _plan: &PhysicalPlan) -> Result<Vec<Row>> {
     Err(Error::Unsupported(
