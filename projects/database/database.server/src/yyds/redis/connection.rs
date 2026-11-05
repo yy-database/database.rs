@@ -69,11 +69,29 @@ struct QueuedCommand {
     request: OwnedRequest,
 }
 
+/// One key pinned by `WATCH`, together with the value it had when the watch was taken.
+///
+/// The snapshot *is* the version used for optimistic locking: `EXEC` compares it against
+/// the current value through the executor and abandons the transaction on any difference.
+/// Comparing bytes (rather than a server-side revision counter) keeps the watch state
+/// session-scoped without adding a revision read to the KV contract, at the cost of not
+/// noticing a write that stores byte-identical content.
+#[derive(Debug, Clone)]
+struct WatchedKey {
+    /// Namespace (`SELECT` target) the key was watched in. Watches are per-database, like
+    /// upstream Redis.
+    namespace: Namespace,
+    /// Opaque key bytes.
+    key: Vec<u8>,
+    /// Value observed at watch time (`None` means the key was absent).
+    snapshot: Option<Vec<u8>>,
+}
+
 /// Per-connection state carried across RESP2 frames.
 ///
-/// Session-scoped by design: transaction queueing and the client name belong to a single
-/// connection. Key expiry is *not* here — it is stored with each KV record and therefore
-/// shared by every connection and durable across restarts.
+/// Session-scoped by design: transaction queueing, the watch list and the client name
+/// belong to a single connection. Key expiry is *not* here — it is stored with each KV
+/// record and therefore shared by every connection and durable across restarts.
 #[derive(Debug)]
 struct ConnectionState {
     /// Protocol version negotiated through `HELLO`. Starts at 2 and becomes 3 once the
@@ -86,11 +104,14 @@ struct ConnectionState {
     /// Name assigned by the most recent `CLIENT SETNAME`, reported by
     /// `CLIENT GETNAME`. Session-scoped, like the upstream client name.
     client_name: Option<Vec<u8>>,
+    /// Keys pinned by `WATCH`, in first-watch order. Cleared by `UNWATCH`, `DISCARD`
+    /// and every `EXEC`, including an aborted one.
+    watched: Vec<WatchedKey>,
 }
 
 impl Default for ConnectionState {
     fn default() -> Self {
-        Self { protocol: 2, in_multi: false, queue: Vec::new(), client_name: None }
+        Self { protocol: 2, in_multi: false, queue: Vec::new(), client_name: None, watched: Vec::new() }
     }
 }
 
@@ -358,6 +379,58 @@ fn handle_client(stream: &mut dyn Write, request: &Request<'_>, state: &mut Conn
     )
 }
 
+/// `WATCH key [key ...]` — pins each key's current value as the version `EXEC` validates.
+///
+/// A repeated `WATCH` of an already-pinned key keeps the original snapshot, and a missing
+/// key is pinned as absent, so a later insert also aborts the transaction. Watching inside
+/// `MULTI` is rejected without touching the existing watch list, like upstream Redis.
+fn handle_watch(
+    stream: &mut dyn Write,
+    request: &Request<'_>,
+    executor: Option<&dyn KeyValueExecutor>,
+    namespace: &Namespace,
+    state: &mut ConnectionState,
+) -> io::Result<()> {
+    let count = request.arguments.len();
+    if count < 2 {
+        stream.write_all(b"-ERR wrong number of arguments for 'watch' command\r\n")?;
+        return Ok(());
+    }
+    if state.in_multi {
+        stream.write_all(b"-ERR WATCH inside MULTI is not allowed\r\n")?;
+        return Ok(());
+    }
+    let Some(executor) = executor
+    else {
+        stream.write_all(b"-ERR unsupported command\r\n")?;
+        return Ok(());
+    };
+    for key in &request.arguments[1..] {
+        if state.watched.iter().any(|entry| entry.namespace == *namespace && entry.key.as_slice() == *key) {
+            continue;
+        }
+        let snapshot = match key_snapshot(executor, namespace, key) {
+            Ok(snapshot) => snapshot,
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(());
+            }
+        };
+        state.watched.push(WatchedKey { namespace: namespace.clone(), key: key.to_vec(), snapshot });
+    }
+    stream.write_all(b"+OK\r\n")
+}
+
+/// `UNWATCH` — forgets every pinned key without touching the transaction queue.
+fn handle_unwatch(stream: &mut dyn Write, count: usize, state: &mut ConnectionState) -> io::Result<()> {
+    if count != 1 {
+        stream.write_all(b"-ERR wrong number of arguments for 'unwatch' command\r\n")?;
+        return Ok(());
+    }
+    state.watched.clear();
+    stream.write_all(b"+OK\r\n")
+}
+
 fn respond(
     stream: &mut dyn Write,
     request: &Request<'_>,
@@ -395,6 +468,31 @@ fn respond(
             stream.write_all(b"-ERR EXEC without MULTI\r\n")?;
             return Ok(true);
         }
+        // Optimistic locking: any write to a watched key since WATCH abandons the whole
+        // transaction before a single queued command runs. The reply is the nil array.
+        if !state.watched.is_empty() {
+            let modified = match executor {
+                Some(executor) => watched_keys_modified(executor, &state.watched),
+                None => Ok(true),
+            };
+            match modified {
+                Ok(false) => {}
+                Ok(true) => {
+                    write_null_array(stream, state.protocol)?;
+                    state.in_multi = false;
+                    state.queue.clear();
+                    state.watched.clear();
+                    return Ok(true);
+                }
+                Err(message) => {
+                    write_error(stream, &message)?;
+                    state.in_multi = false;
+                    state.queue.clear();
+                    state.watched.clear();
+                    return Ok(true);
+                }
+            }
+        }
         execute_transaction(stream, executor, namespace, state)?;
         return Ok(true);
     }
@@ -410,7 +508,30 @@ fn respond(
         }
         state.in_multi = false;
         state.queue.clear();
+        state.watched.clear();
         stream.write_all(b"+OK\r\n")?;
+        return Ok(true);
+    }
+
+    // ---- Optimistic locking control: WATCH / UNWATCH. `WATCH` must run before `MULTI`,
+    // while `UNWATCH` inside a `MULTI` is queued like any other command, as upstream does.
+    if command.eq_ignore_ascii_case(b"WATCH") {
+        handle_watch(stream, request, executor, namespace, state)?;
+        return Ok(true);
+    }
+
+    if command.eq_ignore_ascii_case(b"UNWATCH") {
+        if state.in_multi {
+            if count != 1 {
+                stream.write_all(b"-ERR wrong number of arguments for 'unwatch' command\r\n")?;
+                return Ok(true);
+            }
+            let owned = OwnedRequest { arguments: request.arguments.iter().map(|arg| arg.to_vec()).collect() };
+            state.queue.push(QueuedCommand { request: owned });
+            stream.write_all(b"+QUEUED\r\n")?;
+            return Ok(true);
+        }
+        handle_unwatch(stream, count, state)?;
         return Ok(true);
     }
 
@@ -1153,6 +1274,8 @@ fn execute_transaction(
     let queued = std::mem::take(&mut state.queue);
     let protocol = state.protocol;
     state.in_multi = false;
+    // `EXEC` always releases the watched keys, whether the queue was non-empty or not.
+    state.watched.clear();
 
     write!(stream, "*{count}\r\n")?;
 
@@ -1440,6 +1563,37 @@ fn write_bulk(stream: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
 /// so the choice has to follow the connection state instead of a fixed literal.
 fn write_null(stream: &mut dyn Write, protocol: u8) -> io::Result<()> {
     stream.write_all(if protocol == 3 { b"_\r\n" as &[u8] } else { b"$-1\r\n" })
+}
+
+/// Writes the nil array `EXEC` replies with when a watched key changed.
+///
+/// RESP2 spells it `*-1\r\n` (the null array, not the null bulk that `write_null`
+/// emits). RESP3 replaced it with the dedicated null type `_\r\n`.
+fn write_null_array(stream: &mut dyn Write, protocol: u8) -> io::Result<()> {
+    stream.write_all(if protocol == 3 { b"_\r\n" as &[u8] } else { b"*-1\r\n" })
+}
+
+/// Reads the current value of one key, which is the version compared by `WATCH`.
+fn key_snapshot(executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let command = KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::Get };
+    match executor.execute(None, command) {
+        Ok(KeyValueResult::Get(value)) => Ok(value),
+        Ok(_) => Err("WATCH executor returned unexpected result".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Compares every watched snapshot against the current value.
+///
+/// `true` means at least one watched key was written (or expired) after the watch was
+/// taken, so the caller must abandon the transaction instead of executing it.
+fn watched_keys_modified(executor: &dyn KeyValueExecutor, watched: &[WatchedKey]) -> Result<bool, String> {
+    for entry in watched {
+        if key_snapshot(executor, &entry.namespace, &entry.key)? != entry.snapshot {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Writes the `HELLO` reply in the protocol version the client asked for:
