@@ -11,6 +11,11 @@ use std::{collections::BTreeMap, error, fmt, io, result, sync::Arc};
 /// Catalog uniqueness metadata.
 pub mod constraint;
 
+/// Machine-readable corruption reasons.
+pub mod reason;
+
+pub use reason::ReasonCode;
+
 /// Exact calendar, clock, instant, and fixed-point decimal scalars.
 pub mod scalar;
 
@@ -93,6 +98,13 @@ pub enum Error {
     Io(io::Error),
     /// File contents do not match the expected layout.
     Corrupt(&'static str),
+    /// File contents do not match the expected layout, with a classified reason.
+    CorruptReason {
+        /// Machine-readable failure class.
+        reason: ReasonCode,
+        /// Human-readable detail.
+        message: &'static str,
+    },
     /// Stored schema version does not match the caller’s expectation.
     SchemaConflict {
         /// Expected schema version.
@@ -296,6 +308,7 @@ impl fmt::Display for Error {
         match self {
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::Corrupt(message) => write!(f, "corrupt database file: {message}"),
+            Self::CorruptReason { reason, message } => write!(f, "corrupt database file ({reason}): {message}"),
             Self::SchemaConflict { expected, found } => {
                 write!(f, "schema version conflict: expected {expected}, found {found}")
             }
@@ -371,7 +384,7 @@ impl Error {
     pub fn code(&self) -> &str {
         match self {
             Self::Io(_) => "database.io",
-            Self::Corrupt(_) => "database.corrupt",
+            Self::Corrupt(_) | Self::CorruptReason { .. } => "database.corrupt",
             Self::SchemaConflict { .. } => "database.schema.conflict",
             Self::UdfNotFound { .. } => "database.udf.not_found",
             Self::UdfArity { .. } => "database.udf.arity",
@@ -405,6 +418,41 @@ impl Error {
         }
     }
 
+    /// Stable diagnostic code rewritten under a product namespace.
+    ///
+    /// The facade keeps [`Self::code`] reporting `database.*`. A product host
+    /// that ships this crate under another name (for example `yydb.*`) uses
+    /// this method so its diagnostics stay distinguishable without forking the
+    /// error set. An empty `product` leaves the code unchanged, and a
+    /// [`Self::Remote`] error always reports the peer code verbatim.
+    pub fn code_with_prefix(&self, product: &str) -> String {
+        match self {
+            Self::Remote { code, .. } => code.clone(),
+            _ => {
+                let code = self.code();
+                if product.is_empty() {
+                    return code.to_owned();
+                }
+                match code.strip_prefix("database") {
+                    Some(rest) => format!("{product}{rest}"),
+                    None => code.to_owned(),
+                }
+            }
+        }
+    }
+
+    /// Machine-readable corruption reason when the variant carries one.
+    ///
+    /// Untyped [`Self::Corrupt`] errors predate classification and answer
+    /// `None`. Decoders that know why the bytes were rejected use
+    /// [`ReasonCode`] and answer `Some`.
+    pub fn reason(&self) -> Option<ReasonCode> {
+        match self {
+            Self::CorruptReason { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+
     /// High-level operation category for diagnostic catalog routing.
     ///
     /// One of: `"io"` / `"schema"` / `"udf"` / `"object"` / `"cas"` /
@@ -414,7 +462,7 @@ impl Error {
     pub fn operation(&self) -> &'static str {
         match self {
             Self::Io(_) => "io",
-            Self::Corrupt(_) => "object",
+            Self::Corrupt(_) | Self::CorruptReason { .. } => "object",
             Self::SchemaConflict { .. } | Self::Schema { .. } => "schema",
             Self::UdfNotFound { .. } | Self::UdfArity { .. } | Self::Udf { .. } | Self::UdfVersionMismatch { .. } => "udf",
             Self::ObjectNotFound { .. } | Self::ObjectCorrupt { .. } => "object",
@@ -451,6 +499,9 @@ impl Error {
         let p: Vec<(&'static str, String)> = match self {
             Self::Io(_) | Self::Corrupt(_) | Self::Unsupported(_) | Self::SessionClosed => {
                 return None;
+            }
+            Self::CorruptReason { reason, message } => {
+                vec![("reason", reason.as_str().to_owned()), ("detail", (*message).to_owned())]
             }
             Self::AuthTokenInvalid { message }
             | Self::AuthSessionExpired { message }
@@ -724,3 +775,34 @@ mod value;
 
 pub use object::*;
 pub use value::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_keeps_the_database_namespace() {
+        assert_eq!(Error::Corrupt("broken").code(), "database.corrupt");
+    }
+
+    #[test]
+    fn code_with_prefix_rewrites_the_product_namespace() {
+        assert_eq!(Error::Corrupt("broken").code_with_prefix("yydb"), "yydb.corrupt");
+        assert_eq!(Error::SessionClosed.code_with_prefix("yydb"), "yydb.session.closed");
+        assert_eq!(Error::Corrupt("broken").code_with_prefix(""), "database.corrupt");
+    }
+
+    #[test]
+    fn remote_codes_are_never_rewritten() {
+        let remote = Error::Remote { code: "yydb.session.closed".to_owned(), message: "closed".to_owned() };
+        assert_eq!(remote.code_with_prefix("postgres"), "yydb.session.closed");
+    }
+
+    #[test]
+    fn structured_corruption_exposes_a_reason() {
+        let error = Error::CorruptReason { reason: ReasonCode::ChecksumMismatch, message: "bad checksum" };
+        assert_eq!(error.reason(), Some(ReasonCode::ChecksumMismatch));
+        assert_eq!(error.code(), "database.corrupt");
+        assert!(Error::Corrupt("broken").reason().is_none());
+    }
+}

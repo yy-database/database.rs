@@ -185,6 +185,23 @@ pub fn decode(
     Ok((schema, routing_epoch, shards, resolved_contract, owners))
 }
 
+/// Decode a catalog that registers exactly one shard and return its id.
+///
+/// Convenience for hosts that open one shard per store: the single registration
+/// is validated with [`ShardId::try_new`] instead of being joined raw to a path.
+pub fn decode_catalog_shard_id(bytes: &[u8]) -> Result<ShardId> {
+    let (_, _, shards, _, _) = decode(bytes)?;
+    let mut shards = shards.into_iter();
+    let Some(shard) = shards.next()
+    else {
+        return Err(Error::Unsupported("catalog registers no shard"));
+    };
+    if shards.next().is_some() {
+        return Err(Error::Unsupported("catalog registers more than one shard"));
+    }
+    ShardId::try_new(shard.0)
+}
+
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
     let mut buf = [0u8; 4];
     read_exact(cursor, &mut buf)?;
@@ -204,4 +221,27 @@ fn read_exact(cursor: &mut Cursor<&[u8]>, buf: &mut [u8]) -> Result<()> {
             _ => "catalog read failed",
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_shard_id_roundtrips_through_the_catalog() {
+        let bytes = encode(None, None, &[ShardId("shard-1".to_owned())], None, &[]).expect("encode");
+        assert_eq!(decode_catalog_shard_id(&bytes).expect("decode").0, "shard-1");
+    }
+
+    #[test]
+    fn single_shard_id_requires_exactly_one_registration() {
+        let bytes = encode(None, None, &[], None, &[]).expect("encode");
+        assert!(matches!(decode_catalog_shard_id(&bytes), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn single_shard_id_rejects_a_path_like_id() {
+        let bytes = encode(None, None, &[ShardId("..".to_owned())], None, &[]).expect("encode");
+        assert!(matches!(decode_catalog_shard_id(&bytes), Err(Error::InvalidShardId { .. })));
+    }
 }

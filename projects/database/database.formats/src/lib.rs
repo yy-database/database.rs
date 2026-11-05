@@ -5,3 +5,6 @@
 pub mod yy;
 /// SQLite format-3 只读解析。
 pub mod sqlite;
+
+/// Resolved VOS contract carried by `.yyds` catalogs.
+pub use vos::types::ResolvedContract;

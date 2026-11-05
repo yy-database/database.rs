@@ -175,3 +175,21 @@ fn sweep_uses_the_supplied_clock_and_does_not_resurrect_records() {
     assert!(shard.get(&gone).unwrap().is_none(), "physical deletion is irreversible");
     assert!(shard.get(&later).unwrap().is_some(), "a future deadline survives a rollback");
 }
+
+#[test]
+fn namespaces_len_and_flush_are_scoped_to_one_namespace() {
+    let mut shard = MemoryShard::new();
+    shard.put(Key::new("a", b"1"), StoredValue::Inline(InlineValue(b"v1".to_vec()))).unwrap();
+    shard.put(Key::new("a", b"2"), StoredValue::Inline(InlineValue(b"v2".to_vec()))).unwrap();
+    shard.put(Key::new("b", b"1"), StoredValue::Inline(InlineValue(b"v3".to_vec()))).unwrap();
+
+    assert_eq!(shard.namespaces().unwrap(), vec![Namespace("a".into()), Namespace("b".into())]);
+    assert_eq!(shard.len(&Namespace("a".into())).unwrap(), 2);
+    assert_eq!(shard.len(&Namespace("b".into())).unwrap(), 1);
+    assert_eq!(shard.len(&Namespace("missing".into())).unwrap(), 0);
+
+    assert_eq!(shard.flush(&Namespace("a".into())).unwrap(), 2);
+    assert_eq!(shard.len(&Namespace("a".into())).unwrap(), 0);
+    assert_eq!(shard.len(&Namespace("b".into())).unwrap(), 1);
+    assert_eq!(shard.namespaces().unwrap(), vec![Namespace("b".into())]);
+}

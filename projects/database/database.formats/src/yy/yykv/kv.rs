@@ -6,6 +6,7 @@ use std::{
 };
 
 use database_types::cluster::{Error, Result};
+use database_types::ReasonCode;
 
 use super::{InlineValue, Key, ObjectRef, Record, StoredValue};
 
@@ -64,31 +65,78 @@ pub fn encode_snapshot(records: &BTreeMap<Key, Record>, next_revision: u64) -> R
     Ok(bytes)
 }
 
-/// Decode `.yykv` bytes into a [`Snapshot`].
+/// Decode `.yykv` bytes into a [`Snapshot`], accepting legacy revision layouts.
+///
+/// Use [`decode_snapshot_strict`] when the caller must reject pre-contract
+/// shards instead of normalizing them.
 pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
+    decode_with(bytes, RevisionMode::LegacyTolerant, ValueMode::Any)
+}
+
+/// Decode `.yykv` bytes while enforcing the PostgreSQL revision contract.
+///
+/// Rejects legacy v2 magic, an empty shard recorded as revision `0`, and any
+/// record sitting on `next_revision`. Corruption carries [`ReasonCode`] so a
+/// host can branch on the failure class without parsing text.
+pub fn decode_snapshot_strict(bytes: &[u8]) -> Result<Snapshot> {
+    decode_with(bytes, RevisionMode::Contract, ValueMode::Any)
+}
+
+/// Strict decode that also rejects object-backed values.
+///
+/// Use this on a node that has no object store bound: an inline-only reader
+/// must not silently treat a hash reference as row data.
+pub fn decode_snapshot_inline_only(bytes: &[u8]) -> Result<Snapshot> {
+    decode_with(bytes, RevisionMode::Contract, ValueMode::InlineOnly)
+}
+
+#[derive(Clone, Copy)]
+enum RevisionMode {
+    Contract,
+    LegacyTolerant,
+}
+
+#[derive(Clone, Copy)]
+enum ValueMode {
+    Any,
+    InlineOnly,
+}
+
+fn corrupt(reason: ReasonCode, message: &'static str) -> Error {
+    Error::CorruptReason { reason, message }
+}
+
+fn decode_with(bytes: &[u8], revision_mode: RevisionMode, value_mode: ValueMode) -> Result<Snapshot> {
     let mut cursor = Cursor::new(bytes);
     let mut magic = [0_u8; MAGIC.len()];
     read_exact(&mut cursor, &mut magic)?;
     if magic == LEGACY_MAGIC {
-        return Err(Error::Corrupt("legacy yykv v2 snapshot has no checksum: delete the shard file and let the node recreate it"));
+        return Err(corrupt(
+            ReasonCode::LegacyVersion,
+            "legacy yykv v2 snapshot has no checksum: delete the shard file and let the node recreate it",
+        ));
     }
     if magic != MAGIC {
-        return Err(Error::Corrupt("unknown yykv header"));
+        return Err(corrupt(ReasonCode::BadMagic, "unknown yykv header"));
     }
     let expected_checksum = read_u64(&mut cursor)?;
     let body_start = MAGIC.len() + 8;
-    let body = bytes.get(body_start..).ok_or(Error::Corrupt("truncated yykv checksum"))?;
+    let body = bytes.get(body_start..).ok_or_else(|| corrupt(ReasonCode::Truncated, "truncated yykv checksum"))?;
     if checksum(body) != expected_checksum {
-        return Err(Error::Corrupt("yykv checksum mismatch"));
+        return Err(corrupt(ReasonCode::ChecksumMismatch, "yykv checksum mismatch"));
     }
     let mut cursor = Cursor::new(body);
     let mut next_revision = read_u64(&mut cursor)?;
+    if next_revision == 0 && matches!(revision_mode, RevisionMode::Contract) {
+        return Err(corrupt(ReasonCode::LegacyVersion, "legacy yykv revision layout: next_revision is zero"));
+    }
     let count = read_u32(&mut cursor)? as usize;
     let mut records = BTreeMap::new();
     let mut revisions = HashSet::with_capacity(count);
     let mut legacy_revision = false;
     for _ in 0..count {
-        let namespace = String::from_utf8(read_bytes(&mut cursor)?).map_err(|_| Error::Corrupt("shard namespace utf8"))?;
+        let namespace = String::from_utf8(read_bytes(&mut cursor)?)
+            .map_err(|_| corrupt(ReasonCode::UnknownTag, "shard namespace utf8"))?;
         let key = read_bytes(&mut cursor)?;
         let revision = read_u64(&mut cursor)?;
         if revision == 0 || revision > next_revision || !revisions.insert(revision) {
@@ -98,22 +146,31 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
         // `next_revision` as the last allocated revision, so its newest
         // record can match it. Normalize that on read.
         legacy_revision |= revision == next_revision;
+        if legacy_revision && matches!(revision_mode, RevisionMode::Contract) {
+            return Err(corrupt(ReasonCode::LegacyVersion, "legacy yykv revision layout: record sits on next_revision"));
+        }
         let encoded_expiry = read_u64(&mut cursor)?;
         let expires_at = (encoded_expiry != 0).then_some(encoded_expiry as i64);
         let value = match read_u8(&mut cursor)? {
             0 => StoredValue::Inline(InlineValue(read_bytes(&mut cursor)?)),
-            1 => StoredValue::Object(ObjectRef {
-                hash_hex: String::from_utf8(read_bytes(&mut cursor)?).map_err(|_| Error::Corrupt("shard object hash utf8"))?,
-            }),
-            _ => return Err(Error::Corrupt("invalid shard value kind")),
+            1 => {
+                if matches!(value_mode, ValueMode::InlineOnly) {
+                    return Err(Error::Unsupported("yykv object-backed value requires an object store"));
+                }
+                StoredValue::Object(ObjectRef {
+                    hash_hex: String::from_utf8(read_bytes(&mut cursor)?)
+                        .map_err(|_| corrupt(ReasonCode::UnknownTag, "shard object hash utf8"))?,
+                })
+            }
+            _ => return Err(corrupt(ReasonCode::UnknownTag, "invalid shard value kind")),
         };
         let record = Record { key: Key::new(namespace, key), value, revision, expires_at };
         if records.insert(record.key.clone(), record).is_some() {
-            return Err(Error::Corrupt("duplicate shard key"));
+            return Err(corrupt(ReasonCode::DuplicateKey, "duplicate shard key"));
         }
     }
     if cursor.position() != body.len() as u64 {
-        return Err(Error::Corrupt("trailing shard bytes"));
+        return Err(corrupt(ReasonCode::TrailingBytes, "trailing shard bytes"));
     }
     if next_revision == 0 {
         // Legacy empty shard: the next allocation was stored as `0`.
@@ -169,9 +226,9 @@ fn read_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>> {
     let length = read_u32(cursor)? as usize;
     let position = cursor.position() as usize;
-    let end = position.checked_add(length).ok_or(Error::Corrupt("shard length overflow"))?;
+    let end = position.checked_add(length).ok_or_else(|| corrupt(ReasonCode::Truncated, "shard length overflow"))?;
     if end > cursor.get_ref().len() {
-        return Err(Error::Corrupt("unexpected shard eof"));
+        return Err(corrupt(ReasonCode::Truncated, "unexpected shard eof"));
     }
     let mut value = vec![0_u8; length];
     read_exact(cursor, &mut value)?;
@@ -180,7 +237,12 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>> {
 
 fn read_exact(cursor: &mut Cursor<&[u8]>, bytes: &mut [u8]) -> Result<()> {
     cursor.read_exact(bytes).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::UnexpectedEof { Error::Corrupt("unexpected shard eof") } else { Error::Io(error) }
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            corrupt(ReasonCode::Truncated, "unexpected shard eof")
+        }
+        else {
+            Error::Io(error)
+        }
     })
 }
 
@@ -228,5 +290,92 @@ mod tests {
     fn new_format_next_revision_is_kept() {
         let snapshot = decode_snapshot(&wrap(legacy_body(2, Some(1)))).expect("decode");
         assert_eq!(snapshot.next_revision, 2);
+    }
+
+    fn push_record(body: &mut Vec<u8>, namespace: &str, key: &[u8], revision: u64, tag: u8, value: &[u8]) {
+        write_bytes(body, namespace.as_bytes()).expect("namespace");
+        write_bytes(body, key).expect("key");
+        body.extend_from_slice(&revision.to_le_bytes());
+        body.extend_from_slice(&0_u64.to_le_bytes());
+        body.push(tag);
+        if tag == 0 || tag == 1 {
+            write_bytes(body, value).expect("value");
+        }
+    }
+
+    fn reason_of(bytes: &[u8]) -> ReasonCode {
+        match decode_snapshot_strict(bytes) {
+            Err(error) => error.reason().expect("decoder must classify the failure"),
+            Ok(_) => panic!("strict decode must reject corrupted bytes"),
+        }
+    }
+
+    #[test]
+    fn strict_decode_rejects_legacy_layout() {
+        assert_eq!(reason_of(&wrap(legacy_body(0, None))), ReasonCode::LegacyVersion);
+        assert_eq!(reason_of(&wrap(legacy_body(1, Some(1)))), ReasonCode::LegacyVersion);
+    }
+
+    #[test]
+    fn strict_decode_classifies_bad_magic() {
+        assert_eq!(reason_of(b"XXXX\x03not-a-shard"), ReasonCode::BadMagic);
+    }
+
+    #[test]
+    fn strict_decode_classifies_legacy_magic() {
+        let mut bytes = LEGACY_MAGIC.to_vec();
+        bytes.extend_from_slice(&[0; 8]);
+        assert_eq!(reason_of(&bytes), ReasonCode::LegacyVersion);
+    }
+
+    #[test]
+    fn strict_decode_classifies_truncation() {
+        assert_eq!(reason_of(MAGIC), ReasonCode::Truncated);
+        let mut body = Vec::new();
+        body.extend_from_slice(&2_u64.to_le_bytes());
+        assert_eq!(reason_of(&wrap(body)), ReasonCode::Truncated);
+    }
+
+    #[test]
+    fn strict_decode_classifies_a_checksum_mismatch() {
+        let mut bytes = wrap(legacy_body(2, None));
+        let body_start = MAGIC.len() + 8;
+        bytes[body_start] ^= 0xff;
+        assert_eq!(reason_of(&bytes), ReasonCode::ChecksumMismatch);
+    }
+
+    #[test]
+    fn strict_decode_classifies_unknown_tags() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2_u64.to_le_bytes());
+        write_count(&mut body, 1).expect("count");
+        push_record(&mut body, "ns", b"k", 1, 9, b"");
+        assert_eq!(reason_of(&wrap(body)), ReasonCode::UnknownTag);
+    }
+
+    #[test]
+    fn strict_decode_classifies_duplicate_keys() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3_u64.to_le_bytes());
+        write_count(&mut body, 2).expect("count");
+        push_record(&mut body, "ns", b"k", 1, 0, b"a");
+        push_record(&mut body, "ns", b"k", 2, 0, b"b");
+        assert_eq!(reason_of(&wrap(body)), ReasonCode::DuplicateKey);
+    }
+
+    #[test]
+    fn strict_decode_classifies_trailing_bytes() {
+        let mut body = legacy_body(2, None);
+        body.push(0);
+        assert_eq!(reason_of(&wrap(body)), ReasonCode::TrailingBytes);
+    }
+
+    #[test]
+    fn inline_only_decode_rejects_object_values() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2_u64.to_le_bytes());
+        write_count(&mut body, 1).expect("count");
+        push_record(&mut body, "ns", b"k", 1, 1, b"hash");
+        assert!(matches!(decode_snapshot_inline_only(&wrap(body)), Err(Error::Unsupported(_))));
     }
 }

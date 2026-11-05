@@ -97,6 +97,33 @@ pub trait KvStore {
         let _ = (now_unix_ms, budget);
         Err(Error::Unsupported("store does not provide expiry reclamation"))
     }
+
+    /// Namespaces that hold at least one record, sorted ascending.
+    ///
+    /// A shard can host several namespaces; hosts enumerate them before
+    /// reporting sizes or flushing one boundary. Stores without enumeration
+    /// keep the default `Error::Unsupported`.
+    fn namespaces(&self) -> Result<Vec<Namespace>> {
+        Err(Error::Unsupported("store does not enumerate namespaces"))
+    }
+
+    /// Number of live records inside `namespace`.
+    ///
+    /// Expired records count as absent, matching [`Self::get`] and [`Self::scan`].
+    fn len(&self, namespace: &Namespace) -> Result<usize> {
+        let _ = namespace;
+        Err(Error::Unsupported("store does not report namespace length"))
+    }
+
+    /// Removes every record inside `namespace` and returns how many were removed.
+    ///
+    /// Revisions continue from the shard counter so a later write never reuses
+    /// a flushed revision. File-backed stores persist through the same durable
+    /// boundary as [`Self::commit_changes`].
+    fn flush(&mut self, namespace: &Namespace) -> Result<usize> {
+        let _ = namespace;
+        Err(Error::Unsupported("store does not flush namespaces"))
+    }
 }
 
 /// In-memory shard used by unit tests and early integrations.
@@ -161,6 +188,23 @@ impl KvStore for MemoryShard {
         }
         Ok(SweepReport { examined, reclaimed })
     }
+
+    fn namespaces(&self) -> Result<Vec<Namespace>> {
+        Ok(namespaces_of(&self.records))
+    }
+
+    fn len(&self, namespace: &Namespace) -> Result<usize> {
+        let now = now_unix_ms();
+        Ok(self.records.values().filter(|record| record.key.namespace == *namespace && !record.is_expired_at(now)).count())
+    }
+
+    fn flush(&mut self, namespace: &Namespace) -> Result<usize> {
+        let keys: Vec<Key> = self.records.keys().filter(|key| key.namespace == *namespace).cloned().collect();
+        for key in &keys {
+            self.records.remove(key);
+        }
+        Ok(keys.len())
+    }
 }
 
 /// File-backed shard storing one namespace.using the native `.yykv` snapshot format.
@@ -191,6 +235,20 @@ impl FileShard {
             shard.persist()?;
             Ok(shard)
         }
+    }
+
+    /// Opens a shard that must already exist.
+    ///
+    /// Unlike [`Self::open`], a missing file is `Error::NotFound` instead of
+    /// being created. Hosts that only read existing data use this so a typo in
+    /// a shard path cannot silently install an empty shard.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(Error::NotFound { key: path.display().to_string() });
+        }
+        let bytes = fs::read(&path)?;
+        decode(&path, &bytes)
     }
 
     /// Returns the backing `.yykv` path.
@@ -317,6 +375,37 @@ impl KvStore for FileShard {
         self.sweep_cursor = if capped { next_cursor.or_else(|| self.sweep_cursor.clone()) } else { None };
         Ok(SweepReport { examined, reclaimed })
     }
+
+    fn namespaces(&self) -> Result<Vec<Namespace>> {
+        Ok(namespaces_of(&self.records))
+    }
+
+    fn len(&self, namespace: &Namespace) -> Result<usize> {
+        let now = now_unix_ms();
+        Ok(self.records.values().filter(|record| record.key.namespace == *namespace && !record.is_expired_at(now)).count())
+    }
+
+    fn flush(&mut self, namespace: &Namespace) -> Result<usize> {
+        let changes: Vec<ShardChange> = self
+            .records
+            .keys()
+            .filter(|key| key.namespace == *namespace)
+            .map(|key| ShardChange::Delete { key: key.clone() })
+            .collect();
+        let removed = changes.len();
+        if removed > 0 {
+            self.commit_changes(changes)?;
+        }
+        Ok(removed)
+    }
+}
+
+/// Distinct namespaces present in a shard, sorted ascending.
+fn namespaces_of(records: &BTreeMap<Key, Record>) -> Vec<Namespace> {
+    let mut namespaces: Vec<Namespace> = records.keys().map(|key| key.namespace.clone()).collect();
+    namespaces.sort();
+    namespaces.dedup();
+    namespaces
 }
 
 /// Selects expired records for one budgeted pass.
