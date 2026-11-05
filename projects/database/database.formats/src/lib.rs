@@ -1,9 +1,7 @@
-//! `database-formats`：磁盘字节布局（页、记录、WAL、Blob、分片快照、复制日志、SQLite format-3）。
+//! `database-formats`：磁盘字节布局，YY 家族按文件后缀分模块，SQLite format-3 单列。
 #![deny(missing_docs)]
 
-/// 分布式目录 / 分片 / 复制日志编解码。
-pub mod cluster;
-/// 嵌入式单文件页 / BTree / WAL / Blob 编解码。
-pub mod local;
+/// YY 家族格式编解码（`.yydb` / `.yydx` / WAL / `-shm` / `.yyds` / `.yykv`）。
+pub mod yy;
 /// SQLite format-3 只读解析。
 pub mod sqlite;

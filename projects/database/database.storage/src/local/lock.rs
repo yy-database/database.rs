@@ -8,7 +8,7 @@ use std::{
 
 use database_types::{Error, Result};
 
-use database_formats::local::crc32c;
+use database_formats::yy::yydb::crc32c;
 
 /// How a [`WriterLock`] was acquired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

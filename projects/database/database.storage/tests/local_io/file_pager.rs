@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use database_formats::local::{PAGE_MAGIC, PAGE_SIZE, parse_page0};
+use database_formats::yy::yydb::{PAGE_MAGIC, PAGE_SIZE, parse_page0};
 use database_storage::local_io::{FilePager, shm_sidecar_path, wal_sidecar_path};
 
 fn temp_db(name: &str) -> PathBuf {

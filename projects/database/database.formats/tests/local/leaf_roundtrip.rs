@@ -1,4 +1,4 @@
-use database_formats::local::{LeafPage, TREE_RECORD, TreeKey};
+use database_formats::yy::yydb::{LeafPage, TREE_RECORD, TreeKey};
 
 #[test]
 fn leaf_page_roundtrip_sorted_cells() {

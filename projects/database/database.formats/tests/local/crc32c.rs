@@ -1,6 +1,6 @@
 //! CRC32C conformance against the published vectors and a bitwise reference.
 
-use database_formats::local::crc32c::crc32c;
+use database_formats::yy::yydb::crc32c::crc32c;
 
 /// Castagnoli polynomial, restated here so the reference decoder does not
 /// borrow the table implementation it is checking.

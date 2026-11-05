@@ -1,4 +1,4 @@
-use database_formats::local::{InternalPage, PAGE_TYPE_INTERNAL, PageHeader, TREE_RECORD, TreeKey};
+use database_formats::yy::yydb::{InternalPage, PAGE_TYPE_INTERNAL, PageHeader, TREE_RECORD, TreeKey};
 use database_storage::local_io::MemoryPager;
 
 #[test]
@@ -47,7 +47,7 @@ fn internal_splits_keep_every_record_reachable() {
 
 #[test]
 fn leaf_split_halves_cells() {
-    let mut leaf = database_formats::local::LeafPage::empty(1, 1, TREE_RECORD);
+    let mut leaf = database_formats::yy::yydb::LeafPage::empty(1, 1, TREE_RECORD);
     let value = vec![0_u8; 100];
     for i in 0..20_u32 {
         assert!(leaf.upsert(TreeKey::user_record(format!("k{i:03}")), value.clone()).unwrap());
@@ -102,7 +102,7 @@ fn sequential_prepends_fill_leaves() {
 
 #[test]
 fn internal_page_roundtrip() {
-    use database_formats::local::{InternalEntry, TREE_RECORD, TreeKey};
+    use database_formats::yy::yydb::{InternalEntry, TREE_RECORD, TreeKey};
     let page = InternalPage::new(
         2,
         1,

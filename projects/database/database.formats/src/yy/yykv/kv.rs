@@ -7,7 +7,7 @@ use std::{
 
 use database_types::cluster::{Error, Result};
 
-use crate::cluster::{InlineValue, Key, ObjectRef, Record, StoredValue};
+use super::{InlineValue, Key, ObjectRef, Record, StoredValue};
 
 /// `.yykv` snapshot magic including the format version.
 ///

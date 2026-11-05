@@ -4,7 +4,7 @@ use std::fmt;
 
 use database_types::{Error, Result};
 
-use crate::local::crc32c::crc32c;
+use crate::yy::yydb::crc32c::crc32c;
 
 /// Five-byte magic prefix for WAL sidecar files.
 pub const WAL_MAGIC: &[u8; 5] = b"YYWL\x00";

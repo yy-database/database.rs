@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use database_formats::local::{
+use database_formats::yy::yydb::{
     header::{
         DatabaseHeader, PAGE_SIZE, SLOT_BYTES, SLOT_KIND_A, SLOT_KIND_B, encode_empty_page0, inactive_slot_offset, parse_page0_checked,
         seal_header_slot, slot_offset_for_kind,

@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use database_formats::local::{BlobChunkRef, blob_chunk_hash, encode_blob_chunk, parse_blob_header, read_blob_payload};
+use database_formats::yy::{
+    yydx::{blob_chunk_hash, encode_blob_chunk, parse_blob_header, read_blob_payload},
+    yywl::BlobChunkRef,
+};
 use database_types::{Error, Result};
 
 /// On-disk content-addressed blob root.

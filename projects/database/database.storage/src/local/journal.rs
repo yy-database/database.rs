@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use database_formats::local::{WAL_MAGIC, parse_wal_recover};
+use database_formats::yy::yywl::{WAL_MAGIC, parse_wal_recover};
 use database_types::{Error, Result};
 
 /// How durable writes are published to disk.

@@ -8,11 +8,12 @@ use std::{
     time::Instant,
 };
 
-use database_formats::local::{
-    blob_refs::{BlobManifestDelta, FRAME_BLOB_REFS, commit_digest, encode_blob_refs_body},
-    crc32c::crc32c,
-    header::PAGE_SIZE,
-    wal::{WAL_HEADER_BYTES, WAL_MAGIC, WalFile, WalTail, parse_frame, parse_wal, scan_wal, wal_frame_offsets},
+use database_formats::yy::{
+    yydb::{crc32c::crc32c, header::PAGE_SIZE},
+    yywl::{
+        blob_refs::{BlobManifestDelta, FRAME_BLOB_REFS, commit_digest, encode_blob_refs_body},
+        wal::{WAL_HEADER_BYTES, WAL_MAGIC, WalFile, WalTail, parse_frame, parse_wal, scan_wal, wal_frame_offsets},
+    },
 };
 use database_types::{Error, Result};
 
@@ -432,7 +433,7 @@ pub fn replay_wal_pages_after(wal: &WalFile, checkpoint_lsn: u64, pages: &mut BT
 
 /// Read a WAL sidecar from disk, tolerating a truncated tail frame.
 pub fn read_wal_file(path: &Path) -> Result<WalFile> {
-    database_formats::local::wal::parse_wal_recover(&std::fs::read(path)?)
+    database_formats::yy::yywl::wal::parse_wal_recover(&std::fs::read(path)?)
 }
 
 /// Resolve `<main>-wal` for a database main file path.

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use database_formats::local::{WAL_RECORD_HEADER_BYTES, parse_wal, wal_frame_offsets};
+use database_formats::yy::yywl::{WAL_RECORD_HEADER_BYTES, parse_wal, wal_frame_offsets};
 use database_storage::local::{Database, JournalMode, Snapshot, wal_path};
 use database_types::Error;
 
