@@ -1,4 +1,4 @@
-use database_server::redis::resp::{FrameError, RequestLimits, decode_request};
+use database_server::yyds::redis::resp::{FrameError, RequestLimits, decode_request};
 
 #[test]
 fn request_preserves_binary_arguments() {

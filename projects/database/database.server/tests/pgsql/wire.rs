@@ -1,4 +1,4 @@
-use database_server::pgsql::wire::{FrameError, StartupParameterError, StartupParameters, decode_message, decode_startup, encode_message};
+use database_server::yyds::pgsql::wire::{FrameError, StartupParameterError, StartupParameters, decode_message, decode_startup, encode_message};
 
 #[test]
 fn startup_length_includes_code_and_preserves_pipeline() {

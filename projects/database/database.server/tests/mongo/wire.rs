@@ -3,7 +3,7 @@
 //! Round-trips synthetic OP_MSG frames through `read_frame` / `write_frame`
 //! to lock down header layout, length calculation and opcode validation.
 
-use database_server::mongo::wire::{FrameLimits, MsgHeader, read_frame, write_frame, write_reply_frame};
+use database_server::yyds::mongo::wire::{FrameLimits, MsgHeader, read_frame, write_frame, write_reply_frame};
 use std::io::{Cursor, Write};
 
 fn hello_body() -> Vec<u8> {
@@ -28,8 +28,8 @@ fn hello_body() -> Vec<u8> {
 fn command_name_extracts_hello_from_op_msg_frame() {
     let body = hello_body();
     let header = MsgHeader { total_length: 16 + body.len() as u32, request_id: 1, response_to: 0, opcode: 2013 };
-    let frame = database_server::mongo::wire::Frame { header, body };
-    let name = database_server::mongo::command_name_from_frame(&frame);
+    let frame = database_server::yyds::mongo::wire::Frame { header, body };
+    let name = database_server::yyds::mongo::command_name_from_frame(&frame);
     assert_eq!(name, Some("hello"));
 }
 
@@ -63,7 +63,7 @@ fn frame_too_large_is_rejected() {
 
     let mut reader = Cursor::new(bytes);
     let result = read_frame(&mut reader, FrameLimits::default());
-    assert!(matches!(result, Err(database_server::mongo::wire::FrameError::FrameTooLarge { .. })));
+    assert!(matches!(result, Err(database_server::yyds::mongo::wire::FrameError::FrameTooLarge { .. })));
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn unsupported_opcode_is_rejected() {
 
     let mut reader = Cursor::new(bytes);
     let result = read_frame(&mut reader, FrameLimits::default());
-    assert!(matches!(result, Err(database_server::mongo::wire::FrameError::UnsupportedOpcode { opcode: 5000 })));
+    assert!(matches!(result, Err(database_server::yyds::mongo::wire::FrameError::UnsupportedOpcode { opcode: 5000 })));
 }
 
 #[test]
@@ -88,8 +88,8 @@ fn truncated_header_is_reported_as_connection_closed() {
     let result = read_frame(&mut reader, FrameLimits::default());
     // 全空流 → ConnectionClosed；半拉 → UnexpectedEof (Io)。两者都是有效 IO 终止。
     assert!(
-        matches!(result, Err(database_server::mongo::wire::FrameError::ConnectionClosed))
-            || matches!(result, Err(database_server::mongo::wire::FrameError::Io(_)))
+        matches!(result, Err(database_server::yyds::mongo::wire::FrameError::ConnectionClosed))
+            || matches!(result, Err(database_server::yyds::mongo::wire::FrameError::Io(_)))
     );
 }
 
@@ -131,14 +131,14 @@ fn ismaster_op_query_body() -> Vec<u8> {
 fn op_query_handshake_frame_is_accepted_and_named_ismaster() {
     let body = ismaster_op_query_body();
     let header = MsgHeader { total_length: 16 + body.len() as u32, request_id: 1, response_to: 0, opcode: 2004 };
-    let frame = database_server::mongo::wire::Frame { header, body };
-    assert_eq!(database_server::mongo::command_name_from_frame(&frame), Some("isMaster"));
+    let frame = database_server::yyds::mongo::wire::Frame { header, body };
+    assert_eq!(database_server::yyds::mongo::command_name_from_frame(&frame), Some("isMaster"));
 }
 
 #[test]
 fn op_query_handshake_reply_uses_op_reply_layout() {
     let body = ismaster_op_query_body();
-    let document = database_server::mongo::handle_op_query(&body, None);
+    let document = database_server::yyds::mongo::handle_op_query(&body, None);
     let mut cursor = Cursor::new(Vec::<u8>::new());
     write_reply_frame(&mut cursor, 5, 1, &document).unwrap();
     let bytes = cursor.into_inner();

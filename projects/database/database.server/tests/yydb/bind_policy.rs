@@ -1,4 +1,4 @@
-use database_server::yy::{AuthBootstrap, Principal, PrincipalKind, assert_bind_allowed};
+use database_server::yydb::{AuthBootstrap, Principal, PrincipalKind, assert_bind_allowed};
 
 fn anon_bootstrap() -> AuthBootstrap {
     AuthBootstrap { tokens: vec![("t-anon".to_owned(), Principal::anonymous_loopback())] }
@@ -8,7 +8,7 @@ fn named_bootstrap() -> AuthBootstrap {
     AuthBootstrap {
         tokens: vec![(
             "t-svc".to_owned(),
-            Principal { name: "svc-worker-07".to_owned(), kind: PrincipalKind::Service, roles: vec![database_server::yy::Role::Writer] },
+            Principal { name: "svc-worker-07".to_owned(), kind: PrincipalKind::Service, roles: vec![database_server::yydb::Role::Writer] },
         )],
     }
 }

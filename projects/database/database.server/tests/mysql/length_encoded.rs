@@ -1,4 +1,4 @@
-use database_server::mysql::connection::encode_length_encoded;
+use database_server::yyds::mysql::connection::encode_length_encoded;
 
 /// `251` is the one length a single byte cannot carry: `0xFB` already means
 /// `NULL`, so a 251-octet value has to take the `0xFC` form. Encoding it as

@@ -3,7 +3,7 @@
 
 use database_execution::database_execution::engine::Connection;
 use database_protocol_yy::{Frame, MessageType, encode_execute_prepared, encode_kv_get, encode_kv_put, encode_prepare, encode_schema_ensure};
-use database_server::yy::{Principal, PrincipalKind, Role, Session, SessionState, dispatch};
+use database_server::yydb::{Principal, PrincipalKind, Role, Session, SessionState, dispatch};
 
 /// A VOS schema document that yy-db accepts.
 const VALID_SCHEMA: &str = "table User { @@id: i64, name: utf8, active: bool }";
@@ -166,7 +166,7 @@ fn loopback_only_full_access() {
 
 #[test]
 fn permission_as_str_is_stable() {
-    use database_server::yy::Permission;
+    use database_server::yydb::Permission;
     assert_eq!(Permission::Read.as_str(), "read");
     assert_eq!(Permission::Write.as_str(), "write");
     assert_eq!(Permission::Schema.as_str(), "schema");
@@ -178,7 +178,7 @@ fn principal_has_permission_respects_roles() {
     let writer = named_principal("w", vec![Role::Writer]);
     let admin = named_principal("a", vec![Role::SchemaAdmin]);
 
-    use database_server::yy::Permission;
+    use database_server::yydb::Permission;
 
     assert!(reader.has_permission(Permission::Read));
     assert!(!reader.has_permission(Permission::Write));

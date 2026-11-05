@@ -1,6 +1,6 @@
 //! 从 `src/auth.rs` 迁出的测试。
 
-use database_server::yy::auth::{PrincipalKind, Role, parse_env_tokens};
+use database_server::yydb::auth::{PrincipalKind, Role, parse_env_tokens};
 
 #[test]
 fn parse_explicit_env_multiple_entries() {
