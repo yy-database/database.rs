@@ -1,10 +1,8 @@
 //! 从 `src/types.rs` 迁出的测试。
 
 use database_query::ir::LiteralKind;
-use odm_adapter::{
-    adapter_sqlite::{SqliteValue, from_sql_value, from_sql_value_typed, literal_to_sql_value, to_sql_value},
-    odm_types::Value,
-};
+use odm_adapter::adapter_sqlite::{SqliteValue, from_sql_value, from_sql_value_typed, literal_to_sql_value, to_sql_value};
+use odm_types::Value;
 use vos::types::{CanonicalScalar, ResolvedCanonicalType};
 
 #[test]
@@ -33,16 +31,10 @@ fn values_sqlite_cannot_carry_are_rejected_instead_of_truncated() {
     assert!(to_sql_value(&Value::Float(f64::NAN)).is_err());
     assert!(literal_to_sql_value("18446744073709551615", LiteralKind::UInt).is_err());
     assert!(literal_to_sql_value("NaN", LiteralKind::Float).is_err());
-    assert!(to_sql_value(&Value::Vector(odm_adapter::odm_types::VectorValue::new(2, vec![1.0, 2.0]).expect("vector"))).is_err());
+    assert!(to_sql_value(&Value::Vector(odm_types::VectorValue::new(2, vec![1.0, 2.0]).expect("vector"))).is_err());
     let digest = "00".repeat(32);
-    let descriptor = odm_adapter::odm_types::FileDescriptor::new(
-        digest.clone(),
-        4,
-        None,
-        None,
-        odm_adapter::odm_types::FileManifestRef { hash: digest, size: 4 },
-    )
-    .expect("descriptor");
+    let descriptor = odm_types::FileDescriptor::new(digest.clone(), 4, None, None, odm_types::FileManifestRef { hash: digest, size: 4 })
+        .expect("descriptor");
     assert!(to_sql_value(&Value::File(descriptor)).is_err());
 }
 

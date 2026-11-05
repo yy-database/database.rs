@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use database_execution::cluster::{KeyValueExecutor, LocalExecutor};
 use database_storage::cluster_kv::MemoryShard;
-use database_types::cluster::{KeyValueAction, KeyValueCommand, KeyValueResult, Namespace, ShardEpoch, ShardId, ShardMap};
+use database_cluster::topology::ShardMap;
+use database_query::cluster_kv::{KeyValueAction, KeyValueCommand, KeyValueResult};
+use database_types::cluster::{Namespace, ShardEpoch, ShardId};
 
 fn command(action: KeyValueAction, key: &[u8]) -> KeyValueCommand {
     KeyValueCommand { namespace: Namespace("redis:0".into()), key: key.to_vec(), action }

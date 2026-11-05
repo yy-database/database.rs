@@ -1,6 +1,6 @@
 //! 从 `src/lib.rs` 迁出的测试。
 
-use odm_adapter::adapter_redis::{Error, parse_redis_url};
+use odm_adapter::{Error, adapter_redis::parse_redis_url};
 use std::time::Duration;
 
 #[test]

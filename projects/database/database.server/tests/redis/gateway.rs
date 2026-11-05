@@ -8,7 +8,7 @@ fn redis_ping_returns_pong() {
 #[test]
 fn redis_info_mentions_yyds() {
     let info = handle_command("INFO").expect("info");
-    assert!(info.contains("redis_version:yyds-"));
+    assert!(info.contains(&format!("redis_version:{}", database_query::version_label())));
     assert_eq!(GATEWAY_ID, "redis");
     assert_eq!(DEFAULT_PORT, 6379);
 }

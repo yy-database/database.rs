@@ -1,9 +1,7 @@
 //! Phase 6: Redis keyspace adapter --?offline + optional live tests.
 
-use odm_adapter::{
-    adapter_redis::{BACKEND_ID, KeyEncoding, KeyspaceMapping, MappingManifest, RedisSource},
-    odm_types::Planner,
-};
+use odm_adapter::adapter_redis::{BACKEND_ID, KeyEncoding, KeyspaceMapping, MappingManifest, RedisSource};
+use odm_types::Planner;
 
 fn sample_mapping() -> MappingManifest {
     MappingManifest::with_tables(vec![KeyspaceMapping {

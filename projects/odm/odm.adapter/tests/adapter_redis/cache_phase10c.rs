@@ -1,10 +1,8 @@
 //! Phase 10-C: Redis Cache watermark / invalidate / RYW / BoundedStale / 回源.
 
 use database_query::ir::{CommitToken, ConsistencyIntent, OutboxEffect, OutboxRecord};
-use odm_adapter::{
-    adapter_redis::{CacheEntry, IdentityCacheResult, KeyEncoding, KeyspaceMapping, MappingManifest, RedisSource},
-    odm_types::{AppliedWatermarkState, StampedeBudget, StampedePermit},
-};
+use odm_adapter::adapter_redis::{CacheEntry, IdentityCacheResult, KeyEncoding, KeyspaceMapping, MappingManifest, RedisSource};
+use odm_types::{AppliedWatermarkState, StampedeBudget, StampedePermit};
 
 fn sample_mapping() -> MappingManifest {
     MappingManifest::with_tables(vec![KeyspaceMapping {

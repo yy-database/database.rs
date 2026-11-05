@@ -6,7 +6,7 @@ use std::{
 };
 
 use database_client::yy::{Client, Error};
-use database_execution::database_execution::engine::{Connection, Value};
+use database_execution::engine::{Connection, Value};
 use database_protocol_yy::{read_frame, write_frame};
 use database_server::yydb::{SessionState, dispatch};
 

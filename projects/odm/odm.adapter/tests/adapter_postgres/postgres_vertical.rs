@@ -1,10 +1,8 @@
 //! Phase 4: PostgreSQL foreign adapter --?offline + optional live tests.
 
 use database_query::ir::RealizationClass;
-use odm_adapter::{
-    adapter_postgres::{BACKEND_ID, PostgresSource, adopt_plan, classify_type},
-    odm_types::{ObservedCatalog, ObservedColumn, ObservedTable, Planner, RowWrite, Value},
-};
+use odm_adapter::adapter_postgres::{BACKEND_ID, PostgresSource, adopt_plan, classify_type};
+use odm_types::{ObservedCatalog, ObservedColumn, ObservedTable, Planner, RowWrite, Value};
 use std::collections::BTreeMap;
 
 const USER_SCHEMA: &str = r#"
@@ -35,10 +33,10 @@ fn adapter_is_not_sqlite_or_mysql() {
     assert_ne!(BACKEND_ID, "sqlite");
     assert_ne!(BACKEND_ID, "mysql");
     assert_ne!(BACKEND_ID, "yydb");
-    let manifest = include_str!("../Cargo.toml");
-    assert!(manifest.contains("postgres"));
+    let manifest = include_str!("../../Cargo.toml");
+    assert!(manifest.contains("database-client"));
     assert!(!manifest.contains("rusqlite"));
-    assert!(!manifest.contains("mysql ="));
+    assert!(!manifest.contains("tokio-postgres"));
 }
 
 #[test]
@@ -59,7 +57,7 @@ fn adopt_plan_blocks_missing_pk_without_live_db() {
             columns: vec![ObservedColumn { name: "name".into(), type_name: "text".into(), nullable: true, primary_key: false }],
         }],
     };
-    let doc = odm_adapter::odm_types::parse_schema(
+    let doc = odm_types::parse_schema(
         r#"
         table Legacy {
             @@id: utf8,

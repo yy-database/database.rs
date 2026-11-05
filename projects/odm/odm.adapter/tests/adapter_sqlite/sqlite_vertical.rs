@@ -29,10 +29,10 @@ fn provider_open_paths_fail_closed() {
 #[test]
 fn adapter_surface_does_not_depend_on_rusqlite() {
     assert_eq!(BACKEND_ID, "sqlite");
-    let manifest = include_str!("../Cargo.toml");
+    let manifest = include_str!("../../Cargo.toml");
     assert!(!manifest.contains("rusqlite"));
     assert!(!manifest.contains("yydb"));
-    assert!(manifest.contains("sqlite ="));
+    assert!(manifest.contains("database-formats"));
 }
 
 #[test]
