@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use database_execution::database_execution::engine::{Connection, Result, Value};
+use database_execution::engine::{Connection, Result, Value};
 
 fn temp_yydx(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("database-execution-session-{}-{}.yydx", std::process::id(), label))
@@ -30,7 +30,7 @@ fn sessions_share_records_and_isolate_transactions_and_udfs() -> Result<()> {
 
     writer.create_scalar("twice", 1, |args| match args {
         [Value::I64(value)] => Ok(Value::I64(value * 2)),
-        _ => Err(database_execution::database_execution::engine::Error::Unsupported("twice expects one integer")),
+        _ => Err(database_execution::engine::Error::Unsupported("twice expects one integer")),
     })?;
     assert_eq!(writer.list_scalars(), vec!["twice".to_owned()]);
     assert!(reader.list_scalars().is_empty());

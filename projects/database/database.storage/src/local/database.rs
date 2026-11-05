@@ -137,25 +137,53 @@ impl Database {
     /// `__yydb/meta/` rows are not records: they are skipped exactly like the
     /// snapshot decoder skips them, and the window is walked further to still
     /// return `limit` records.
+    ///
+    /// Every widening step advances the cursor past the rows it already
+    /// inspected, so a window whose visible rows are fewer than `limit` ends
+    /// instead of re-reading the same reserved rows forever.
     pub fn scan_records(&mut self, start: &str, end: Option<&str>, limit: usize) -> Result<Vec<(String, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut want = limit;
+        let mut cursor = start.to_owned();
         loop {
-            let batch = self.pager.scan_kv_range_limited(start, end.map(str::as_bytes), want)?;
+            let batch = self.pager.scan_kv_range_limited(&cursor, end.map(str::as_bytes), want)?;
+            let fetched = batch.len();
             let mut skipped = 0_usize;
-            let mut out = Vec::with_capacity(batch.len());
-            for (key, value) in batch {
+            let mut out = Vec::with_capacity(fetched);
+            let mut last_key: Option<String> = None;
+            for (index, (key, value)) in batch.into_iter().enumerate() {
+                let is_last = index + 1 == fetched;
                 if key.encoded.starts_with(META_PREFIX) {
                     skipped += 1;
+                    if is_last {
+                        last_key =
+                            Some(String::from_utf8(key.encoded).map_err(|_| Error::Corrupt("record key is not UTF-8"))?);
+                    }
                     continue;
                 }
                 let name = String::from_utf8(key.encoded).map_err(|_| Error::Corrupt("record key is not UTF-8"))?;
+                if is_last {
+                    last_key = Some(name.clone());
+                }
                 out.push((name, value));
             }
-            if out.len() >= limit || skipped == 0 {
+            if out.len() >= limit || fetched < want || skipped == 0 {
                 out.truncate(limit);
                 return Ok(out);
             }
-            want += skipped;
+            let last_key = match last_key {
+                Some(last_key) => last_key,
+                None => {
+                    out.truncate(limit);
+                    return Ok(out);
+                }
+            };
+            // The range is inclusive at the lower bound, so step past the last
+            // inspected key instead of scanning that same window again.
+            cursor = format!("{last_key}\0");
+            want = want.saturating_add(skipped);
         }
     }
 

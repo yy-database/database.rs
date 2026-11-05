@@ -2,4 +2,5 @@
 
 mod connection_close;
 mod prepared_schema_invalidation;
+mod scan;
 mod session;

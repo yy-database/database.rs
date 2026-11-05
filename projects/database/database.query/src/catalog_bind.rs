@@ -143,6 +143,8 @@ pub struct SqlCatalogField {
     /// Declared character or octet capacity from local DDL, absent for fields
     /// projected from the published VOS contract.
     pub capacity: Option<u32>,
+    /// Raw `DEFAULT` literal text from local DDL, when declared.
+    pub default: Option<String>,
 }
 
 /// The gateway's immutable view of one published VOS catalog revision.
@@ -197,6 +199,7 @@ impl SqlCatalog {
                             field_type,
                             vos_type_name,
                             capacity: None,
+                            default: None,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;

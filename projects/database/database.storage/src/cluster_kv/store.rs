@@ -100,12 +100,19 @@ pub trait KvStore {
 }
 
 /// In-memory shard used by unit tests and early integrations.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryShard {
     records: BTreeMap<Key, Record>,
+    /// Next revision to allocate; an empty shard starts at `1`.
     next_revision: u64,
     /// Resume point for a budgeted expiry pass; process-local and not observable.
     sweep_cursor: Option<Key>,
+}
+
+impl Default for MemoryShard {
+    fn default() -> Self {
+        Self { records: BTreeMap::new(), next_revision: 1, sweep_cursor: None }
+    }
 }
 
 impl MemoryShard {
@@ -115,8 +122,8 @@ impl MemoryShard {
     }
 
     fn insert(&mut self, key: Key, value: StoredValue, expires_at: Option<i64>) -> Result<u64> {
-        self.next_revision += 1;
         let revision = self.next_revision;
+        self.next_revision = revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
         let record = Record { key: key.clone(), value, revision, expires_at };
         self.records.insert(key, record);
         Ok(revision)
@@ -180,7 +187,7 @@ impl FileShard {
                     fs::create_dir_all(parent)?;
                 }
             }
-            let shard = Self { path, records: BTreeMap::new(), next_revision: 0, sweep_cursor: None };
+            let shard = Self { path, records: BTreeMap::new(), next_revision: 1, sweep_cursor: None };
             shard.persist()?;
             Ok(shard)
         }
@@ -202,12 +209,13 @@ impl FileShard {
     }
 
     fn insert(&mut self, key: Key, value: StoredValue, expires_at: Option<i64>) -> Result<u64> {
-        let revision = self.next_revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
+        let revision = self.next_revision;
+        let next_revision = revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
         let record = Record { key: key.clone(), value, revision, expires_at };
         let previous = self.records.insert(key.clone(), record);
-        self.next_revision = revision;
+        self.next_revision = next_revision;
         if let Err(error) = self.persist() {
-            self.next_revision = revision - 1;
+            self.next_revision = revision;
             match previous {
                 Some(record) => {
                     self.records.insert(key, record);
@@ -253,14 +261,15 @@ impl KvStore for FileShard {
             return Ok(());
         }
         let mut staged_records = self.records.clone();
-        let mut staged_revision = self.next_revision;
+        let mut next_revision = self.next_revision;
         for change in &changes {
             match change {
                 ShardChange::Put { key, value, expires_at } => {
-                    staged_revision = staged_revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
+                    let revision = next_revision;
+                    next_revision = next_revision.checked_add(1).ok_or(Error::Corrupt("shard revision exhausted"))?;
                     staged_records.insert(
                         key.clone(),
-                        Record { key: key.clone(), value: value.clone(), revision: staged_revision, expires_at: *expires_at },
+                        Record { key: key.clone(), value: value.clone(), revision, expires_at: *expires_at },
                     );
                 }
                 ShardChange::Delete { key } => {
@@ -268,7 +277,7 @@ impl KvStore for FileShard {
                 }
             }
         }
-        let bytes = encode_snapshot(&staged_records, staged_revision)?;
+        let bytes = encode_snapshot(&staged_records, next_revision)?;
         // Durable commit point: the full post-commit snapshot is fsynced to a temp file and
         // atomically replaces the shard. Memory is only published after this returns `Ok`,
         // so a crash or storage failure here leaves the previous snapshot both visible and
@@ -281,7 +290,7 @@ impl KvStore for FileShard {
         // rollback to the previous snapshot.
         write_snapshot_durable(&self.path, &bytes)?;
         self.records = staged_records;
-        self.next_revision = staged_revision;
+        self.next_revision = next_revision;
         Ok(())
     }
 

@@ -2,6 +2,19 @@
 
 use super::*;
 
+/// Value of a projected column: what the stored row carries, otherwise the
+/// column default declared by `ALTER TABLE ... ADD COLUMN ... DEFAULT`.
+fn projected_value(
+    row: &RowFieldValues,
+    field_id: u64,
+    field_types: &std::collections::BTreeMap<u64, database_query::catalog_bind::SqlFieldType>,
+    field_defaults: &std::collections::BTreeMap<u64, database_query::DefaultValue>,
+) -> SqlValue {
+    row.value_typed(field_id, field_types)
+        .or_else(|| field_defaults.get(&field_id).map(database_query::DefaultValue::to_sql_value))
+        .unwrap_or(SqlValue::Null)
+}
+
 pub(crate) fn execute_read(
     executor: &dyn KeyValueExecutor,
     transaction: Option<&dyn TransactionHandle>,
@@ -40,7 +53,7 @@ pub(crate) fn execute_read(
     let columns = read_column_labels(plan);
     let mut row_values: Vec<SqlValue> = Vec::new();
     for (field_id, _) in &plan.projection_fields {
-        row_values.push(row.value_typed(*field_id, &plan.field_types).unwrap_or(SqlValue::Null));
+        row_values.push(projected_value(&row, *field_id, &plan.field_types, &plan.field_defaults));
     }
     for (expr, _) in &plan.projection_expressions {
         row_values.push(eval_row_expression(expr, &row, &plan.field_types, dialect, executor, transaction)?);
@@ -116,7 +129,7 @@ pub(crate) fn execute_join(
         };
         let mut row_values: Vec<SqlValue> = Vec::new();
         for (field_id, _) in &plan.projection_fields {
-            row_values.push(row.value_typed(*field_id, &plan.field_types).unwrap_or(SqlValue::Null));
+            row_values.push(projected_value(row, *field_id, &plan.field_types, &plan.field_defaults));
         }
         for (expr, _) in &plan.projection_expressions {
             row_values.push(eval_row_expression(expr, row, &plan.field_types, dialect, executor, transaction)?);
@@ -265,7 +278,7 @@ pub(crate) fn execute_scan(
             };
             let mut row_values: Vec<SqlValue> = Vec::new();
             for (field_id, _) in &plan.projection_fields {
-                row_values.push(row.value_typed(*field_id, &plan.field_types).unwrap_or(SqlValue::Null));
+                row_values.push(projected_value(row, *field_id, &plan.field_types, &plan.field_defaults));
             }
             for (position, (expr, _)) in plan.projection_expressions.iter().enumerate() {
                 match &window_columns[position] {
@@ -423,7 +436,7 @@ pub(crate) fn execute_scan(
             let sort_key = Some(eval_expression(order_expr, &row, &plan.field_types, dialect)?);
             let mut row_values: Vec<SqlValue> = Vec::new();
             for (field_id, _) in &plan.projection_fields {
-                row_values.push(row.value_typed(*field_id, &plan.field_types).unwrap_or(SqlValue::Null));
+                row_values.push(projected_value(&row, *field_id, &plan.field_types, &plan.field_defaults));
             }
             for (expr, _) in &plan.projection_expressions {
                 row_values.push(eval_expression(expr, &row, &plan.field_types, dialect)?);
@@ -467,7 +480,7 @@ pub(crate) fn execute_scan(
         };
         let mut row_values: Vec<SqlValue> = Vec::new();
         for (field_id, _) in &plan.projection_fields {
-            row_values.push(row.value_typed(*field_id, &plan.field_types).unwrap_or(SqlValue::Null));
+            row_values.push(projected_value(&row, *field_id, &plan.field_types, &plan.field_defaults));
         }
         for (expr, _) in &plan.projection_expressions {
             row_values.push(eval_row_expression(expr, &row, &plan.field_types, dialect, executor, transaction)?);
@@ -576,4 +589,20 @@ pub(crate) fn join_column_labels(plan: &JoinPlan) -> Vec<String> {
         labels.push(name.clone());
     }
     labels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use database_query::{DefaultValue, RowFieldValues};
+
+    #[test]
+    fn added_column_reads_the_declared_default_from_a_short_row() {
+        let row = RowFieldValues::new();
+        let field_types = std::collections::BTreeMap::new();
+        let mut defaults = std::collections::BTreeMap::new();
+        defaults.insert(42_u64, DefaultValue::Integer(7));
+        assert_eq!(projected_value(&row, 42, &field_types, &defaults), SqlValue::Integer(7));
+        assert_eq!(projected_value(&row, 43, &field_types, &defaults), SqlValue::Null);
+    }
 }

@@ -184,6 +184,19 @@ pub(crate) fn execute_multi_insert(
     if transaction.is_none() && plans.len() > 1 {
         return execute_multi_insert_atomic(executor, plans, dialect);
     }
+    if let Some(handle) = transaction {
+        // 事务里的逐行写入各自只看已落库快照，同语句后一行的唯一键冲突可能被前一行缓冲
+        // 掩盖，所以先按整条语句折叠一次，再连同事务可见快照一起做唯一性复核。
+        if plans.len() > 1 && plans.first().is_some_and(|plan| !plan.unique_constraints.is_empty()) {
+            let first = plans.first().expect("plans checked above");
+            let namespace = Namespace(first.namespace.clone());
+            let needs_preimage = plans.iter().any(|plan| plan.conflict.is_some());
+            let preimages = load_insert_preimages(executor, Some(handle), plans, &namespace, needs_preimage)?;
+            let (order, folded) = fold_insert_plans(plans, &preimages, dialect)?;
+            let stored = scan_rows(executor, Some(handle), &namespace, &[], None, None, 0, "unique_check")?;
+            ensure_unique_rows(&first.unique_constraints, &order, &folded, &stored)?;
+        }
+    }
     let columns = plans.first().and_then(|plan| plan.returning.as_ref()).map(returning_column_labels).unwrap_or_default();
     let mut rows = Vec::new();
     let mut total_affected = 0u64;
@@ -219,114 +232,20 @@ pub(crate) fn execute_multi_insert_atomic(
 ) -> Result<SqlResult, SqlFrontendError> {
     let first = plans.first().expect("atomic multi-insert requires at least one plan");
     let namespace = Namespace(first.namespace.clone());
-    let unique_conflict =
-        || SqlFrontendError::new(SqlErrorKind::DuplicateKey, format!("duplicate key value violates unique constraint: {}", first.namespace));
+    let unique_conflict = || {
+        SqlFrontendError::new(SqlErrorKind::DuplicateKey, format!("duplicate key value violates unique constraint: {}", first.namespace))
+    };
     let needs_preimage = plans.iter().any(|plan| plan.conflict.is_some());
     for attempt in 0..2 {
         // 冲突策略需要先看到基存 pre-image 才能决定跳过还是改写；无策略的行交给提交边界的
         // OCC 条件复核，不做多余预读。
-        let mut preimages: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        if needs_preimage {
-            let mut rowids: Vec<Vec<u8>> = Vec::new();
-            let mut seen = BTreeSet::new();
-            for plan in plans {
-                if seen.insert(plan.rowid.clone()) {
-                    rowids.push(plan.rowid.clone());
-                }
-            }
-            let commands: Vec<KeyValueCommand> = rowids
-                .iter()
-                .map(|rowid| KeyValueCommand { namespace: namespace.clone(), key: rowid.clone(), action: KeyValueAction::Get })
-                .collect();
-            let results = executor
-                .execute_read_batch(None, &commands)
-                .map_err(|e| internal_error(&format!("KeyValueExecutor.read_batch failed: {e}")))?;
-            for (rowid, result) in rowids.iter().zip(results) {
-                let bytes = match result {
-                    database_query::cluster_kv::KeyValueResult::Get(bytes) => bytes,
-                    other => return Err(internal_error(&format!("unexpected storage result for pre-read: {other:?}"))),
-                };
-                preimages.insert(rowid.clone(), bytes);
-            }
-        }
-
-        // 按语句首次出现的顺序折叠每个 rowid 的最终行值与 OCC 条件。
-        let mut order: Vec<Vec<u8>> = Vec::new();
-        let mut folded: BTreeMap<Vec<u8>, BatchedRow> = BTreeMap::new();
-        for plan in plans {
-            match &plan.conflict {
-                None => {
-                    if folded.contains_key(&plan.rowid) {
-                        return Err(unique_conflict());
-                    }
-                    order.push(plan.rowid.clone());
-                    folded.insert(
-                        plan.rowid.clone(),
-                        BatchedRow { current: Some(write_plan_to_row(plan)), applied: true, condition: CommitCondition::PutIfAbsent },
-                    );
-                }
-                Some(ConflictPolicy::DoNothing) => {
-                    if folded.contains_key(&plan.rowid) {
-                        continue;
-                    }
-                    let existing = preimages.get(&plan.rowid).cloned().flatten();
-                    let (current, applied) = match &existing {
-                        Some(bytes) => (Some(decode_row(bytes)?), false),
-                        None => (Some(write_plan_to_row(plan)), true),
-                    };
-                    order.push(plan.rowid.clone());
-                    folded.insert(plan.rowid.clone(), BatchedRow { current, applied, condition: CommitCondition::PutIfAbsent });
-                }
-                Some(ConflictPolicy::DoUpdate { assignments, predicate }) => {
-                    if !folded.contains_key(&plan.rowid) {
-                        let existing = preimages.get(&plan.rowid).cloned().flatten();
-                        let condition = match &existing {
-                            Some(bytes) => CommitCondition::ValueEquals(Some(bytes.clone())),
-                            None => CommitCondition::PutIfAbsent,
-                        };
-                        let current = match &existing {
-                            Some(bytes) => Some(decode_row(bytes)?),
-                            None => None,
-                        };
-                        order.push(plan.rowid.clone());
-                        folded.insert(plan.rowid.clone(), BatchedRow { current, applied: false, condition });
-                    }
-                    let entry = folded.get_mut(&plan.rowid).expect("entry inserted above");
-                    match &entry.current {
-                        None => {
-                            entry.current = Some(write_plan_to_row(plan));
-                            entry.applied = true;
-                        }
-                        Some(existing_row) => {
-                            if let Some(updated) = conflict_updated_row(existing_row, plan, assignments, predicate.as_ref(), dialect)? {
-                                entry.current = Some(updated);
-                                entry.applied = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let preimages = load_insert_preimages(executor, None, plans, &namespace, needs_preimage)?;
+        let (order, folded) = fold_insert_plans(plans, &preimages, dialect)?;
 
         if !first.unique_constraints.is_empty() {
             // 基存快照 + 同语句已折叠行共同决定 `UNIQUE` 冲突，整批在提交前拦截。
             let stored = scan_rows(executor, None, &namespace, &[], None, None, 0, "unique_check")?;
-            let mut pending: Vec<(Vec<u8>, RowFieldValues)> = Vec::new();
-            for rowid in &order {
-                let entry = &folded[rowid];
-                if !entry.applied {
-                    continue;
-                }
-                let row = entry.current.as_ref().expect("applied entry carries a row");
-                let pending_without_self: Vec<(Vec<u8>, RowFieldValues)> =
-                    pending.iter().filter(|(pending_rowid, _)| pending_rowid != rowid).cloned().collect();
-                if let Some(constraint) =
-                    unique_conflict_in_snapshot(&first.unique_constraints, row, Some(rowid), &pending_without_self, &stored)?
-                {
-                    return Err(duplicate_key_error(&constraint));
-                }
-                pending.push((rowid.clone(), row.clone()));
-            }
+            ensure_unique_rows(&first.unique_constraints, &order, &folded, &stored)?;
         }
 
         let batch: Vec<BufferedCommit> = order
@@ -371,11 +290,151 @@ pub(crate) fn execute_multi_insert_atomic(
     Err(SqlFrontendError::new(SqlErrorKind::Conflict, format!("concurrent writes to {} prevented the batch commit", first.namespace)))
 }
 
+/// Reads the base rows a conflict policy needs. Transaction reads go through the
+/// handle so rows buffered earlier in the same transaction count as existing.
+fn load_insert_preimages(
+    executor: &dyn KeyValueExecutor,
+    transaction: Option<&dyn TransactionHandle>,
+    plans: &[WritePlan],
+    namespace: &Namespace,
+    needed: bool,
+) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>, SqlFrontendError> {
+    let mut preimages = BTreeMap::new();
+    if !needed {
+        return Ok(preimages);
+    }
+    let mut rowids: Vec<Vec<u8>> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for plan in plans {
+        if seen.insert(plan.rowid.clone()) {
+            rowids.push(plan.rowid.clone());
+        }
+    }
+    let commands: Vec<KeyValueCommand> = rowids
+        .iter()
+        .map(|rowid| KeyValueCommand { namespace: namespace.clone(), key: rowid.clone(), action: KeyValueAction::Get })
+        .collect();
+    let results = match transaction {
+        Some(handle) => handle
+            .execute_read_batch(&commands)
+            .map_err(|e| internal_error(&format!("TransactionHandle.read_batch failed: {e}")))?,
+        None => executor
+            .execute_read_batch(None, &commands)
+            .map_err(|e| internal_error(&format!("KeyValueExecutor.read_batch failed: {e}")))?,
+    };
+    for (rowid, result) in rowids.iter().zip(results) {
+        let bytes = match result {
+            database_query::cluster_kv::KeyValueResult::Get(bytes) => bytes,
+            other => return Err(internal_error(&format!("unexpected storage result for pre-read: {other:?}"))),
+        };
+        preimages.insert(rowid.clone(), bytes);
+    }
+    Ok(preimages)
+}
+
+/// Folds every statement row into its final value and OCC condition, in first
+/// appearance order. Shared by the atomic path and the transaction pre-check so
+/// both reject the same in-statement duplicate primary keys.
+fn fold_insert_plans(
+    plans: &[WritePlan],
+    preimages: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    dialect: SqlDialect,
+) -> Result<(Vec<Vec<u8>>, BTreeMap<Vec<u8>, BatchedRow>), SqlFrontendError> {
+    let namespace = plans.first().map(|plan| plan.namespace.clone()).unwrap_or_default();
+    let mut order: Vec<Vec<u8>> = Vec::new();
+    let mut folded: BTreeMap<Vec<u8>, BatchedRow> = BTreeMap::new();
+    for plan in plans {
+        match &plan.conflict {
+            None => {
+                if folded.contains_key(&plan.rowid) {
+                    return Err(SqlFrontendError::new(
+                        SqlErrorKind::DuplicateKey,
+                        format!("duplicate key value violates unique constraint: {namespace}"),
+                    ));
+                }
+                order.push(plan.rowid.clone());
+                folded.insert(
+                    plan.rowid.clone(),
+                    BatchedRow { current: Some(write_plan_to_row(plan)), applied: true, condition: CommitCondition::PutIfAbsent },
+                );
+            }
+            Some(ConflictPolicy::DoNothing) => {
+                if folded.contains_key(&plan.rowid) {
+                    continue;
+                }
+                let existing = preimages.get(&plan.rowid).cloned().flatten();
+                let (current, applied) = match &existing {
+                    Some(bytes) => (Some(decode_row(bytes)?), false),
+                    None => (Some(write_plan_to_row(plan)), true),
+                };
+                order.push(plan.rowid.clone());
+                folded.insert(plan.rowid.clone(), BatchedRow { current, applied, condition: CommitCondition::PutIfAbsent });
+            }
+            Some(ConflictPolicy::DoUpdate { assignments, predicate }) => {
+                if !folded.contains_key(&plan.rowid) {
+                    let existing = preimages.get(&plan.rowid).cloned().flatten();
+                    let condition = match &existing {
+                        Some(bytes) => CommitCondition::ValueEquals(Some(bytes.clone())),
+                        None => CommitCondition::PutIfAbsent,
+                    };
+                    let current = match &existing {
+                        Some(bytes) => Some(decode_row(bytes)?),
+                        None => None,
+                    };
+                    order.push(plan.rowid.clone());
+                    folded.insert(plan.rowid.clone(), BatchedRow { current, applied: false, condition });
+                }
+                let entry = folded.get_mut(&plan.rowid).expect("entry inserted above");
+                match &entry.current {
+                    None => {
+                        entry.current = Some(write_plan_to_row(plan));
+                        entry.applied = true;
+                    }
+                    Some(existing_row) => {
+                        if let Some(updated) = conflict_updated_row(existing_row, plan, assignments, predicate.as_ref(), dialect)? {
+                            entry.current = Some(updated);
+                            entry.applied = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((order, folded))
+}
+
+/// Rejects `UNIQUE` conflicts among the folded statement rows and the stored
+/// snapshot before anything is written.
+fn ensure_unique_rows(
+    constraints: &[UniqueConstraintPlan],
+    order: &[Vec<u8>],
+    folded: &BTreeMap<Vec<u8>, BatchedRow>,
+    stored: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(), SqlFrontendError> {
+    let mut pending: Vec<(Vec<u8>, RowFieldValues)> = Vec::new();
+    for rowid in order {
+        let entry = &folded[rowid];
+        if !entry.applied {
+            continue;
+        }
+        let row = entry.current.as_ref().expect("applied entry carries a row");
+        let pending_without_self: Vec<(Vec<u8>, RowFieldValues)> =
+            pending.iter().filter(|(pending_rowid, _)| pending_rowid != rowid).cloned().collect();
+        if let Some(constraint) = unique_conflict_in_snapshot(constraints, row, Some(rowid), &pending_without_self, stored)? {
+            return Err(duplicate_key_error(&constraint));
+        }
+        pending.push((rowid.clone(), row.clone()));
+    }
+    Ok(())
+}
+
 /// 计算 `ON CONFLICT DO UPDATE` 命中既有行后的最终行值。
 ///
 /// 谓词只对既有行求值，不成立时返回 `None` 表示跳过；赋值在既有行与 `EXCLUDED` 行合并后的
 /// 作用域里求值（列带 `ROW_ID_STRIDE` 偏移），再统一应用，等价于 PostgreSQL 的「同时赋值」语义。
-/// 单行 `upsert_row` 与批量 `execute_multi_insert_atomic` 共用本函数，冲突语义只有一份。
+///
+/// Single-row `upsert_row` and atomic `execute_multi_insert_atomic` share this function so
+/// conflict semantics exist in one place.
 pub(crate) fn conflict_updated_row(
     existing: &RowFieldValues,
     plan: &WritePlan,
@@ -894,5 +953,59 @@ pub(crate) fn sql_value_to_bytes(lit: &SqlBoundLiteral) -> Option<Vec<u8>> {
         SqlBoundLiteral::Bytes(bytes) => Some(bytes.clone()),
         SqlBoundLiteral::Boolean(v) => Some((if *v { "1" } else { "0" }).as_bytes().to_vec()),
         SqlBoundLiteral::Null => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use database_query::catalog_bind::SqlFieldType;
+
+    fn insert_plan(rowid: &[u8], email: &str, constraints: &[UniqueConstraintPlan]) -> WritePlan {
+        WritePlan {
+            namespace: "table:users".to_string(),
+            rowid: rowid.to_vec(),
+            fields: vec![WriteField {
+                field_id: 1,
+                value: SqlBoundLiteral::String(email.to_string()),
+                field_type: SqlFieldType::String,
+                capacity: None,
+            }],
+            field_types: BTreeMap::from([(1, SqlFieldType::String)]),
+            conflict: None,
+            returning: None,
+            unique_constraints: constraints.to_vec(),
+        }
+    }
+
+    #[test]
+    fn later_statement_row_duplicating_a_unique_value_is_rejected() {
+        let constraints = vec![UniqueConstraintPlan { columns: vec![(1, "email".to_string())] }];
+        let plans = vec![
+            insert_plan(b"first", "same@example.com", &constraints),
+            insert_plan(b"second", "same@example.com", &constraints),
+        ];
+        let (order, folded) = fold_insert_plans(&plans, &BTreeMap::new(), SqlDialect::Postgres).expect("fold succeeds");
+        let error = ensure_unique_rows(&constraints, &order, &folded, &[]).expect_err("the later row must clash");
+        assert_eq!(error.kind, SqlErrorKind::DuplicateKey);
+    }
+
+    #[test]
+    fn distinct_unique_values_pass_the_statement_check() {
+        let constraints = vec![UniqueConstraintPlan { columns: vec![(1, "email".to_string())] }];
+        let plans = vec![insert_plan(b"first", "a@example.com", &constraints), insert_plan(b"second", "b@example.com", &constraints)];
+        let (order, folded) = fold_insert_plans(&plans, &BTreeMap::new(), SqlDialect::Postgres).expect("fold succeeds");
+        ensure_unique_rows(&constraints, &order, &folded, &[]).expect("distinct values must pass");
+    }
+
+    #[test]
+    fn repeated_primary_key_without_a_conflict_policy_is_rejected() {
+        let constraints: Vec<UniqueConstraintPlan> = Vec::new();
+        let plans = vec![insert_plan(b"same", "a@example.com", &constraints), insert_plan(b"same", "b@example.com", &constraints)];
+        let error = match fold_insert_plans(&plans, &BTreeMap::new(), SqlDialect::Postgres) {
+            Err(error) => error,
+            Ok(_) => panic!("repeated rowid must clash"),
+        };
+        assert_eq!(error.kind, SqlErrorKind::DuplicateKey);
     }
 }
