@@ -246,7 +246,7 @@ fn blmove_moves_and_wakes_the_destination_waiter() {
 }
 
 #[test]
-fn brpoplpush_moves_immediately_and_times_out_with_null() {
+fn brpoplpush_moves_immediately_and_times_out_with_null_array() {
     let (address, _executor) = start_server(1);
     let mut client = connect(address);
     push(&mut client, "RPUSH", "src", &["a", "b"]);
@@ -260,7 +260,7 @@ fn brpoplpush_moves_immediately_and_times_out_with_null() {
     send(&mut client, &["BRPOPLPUSH", "src", "dst", "0"]);
     expect(&mut client, "$1\r\na\r\n");
     send(&mut client, &["BRPOPLPUSH", "src", "dst", "0.1"]);
-    expect(&mut client, "$-1\r\n");
+    expect(&mut client, "*-1\r\n");
 }
 
 #[test]
