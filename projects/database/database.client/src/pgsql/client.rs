@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use super::auth::{md5_password, ScramClient};
 use super::error::{Notice, PostgresError};
 use database_protocol_pgsql::{self as protocol, MAX_MESSAGE_BYTES};
 
@@ -16,27 +17,24 @@ pub struct ClientConfig {
     pub port: u16,
     pub user: String,
     pub database: String,
+    pub password: Option<String>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        Self {
-            host: "127.0.0.1".into(),
-            port: 5432,
-            user: "postgres".into(),
-            database: "postgres".into(),
-        }
+        Self { host: "127.0.0.1".into(), port: 5432, user: "postgres".into(), database: "postgres".into(), password: None }
     }
 }
 
 impl ClientConfig {
     pub fn new(host: impl Into<String>, port: u16, user: impl Into<String>, database: impl Into<String>) -> Self {
-        Self {
-            host: host.into(),
-            port,
-            user: user.into(),
-            database: database.into(),
-        }
+        Self { host: host.into(), port, user: user.into(), database: database.into(), password: None }
+    }
+
+    /// Supplies a password for MD5, cleartext or SCRAM-SHA-256 authentication.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
     }
 }
 
@@ -277,15 +275,19 @@ impl Connection {
             .write_all(&protocol::startup_packet(&config.user, &config.database))
             .map_err(io_error)?;
         let mut authenticated = false;
+        let mut scram: Option<ScramClient> = None;
         loop {
             let (tag, payload) = self.read_message()?;
             match tag {
                 b'E' => return Err(protocol::error_response(&payload)),
                 b'R' => {
-                    if payload.len() != 4 || u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) != 0 {
-                        return Err(PostgresError::Protocol("PostgreSQL authentication is unsupported".into()));
+                    if payload.len() < 4 {
+                        return Err(PostgresError::Protocol("truncated PostgreSQL authentication request".into()));
                     }
-                    authenticated = true;
+                    let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    if let Some(answer) = authentication_answer(config, code, &payload[4..], &mut scram, &mut authenticated)? {
+                        self.stream.write_all(&answer).map_err(io_error)?;
+                    }
                 }
                 b'Z' => {
                     if !authenticated {
@@ -837,6 +839,73 @@ impl Connection {
         self.stream.read_exact(&mut payload).map_err(io_error)?;
         Ok((header[0], payload))
     }
+}
+
+/// Turns one server authentication request into the packet the client must
+/// answer with, or `None` when the request needs no reply.
+///
+/// Codes come from the protocol-v3 `AuthenticationRequest`: `0` ok, `3`
+/// cleartext, `5` MD5, `10` SASL mechanisms, `11` SASL continue, `12` SASL
+/// final. Anything else is a request this client cannot satisfy, so it fails
+/// loudly instead of leaving the socket half authenticated.
+fn authentication_answer(
+    config: &ClientConfig,
+    code: u32,
+    data: &[u8],
+    scram: &mut Option<ScramClient>,
+    authenticated: &mut bool,
+) -> Result<Option<Vec<u8>>, PostgresError> {
+    match code {
+        0 => {
+            if !data.is_empty() {
+                return Err(PostgresError::Protocol("invalid AuthenticationOk".into()));
+            }
+            *authenticated = true;
+            Ok(None)
+        }
+        3 => {
+            let password = required_password(config, "cleartext")?;
+            Ok(Some(protocol::password_packet(password)?))
+        }
+        5 => {
+            if data.len() != 4 {
+                return Err(PostgresError::Protocol("invalid MD5 authentication salt".into()));
+            }
+            let password = required_password(config, "MD5")?;
+            Ok(Some(protocol::password_packet(md5_password(password, &config.user, data))?))
+        }
+        10 => {
+            if !data.split(|byte| *byte == 0).any(|part| part == b"SCRAM-SHA-256") {
+                return Err(PostgresError::Unsupported("no supported SASL mechanism offered by the server".into()));
+            }
+            let password = required_password(config, "SCRAM-SHA-256")?;
+            let (client, client_first) = ScramClient::new(&config.user, password)?;
+            *scram = Some(client);
+            Ok(Some(protocol::sasl_initial_packet("SCRAM-SHA-256", client_first.as_bytes())?))
+        }
+        11 => {
+            let client = scram.as_mut().ok_or(PostgresError::Protocol("SASLContinue arrived before SASLInitialResponse".into()))?;
+            let server_first = std::str::from_utf8(data)
+                .map_err(|_| PostgresError::Protocol("SCRAM server-first is not valid UTF-8".into()))?;
+            let client_final = client.continue_with(server_first)?;
+            Ok(Some(protocol::sasl_response_packet(client_final.as_bytes())?))
+        }
+        12 => {
+            let client = scram.as_ref().ok_or(PostgresError::Protocol("SASLFinal arrived before SASLInitialResponse".into()))?;
+            let server_final = std::str::from_utf8(data)
+                .map_err(|_| PostgresError::Protocol("SCRAM server-final is not valid UTF-8".into()))?;
+            client.verify(server_final)?;
+            Ok(None)
+        }
+        other => Err(PostgresError::Unsupported(format!("PostgreSQL authentication method {other}"))),
+    }
+}
+
+fn required_password<'a>(config: &'a ClientConfig, method: &str) -> Result<&'a str, PostgresError> {
+    config
+        .password
+        .as_deref()
+        .ok_or_else(|| PostgresError::Protocol(format!("PostgreSQL server requested {method} authentication but no password was configured")))
 }
 
 /// Wire format codes for a parameter list: empty when every parameter is text,

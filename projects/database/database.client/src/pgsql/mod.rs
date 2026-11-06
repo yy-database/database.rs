@@ -19,6 +19,9 @@ use database_types::{Error, Result};
 /// PostgreSQL wire errors, shared with `database-protocol-pgsql`.
 pub mod error;
 
+/// Password authentication: MD5, cleartext and SCRAM-SHA-256.
+mod auth;
+
 /// Connection primitives: startup handshake, simple and extended query.
 #[allow(missing_docs)]
 pub mod client;
@@ -128,9 +131,13 @@ fn parse_postgres_endpoint(endpoint: &str) -> Result<(ClientConfig, SocketAddr)>
             None => ("", authority),
         };
         let user = userinfo.split(':').next().filter(|user| !user.is_empty()).unwrap_or("postgres");
+        let password = userinfo.split_once(':').map(|(_, password)| password).filter(|password| !password.is_empty());
         let (host, port) = split_host_port(hostport)?;
         let database = if database.is_empty() { user } else { database };
-        let config = ClientConfig::new(host.clone(), port, user, database);
+        let mut config = ClientConfig::new(host.clone(), port, user, database);
+        if let Some(password) = password {
+            config = config.with_password(password);
+        }
         let address = resolve(&host, port)?;
         return Ok((config, address));
     }
@@ -139,6 +146,7 @@ fn parse_postgres_endpoint(endpoint: &str) -> Result<(ClientConfig, SocketAddr)>
     let mut port = 5432u16;
     let mut user = "postgres".to_owned();
     let mut database = String::new();
+    let mut password = None;
     for part in endpoint.split_whitespace() {
         if let Some(value) = part.strip_prefix("host=") {
             host = value.to_owned();
@@ -149,6 +157,9 @@ fn parse_postgres_endpoint(endpoint: &str) -> Result<(ClientConfig, SocketAddr)>
         else if let Some(value) = part.strip_prefix("user=") {
             user = value.to_owned();
         }
+        else if let Some(value) = part.strip_prefix("password=") {
+            password = Some(value.to_owned());
+        }
         else if let Some(value) = part.strip_prefix("dbname=") {
             database = value.to_owned();
         }
@@ -157,7 +168,11 @@ fn parse_postgres_endpoint(endpoint: &str) -> Result<(ClientConfig, SocketAddr)>
         database = user.clone();
     }
     let address = resolve(&host, port)?;
-    Ok((ClientConfig::new(host, port, user, database), address))
+    let mut config = ClientConfig::new(host, port, user, database);
+    if let Some(password) = password {
+        config = config.with_password(password);
+    }
+    Ok((config, address))
 }
 
 fn split_host_port(hostport: &str) -> Result<(String, u16)> {
