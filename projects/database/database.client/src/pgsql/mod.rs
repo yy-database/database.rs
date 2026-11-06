@@ -19,8 +19,9 @@ use database_types::{Error, Result};
 /// PostgreSQL wire errors, shared with `database-protocol-pgsql`.
 pub mod error;
 
+/// Connection primitives: startup handshake, simple and extended query.
 #[allow(missing_docs)]
-mod client;
+pub mod client;
 
 pub use client::{
     BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Param, Portal, PortalReport, Prepared, Report,
