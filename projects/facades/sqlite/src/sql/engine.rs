@@ -3849,7 +3849,16 @@ impl Engine {
                 }
             }
         }
-        let old_lookup: BTreeMap<i64, Vec<Cell>> = live.iter().cloned().collect();
+        let old_rows: Vec<(i64, Vec<Cell>)> = live.clone();
+        let old_lookup: BTreeMap<i64, Vec<Cell>> = old_rows.iter().cloned().collect();
+        // A `DO UPDATE` is an ordinary UPDATE for trigger and foreign-key
+        // purposes: SQLite fires the update triggers with the rewritten row and
+        // re-checks references the statement moves.
+        let queue_triggers = self.table_has_triggers(table_key);
+        let trigger_columns = trigger_frame_columns(def);
+        let assigned_names: Vec<String> = plan.assignments.iter().map(|(position, _)| def.columns[*position].name.clone()).collect();
+        let assigned: Vec<bool> = (0..width).map(|position| plan.assignments.iter().any(|(target, _)| *target == position)).collect();
+        let mut events: Vec<(i64, Vec<Cell>, Vec<Cell>)> = Vec::new();
         if let Some(position) = temp_position {
             let table_state = &mut self.temp_tables[position];
             for (write_rowid, values) in &planned.writes {
@@ -3857,27 +3866,34 @@ impl Engine {
                     .rows
                     .get_mut(write_rowid)
                     .ok_or_else(|| SqlError::new("storage", "temp row disappeared").in_statement("insert"))?;
+                let old_cells = cells.clone();
                 for (slot, value) in values.iter().enumerate() {
                     if let crate::UpdateValue::Set(value) = value {
                         cells[slot] = write_value_cell(value);
                     }
                 }
+                if queue_triggers {
+                    events.push((*write_rowid, old_cells, cells.clone()));
+                }
             }
         }
         else {
             for (write_rowid, values) in &planned.writes {
+                let old_cells = old_lookup.get(write_rowid).cloned().unwrap_or_default();
+                let mut new_cells = old_cells.clone();
+                if new_cells.len() < width {
+                    new_cells.resize(width, Cell::Null);
+                }
+                for (slot, value) in values.iter().enumerate() {
+                    if let crate::UpdateValue::Set(value) = value {
+                        new_cells[slot] = write_value_cell(value);
+                    }
+                }
+                if queue_triggers {
+                    events.push((*write_rowid, old_cells.clone(), new_cells.clone()));
+                }
                 let written = if def.without_rowid {
-                    let old_cells = old_lookup.get(write_rowid).cloned().unwrap_or_default();
                     let old_values: Vec<crate::WriteValue> = old_cells.iter().map(cell_write_value).collect();
-                    let mut new_cells = old_cells;
-                    if new_cells.len() < width {
-                        new_cells.resize(width, Cell::Null);
-                    }
-                    for (slot, value) in values.iter().enumerate() {
-                        if let crate::UpdateValue::Set(value) = value {
-                            new_cells[slot] = write_value_cell(value);
-                        }
-                    }
                     let new_values: Vec<crate::WriteValue> = new_cells.iter().map(cell_write_value).collect();
                     self.writer.update_without_rowid(table, &old_values, &new_values)
                 }
@@ -3888,6 +3904,12 @@ impl Engine {
                     return Err(write_failure(error, "insert", def));
                 }
             }
+        }
+        for (updated_rowid, old_cells, new_cells) in events {
+            self.queue_update_events(table_key, def, &trigger_columns, &assigned_names, updated_rowid, &old_cells, &new_cells);
+        }
+        if self.foreign_keys {
+            self.check_update_foreign_keys(def, &planned, &old_rows, &assigned, "insert")?;
         }
         *live = self.live_rows(def, "insert")?;
         let rowid = planned.writes.first().map(|(rowid, _)| *rowid).unwrap_or(rowid);
