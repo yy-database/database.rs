@@ -5476,6 +5476,19 @@ fn eval_function(name: ScalarFunction, args: &[Cell]) -> Cell {
         ScalarFunction::Quote => Cell::Text(quote_text(&args[0])),
         ScalarFunction::Random => Cell::Integer(next_random()),
         ScalarFunction::RandomBlob => Cell::Blob(random_blob(&args[0])),
+        ScalarFunction::Instr => instr_cell(args),
+    }
+}
+
+/// `instr(x, y)`: the one-based character position of the first `y` inside
+/// `x`, or zero when `y` does not occur. Either `NULL` propagates.
+fn instr_cell(args: &[Cell]) -> Cell {
+    match (text_form(&args[0]), text_form(&args[1])) {
+        (Some(haystack), Some(needle)) => match haystack.find(&needle) {
+            Some(byte) => Cell::Integer(haystack[..byte].chars().count() as i64 + 1),
+            None => Cell::Integer(0),
+        },
+        _ => Cell::Null,
     }
 }
 
@@ -6628,6 +6641,42 @@ mod tests {
         assert_eq!(value(&mut engine, "SELECT round(NULL, 1)"), Cell::Null);
         assert_eq!(value(&mut engine, "SELECT round(1.5, NULL)"), Cell::Null);
         assert_eq!(value(&mut engine, "SELECT typeof(round(2.5, 1))"), Cell::Text("real".to_string()));
+    }
+
+    #[test]
+    fn instr_returns_one_based_character_positions() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let value = |engine: &mut Engine, sql: &str| engine.execute_one(sql).expect("instr query").rows[0][0].clone();
+        // Measured on better-sqlite3 3.53.2 and CPython sqlite3 3.49.1.
+        assert_eq!(value(&mut engine, "SELECT instr('abcabc', 'bc')"), Cell::Integer(2));
+        assert_eq!(value(&mut engine, "SELECT instr('abc', 'abc')"), Cell::Integer(1));
+        assert_eq!(value(&mut engine, "SELECT instr('abc', 'z')"), Cell::Integer(0));
+        assert_eq!(value(&mut engine, "SELECT instr('abc', 'abcd')"), Cell::Integer(0));
+        // An empty needle matches at the first character, an empty haystack
+        // with a non-empty needle does not.
+        assert_eq!(value(&mut engine, "SELECT instr('abc', '')"), Cell::Integer(1));
+        assert_eq!(value(&mut engine, "SELECT instr('', 'a')"), Cell::Integer(0));
+        assert_eq!(value(&mut engine, "SELECT instr('', '')"), Cell::Integer(1));
+        // Positions are counted in characters, not bytes; bound text keeps
+        // every code point intact.
+        let unicode = engine
+            .execute_with_parameters("SELECT instr(?1, ?2)", &[Cell::Text("αβγδ".to_string()), Cell::Text("γ".to_string())])
+            .expect("bound instr");
+        assert_eq!(unicode[0].rows, vec![vec![Cell::Integer(3)]]);
+        let han = engine
+            .execute_with_parameters("SELECT instr(?1, ?2)", &[Cell::Text("你好世界".to_string()), Cell::Text("好".to_string())])
+            .expect("bound instr");
+        assert_eq!(han[0].rows, vec![vec![Cell::Integer(2)]]);
+        // Numeric arguments use their SQLite text form.
+        assert_eq!(value(&mut engine, "SELECT instr(12345, 34)"), Cell::Integer(3));
+        assert_eq!(value(&mut engine, "SELECT instr(1.5, '.')"), Cell::Integer(2));
+        assert_eq!(value(&mut engine, "SELECT typeof(instr('a', 'a'))"), Cell::Text("integer".to_string()));
+        assert_eq!(value(&mut engine, "SELECT instr(NULL, 'a')"), Cell::Null);
+        assert_eq!(value(&mut engine, "SELECT instr('a', NULL)"), Cell::Null);
+        assert_eq!(
+            engine.execute_one("SELECT instr('a', 'b', 'c')").expect_err("three arguments").message,
+            "wrong number of arguments to function instr()"
+        );
     }
 
     fn text(value: &str) -> Cell {
