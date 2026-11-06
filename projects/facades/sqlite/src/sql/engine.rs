@@ -160,6 +160,46 @@ struct IndexDef {
     unique: bool,
 }
 
+/// One view in the engine catalog, keyed by its lowercase name.
+struct ViewDef {
+    /// View name as written, used for diagnostics.
+    name: String,
+    /// Optional `CREATE VIEW v(a, b)` list that renames the query output.
+    columns: Option<Vec<String>>,
+    /// Parsed query the view re-evaluates on every read.
+    query: Statement,
+}
+
+thread_local! {
+    /// Views can be nested, but a view that reaches itself would recurse
+    /// forever. SQLite rejects the circular definition at prepare time; this
+    /// counter turns the same case into one structured error instead.
+    static VIEW_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Decrements the view depth when the nested evaluation returns, including on
+/// an error path.
+struct ViewDepthGuard;
+
+impl ViewDepthGuard {
+    fn enter() -> Result<Self, SqlError> {
+        VIEW_DEPTH.with(|depth| {
+            depth.set(depth.get() + 1);
+            if depth.get() > 8 {
+                depth.set(depth.get() - 1);
+                return Err(SqlError::new("view-depth", "view nesting depth exceeded"));
+            }
+            Ok(Self)
+        })
+    }
+}
+
+impl Drop for ViewDepthGuard {
+    fn drop(&mut self) {
+        VIEW_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// One uniqueness rule an `UPDATE` re-checks against the live table.
 enum UniqueKey {
     /// The hidden rowid, reported under `t.rowid` or `t.<alias>`.
@@ -315,6 +355,9 @@ pub struct Engine {
     /// Lowercase table name to its position in [`Engine::tables`].
     table_lookup: BTreeMap<String, usize>,
     indexes: BTreeMap<String, IndexDef>,
+    /// Views keyed by lowercase name. A view shares the object namespace with
+    /// tables and indexes and re-evaluates its query on every read.
+    views: BTreeMap<String, ViewDef>,
     /// Values bound to `?` / `:name` placeholders for the statement currently
     /// executing, in declaration order.
     parameters: Vec<Cell>,
@@ -354,6 +397,7 @@ impl Engine {
             tables: Vec::new(),
             table_lookup: BTreeMap::new(),
             indexes: BTreeMap::new(),
+            views: BTreeMap::new(),
             parameters: Vec::new(),
             foreign_keys: true,
             last_insert_rowid: 0,
@@ -450,6 +494,7 @@ impl Engine {
         self.tables.clear();
         self.table_lookup.clear();
         self.indexes.clear();
+        self.views.clear();
         self.load_catalog()
     }
 
@@ -488,6 +533,12 @@ impl Engine {
                         continue;
                     }
                     self.indexes.insert(name.to_ascii_lowercase(), IndexDef { table: table.to_ascii_lowercase(), columns: positions, unique });
+                }
+                Some(Statement::CreateView { name, columns, query, .. }) => {
+                    let key = name.to_ascii_lowercase();
+                    if !self.table_lookup.contains_key(&key) && !self.views.contains_key(&key) {
+                        self.views.insert(key, ViewDef { name, columns, query: *query });
+                    }
                 }
                 _ => {}
             }
@@ -691,6 +742,9 @@ impl Engine {
                 if self.indexes.contains_key(&key) {
                     return Err(SqlError::new("index-exists", format!("there is already an index named `{name}`")).in_statement("create-table"));
                 }
+                if self.views.contains_key(&key) {
+                    return Err(SqlError::new("view-exists", format!("there is already a view named `{name}`")).in_statement("create-table"));
+                }
                 if self.table_lookup.contains_key(&key) {
                     if if_not_exists {
                         return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
@@ -715,9 +769,49 @@ impl Engine {
                 self.tables.push(def);
                 Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
+            Statement::CreateView { name, if_not_exists, columns, query, sql } => {
+                let key = name.to_ascii_lowercase();
+                check_reserved_object_name(&name, "create-view")?;
+                if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name))
+                    || self.indexes.contains_key(&key)
+                    || self.views.contains_key(&key)
+                {
+                    if if_not_exists {
+                        return Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                    }
+                    return Err(SqlError::new("table-exists", format!("table `{name}` already exists")).in_statement("create-view"));
+                }
+                self.writer
+                    .create_view(&name, &sql)
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-view"))?;
+                self.views.insert(key, ViewDef { name, columns, query: *query });
+                Ok(ExecResult { statement: "create-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
+            }
+            Statement::DropView { name, if_exists } => {
+                let key = name.to_ascii_lowercase();
+                if self.tables.iter().any(|def| def.name.eq_ignore_ascii_case(&name)) {
+                    return Err(SqlError::new("wrong-object", format!("use DROP TABLE to delete table `{name}`")).in_statement("drop-view"));
+                }
+                if self.indexes.contains_key(&key) {
+                    return Err(SqlError::new("wrong-object", format!("use DROP INDEX to delete index `{name}`")).in_statement("drop-view"));
+                }
+                if self.views.remove(&key).is_none() {
+                    if if_exists {
+                        return Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                    }
+                    return Err(SqlError::new("unknown-view", format!("no such view: {name}")).in_statement("drop-view"));
+                }
+                self.writer
+                    .drop_view(&name)
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("drop-view"))?;
+                Ok(ExecResult { statement: "drop-view", columns: Vec::new(), rows: Vec::new(), affected: 1 })
+            }
             Statement::Insert { table, columns, rows, default_values, returning } => {
                 let key = table.to_ascii_lowercase();
                 check_readonly_table(&table, "insert")?;
+                if self.views.contains_key(&key) {
+                    return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("insert"));
+                }
                 let position = *self
                     .table_lookup
                     .get(&key)
@@ -880,6 +974,9 @@ impl Engine {
                 if is_schema_table(&table) {
                     return Err(SqlError::new("readonly-system-table", format!("table {table} may not be indexed")).in_statement("create-index"));
                 }
+                if self.views.contains_key(&table_key) {
+                    return Err(SqlError::new("readonly-view", format!("views may not be indexed: {table}")).in_statement("create-index"));
+                }
                 check_reserved_object_name(&name, "create-index")?;
                 let position = *self
                     .table_lookup
@@ -920,6 +1017,9 @@ impl Engine {
             Statement::Update { table, alias, assignments, filter, returning } => {
                 check_readonly_table(&table, "update")?;
                 let key = table.to_ascii_lowercase();
+                if self.views.contains_key(&key) {
+                    return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("update"));
+                }
                 let position = *self
                     .table_lookup
                     .get(&key)
@@ -991,6 +1091,9 @@ impl Engine {
             Statement::Delete { table, alias, filter, returning } => {
                 check_readonly_table(&table, "delete")?;
                 let key = table.to_ascii_lowercase();
+                if self.views.contains_key(&key) {
+                    return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("delete"));
+                }
                 let position = *self
                     .table_lookup
                     .get(&key)
@@ -1073,6 +1176,9 @@ impl Engine {
                 let objects = self.schema_objects("drop-table")?;
                 let present = objects.iter().any(|object| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case(&name));
                 if !present {
+                    if objects.iter().any(|object| object.kind == SchemaObjectKind::View && object.name.eq_ignore_ascii_case(&name)) {
+                        return Err(SqlError::new("wrong-object", format!("use DROP VIEW to delete view `{name}`")).in_statement("drop-table"));
+                    }
                     if if_exists {
                         return Ok(ExecResult { statement: "drop-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
                     }
@@ -1849,25 +1955,53 @@ impl Engine {
             }
             else {
                 let key = table.name.to_ascii_lowercase();
-                let position = *self
-                    .table_lookup
-                    .get(&key)
-                    .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{}`", table.name)).in_statement("select"))?;
-                let def = &self.tables[position];
-                let stored = self.writer.table_rows(&def.name, TableLimits::default()).map_err(|error| {
-                    SqlError::new("storage", error.to_string()).in_statement("select")
-                })?;
-                let decoded = stored
-                    .iter()
-                    .map(|row| {
-                        let mut cells = decode_row(&row.payload, def, row.rowid)?;
-                        // Rowid tables expose the implicit integer primary key
-                        // through `rowid`, `_rowid_` and `oid`.
-                        cells.push(Cell::Integer(row.rowid));
-                        Ok(cells)
-                    })
-                    .collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
-                (SourceColumns::Table(def), decoded)
+                if let Some(view) = self.views.get(&key) {
+                    // A view re-runs its stored query against the current contents
+                    // of every base table, exactly like SQLite. Views are not
+                    // correlated, so they see no outer row or CTE from this query.
+                    let _depth = ViewDepthGuard::enter()?;
+                    let result = self.select_statement(&view.query, &[], budget, None)?;
+                    let names = match &view.columns {
+                        Some(declared) => {
+                            if declared.len() != result.columns.len() {
+                                return Err(SqlError::new(
+                                    "view-arity",
+                                    format!(
+                                        "view {} has {} columns but {} declared",
+                                        view.name,
+                                        result.columns.len(),
+                                        declared.len()
+                                    ),
+                                )
+                                .in_statement("select"));
+                            }
+                            declared.clone()
+                        }
+                        None => result.columns.clone(),
+                    };
+                    (SourceColumns::Materialized { names, rowid: false }, result.rows)
+                }
+                else {
+                    let position = *self
+                        .table_lookup
+                        .get(&key)
+                        .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{}`", table.name)).in_statement("select"))?;
+                    let def = &self.tables[position];
+                    let stored = self.writer.table_rows(&def.name, TableLimits::default()).map_err(|error| {
+                        SqlError::new("storage", error.to_string()).in_statement("select")
+                    })?;
+                    let decoded = stored
+                        .iter()
+                        .map(|row| {
+                            let mut cells = decode_row(&row.payload, def, row.rowid)?;
+                            // Rowid tables expose the implicit integer primary key
+                            // through `rowid`, `_rowid_` and `oid`.
+                            cells.push(Cell::Integer(row.rowid));
+                            Ok(cells)
+                        })
+                        .collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
+                    (SourceColumns::Table(def), decoded)
+                }
             };
             let width = columns.width();
             let source = Source {
@@ -7960,5 +8094,25 @@ mod tests {
         assert_eq!(text.message, "cannot store TEXT value in BLOB column s.c");
         let unknown = engine.execute_one("CREATE TABLE bad(a varchar(10)) STRICT").expect_err("bad datatype");
         assert_eq!(unknown.message, "unknown datatype for bad.a: \"varchar(10)\"");
+    }
+
+    #[test]
+    fn views_rerun_their_query_and_share_the_object_namespace() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE base(a INTEGER, b TEXT)").expect("base");
+        engine.execute("INSERT INTO base VALUES (1, 'x'), (2, 'y')").expect("rows");
+        engine.execute("CREATE VIEW v(c) AS SELECT a FROM base WHERE a > 1").expect("view");
+        assert_eq!(engine.execute_one("SELECT c FROM v ORDER BY c").expect("read view").rows, vec![vec![Cell::Integer(2)]]);
+        engine.execute("INSERT INTO base VALUES (3, 'z')").expect("later row");
+        assert_eq!(engine.execute_one("SELECT count(*) FROM v").expect("count view").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(
+            engine.execute_one("SELECT type, name, tbl_name, rootpage FROM sqlite_master WHERE name = 'v'").expect("master").rows,
+            vec![vec![Cell::Text("view".to_string()), Cell::Text("v".to_string()), Cell::Text("v".to_string()), Cell::Integer(0)]]
+        );
+        let modify = engine.execute_one("INSERT INTO v VALUES (4)").expect_err("view is read only");
+        assert_eq!(modify.code, "readonly-view");
+        engine.execute("DROP VIEW v").expect("drop view");
+        let missing = engine.execute_one("SELECT * FROM v").expect_err("dropped");
+        assert_eq!(missing.code, "unknown-table");
     }
 }
