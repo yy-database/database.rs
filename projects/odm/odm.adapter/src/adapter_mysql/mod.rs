@@ -62,14 +62,12 @@ impl MysqlSource {
 
     /// Connect using a mysql URL (`mysql://user:pass@host:3306/db`).
     ///
-    /// The gateway wire client has no handshake / `COM_QUERY` extraction in
-    /// this dev line, so every execute path would fail after a successful
-    /// open. The session is refused here instead of exposing a half-open
-    /// backend.
+    /// The handshake, authentication and `COM_QUERY` path live in
+    /// [`database_client::mysql`], so this fails only on a real wire error
+    /// (unreachable server, bad credentials, unsupported plugin).
     pub fn connect(url: &str) -> Result<Self> {
-        Err(Error::Unsupported(format!(
-            "mysql session refused for `{url}` — gateway wire client handshake/COM_QUERY is not available in this dev line (use sqlite)"
-        )))
+        let session = Session::connect(url, Duration::from_secs(5)).map_err(Error::Wire)?;
+        Ok(Self { url: url.to_owned(), session: Mutex::new(session), uuid_fields: HashSet::new() })
     }
 
     /// Register VOS schema so `uuid` columns encode/decode as MySQL `BINARY(16)`.
@@ -113,16 +111,22 @@ impl MysqlSource {
 
     /// Build an adopt mapping against a VOS schema document.
     pub fn adopt(&self, vos_schema: &str) -> Result<MappingManifest> {
-        let catalog = self.inspect()?;
         let document = parse_vos(vos_schema)?;
-        Ok(catalog::adopt_plan(&document, &catalog))
+        self.with_session(|conn| {
+            let catalog = catalog::inspect_catalog(conn)?;
+            let folded = catalog::names_are_folded(conn)?;
+            Ok(catalog::adopt_plan_with_case(&document, &catalog, folded))
+        })
     }
 
     /// Plan a Managed Push from a VOS schema.
     pub fn plan_managed_push(&self, vos_schema: &str) -> Result<LogicalMigrationPlan> {
         let document = parse_vos(vos_schema)?;
-        let observed = self.inspect()?;
-        migrate::plan_push(&document, &observed)
+        self.with_session(|conn| {
+            let observed = catalog::inspect_catalog(conn)?;
+            let folded = catalog::names_are_folded(conn)?;
+            migrate::plan_push_with_case(&document, &observed, folded)
+        })
     }
 
     /// Apply a previously reviewed Managed Push plan.
@@ -143,8 +147,11 @@ impl MysqlSource {
     /// Drift report against a VOS schema.
     pub fn drift(&self, vos_schema: &str) -> Result<DriftReport> {
         let document = parse_vos(vos_schema)?;
-        let catalog = self.inspect()?;
-        Ok(catalog::drift_report(&document, &catalog))
+        self.with_session(|conn| {
+            let catalog = catalog::inspect_catalog(conn)?;
+            let folded = catalog::names_are_folded(conn)?;
+            Ok(catalog::drift_report(&document, &catalog, folded))
+        })
     }
 
     /// Execute a physical plan.

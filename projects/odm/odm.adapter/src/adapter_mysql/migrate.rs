@@ -22,11 +22,17 @@ pub struct PushReport {
 
 /// Build a non-destructive plan: create missing tables + add missing fields.
 pub fn plan_push(document: &SchemaProjection, observed: &ObservedCatalog) -> Result<LogicalMigrationPlan> {
+    plan_push_with_case(document, observed, false)
+}
+
+/// Same as [`plan_push`], with table-name case folding configured from the
+/// server (`lower_case_table_names`).
+pub(crate) fn plan_push_with_case(document: &SchemaProjection, observed: &ObservedCatalog, folded: bool) -> Result<LogicalMigrationPlan> {
     let target = fingerprint_document(document);
     let mut changes = Vec::new();
     for table in document.types.iter().filter(|item| item.kind == TypeContractKind::Table) {
         let name = table_name(table);
-        match observed.table(name) {
+        match super::catalog::find_table(observed, name, folded) {
             None => {
                 changes.push(LogicalChange::CreateTable { vos_table: name.to_owned() });
             }

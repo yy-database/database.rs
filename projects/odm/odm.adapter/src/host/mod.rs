@@ -535,7 +535,8 @@ impl HostSession {
 
     /// Project profile resolved from an Iris config and datasource name.
     pub fn open_project(config_path: &str, source: &str) -> Result<Self, ErrorEnvelope> {
-        let (project_dir, project) = load_project(Path::new(config_path)).map_err(|err| ErrorEnvelope::internal(DIAG_EXEC_FAILED, err.to_string()))?;
+        let (project_dir, project) =
+            load_project(Path::new(config_path)).map_err(|err| ErrorEnvelope::internal(DIAG_EXEC_FAILED, err.to_string()))?;
         let ds = project.datasource(source).map_err(|err| ErrorEnvelope::internal(DIAG_EXEC_FAILED, err.to_string()))?;
         let store = match ds.kind {
             DatasourceKind::Yydb => {
@@ -701,9 +702,10 @@ impl HostSession {
         match &self.store {
             Some(SessionStore::Sqlite(db)) => db.managed_push(schema).map_err(from_sqlite_error).map(|_| ()),
             Some(SessionStore::Postgres { db, .. }) => db.managed_push(schema).map_err(from_postgres_error).map(|_| ()),
+            Some(SessionStore::Mysql { db, .. }) => db.managed_push(schema).map_err(from_mysql_error).map(|_| ()),
             _ => Err(ErrorEnvelope::invalid_argument(
                 DIAG_MANAGED_PUSH_UNSUPPORTED,
-                "managed_push is only supported on sqlite and postgres sessions",
+                "managed_push is only supported on sqlite, postgres and mysql sessions",
             )),
         }
     }
