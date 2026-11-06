@@ -69,6 +69,24 @@ pub struct OutboxAppend {
     pub effect: OutboxEffect,
 }
 
+/// Backlog reading for one authority shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxBacklog {
+    /// Durable rows with `seq > min_acked_seq`, or the cumulative row count
+    /// when no consumer has acknowledged anything yet.
+    pub pending: u64,
+    /// Lowest `acked_seq` across consumers. `None` means no consumer acked,
+    /// so `pending` is the cumulative count rather than a live backlog.
+    pub min_acked_seq: Option<u64>,
+}
+
+impl OutboxBacklog {
+    /// True when `pending` is the cumulative row count because consumers never acked.
+    pub fn is_cumulative(&self) -> bool {
+        self.min_acked_seq.is_none()
+    }
+}
+
 /// Durable outbox row after authority commit (propagation duty accepted).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxRecord {
