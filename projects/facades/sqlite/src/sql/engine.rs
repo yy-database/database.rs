@@ -16,7 +16,7 @@ use super::json_string;
 use super::sql::{
     AggregateFunction, AlterAction, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm, Expr,
     ForeignKey, FrameEdge, FrameUnits, IndexColumn, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems,
-    Statement, TableRef, UnaryOp, WindowFunction, WindowSpec, parse, rewrite_create_index_column, rewrite_create_index_table,
+    Statement, TableRef, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column, rewrite_create_index_table,
     rewrite_create_table_column, rewrite_create_table_name, statement_references,
 };
 
@@ -2541,11 +2541,10 @@ impl Engine {
 
     /// Evaluates a `SELECT` statement, materializing its `WITH` entries first.
     ///
-    /// Each CTE is evaluated once, in declaration order, and only sees the
-    /// entries before it plus the enclosing environment. References to the
-    /// CTE's own name are rejected: this round deliberately has no fixed-point
-    /// evaluator, so a recursive query reports `unsupported-clause` rather than
-    /// looping or returning a half-correct row set.
+    /// A CTE that reads its own name is evaluated as a fixed point: the terms
+    /// before the first self-reference form the seed, and the remaining terms
+    /// run against the previous iteration's rows until the working set is
+    /// empty. The `RECURSIVE` keyword is optional, matching SQLite.
     #[allow(clippy::too_many_arguments)]
     fn run_select(
         &self,
@@ -2562,41 +2561,242 @@ impl Engine {
         if with.is_empty() {
             return self.select(first, compounds, order, limit, outer, budget, parent);
         }
+        // Only an actual self-reference makes a `WITH` entry recursive, so the
+        // keyword itself carries no extra behavior.
+        let _ = recursive;
+        let pushdown = self.recursive_limit(first, compounds, &order, limit.as_ref(), outer, budget, parent)?;
+        let mut env = CteEnv { parent, tables: BTreeMap::new() };
         for entry in with {
-            if statement_references(&entry.query, &entry.name) {
+            let bound = pushdown
+                .as_ref()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(&entry.name))
+                .map(|(_, bound)| *bound);
+            let result = match self.recursive_start(entry)? {
+                Some(start) => self.materialize_recursive(entry, start, &env, budget, bound)?,
+                None => {
+                    let result = self.select_statement(&entry.query, &[], budget, Some(&env))?;
+                    if let Some(names) = &entry.columns {
+                        if names.len() != result.columns.len() {
+                            let mut error = SqlError::new(
+                                "arity-mismatch",
+                                format!("table {} has {} values for {} columns", entry.name, result.columns.len(), names.len()),
+                            )
+                            .in_statement("select");
+                            error.clause = Some("WITH".to_string());
+                            return Err(error);
+                        }
+                    }
+                    Materialized { columns: entry.columns.clone().unwrap_or(result.columns), rows: result.rows }
+                }
+            };
+            env.tables.insert(entry.name.to_ascii_lowercase(), result);
+        }
+        self.select(first, compounds, order, limit, outer, budget, Some(&env))
+    }
+
+    /// Where the recursive part of a CTE begins, or `None` when the entry only
+    /// reads earlier tables.
+    ///
+    /// SQLite splits the compound body at the first term that reads the CTE
+    /// name: everything before it is the seed, everything after it is a
+    /// recursive term and must also read the name. Mixed operators and a
+    /// seed that reads its own CTE are reported as `circular reference`.
+    fn recursive_start(&self, entry: &CommonTable) -> Result<Option<usize>, SqlError> {
+        let Statement::Select { first, compounds, .. } = entry.query.as_ref() else {
+            return Ok(None);
+        };
+        let name = entry.name.as_str();
+        if core_references(first, name) {
+            return Err(circular_reference(name));
+        }
+        let Some(start) = compounds.iter().position(|term| core_references(&term.core, name)) else {
+            if statement_references(&entry.query, name) {
+                return Err(circular_reference(name));
+            }
+            return Ok(None);
+        };
+        if compounds[start..].iter().any(|term| !core_references(&term.core, name)) {
+            return Err(circular_reference(name));
+        }
+        let op = compounds[start].op;
+        if !matches!(op, CompoundOp::Union | CompoundOp::UnionAll) || compounds.iter().any(|term| term.op != op) {
+            return Err(circular_reference(name));
+        }
+        Ok(Some(start))
+    }
+
+    /// Evaluates one recursive CTE to its fixed point.
+    ///
+    /// `bound` is the largest row count the enclosing query can still consume;
+    /// it is only supplied when the outer `LIMIT` is directly over this CTE's
+    /// rows, so an infinite recursion can be cut off without changing the
+    /// result of the statement.
+    fn materialize_recursive(
+        &self,
+        entry: &CommonTable,
+        start: usize,
+        env: &CteEnv,
+        budget: &Budget,
+        bound: Option<usize>,
+    ) -> Result<Materialized, SqlError> {
+        let Statement::Select { with: inner_with, first, compounds, order, limit, .. } = entry.query.as_ref() else {
+            return Err(SqlError::new("unsupported-statement", "a `WITH` body must be a `SELECT`").in_statement("select"));
+        };
+        // Terms before the first self-reference are the initial select; they
+        // run once and may not read the CTE.
+        let seed_statement = Statement::Select {
+            with: inner_with.clone(),
+            recursive: false,
+            first: first.clone(),
+            compounds: compounds[..start].to_vec(),
+            order: Vec::new(),
+            limit: None,
+        };
+        let seed = self.select_statement(&seed_statement, &[], budget, Some(env))?;
+        if let Some(names) = &entry.columns {
+            if names.len() != seed.columns.len() {
                 let mut error = SqlError::new(
-                    "unsupported-clause",
-                    format!(
-                        "`WITH RECURSIVE` is not supported: CTE `{}` references itself, and this engine evaluates each CTE once",
-                        entry.name
-                    ),
+                    "arity-mismatch",
+                    format!("table {} has {} values for {} columns", entry.name, seed.columns.len(), names.len()),
                 )
                 .in_statement("select");
                 error.clause = Some("WITH".to_string());
                 return Err(error);
             }
         }
-        // `recursive` is accepted and then ignored: with no self-reference the
-        // declaration behaves exactly like a non-recursive `WITH`.
-        let _ = recursive;
-        let mut env = CteEnv { parent, tables: BTreeMap::new() };
-        for entry in with {
-            let result = self.select_statement(&entry.query, &[], budget, Some(&env))?;
-            if let Some(names) = &entry.columns {
-                if names.len() != result.columns.len() {
+        let columns = entry.columns.clone().unwrap_or(seed.columns);
+        let width = columns.len();
+        let operator = compounds[start].op;
+        // The CTE's own `LIMIT` is also a stopping condition: SQLite cuts an
+        // infinite recursion as soon as the body has produced that many rows.
+        let own = if order.is_empty() {
+            match self.eval_limit(limit.as_ref(), &[], budget, Some(env))? {
+                Some((offset, Some(count))) => Some(offset.saturating_add(count)),
+                _ => None,
+            }
+        }
+        else {
+            None
+        };
+        let bound = match (bound, own) {
+            (Some(outer), Some(own)) => Some(outer.min(own)),
+            (outer, own) => outer.or(own),
+        };
+        // `UNION` deduplicates the whole fixed point, including the seed.
+        let mut rows = if matches!(operator, CompoundOp::Union) { distinct_rows(&seed.rows) } else { seed.rows };
+        if let Some(bound) = bound {
+            rows.truncate(bound);
+        }
+        let mut seen: Vec<Vec<Cell>> = if matches!(operator, CompoundOp::Union) { rows.clone() } else { Vec::new() };
+        let mut working = rows.clone();
+        while !working.is_empty() {
+            if bound.is_some_and(|limit| rows.len() >= limit) {
+                break;
+            }
+            let mut next: Vec<Vec<Cell>> = Vec::new();
+            let mut done = false;
+            for term in &compounds[start..] {
+                let scope = CteEnv {
+                    parent: Some(env),
+                    tables: BTreeMap::from([(
+                        entry.name.to_ascii_lowercase(),
+                        Materialized { columns: columns.clone(), rows: working.clone() },
+                    )]),
+                };
+                let output = self.select(&term.core, &[], Vec::new(), None, &[], budget, Some(&scope))?;
+                if output.columns.len() != width {
                     let mut error = SqlError::new(
                         "arity-mismatch",
-                        format!("table {} has {} values for {} columns", entry.name, result.columns.len(), names.len()),
+                        format!("SELECTs to the left and right of {} do not have the same number of result columns", term.op.text()),
                     )
                     .in_statement("select");
-                    error.clause = Some("WITH".to_string());
+                    error.clause = Some(term.op.clause().to_string());
+                    error.position = Some(term.position);
                     return Err(error);
                 }
+                for row in output.rows {
+                    if bound.is_some_and(|limit| rows.len() >= limit) {
+                        done = true;
+                        break;
+                    }
+                    if matches!(term.op, CompoundOp::Union) {
+                        if seen.iter().any(|existing| cells_equal(existing, &row)) {
+                            continue;
+                        }
+                        seen.push(row.clone());
+                    }
+                    next.push(row.clone());
+                    rows.push(row);
+                }
+                if done {
+                    break;
+                }
             }
-            let columns = entry.columns.clone().unwrap_or(result.columns);
-            env.tables.insert(entry.name.to_ascii_lowercase(), Materialized { columns, rows: result.rows });
+            if done {
+                break;
+            }
+            working = next;
         }
-        self.select(first, compounds, order, limit, outer, budget, Some(&env))
+        // A trailing `ORDER BY` / `LIMIT` on the CTE body applies to its whole
+        // output, like a compound select outside a `WITH`.
+        if !order.is_empty() {
+            let keys = compound_order_keys(order, &columns)?;
+            rows.sort_by(|left, right| {
+                keys.iter()
+                    .find_map(|(index, descending)| {
+                        let ordering = compare_cells(&left[*index], &right[*index]);
+                        (ordering != Ordering::Equal).then(|| if *descending { ordering.reverse() } else { ordering })
+                    })
+                    .unwrap_or(Ordering::Equal)
+            });
+        }
+        let evaluated = self.eval_limit(limit.as_ref(), &[], budget, Some(env))?;
+        if evaluated.is_some() {
+            let (start, end) = limit_range(rows.len(), evaluated);
+            rows = rows.drain(start..end).collect();
+        }
+        Ok(Materialized { columns, rows })
+    }
+
+    /// Computes a safe row bound for a recursive CTE when the enclosing query
+    /// is `SELECT <row-wise items> FROM <cte> LIMIT n [OFFSET m]`.
+    ///
+    /// Materializing a recursive CTE eagerly would never terminate for an
+    /// unbounded recursion, while SQLite stops as soon as the `LIMIT` is
+    /// satisfied. The bound is only used when every row of the CTE produces at
+    /// most one output row and nothing else reads the CTE, so truncating the
+    /// fixed point at `offset + count` rows cannot change the result.
+    #[allow(clippy::too_many_arguments)]
+    fn recursive_limit(
+        &self,
+        first: &SelectCore,
+        compounds: &[CompoundTerm],
+        order: &[OrderKey],
+        limit: Option<&Limit>,
+        outer: &[Scope],
+        budget: &Budget,
+        parent: Option<&CteEnv>,
+    ) -> Result<Option<(String, usize)>, SqlError> {
+        if !compounds.is_empty()
+            || !order.is_empty()
+            || limit.is_none()
+            || !first.group.is_empty()
+            || first.having.is_some()
+            || first.filter.is_some()
+            || !first.windows.is_empty()
+            || !row_preserving_items(&first.items)
+            || first.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let source = &first.from[0];
+        if source.query.is_some() || source.join.is_some() || source.using.is_some() || source.natural || source.name.is_empty() {
+            return Ok(None);
+        }
+        let Some((offset, Some(count))) = self.eval_limit(limit, outer, budget, parent)? else {
+            return Ok(None);
+        };
+        Ok(Some((source.name.to_ascii_lowercase(), offset.saturating_add(count))))
     }
 
     /// Runs a nested `SELECT` statement through the same entry point as a
@@ -2835,6 +3035,45 @@ fn combine_rows(op: CompoundOp, left: Vec<Vec<Cell>>, right: Vec<Vec<Cell>>) -> 
             let right_rows = distinct_rows(&right);
             distinct_rows(&left).into_iter().filter(|row| !rows_contain(&right_rows, row)).collect()
         }
+    }
+}
+
+/// The error SQLite raises when a recursive `WITH` entry reads itself in a
+/// place the fixed-point evaluator cannot handle.
+fn circular_reference(name: &str) -> SqlError {
+    SqlError::new("SQLITE_ERROR", format!("circular reference: {name}")).in_statement("select")
+}
+
+/// Whether a projection turns each input row into at most one output row, so a
+/// recursive CTE may be truncated at the enclosing `LIMIT`.
+fn row_preserving_items(items: &SelectItems) -> bool {
+    match items {
+        SelectItems::Star => true,
+        SelectItems::CountAll => false,
+        SelectItems::Named(exprs) => exprs.iter().all(row_preserving_expr),
+    }
+}
+
+fn row_preserving_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter { .. } => true,
+        Expr::Unary { value, .. } => row_preserving_expr(value),
+        Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            row_preserving_expr(left) && row_preserving_expr(right)
+        }
+        Expr::IsNull { value, .. } | Expr::IsTruth { value, .. } | Expr::Not(value) => row_preserving_expr(value),
+        Expr::Case { operand, branches, otherwise } => {
+            operand.as_ref().map_or(true, |expr| row_preserving_expr(expr))
+                && branches.iter().all(|(condition, result)| row_preserving_expr(condition) && row_preserving_expr(result))
+                && otherwise.as_ref().map_or(true, |expr| row_preserving_expr(expr))
+        }
+        Expr::In { value, list, .. } => row_preserving_expr(value) && list.iter().all(row_preserving_expr),
+        Expr::Function { args, .. } => args.iter().all(row_preserving_expr),
+        Expr::Alias { value, .. } | Expr::Cast { value, .. } => row_preserving_expr(value),
+        Expr::Like { value, pattern, escape, .. } => {
+            row_preserving_expr(value) && row_preserving_expr(pattern) && escape.as_ref().map_or(true, |expr| row_preserving_expr(expr))
+        }
+        _ => false,
     }
 }
 
@@ -6956,5 +7195,100 @@ mod tests {
             .execute_one("ALTER TABLE c4 ADD COLUMN other INTEGER REFERENCES parent(id)")
             .expect_err("add column with a foreign key");
         assert_eq!(added.code, "unsupported-column-constraint");
+    }
+
+    #[test]
+    fn recursive_ctes_iterate_until_the_working_set_is_empty() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let walked = engine
+            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5) SELECT x FROM c")
+            .expect("recursive walk");
+        assert_eq!(walked.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(4)], vec![Cell::Integer(5)]]);
+        // The keyword is not required when the body reads itself.
+        let bare = engine
+            .execute_one("WITH c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3) SELECT x FROM c")
+            .expect("recursive without the keyword");
+        assert_eq!(bare.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)]]);
+        // `UNION` removes duplicates and therefore terminates a self-cycle.
+        let cycle = engine
+            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT x FROM c) SELECT x FROM c")
+            .expect("distinct cycle");
+        assert_eq!(cycle.rows, vec![vec![Cell::Integer(1)]]);
+        let factorial = engine
+            .execute_one("WITH RECURSIVE c(n, f) AS (SELECT 1, 1 UNION ALL SELECT n+1, f*(n+1) FROM c WHERE n < 5) SELECT n, f FROM c")
+            .expect("factorial");
+        assert_eq!(
+            factorial.rows,
+            vec![
+                vec![Cell::Integer(1), Cell::Integer(1)],
+                vec![Cell::Integer(2), Cell::Integer(2)],
+                vec![Cell::Integer(3), Cell::Integer(6)],
+                vec![Cell::Integer(4), Cell::Integer(24)],
+                vec![Cell::Integer(5), Cell::Integer(120)],
+            ]
+        );
+    }
+
+    #[test]
+    fn recursive_ctes_keep_duplicates_for_union_all() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let duplicated = engine
+            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x FROM c LIMIT 3) SELECT x FROM c")
+            .expect("duplicates");
+        assert_eq!(duplicated.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(1)], vec![Cell::Integer(1)]]);
+        let seeded = engine
+            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3) SELECT x FROM c ORDER BY x")
+            .expect("seed duplicates");
+        assert_eq!(seeded.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(3)]]);
+    }
+
+    #[test]
+    fn infinite_recursion_is_cut_off_by_the_enclosing_limit() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let limited = engine
+            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT x FROM c LIMIT 5")
+            .expect("bounded recursion");
+        assert_eq!(limited.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(2)], vec![Cell::Integer(3)], vec![Cell::Integer(4)], vec![Cell::Integer(5)]]);
+        let offset = engine
+            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT x FROM c LIMIT 2 OFFSET 3")
+            .expect("bounded recursion with offset");
+        assert_eq!(offset.rows, vec![vec![Cell::Integer(4)], vec![Cell::Integer(5)]]);
+    }
+
+    #[test]
+    fn recursive_ctes_can_read_live_tables_and_earlier_entries() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute_one("CREATE TABLE edges (parent INTEGER, child INTEGER)").expect("create edges");
+        engine.execute_one("INSERT INTO edges VALUES (1,2), (1,3), (2,4), (3,5), (5,6)").expect("edge rows");
+        let tree = engine
+            .execute_one("WITH RECURSIVE d(id, depth) AS (SELECT 1, 0 UNION ALL SELECT e.child, d.depth+1 FROM edges e, d WHERE e.parent = d.id) SELECT id, depth FROM d ORDER BY id")
+            .expect("tree walk");
+        assert_eq!(
+            tree.rows,
+            vec![
+                vec![Cell::Integer(1), Cell::Integer(0)],
+                vec![Cell::Integer(2), Cell::Integer(1)],
+                vec![Cell::Integer(3), Cell::Integer(1)],
+                vec![Cell::Integer(4), Cell::Integer(2)],
+                vec![Cell::Integer(5), Cell::Integer(2)],
+                vec![Cell::Integer(6), Cell::Integer(3)],
+            ]
+        );
+        let chained = engine
+            .execute_one("WITH a(k) AS (SELECT 2), b(x) AS (SELECT 1 UNION ALL SELECT x+k FROM b, a WHERE x < 9) SELECT x FROM b ORDER BY x")
+            .expect("earlier entry");
+        assert_eq!(chained.rows, vec![vec![Cell::Integer(1)], vec![Cell::Integer(3)], vec![Cell::Integer(5)], vec![Cell::Integer(7)], vec![Cell::Integer(9)]]);
+    }
+
+    #[test]
+    fn malformed_recursive_ctes_report_a_circular_reference() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let mixed = engine
+            .execute_one("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3 UNION ALL SELECT 9) SELECT x FROM c")
+            .expect_err("non-recursive term after a recursive one");
+        assert_eq!(mixed.code, "SQLITE_ERROR");
+        assert_eq!(mixed.message, "circular reference: c");
+        let self_seed = engine.execute_one("WITH c(x) AS (SELECT x FROM c) SELECT x FROM c").expect_err("seed reads itself");
+        assert_eq!(self_seed.message, "circular reference: c");
     }
 }

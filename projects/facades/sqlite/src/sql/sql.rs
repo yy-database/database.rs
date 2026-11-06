@@ -3966,7 +3966,9 @@ pub(crate) fn statement_references(statement: &Statement, name: &str) -> bool {
         || order.iter().any(|key| expr_references(&key.expr, name))
 }
 
-fn core_references(core: &SelectCore, name: &str) -> bool {
+/// Whether one `SELECT` core reads `name` in its `FROM`, projection,
+/// predicate, grouping or window clauses.
+pub(crate) fn core_references(core: &SelectCore, name: &str) -> bool {
     let source = core.from.iter().any(|table| match &table.query {
         Some(query) => statement_references(query, name),
         None => table.name.eq_ignore_ascii_case(name),
