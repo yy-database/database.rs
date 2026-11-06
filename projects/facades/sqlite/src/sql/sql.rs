@@ -3918,6 +3918,7 @@ impl<'a> Parser<'a> {
             declared_type,
             not_null: false,
             default_value: None,
+            default_text: None,
             primary_key: false,
             unique: false,
             autoincrement: false,
@@ -3947,7 +3948,13 @@ impl<'a> Parser<'a> {
                 // Explicit `NULL` is the SQLite default; nothing to record.
             }
             else if self.eat_word("default") {
-                spec.default_value = Some(self.literal()?.to_write_value());
+                let start = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
+                let value = self.literal()?;
+                let end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
+                // SQLite echoes the written `DEFAULT` text, so keep the span
+                // instead of rendering the evaluated literal.
+                spec.default_text = self.source.get(start..end).map(|text| text.trim().to_string());
+                spec.default_value = Some(value.to_write_value());
             }
             else if self.peek_keyword("constraint") {
                 // Column-level `CONSTRAINT name CHECK (...)` or
