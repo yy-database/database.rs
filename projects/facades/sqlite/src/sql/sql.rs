@@ -94,6 +94,20 @@ impl Literal {
     }
 }
 
+/// One value inside an `INSERT ... VALUES` tuple.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InsertValue {
+    /// A literal as written.
+    Literal(Literal),
+    /// A bound parameter placeholder.
+    Parameter {
+        /// Zero-based binding index.
+        index: usize,
+        /// Placeholder text as written.
+        text: String,
+    },
+}
+
 /// Projection of a `SELECT` statement.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SelectItems {
@@ -1178,8 +1192,8 @@ pub enum Statement {
         table: String,
         /// Optional explicit column list.
         columns: Option<Vec<String>>,
-        /// One literal tuple per inserted row; empty for `DEFAULT VALUES`.
-        rows: Vec<Vec<Literal>>,
+        /// One value tuple per inserted row; empty for `DEFAULT VALUES`.
+        rows: Vec<Vec<InsertValue>>,
         /// `DEFAULT VALUES` was written: insert one row built from the column defaults.
         default_values: bool,
         /// `RETURNING` projection, `*` or an explicit list.
@@ -2222,48 +2236,9 @@ impl<'a> Parser<'a> {
             }
         }
         if let Some(Token::Operator(operator)) = self.peek() {
-            match operator.as_str() {
-                "?" => {
-                    let marker = self.offset();
-                    self.at += 1;
-                    let (index, text) = match self.peek().cloned() {
-                        Some(Token::Int(value)) if self.offset() == marker + 1 => {
-                            if value <= 0 {
-                                return Err(self.error("syntax", "parameter indexes are one-based"));
-                            }
-                            self.at += 1;
-                            (value as usize - 1, format!("?{value}"))
-                        }
-                        _ => {
-                            let index = self.next_parameter;
-                            self.next_parameter += 1;
-                            (index, "?".to_string())
-                        }
-                    };
-                    // `?NNN` fixes that slot, so later bare `?` placeholders
-                    // continue after the highest index seen so far.
-                    self.next_parameter = self.next_parameter.max(index + 1);
-                    return Ok(Expr::Parameter { index, text });
-                }
-                ":" => {
-                    self.at += 1;
-                    let name = match self.next() {
-                        Some(Token::Word(word)) => word,
-                        _ => return Err(self.error("syntax", "expected a parameter name after `:`")),
-                    };
-                    let text = format!(":{name}");
-                    let index = match self.parameter_names.get(&name) {
-                        Some(index) => *index,
-                        None => {
-                            let index = self.next_parameter;
-                            self.next_parameter += 1;
-                            self.parameter_names.insert(name, index);
-                            index
-                        }
-                    };
-                    return Ok(Expr::Parameter { index, text });
-                }
-                _ => {}
+            let operator = operator.clone();
+            if let Some((index, text)) = self.parameter(&operator)? {
+                return Ok(Expr::Parameter { index, text });
             }
         }
         match self.peek() {
@@ -3418,6 +3393,66 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses `?`, `?NNN` or `:name` at the current position, returning the
+    /// zero-based binding index and the text as written. Other operators are
+    /// left for the expression parser.
+    fn parameter(&mut self, operator: &str) -> Result<Option<(usize, String)>, SqlError> {
+        match operator {
+            "?" => {
+                let marker = self.offset();
+                self.at += 1;
+                let (index, text) = match self.peek().cloned() {
+                    Some(Token::Int(value)) if self.offset() == marker + 1 => {
+                        if value <= 0 {
+                            return Err(self.error("syntax", "parameter indexes are one-based"));
+                        }
+                        self.at += 1;
+                        (value as usize - 1, format!("?{value}"))
+                    }
+                    _ => {
+                        let index = self.next_parameter;
+                        self.next_parameter += 1;
+                        (index, "?".to_string())
+                    },
+                };
+                // `?NNN` fixes that slot, so later bare `?` placeholders
+                // continue after the highest index seen so far.
+                self.next_parameter = self.next_parameter.max(index + 1);
+                Ok(Some((index, text)))
+            }
+            ":" => {
+                self.at += 1;
+                let name = match self.next() {
+                    Some(Token::Word(word)) => word,
+                    _ => return Err(self.error("syntax", "expected a parameter name after `:`")),
+                };
+                let text = format!(":{name}");
+                let index = match self.parameter_names.get(&name) {
+                    Some(index) => *index,
+                    None => {
+                        let index = self.next_parameter;
+                        self.next_parameter += 1;
+                        self.parameter_names.insert(name, index);
+                        index
+                    },
+                };
+                Ok(Some((index, text)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Parses one `VALUES` tuple element: a bound placeholder or a literal.
+    fn insert_value(&mut self) -> Result<InsertValue, SqlError> {
+        if let Some(Token::Operator(operator)) = self.peek() {
+            let operator = operator.clone();
+            if let Some((index, text)) = self.parameter(&operator)? {
+                return Ok(InsertValue::Parameter { index, text });
+            }
+        }
+        Ok(InsertValue::Literal(self.literal()?))
+    }
+
     fn literal(&mut self) -> Result<Literal, SqlError> {
         let negative = matches!(self.peek(), Some(Token::Minus));
         if negative {
@@ -3486,7 +3521,7 @@ impl<'a> Parser<'a> {
             self.expect_char(&Token::LParen)?;
             let mut values = Vec::new();
             loop {
-                values.push(self.literal()?);
+                values.push(self.insert_value()?);
                 match self.peek() {
                     Some(Token::Comma) => {
                         self.at += 1;
