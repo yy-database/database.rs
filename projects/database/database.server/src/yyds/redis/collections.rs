@@ -1,9 +1,10 @@
-//! Redis 的 hash 与 list 值类型，落在既有扁平键值合同之上。
+//! Redis 的 hash / list / set 值类型，落在既有扁平键值合同之上。
 //!
 //! `.yykv` v3 的字节布局不能改动，`Record` 也没有类型字段。这里把类型编码在
 //! **命名空间** 上：字符串继续使用逻辑库命名空间（`redis:<db>`），hash 落在
-//! `redis:<db>:hash`，list 落在 `redis:<db>:list`。命名空间本来就是 `Record.key`
-//! 的一部分，所以不新增字段、不升格式版本，重启后随快照恢复。
+//! `redis:<db>:hash`，list 落在 `redis:<db>:list`，set 落在 `redis:<db>:set`。
+//! 命名空间本来就是 `Record.key` 的一部分，所以不新增字段、不升格式版本，重启后随
+//! 快照恢复。
 //!
 //! 这样不会把既有字符串键误判成集合：两类数据位于互不相交的命名空间，
 //! 字符串内容再特殊也不会被当成 hash/list；判定类型只是逐个命名空间探测可见记录，
@@ -29,11 +30,13 @@ pub(crate) enum KeyKind {
     Hash,
     /// 列表，元素按从表头到表尾的顺序保存在一个值 blob 内。
     List,
+    /// 集合，成员按插入顺序保存在一个值 blob 内（真机小集合同样保持插入顺序）。
+    Set,
 }
 
 impl KeyKind {
     /// 所有已知类型，按探测顺序排列（字符串优先，保持既有语义）。
-    pub(crate) const ALL: [KeyKind; 3] = [KeyKind::String, KeyKind::Hash, KeyKind::List];
+    pub(crate) const ALL: [KeyKind; 4] = [KeyKind::String, KeyKind::Hash, KeyKind::List, KeyKind::Set];
 
     /// `TYPE` 回复里使用的类型名。
     pub(crate) fn name(self) -> &'static str {
@@ -41,6 +44,7 @@ impl KeyKind {
             KeyKind::String => "string",
             KeyKind::Hash => "hash",
             KeyKind::List => "list",
+            KeyKind::Set => "set",
         }
     }
 
@@ -52,6 +56,7 @@ impl KeyKind {
             KeyKind::String => base.clone(),
             KeyKind::Hash => Namespace(format!("{}:hash", base.0)),
             KeyKind::List => Namespace(format!("{}:list", base.0)),
+            KeyKind::Set => Namespace(format!("{}:set", base.0)),
         }
     }
 }
@@ -211,6 +216,17 @@ pub(crate) fn decode_list(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
     if rest.is_empty() { Some(elements) } else { None }
 }
 
+/// set 值编码：成员列表格式与 list 相同（`u32 成员数` + 每个 `u32 长度 + 字节`），
+/// 顺序保留插入顺序，便于小集合的输出稳定。
+pub(crate) fn encode_set(members: &[Vec<u8>]) -> Option<Vec<u8>> {
+    encode_list(members)
+}
+
+/// 解码 set 值；成员重复检查在写入侧完成，读取侧只做结构校验。
+pub(crate) fn decode_set(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    decode_list(bytes)
+}
+
 /// hash 命令名集合。
 pub(crate) fn is_hash_command(command: &[u8]) -> bool {
     for name in [b"HSET".as_slice(), b"HGET", b"HGETALL", b"HDEL", b"HLEN", b"HINCRBY"] {
@@ -224,6 +240,16 @@ pub(crate) fn is_hash_command(command: &[u8]) -> bool {
 /// list 命令名集合。
 pub(crate) fn is_list_command(command: &[u8]) -> bool {
     for name in [b"LPUSH".as_slice(), b"RPUSH", b"LRANGE", b"LPOP", b"RPOP", b"LLEN", b"LINDEX"] {
+        if command.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// set 命令名集合。
+pub(crate) fn is_set_command(command: &[u8]) -> bool {
+    for name in [b"SADD".as_slice(), b"SREM", b"SMEMBERS", b"SCARD", b"SISMEMBER"] {
         if command.eq_ignore_ascii_case(name) {
             return true;
         }
@@ -290,6 +316,41 @@ fn load_list(
             Some(elements) => Ok(Loaded::Found(elements)),
             None => {
                 write_error(stream, "stored list value is corrupt")?;
+                Ok(Loaded::Rejected)
+            }
+        },
+        Ok(None) => Ok(Loaded::Missing),
+        Err(message) => {
+            write_storage_error(stream, &message)?;
+            Ok(Loaded::Rejected)
+        }
+    }
+}
+
+/// 载入 set 成员并校验类型。
+fn load_set(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    key: &[u8],
+) -> io::Result<Loaded<Vec<Vec<u8>>>> {
+    match find_kind(executor, base, key) {
+        Ok(None) => return Ok(Loaded::Missing),
+        Ok(Some(KeyKind::Set)) => {}
+        Ok(Some(_)) => {
+            write_wrong_type(stream)?;
+            return Ok(Loaded::Rejected);
+        }
+        Err(message) => {
+            write_storage_error(stream, &message)?;
+            return Ok(Loaded::Rejected);
+        }
+    }
+    match load_value(executor, &KeyKind::Set.namespace(base), key) {
+        Ok(Some(bytes)) => match decode_set(&bytes) {
+            Some(members) => Ok(Loaded::Found(members)),
+            None => {
+                write_error(stream, "stored set value is corrupt")?;
                 Ok(Loaded::Rejected)
             }
         },
@@ -669,6 +730,132 @@ pub(crate) fn handle_list(
     match load_list(stream, executor, base, key)? {
         Loaded::Missing => write_integer(stream, 0),
         Loaded::Found(elements) => write_integer(stream, elements.len() as i64),
+        Loaded::Rejected => Ok(()),
+    }
+}
+
+/// `SADD` / `SREM` / `SMEMBERS` / `SCARD` / `SISMEMBER` 的分派入口。
+pub(crate) fn handle_set(
+    stream: &mut dyn io::Write,
+    request: &Request<'_>,
+    executor: Option<&dyn KeyValueExecutor>,
+    base: &Namespace,
+) -> io::Result<()> {
+    let command = request.arguments[0];
+    let Some(executor) = executor
+    else {
+        return write_error(stream, "unsupported command");
+    };
+    if command.eq_ignore_ascii_case(b"SADD") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "sadd");
+        }
+        let key = request.arguments[1];
+        match find_kind(executor, base, key) {
+            Ok(None) | Ok(Some(KeyKind::Set)) => {}
+            Ok(Some(_)) => return write_wrong_type(stream),
+            Err(message) => return write_storage_error(stream, &message),
+        }
+        let mut members = match load_value(executor, &KeyKind::Set.namespace(base), key) {
+            Ok(Some(bytes)) => match decode_set(&bytes) {
+                Some(members) => members,
+                None => return write_error(stream, "stored set value is corrupt"),
+            },
+            Ok(None) => Vec::new(),
+            Err(message) => return write_storage_error(stream, &message),
+        };
+        let mut added = 0_i64;
+        for member in &request.arguments[2..] {
+            if !members.iter().any(|existing| existing == member) {
+                members.push(member.to_vec());
+                added += 1;
+            }
+        }
+        // 全是重复成员时不重写值，已有集合连同 TTL 原样保留。
+        if added > 0 {
+            let Some(bytes) = encode_set(&members)
+            else {
+                return write_error(stream, "set exceeds the storage limit");
+            };
+            if let Err(message) = store_value(executor, &KeyKind::Set.namespace(base), key, bytes) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        return write_integer(stream, added);
+    }
+    if command.eq_ignore_ascii_case(b"SREM") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "srem");
+        }
+        let key = request.arguments[1];
+        let mut members = match load_set(stream, executor, base, key)? {
+            Loaded::Missing => return write_integer(stream, 0),
+            Loaded::Found(members) => members,
+            Loaded::Rejected => return Ok(()),
+        };
+        let mut removed = 0_i64;
+        members.retain(|existing| {
+            let hit = request.arguments[2..].iter().any(|candidate| candidate == existing);
+            if hit {
+                removed += 1;
+            }
+            !hit
+        });
+        if members.is_empty() {
+            if let Err(message) = remove_value(executor, &KeyKind::Set.namespace(base), key) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        else {
+            let Some(bytes) = encode_set(&members)
+            else {
+                return write_error(stream, "set exceeds the storage limit");
+            };
+            if let Err(message) = store_value(executor, &KeyKind::Set.namespace(base), key, bytes) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        return write_integer(stream, removed);
+    }
+    if command.eq_ignore_ascii_case(b"SMEMBERS") {
+        if request.arguments.len() != 2 {
+            return write_arity_error(stream, "smembers");
+        }
+        let key = request.arguments[1];
+        return match load_set(stream, executor, base, key)? {
+            Loaded::Missing => write_array_header(stream, 0),
+            Loaded::Found(members) => {
+                write_array_header(stream, members.len())?;
+                for member in &members {
+                    write_bulk(stream, member)?;
+                }
+                Ok(())
+            }
+            Loaded::Rejected => Ok(()),
+        };
+    }
+    if command.eq_ignore_ascii_case(b"SCARD") {
+        if request.arguments.len() != 2 {
+            return write_arity_error(stream, "scard");
+        }
+        let key = request.arguments[1];
+        return match load_set(stream, executor, base, key)? {
+            Loaded::Missing => write_integer(stream, 0),
+            Loaded::Found(members) => write_integer(stream, members.len() as i64),
+            Loaded::Rejected => Ok(()),
+        };
+    }
+    // SISMEMBER
+    if request.arguments.len() != 3 {
+        return write_arity_error(stream, "sismember");
+    }
+    let key = request.arguments[1];
+    match load_set(stream, executor, base, key)? {
+        Loaded::Missing => write_integer(stream, 0),
+        Loaded::Found(members) => {
+            let present = members.iter().any(|member| member.as_slice() == request.arguments[2]);
+            write_integer(stream, i64::from(present))
+        }
         Loaded::Rejected => Ok(()),
     }
 }
