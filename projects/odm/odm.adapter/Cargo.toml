@@ -21,6 +21,7 @@ database-types = { workspace = true }
 odm-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlite = { workspace = true }
 vos = { workspace = true }
 
 [dev-dependencies]

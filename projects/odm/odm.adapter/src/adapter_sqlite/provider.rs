@@ -1,12 +1,23 @@
-//! SQLite execution surface for the Iris adapter.
+//! SQLite execution surface for the ODM adapter.
 //!
-//! Bundled `rusqlite` / official SQLite engines are **forbidden**. Format-3
-//! continuation (L3) belongs to the `sqlite` product facade. Until that kernel
-//! is wired here, open and execute paths fail closed with a stable policy error.
+//! SQL 解析与执行全部在 `sqlite` 产品门面（`projects/facades/sqlite`）内完成；
+//! 本模块只负责持有连接、做参数/结果类型映射与错误转译。不引入 `rusqlite`，
+//! 也不在本 crate 里实现任何 SQL 语义。
+//!
+//! 门面当前尚未提供、因此仍 fail-closed 的能力：
+//!
+//! - **文件打开**：`Engine` 只有 `new`（建空库），没有从既有 format-3 镜像构造的
+//!   入口；`SqliteWriter::open` 能读既有镜像，但 `Engine` 没有 `from_writer`。
+//! - **事务**：`Engine` 没有 `begin` / `commit` / `rollback`，事务只在
+//!   `SqliteWriter` 内部使用。适配器的 `begin_immediate` / `commit` / `rollback`
+//!   因此无法映射，`authority_commit` 与 Managed Push 的原子提交同样受阻。
+//! - **`last_insert_rowid`**：门面只回 `columns` / `rows` / `affected`，没有取值
+//!   入口，该字段恒为 `0`。
 
-use std::path::Path;
+use std::{path::Path, sync::Mutex};
 
 use database_formats::sqlite::{ENGINE_LIBRARY_VERSION, ENGINE_LIBRARY_VERSION_NUMBER};
+use sqlite::{Cell, Engine, SchemaObjectKind, SqlError, Statement, TableLimits, parse, read_schema};
 
 /// One SQLite storage-class value with lossless integer and binary payloads.
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +75,8 @@ pub struct StatementResult {
     /// Rows changed by the statement.
     pub changes: u64,
     /// Last insert rowid for the connection after execution.
+    ///
+    /// 门面没有暴露该值，当前恒为 `0`（见模块文档的缺口说明）。
     pub last_insert_rowid: i64,
 }
 
@@ -124,21 +137,19 @@ impl std::fmt::Display for SqliteError {
 
 impl std::error::Error for SqliteError {}
 
-fn continuation_pending(action: &str) -> SqliteError {
-    SqliteError::policy(format!(
-        "iris-adapter-sqlite: {action} requires SQLite product L3 continuation runtime (no rusqlite); see database compatibility levels"
-    ))
+/// 门面缺口：点名缺的能力、门面坐标与需要的最小复现。
+fn facade_gap(action: &str, capability: &str, coordinate: &str, repro: &str) -> SqliteError {
+    SqliteError::policy(format!("iris-adapter-sqlite: {action} requires `{capability}` from the sqlite facade at {coordinate}; repro: {repro}"))
 }
 
-/// Native SQLite handle placeholder until the product L3 kernel is wired.
+/// SQLite handle backed by the `sqlite` product facade.
 ///
-/// Historically named `RusqliteProvider`; the type alias keeps call sites compiling
-/// while the implementation stays fail-closed.
+/// Historically named `RusqliteProvider`; the type alias keeps call sites compiling.
 pub struct SqliteProvider {
-    _private: (),
+    engine: Mutex<Engine>,
 }
 
-/// Historical name kept as a type alias during the L3 cutover.
+/// Historical name kept as a type alias during the facade cutover.
 pub type RusqliteProvider = SqliteProvider;
 
 impl std::fmt::Debug for SqliteProvider {
@@ -148,15 +159,22 @@ impl std::fmt::Debug for SqliteProvider {
 }
 
 impl SqliteProvider {
-    /// Open an in-memory SQLite database.
+    /// Open an in-memory SQLite database backed by the facade engine.
     pub fn open_in_memory() -> Result<Self, SqliteError> {
-        Err(continuation_pending("open_in_memory"))
+        let engine = Engine::new(None).map_err(map_sql_error)?;
+        Ok(Self { engine: Mutex::new(engine) })
     }
 
     /// Open or create a file-backed SQLite database.
+    ///
+    /// 门面还没有把既有镜像装回 `Engine` 的入口，这里保持 fail-closed 并点名缺口。
     pub fn open(path: &Path) -> Result<Self, SqliteError> {
-        let _ = path;
-        Err(continuation_pending("open"))
+        Err(facade_gap(
+            "open",
+            "Engine::from_writer",
+            "projects/facades/sqlite/src/sql/engine.rs Engine::new (blank image only)",
+            &format!("SqliteWriter::open({}) then execute a SELECT", path.display()),
+        ))
     }
 
     /// Returns the product facade library version label (not an official SQLite build).
@@ -171,33 +189,112 @@ impl SqliteProvider {
 
     /// Executes exactly one statement with positional bind parameters.
     pub fn execute_one(&self, sql: &str, params: &[SqliteValue]) -> Result<StatementResult, SqliteError> {
-        let _ = (sql, params);
-        Err(continuation_pending("execute_one"))
+        let statements = parse(sql).map_err(map_sql_error)?;
+        if statements.len() != 1 {
+            return Err(SqliteError::policy(format!("execute_one expects exactly one statement but found {}", statements.len())));
+        }
+        let cells = params.iter().map(to_cell).collect::<Result<Vec<_>, _>>()?;
+        let mut results = self.engine.lock().expect("sqlite mutex").execute_with_parameters(sql, &cells).map_err(map_sql_error)?;
+        let result = results.pop().expect("single statement returns one result");
+        Ok(StatementResult {
+            columns: result.columns,
+            rows: result.rows.into_iter().map(|row| row.into_iter().map(from_cell).collect()).collect(),
+            changes: result.affected as u64,
+            last_insert_rowid: 0,
+        })
     }
 
     /// Executes a multi-statement batch and discards result rows.
     pub fn execute_batch(&self, sql: &str) -> Result<(), SqliteError> {
-        let _ = sql;
-        Err(continuation_pending("execute_batch"))
+        self.engine.lock().expect("sqlite mutex").execute(sql).map_err(map_sql_error)?;
+        Ok(())
     }
 
     /// Starts an immediate write transaction.
     pub fn begin_immediate(&self) -> Result<(), SqliteError> {
-        Err(continuation_pending("begin_immediate"))
+        Err(facade_gap(
+            "begin_immediate",
+            "Engine::begin / Engine::commit / Engine::rollback",
+            "projects/facades/sqlite/src/sql/engine.rs Engine (no transaction methods)",
+            "Engine::new(None), execute INSERT, roll back, then SELECT sees the rolled-back row",
+        ))
     }
 
     /// Commits the active transaction.
     pub fn commit(&self) -> Result<(), SqliteError> {
-        Err(continuation_pending("commit"))
+        Err(facade_gap(
+            "commit",
+            "Engine::begin / Engine::commit / Engine::rollback",
+            "projects/facades/sqlite/src/sql/engine.rs Engine (no transaction methods)",
+            "Engine::new(None), begin, execute INSERT, commit, reopen the writer and read the row",
+        ))
     }
 
     /// Rolls back the active transaction.
     pub fn rollback(&self) -> Result<(), SqliteError> {
-        Err(continuation_pending("rollback"))
+        Err(facade_gap(
+            "rollback",
+            "Engine::begin / Engine::commit / Engine::rollback",
+            "projects/facades/sqlite/src/sql/engine.rs Engine (no transaction methods)",
+            "Engine::new(None), begin, execute INSERT, roll back, then SELECT finds no row",
+        ))
     }
 
     /// Inspects live catalog metadata.
     pub fn inspect_catalog(&self) -> Result<CatalogSnapshot, SqliteError> {
-        Err(continuation_pending("inspect_catalog"))
+        let engine = self.engine.lock().expect("sqlite mutex");
+        let objects =
+            read_schema(engine.snapshot(), TableLimits::default()).map_err(|error| SqliteError::policy(format!("sqlite facade: {error}")))?;
+        let mut tables = Vec::new();
+        for object in objects {
+            if object.kind != SchemaObjectKind::Table || object.name.starts_with("sqlite_") {
+                continue;
+            }
+            let Some(sql) = object.sql
+            else {
+                continue;
+            };
+            let Some(Statement::CreateTable { columns, primary_key, .. }) = parse(&sql).map_err(map_sql_error)?.into_iter().next()
+            else {
+                return Err(SqliteError::policy(format!("catalog entry `{}` is not a CREATE TABLE statement", object.name)));
+            };
+            let columns = columns
+                .into_iter()
+                .map(|column| CatalogColumn {
+                    primary_key: column.primary_key || primary_key.iter().any(|key| key.eq_ignore_ascii_case(&column.name)),
+                    nullable: !column.not_null,
+                    name: column.name,
+                    type_name: column.declared_type,
+                })
+                .collect();
+            tables.push(CatalogTable { name: object.name, columns });
+        }
+        Ok(CatalogSnapshot { tables })
     }
+}
+
+fn to_cell(value: &SqliteValue) -> Result<Cell, SqliteError> {
+    Ok(match value {
+        SqliteValue::Null => Cell::Null,
+        SqliteValue::Integer(value) => Cell::Integer(*value),
+        SqliteValue::Real(value) => Cell::Real(*value),
+        SqliteValue::Text(value) => {
+            Cell::Text(String::from_utf8(value.clone()).map_err(|_| SqliteError::policy("sqlite TEXT parameter is not valid UTF-8"))?)
+        }
+        SqliteValue::Blob(value) => Cell::Blob(value.clone()),
+    })
+}
+
+fn from_cell(cell: Cell) -> SqliteValue {
+    match cell {
+        Cell::Null => SqliteValue::Null,
+        Cell::Integer(value) => SqliteValue::Integer(value),
+        Cell::Real(value) => SqliteValue::Real(value),
+        Cell::Text(value) => SqliteValue::Text(value.into_bytes()),
+        Cell::Blob(value) => SqliteValue::Blob(value),
+    }
+}
+
+fn map_sql_error(error: SqlError) -> SqliteError {
+    SqliteError::policy(error.message)
 }
