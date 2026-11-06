@@ -694,6 +694,98 @@ fn clear_other_kinds(executor: &dyn KeyValueExecutor, namespace: &Namespace, key
     Ok(())
 }
 
+/// 断言逻辑键当前是字符串或不存在；失败时错误已写入，返回 `false`。
+fn ensure_string(stream: &mut dyn Write, executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8]) -> io::Result<bool> {
+    match resolve_kind(stream, executor, namespace, key)? {
+        Resolved::Kind(KeyKind::String) | Resolved::Missing => Ok(true),
+        Resolved::Kind(_) => {
+            collections::write_wrong_type(stream)?;
+            Ok(false)
+        }
+        Resolved::Rejected => Ok(false),
+    }
+}
+
+/// 读取字符串键的原始值；缺键回 `None`。
+fn load_string(executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    match executor.execute(None, KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::Get }) {
+        Ok(KeyValueResult::Get(value)) => Ok(value),
+        Ok(_) => Err("GET executor returned unexpected result".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// 写入字符串键并保留原有过期时间（缺键即普通写入）。
+fn store_string(executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8], value: Vec<u8>) -> Result<(), String> {
+    match executor.execute(None, KeyValueCommand {
+        namespace: namespace.clone(),
+        key: key.to_vec(),
+        action: KeyValueAction::PutKeepingExpiry(value),
+    }) {
+        Ok(KeyValueResult::Put { .. }) => Ok(()),
+        Ok(_) => Err("PUT executor returned unexpected result".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// 解析无符号偏移：只接受规范十进制写法（拒绝空串、符号与带前导零的写法）。
+fn parse_offset(raw: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let value = text.parse::<u64>().ok()?;
+    if value.to_string() != text { None } else { Some(value) }
+}
+
+/// Redis 字符串上限 512MB，位偏移上限为 2^32-1。
+const MAX_STRING_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 把闭区间 `[start, stop]` 归一化为可安全切片的下标；空区间回 `None`。
+fn normalized_range(start: i64, stop: i64, length: usize) -> Option<(usize, usize)> {
+    let length = length as i64;
+    let begin = if start < 0 { length.saturating_add(start) } else { start }.max(0);
+    let end = if stop < 0 { length.saturating_add(stop) } else { stop }.min(length - 1);
+    if begin > end || begin >= length || end < 0 { None } else { Some((begin as usize, end as usize)) }
+}
+
+/// 把 `BITPOS` 的字节或位索引归一化到 `[0, units - 1]`：负索引从尾部起算，越界被裁剪。
+///
+/// 归一化后的区间仍可能为空（例如空字符串得到 `units == 0`），由调用方判定 `-1`。
+fn normalize_unit(index: i64, units: i64) -> i64 {
+    let normalized = if index < 0 { units.saturating_add(index) } else { index };
+    normalized.clamp(0, (units - 1).max(0))
+}
+
+/// 统计一段 bit 区间（含端点）中被置位的数量。
+fn count_set_bits(value: &[u8], start: usize, end: usize) -> i64 {
+    let mut total = 0_i64;
+    for bit in start..=end {
+        if value[bit / 8] & (1 << (7 - bit % 8)) != 0 {
+            total += 1;
+        }
+    }
+    total
+}
+
+/// 定位 `[start, end]` 内第一个等于 `target` 的位；找不到回 `None`。
+fn find_bit(value: &[u8], start: usize, end: usize, target: u8) -> Option<usize> {
+    for bit in start..=end {
+        let set = value[bit / 8] & (1 << (7 - bit % 8)) != 0;
+        if set == (target == 1) {
+            return Some(bit);
+        }
+    }
+    None
+}
+
+/// `INCRBYFLOAT` 的回复与存储格式：最短十进制表示，整数不带 `.0`。
+fn format_float(value: f64) -> String {
+    value.to_string()
+}
+
+/// 命令名转小写，用于构造 `wrong number of arguments for '<name>' command`。
+fn lowercase_command(command: &[u8]) -> String {
+    String::from_utf8_lossy(command).to_ascii_lowercase()
+}
+
 /// 简易 Redis glob：支持 `*`、`?` 与反斜杠转义，其余字符按字面量比较。
 ///
 /// `MATCH` 只影响本次返回的键，不改变游标推进，与真机的过滤语义一致。
@@ -1498,6 +1590,399 @@ fn respond(
             }
         }
     }
+    else if command.eq_ignore_ascii_case(b"GETRANGE") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 4 {
+            stream.write_all(b"-ERR wrong number of arguments for 'getrange' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        let (Some(start), Some(stop)) =
+            (collections::parse_index(request.arguments[2]), collections::parse_index(request.arguments[3]))
+        else {
+            write_error(stream, "value is not an integer or out of range")?;
+            return Ok(true);
+        };
+        if !ensure_string(stream, executor, namespace, key)? {
+            return Ok(true);
+        }
+        let value = match load_string(executor, namespace, key) {
+            Ok(value) => value,
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        match value.and_then(|bytes| normalized_range(start, stop, bytes.len()).map(|(begin, end)| bytes[begin..=end].to_vec())) {
+            Some(slice) => write_bulk(stream, &slice)?,
+            None => write_bulk(stream, b"")?,
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"SETRANGE") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 4 {
+            stream.write_all(b"-ERR wrong number of arguments for 'setrange' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        let replacement = request.arguments[3];
+        // 真机区分两种失败：非规范整数报解析错误，负数报偏移越界。
+        let offset = match std::str::from_utf8(request.arguments[2]).ok().and_then(|text| {
+            let value = text.parse::<i64>().ok()?;
+            (value.to_string() == text).then_some(value)
+        }) {
+            Some(value) if value >= 0 => value as u64,
+            Some(_) => {
+                write_error(stream, "offset is out of range")?;
+                return Ok(true);
+            }
+            None => {
+                write_error(stream, "value is not an integer or out of range")?;
+                return Ok(true);
+            }
+        };
+        if !ensure_string(stream, executor, namespace, key)? {
+            return Ok(true);
+        }
+        let current = match load_string(executor, namespace, key) {
+            Ok(value) => value.unwrap_or_default(),
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        // 空值只回当前长度，不创建键、也不改动已有内容。
+        if replacement.is_empty() {
+            write!(stream, ":{}\r\n", current.len())?;
+            return Ok(true);
+        }
+        let end = offset.saturating_add(replacement.len() as u64);
+        if end > MAX_STRING_BYTES {
+            write_error(stream, "string exceeds maximum allowed size (proto-max-bulk-len)")?;
+            return Ok(true);
+        }
+        let offset = offset as usize;
+        let end = end as usize;
+        let mut value = current;
+        if value.len() < offset {
+            value.resize(offset, 0);
+        }
+        if value.len() < end {
+            value.resize(end, 0);
+        }
+        value[offset..end].copy_from_slice(replacement);
+        // 回复是覆盖后的总长度，而不是写入区间的终点。
+        let new_len = value.len();
+        if let Err(message) = store_string(executor, namespace, key, value) {
+            write_error(stream, &message)?;
+            return Ok(true);
+        }
+        write!(stream, ":{new_len}\r\n")?;
+    }
+    else if command.eq_ignore_ascii_case(b"INCRBYFLOAT") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 3 {
+            stream.write_all(b"-ERR wrong number of arguments for 'incrbyfloat' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        let increment = match std::str::from_utf8(request.arguments[2]).ok().and_then(|text| text.parse::<f64>().ok()) {
+            Some(increment) => increment,
+            None => {
+                write_error(stream, "value is not a valid float")?;
+                return Ok(true);
+            }
+        };
+        // 真机解析 `nan` 直接失败（字符串本身就是非法浮点），而 `+inf` / `-inf`
+        // 能解析却在结果阶段被「非有限」规则拒绝。
+        if increment.is_nan() {
+            write_error(stream, "value is not a valid float")?;
+            return Ok(true);
+        }
+        if increment.is_infinite() {
+            write_error(stream, "increment would produce NaN or Infinity")?;
+            return Ok(true);
+        }
+        if !ensure_string(stream, executor, namespace, key)? {
+            return Ok(true);
+        }
+        let current = match load_string(executor, namespace, key) {
+            Ok(None) => 0.0,
+            Ok(Some(bytes)) => match std::str::from_utf8(&bytes).ok().and_then(|text| text.parse::<f64>().ok()) {
+                // 存量值只拒绝 NaN 与非数字写法；inf 交给结果阶段报错。
+                Some(value) if !value.is_nan() => value,
+                _ => {
+                    write_error(stream, "value is not a valid float")?;
+                    return Ok(true);
+                }
+            },
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        let result = current + increment;
+        if !result.is_finite() {
+            write_error(stream, "increment would produce NaN or Infinity")?;
+            return Ok(true);
+        }
+        let formatted = format_float(result);
+        if let Err(message) = store_string(executor, namespace, key, formatted.clone().into_bytes()) {
+            write_error(stream, &message)?;
+            return Ok(true);
+        }
+        write_bulk(stream, formatted.as_bytes())?;
+    }
+    else if command.eq_ignore_ascii_case(b"SETBIT") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 4 {
+            stream.write_all(b"-ERR wrong number of arguments for 'setbit' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        let Some(offset) = parse_offset(request.arguments[2]).filter(|offset| *offset <= u32::MAX as u64)
+        else {
+            write_error(stream, "bit offset is not an integer or out of range")?;
+            return Ok(true);
+        };
+        let bit = match request.arguments[3] {
+            b"0" => false,
+            b"1" => true,
+            _ => {
+                write_error(stream, "bit is not an integer or out of range")?;
+                return Ok(true);
+            }
+        };
+        if !ensure_string(stream, executor, namespace, key)? {
+            return Ok(true);
+        }
+        let mut value = match load_string(executor, namespace, key) {
+            Ok(value) => value.unwrap_or_default(),
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        let byte = (offset / 8) as usize;
+        let shift = 7 - (offset % 8) as u32;
+        if value.len() <= byte {
+            value.resize(byte + 1, 0);
+        }
+        let previous = (value[byte] >> shift) & 1;
+        if bit {
+            value[byte] |= 1 << shift;
+        }
+        else {
+            value[byte] &= !(1 << shift);
+        }
+        if let Err(message) = store_string(executor, namespace, key, value) {
+            write_error(stream, &message)?;
+            return Ok(true);
+        }
+        write!(stream, ":{previous}\r\n")?;
+    }
+    else if command.eq_ignore_ascii_case(b"GETBIT") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 3 {
+            stream.write_all(b"-ERR wrong number of arguments for 'getbit' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        let Some(offset) = parse_offset(request.arguments[2]).filter(|offset| *offset <= u32::MAX as u64)
+        else {
+            write_error(stream, "bit offset is not an integer or out of range")?;
+            return Ok(true);
+        };
+        if !ensure_string(stream, executor, namespace, key)? {
+            return Ok(true);
+        }
+        let value = match load_string(executor, namespace, key) {
+            Ok(value) => value.unwrap_or_default(),
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        let byte = (offset / 8) as usize;
+        let bit = value.get(byte).map_or(0, |byte| (byte >> (7 - (offset % 8) as u32)) & 1);
+        write!(stream, ":{bit}\r\n")?;
+    }
+    else if command.eq_ignore_ascii_case(b"BITCOUNT") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if !matches!(count, 2 | 4 | 5) {
+            stream.write_all(b"-ERR wrong number of arguments for 'bitcount' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        let bit_unit = match count {
+            5 if request.arguments[4].eq_ignore_ascii_case(b"BIT") => true,
+            5 if request.arguments[4].eq_ignore_ascii_case(b"BYTE") => false,
+            5 => {
+                write_error(stream, "syntax error")?;
+                return Ok(true);
+            }
+            _ => false,
+        };
+        let range = if count == 2 {
+            None
+        }
+        else {
+            let (Some(start), Some(stop)) =
+                (collections::parse_index(request.arguments[2]), collections::parse_index(request.arguments[3]))
+            else {
+                write_error(stream, "value is not an integer or out of range")?;
+                return Ok(true);
+            };
+            Some((start, stop))
+        };
+        if !ensure_string(stream, executor, namespace, key)? {
+            return Ok(true);
+        }
+        let value = match load_string(executor, namespace, key) {
+            Ok(value) => value.unwrap_or_default(),
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        let total = match range {
+            None => value.iter().map(|byte| i64::from(byte.count_ones())).sum(),
+            Some((start, stop)) => {
+                let length = if bit_unit { value.len() * 8 } else { value.len() };
+                match normalized_range(start, stop, length) {
+                    None => 0,
+                    Some((begin, end)) => {
+                        if bit_unit {
+                            count_set_bits(&value, begin, end)
+                        }
+                        else {
+                            value[begin..=end].iter().map(|byte| i64::from(byte.count_ones())).sum()
+                        }
+                    }
+                }
+            }
+        };
+        write!(stream, ":{total}\r\n")?;
+    }
+    else if command.eq_ignore_ascii_case(b"BITPOS") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if !(3..=6).contains(&count) {
+            stream.write_all(b"-ERR wrong number of arguments for 'bitpos' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        let target: u8 = match request.arguments[2] {
+            b"0" => 0,
+            b"1" => 1,
+            _ => {
+                write_error(stream, "The bit argument must be 1 or 0")?;
+                return Ok(true);
+            }
+        };
+        let bit_unit = match count {
+            6 if request.arguments[5].eq_ignore_ascii_case(b"BIT") => true,
+            6 if request.arguments[5].eq_ignore_ascii_case(b"BYTE") => false,
+            6 => {
+                write_error(stream, "syntax error")?;
+                return Ok(true);
+            }
+            _ => false,
+        };
+        let (start, stop, end_given) = match count {
+            3 => (None, None, false),
+            4 => (Some(request.arguments[3]), None, false),
+            5 => (Some(request.arguments[3]), Some(request.arguments[4]), true),
+            _ => (Some(request.arguments[3]), Some(request.arguments[4]), true),
+        };
+        let parsed_start = match start {
+            None => None,
+            Some(raw) => match collections::parse_index(raw) {
+                Some(index) => Some(index),
+                None => {
+                    write_error(stream, "value is not an integer or out of range")?;
+                    return Ok(true);
+                }
+            },
+        };
+        let parsed_stop = match stop {
+            None => None,
+            Some(raw) => match collections::parse_index(raw) {
+                Some(index) => Some(index),
+                None => {
+                    write_error(stream, "value is not an integer or out of range")?;
+                    return Ok(true);
+                }
+            },
+        };
+        if !ensure_string(stream, executor, namespace, key)? {
+            return Ok(true);
+        }
+        let value = match load_string(executor, namespace, key) {
+            Ok(value) => value,
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        // 键不存在时真机把它视为无限长的 0 串，忽略范围：找 0 回 0，找 1 回 -1。
+        let Some(value) = value else {
+            let answer = if target == 0 { 0 } else { -1 };
+            write!(stream, ":{answer}\r\n")?;
+            return Ok(true);
+        };
+        // 真机在归一化之前先比原始负索引：两个负值且起点大于终点即空区间。
+        if let (Some(start), Some(stop)) = (parsed_start, parsed_stop) {
+            if start < 0 && stop < 0 && start > stop {
+                write!(stream, ":-1\r\n")?;
+                return Ok(true);
+            }
+        }
+        let total_bits = (value.len() * 8) as i64;
+        let units = if bit_unit { total_bits } else { value.len() as i64 };
+        let begin_unit = parsed_start.map_or(0, |start| normalize_unit(start, units));
+        let end_unit = parsed_stop.map_or(units - 1, |stop| normalize_unit(stop, units));
+        if begin_unit > end_unit {
+            write!(stream, ":-1\r\n")?;
+            return Ok(true);
+        }
+        let (begin, end) = if bit_unit { (begin_unit, end_unit) } else { (begin_unit * 8, end_unit * 8 + 7) };
+        match find_bit(&value, begin as usize, end as usize, target) {
+            Some(bit) => write!(stream, ":{bit}\r\n")?,
+            None => {
+                // 没显式给终点且找 0 时，末尾之后的第一个位就是答案。
+                let answer = if target == 0 && !end_given { total_bits } else { -1 };
+                write!(stream, ":{answer}\r\n")?;
+            }
+        }
+    }
     else if command.eq_ignore_ascii_case(b"SET") {
         handle_set(stream, request, executor, namespace, state.protocol)?;
     }
@@ -2232,6 +2717,47 @@ fn validate_command_for_queue(
         }
         if count < 2 {
             return Err(b"-ERR wrong number of arguments for 'del' command\r\n".to_vec());
+        }
+        return Ok(());
+    }
+    // String range and bit commands: they need the executor. Argument values are
+    // validated at runtime, so queueing only checks arity like upstream.
+    if command.eq_ignore_ascii_case(b"GETRANGE")
+        || command.eq_ignore_ascii_case(b"SETRANGE")
+        || command.eq_ignore_ascii_case(b"SETBIT")
+    {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if count != 4 {
+            return Err(format!("-ERR wrong number of arguments for '{}' command\r\n", lowercase_command(command)).into_bytes());
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"INCRBYFLOAT") || command.eq_ignore_ascii_case(b"GETBIT") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if count != 3 {
+            return Err(format!("-ERR wrong number of arguments for '{}' command\r\n", lowercase_command(command)).into_bytes());
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"BITCOUNT") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if !matches!(count, 2 | 4 | 5) {
+            return Err(b"-ERR wrong number of arguments for 'bitcount' command\r\n".to_vec());
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"BITPOS") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if !(3..=6).contains(&count) {
+            return Err(b"-ERR wrong number of arguments for 'bitpos' command\r\n".to_vec());
         }
         return Ok(());
     }

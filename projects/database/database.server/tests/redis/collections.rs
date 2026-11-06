@@ -845,6 +845,330 @@ fn rename_any_type_and_overwrite() {
     assert_eq!(expect_integer(&mut client), 0);
 }
 
+/// `SETRANGE` / `GETRANGE` / `APPEND` / `STRLEN` cover negative indexes, silent
+/// zero-padding, empty payloads and boundary offsets.
+#[test]
+fn string_range_append_and_strlen() {
+    let (mut client, _server) = memory_server("redis-string-range");
+    send(&mut client, &["SET", "k", "Hello World"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["STRLEN", "k"]);
+    assert_eq!(expect_integer(&mut client), 11);
+    send(&mut client, &["GETRANGE", "k", "0", "4"]);
+    expect_bulk(&mut client, Some("Hello"));
+    send(&mut client, &["GETRANGE", "k", "-5", "-1"]);
+    expect_bulk(&mut client, Some("World"));
+    send(&mut client, &["GETRANGE", "k", "0", "-1"]);
+    expect_bulk(&mut client, Some("Hello World"));
+    send(&mut client, &["GETRANGE", "k", "-100", "4"]);
+    expect_bulk(&mut client, Some("Hello"));
+    send(&mut client, &["GETRANGE", "k", "0", "100"]);
+    expect_bulk(&mut client, Some("Hello World"));
+    send(&mut client, &["GETRANGE", "k", "5", "3"]);
+    expect_bulk(&mut client, Some(""));
+    send(&mut client, &["GETRANGE", "k", "100", "200"]);
+    expect_bulk(&mut client, Some(""));
+    send(&mut client, &["GETRANGE", "no-such-key", "0", "-1"]);
+    expect_bulk(&mut client, Some(""));
+    send(&mut client, &["GETRANGE", "k", "not-a-number", "1"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+
+    // Overwriting in place keeps the original length.
+    send(&mut client, &["SETRANGE", "k", "6", "Redis"]);
+    assert_eq!(expect_integer(&mut client), 11);
+    send(&mut client, &["GET", "k"]);
+    expect_bulk(&mut client, Some("Hello Redis"));
+    // Offsets past the end are zero-padded, and the reply is the new length.
+    send(&mut client, &["SET", "pad", "abc"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SETRANGE", "pad", "5", "xy"]);
+    assert_eq!(expect_integer(&mut client), 7);
+    send(&mut client, &["STRLEN", "pad"]);
+    assert_eq!(expect_integer(&mut client), 7);
+    send(&mut client, &["GETRANGE", "pad", "3", "4"]);
+    expect_bulk(&mut client, Some("\0\0"));
+    send(&mut client, &["GETRANGE", "pad", "5", "-1"]);
+    expect_bulk(&mut client, Some("xy"));
+    // An empty payload never creates a key and never changes an existing value.
+    send(&mut client, &["SETRANGE", "no-such-key", "0", ""]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SETRANGE", "k", "0", ""]);
+    assert_eq!(expect_integer(&mut client), 11);
+    send(&mut client, &["GET", "k"]);
+    expect_bulk(&mut client, Some("Hello Redis"));
+    send(&mut client, &["SETRANGE", "k", "-1", "x"]);
+    expect_error(&mut client, "ERR offset is out of range");
+    send(&mut client, &["SETRANGE", "k", "abc", "x"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+
+    // `APPEND` creates missing keys and replies the new length.
+    send(&mut client, &["APPEND", "app", "abc"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["APPEND", "app", "def"]);
+    assert_eq!(expect_integer(&mut client), 6);
+    send(&mut client, &["GET", "app"]);
+    expect_bulk(&mut client, Some("abcdef"));
+    send(&mut client, &["APPEND", "app", ""]);
+    assert_eq!(expect_integer(&mut client), 6);
+    send(&mut client, &["STRLEN", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    // TTL survives in-place string edits.
+    send(&mut client, &["EXPIRE", "k", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SETRANGE", "k", "0", "J"]);
+    assert_eq!(expect_integer(&mut client), 11);
+    send(&mut client, &["TTL", "k"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "SETRANGE dropped the TTL: {ttl}");
+    send(&mut client, &["APPEND", "k", "!"]);
+    assert_eq!(expect_integer(&mut client), 12);
+    send(&mut client, &["TTL", "k"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "APPEND dropped the TTL: {ttl}");
+    send(&mut client, &["PERSIST", "k"]);
+    assert_eq!(expect_integer(&mut client), 1);
+
+    // Key-level commands agree with the other value types.
+    send(&mut client, &["TYPE", "k"]);
+    expect_status(&mut client, "string");
+    send(&mut client, &["EXISTS", "k", "app"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["DEL", "k"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "k"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    send(&mut client, &["HSET", "h", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    for arguments in [
+        ["STRLEN", "h"].as_slice(),
+        ["APPEND", "h", "x"].as_slice(),
+        ["GETRANGE", "h", "0", "-1"].as_slice(),
+        ["SETRANGE", "h", "0", "x"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, WRONGTYPE);
+    }
+}
+
+/// `INCRBYFLOAT` keeps Redis float formatting and rejects non-finite inputs, while
+/// `INCR` / `DECR` reuse the overflow message of the KV layer.
+#[test]
+fn string_incrbyfloat_and_integer_overflow() {
+    let (mut client, _server) = memory_server("redis-string-incr");
+    send(&mut client, &["INCRBYFLOAT", "f", "10.5"]);
+    expect_bulk(&mut client, Some("10.5"));
+    send(&mut client, &["INCRBYFLOAT", "f", "0.1"]);
+    expect_bulk(&mut client, Some("10.6"));
+    send(&mut client, &["INCRBYFLOAT", "f", "-0.1"]);
+    expect_bulk(&mut client, Some("10.5"));
+    send(&mut client, &["INCRBYFLOAT", "missing", "5.0e3"]);
+    expect_bulk(&mut client, Some("5000"));
+    send(&mut client, &["TYPE", "missing"]);
+    expect_status(&mut client, "string");
+    send(&mut client, &["INCRBYFLOAT", "f", "0"]);
+    expect_bulk(&mut client, Some("10.5"));
+
+    send(&mut client, &["INCRBYFLOAT", "f", "+inf"]);
+    expect_error(&mut client, "ERR increment would produce NaN or Infinity");
+    send(&mut client, &["INCRBYFLOAT", "f", "-inf"]);
+    expect_error(&mut client, "ERR increment would produce NaN or Infinity");
+    send(&mut client, &["INCRBYFLOAT", "f", "nan"]);
+    expect_error(&mut client, "ERR value is not a valid float");
+    send(&mut client, &["INCRBYFLOAT", "f", "abc"]);
+    expect_error(&mut client, "ERR value is not a valid float");
+    send(&mut client, &["INCRBYFLOAT", "f", "1"]);
+    expect_bulk(&mut client, Some("11.5"));
+
+    // A non-numeric stored value is rejected without being overwritten.
+    send(&mut client, &["SET", "bad", "abc"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["INCRBYFLOAT", "bad", "1"]);
+    expect_error(&mut client, "ERR value is not a valid float");
+    send(&mut client, &["GET", "bad"]);
+    expect_bulk(&mut client, Some("abc"));
+
+    // TTL survives `INCRBYFLOAT` just like the integer counters.
+    send(&mut client, &["EXPIRE", "f", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["INCRBYFLOAT", "f", "1"]);
+    expect_bulk(&mut client, Some("12.5"));
+    send(&mut client, &["TTL", "f"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "INCRBYFLOAT dropped the TTL: {ttl}");
+
+    // Integer reply types and overflow messages.
+    send(&mut client, &["INCR", "n"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["DECR", "n"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SET", "n", "9223372036854775807"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["INCR", "n"]);
+    expect_error(&mut client, "ERR increment or decrement would overflow");
+    send(&mut client, &["SET", "n", "-9223372036854775808"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["DECR", "n"]);
+    expect_error(&mut client, "ERR increment or decrement would overflow");
+
+    send(&mut client, &["HSET", "h", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["INCRBYFLOAT", "h", "1"]);
+    expect_error(&mut client, WRONGTYPE);
+}
+
+/// `SETBIT` / `GETBIT` / `BITCOUNT` / `BITPOS` follow Redis bit ordering, zero padding,
+/// empty keys and the byte/bit range units.
+#[test]
+fn bit_operations() {
+    let (mut client, _server) = memory_server("redis-bits");
+    send(&mut client, &["SETBIT", "bits", "7", "1"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["GETBIT", "bits", "7"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["GETBIT", "bits", "0"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["GETBIT", "no-such-key", "0"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    // The first byte is 0x01, so the value survives as a string of length 1.
+    send(&mut client, &["STRLEN", "bits"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SETBIT", "bits", "7", "0"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["GETBIT", "bits", "7"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    // Writing a high offset zero-fills every byte before it.
+    send(&mut client, &["SETBIT", "bits", "100", "1"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["GETBIT", "bits", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["STRLEN", "bits"]);
+    assert_eq!(expect_integer(&mut client), 13);
+    send(&mut client, &["SETBIT", "bits", "abc", "1"]);
+    expect_error(&mut client, "ERR bit offset is not an integer or out of range");
+    send(&mut client, &["SETBIT", "bits", "-1", "1"]);
+    expect_error(&mut client, "ERR bit offset is not an integer or out of range");
+    send(&mut client, &["SETBIT", "bits", "0", "2"]);
+    expect_error(&mut client, "ERR bit is not an integer or out of range");
+    send(&mut client, &["GETBIT", "bits", "not-a-number"]);
+    expect_error(&mut client, "ERR bit offset is not an integer or out of range");
+
+    // `BITCOUNT` on a known payload, in both byte and bit units.
+    send(&mut client, &["SET", "be", "foobar"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["BITCOUNT", "be"]);
+    assert_eq!(expect_integer(&mut client), 26);
+    send(&mut client, &["BITCOUNT", "be", "0", "0"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["BITCOUNT", "be", "1", "1"]);
+    assert_eq!(expect_integer(&mut client), 6);
+    send(&mut client, &["BITCOUNT", "be", "0", "-5"]);
+    assert_eq!(expect_integer(&mut client), 10);
+    send(&mut client, &["BITCOUNT", "be", "-2", "-1"]);
+    assert_eq!(expect_integer(&mut client), 7);
+    send(&mut client, &["BITCOUNT", "be", "0", "5", "BYTE"]);
+    assert_eq!(expect_integer(&mut client), 26);
+    send(&mut client, &["BITCOUNT", "be", "0", "7", "BIT"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["BITCOUNT", "be", "8", "15", "BIT"]);
+    assert_eq!(expect_integer(&mut client), 6);
+    send(&mut client, &["BITCOUNT", "be", "100", "200", "BYTE"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["BITCOUNT", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["BITCOUNT", "be", "0", "0", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["BITCOUNT", "be", "not-a-number", "1"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+
+    // Three bytes: 0xff, 0x00, 0xf0.
+    for bit in 0..8 {
+        let offset = bit.to_string();
+        send(&mut client, &["SETBIT", "bp", &offset, "1"]);
+        assert_eq!(expect_integer(&mut client), 0);
+    }
+    for bit in 16..20 {
+        let offset = bit.to_string();
+        send(&mut client, &["SETBIT", "bp", &offset, "1"]);
+        assert_eq!(expect_integer(&mut client), 0);
+    }
+    send(&mut client, &["BITPOS", "bp", "1"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["BITPOS", "bp", "0"]);
+    assert_eq!(expect_integer(&mut client), 8);
+    send(&mut client, &["BITPOS", "bp", "0", "1"]);
+    assert_eq!(expect_integer(&mut client), 8);
+    send(&mut client, &["BITPOS", "bp", "1", "2"]);
+    assert_eq!(expect_integer(&mut client), 16);
+    send(&mut client, &["BITPOS", "bp", "0", "2"]);
+    assert_eq!(expect_integer(&mut client), 20);
+    send(&mut client, &["BITPOS", "bp", "1", "2", "2"]);
+    assert_eq!(expect_integer(&mut client), 16);
+    send(&mut client, &["BITPOS", "bp", "0", "8", "23", "BIT"]);
+    assert_eq!(expect_integer(&mut client), 8);
+    send(&mut client, &["BITPOS", "bp", "1", "0", "-1"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["BITPOS", "bp", "1", "2", "-1"]);
+    assert_eq!(expect_integer(&mut client), 16);
+    // Out-of-range starts clamp to the last unit, negative ends clamp to the first.
+    send(&mut client, &["BITPOS", "bp", "0", "100"]);
+    assert_eq!(expect_integer(&mut client), 20);
+    send(&mut client, &["BITPOS", "bp", "0", "0", "-100"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    // Missing keys are treated as infinite zero strings, ignoring any range.
+    send(&mut client, &["BITPOS", "no-such-key", "0"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["BITPOS", "no-such-key", "0", "0", "-1"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["BITPOS", "no-such-key", "1"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    // An existing empty string is a range with no bits at all.
+    send(&mut client, &["SET", "empty", ""]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["BITPOS", "empty", "0"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    // All-ones without an explicit end reports the first bit past the string.
+    for bit in 0..8 {
+        let offset = bit.to_string();
+        send(&mut client, &["SETBIT", "ones", &offset, "1"]);
+        assert_eq!(expect_integer(&mut client), 0);
+    }
+    send(&mut client, &["BITPOS", "ones", "0"]);
+    assert_eq!(expect_integer(&mut client), 8);
+    send(&mut client, &["BITPOS", "ones", "0", "0", "-1"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    send(&mut client, &["BITPOS", "bp", "2"]);
+    expect_error(&mut client, "ERR The bit argument must be 1 or 0");
+    send(&mut client, &["BITPOS", "bp", "0", "0", "5", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+
+    send(&mut client, &["HSET", "h", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    for arguments in [
+        ["SETBIT", "h", "0", "1"].as_slice(),
+        ["GETBIT", "h", "0"].as_slice(),
+        ["BITCOUNT", "h"].as_slice(),
+        ["BITPOS", "h", "0"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, WRONGTYPE);
+    }
+    send(&mut client, &["TYPE", "bp"]);
+    expect_status(&mut client, "string");
+    send(&mut client, &["EXISTS", "bp", "bits", "be"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["DEL", "bp", "bits"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["EXPIRE", "be", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TTL", "be"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "unexpected string TTL: {ttl}");
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
@@ -867,6 +1191,20 @@ fn restart_preserves_types_and_contents() {
     expect_status(&mut first, "OK");
     send(&mut first, &["RENAME", "rn", "rn2"]);
     expect_status(&mut first, "OK");
+
+    // 字符串族的编辑结果同样落在同一份快照里。
+    send(&mut first, &["SETRANGE", "range", "0", "abc"]);
+    assert_eq!(expect_integer(&mut first), 3);
+    send(&mut first, &["SETRANGE", "range", "4", "de"]);
+    assert_eq!(expect_integer(&mut first), 6);
+    send(&mut first, &["APPEND", "app", "hello"]);
+    assert_eq!(expect_integer(&mut first), 5);
+    send(&mut first, &["INCRBYFLOAT", "flt", "2.5"]);
+    expect_bulk(&mut first, Some("2.5"));
+    send(&mut first, &["SETBIT", "bitk", "3", "1"]);
+    assert_eq!(expect_integer(&mut first), 0);
+    send(&mut first, &["EXPIRE", "app", "100"]);
+    assert_eq!(expect_integer(&mut first), 1);
 
     let (mut second, _second_server) = file_server(&path);
     send(&mut second, &["TYPE", "s"]);
@@ -900,7 +1238,29 @@ fn restart_preserves_types_and_contents() {
     send(&mut second, &["SCAN", "0", "COUNT", "100"]);
     let (cursor, keys) = expect_scan(&mut second);
     assert_eq!(cursor, "0");
-    assert_eq!(keys, ["h", "l", "ps", "pz", "rn2", "s"]);
+    assert_eq!(keys, ["app", "bitk", "flt", "h", "l", "ps", "pz", "range", "rn2", "s"]);
+
+    send(&mut second, &["TYPE", "range"]);
+    expect_status(&mut second, "string");
+    send(&mut second, &["STRLEN", "range"]);
+    assert_eq!(expect_integer(&mut second), 6);
+    send(&mut second, &["GETRANGE", "range", "0", "2"]);
+    expect_bulk(&mut second, Some("abc"));
+    send(&mut second, &["GETRANGE", "range", "4", "5"]);
+    expect_bulk(&mut second, Some("de"));
+    send(&mut second, &["STRLEN", "app"]);
+    assert_eq!(expect_integer(&mut second), 5);
+    send(&mut second, &["GET", "app"]);
+    expect_bulk(&mut second, Some("hello"));
+    send(&mut second, &["TTL", "app"]);
+    let ttl = expect_integer(&mut second);
+    assert!((1..=100).contains(&ttl), "string TTL missing after reopen: {ttl}");
+    send(&mut second, &["INCRBYFLOAT", "flt", "0"]);
+    expect_bulk(&mut second, Some("2.5"));
+    send(&mut second, &["GETBIT", "bitk", "3"]);
+    assert_eq!(expect_integer(&mut second), 1);
+    send(&mut second, &["BITCOUNT", "bitk"]);
+    assert_eq!(expect_integer(&mut second), 1);
     send(&mut second, &["GET", "rn2"]);
     expect_bulk(&mut second, Some("v"));
     send(&mut second, &["TYPE", "rn2"]);
