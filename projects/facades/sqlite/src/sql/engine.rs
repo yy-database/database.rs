@@ -1365,7 +1365,7 @@ impl Engine {
                 self.tables[position].columns[column].name = new;
                 Ok(ExecResult { statement: "alter-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
-            AlterAction::AddColumn { column, checks, sql } => {
+            AlterAction::AddColumn { column, checks, foreign_keys, sql } => {
                 let def = &self.tables[position];
                 if def.columns.iter().any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) {
                     return Err(SqlError::new("duplicate-column", format!("duplicate column name: {}", column.name))
@@ -1376,6 +1376,10 @@ impl Engine {
                 }
                 if column.unique {
                     return Err(SqlError::new("invalid-alter", "Cannot add a UNIQUE column").in_statement("alter-table"));
+                }
+                if !foreign_keys.is_empty() && matches!(&column.default_value, Some(value) if !matches!(value, crate::WriteValue::Null)) {
+                    return Err(SqlError::new("invalid-alter", "Cannot add a REFERENCES column with non-NULL default value")
+                        .in_statement("alter-table"));
                 }
                 // SQLite only refuses when an existing row would read back
                 // NULL; on an empty table the same definition is accepted.
@@ -1391,6 +1395,7 @@ impl Engine {
                 let mut columns = def.columns.clone();
                 columns.push(column.clone());
                 let resolved = resolve_checks(&def.name, &columns, &checks, "alter-table")?;
+                let resolved_foreign_keys = resolve_foreign_keys(&columns, &foreign_keys)?;
                 let open = stored
                     .rfind(')')
                     .ok_or_else(|| SqlError::new("storage", "sqlite stored table text has no column list").in_statement("alter-table"))?;
@@ -1403,6 +1408,7 @@ impl Engine {
                 self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
                 self.tables[position].columns.push(column);
                 self.tables[position].checks.extend(resolved);
+                self.tables[position].foreign_keys.extend(resolved_foreign_keys);
                 Ok(ExecResult { statement: "alter-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             AlterAction::DropColumn { column } => {
@@ -7949,10 +7955,7 @@ mod tests {
         assert_eq!(deferred.code, "unsupported-deferred-foreign-key");
         // Immediate deferral spellings keep working.
         engine.execute_one("CREATE TABLE c4 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) NOT DEFERRABLE)").expect("not deferrable");
-        let added = engine
-            .execute_one("ALTER TABLE c4 ADD COLUMN other INTEGER REFERENCES parent(id)")
-            .expect_err("add column with a foreign key");
-        assert_eq!(added.code, "unsupported-column-constraint");
+        engine.execute_one("ALTER TABLE c4 ADD COLUMN other INTEGER REFERENCES parent(id)").expect("add column with a foreign key");
     }
 
     #[test]

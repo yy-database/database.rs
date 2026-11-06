@@ -2947,7 +2947,7 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
     let mut index = 1usize;
     while index < tokens.len() {
         let upper = tokens[index].to_ascii_uppercase();
-        if matches!(upper.as_str(), "NOT" | "DEFAULT" | "PRIMARY" | "UNIQUE" | "NULL") {
+        if matches!(upper.as_str(), "NOT" | "DEFAULT" | "PRIMARY" | "UNIQUE" | "NULL" | "REFERENCES") {
             break;
         }
         if !declared_type.is_empty() {
@@ -3024,6 +3024,46 @@ fn parse_column(fragment: &str) -> Result<ColumnSpec> {
                 }
                 if !opened {
                     return Err(Error::Unsupported("sqlite CHECK constraint lacks parentheses"));
+                }
+            }
+            "REFERENCES" => {
+                // The storage layer does not enforce foreign keys; the engine
+                // does. Skip the parent reference, its optional column list,
+                // the `ON DELETE` / `ON UPDATE` action and the deferral clause
+                // so the column definition still parses on reopen.
+                index += 1;
+                if index < tokens.len() {
+                    index += 1;
+                }
+                if tokens.get(index).map(|token| token == "(").unwrap_or(false) {
+                    let mut depth = 0i64;
+                    let mut opened = false;
+                    while index < tokens.len() {
+                        for character in tokens[index].chars() {
+                            match character {
+                                '(' => {
+                                    depth += 1;
+                                    opened = true;
+                                }
+                                ')' => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        index += 1;
+                        if opened && depth <= 0 {
+                            break;
+                        }
+                    }
+                }
+                while index < tokens.len() {
+                    if tokens[index].eq_ignore_ascii_case("NOT")
+                        && tokens.get(index + 1).map(|token| token.eq_ignore_ascii_case("DEFERRABLE")).unwrap_or(false)
+                    {
+                        index += 2;
+                    }
+                    else {
+                        index += 1;
+                    }
                 }
             }
             _ => return Err(Error::Unsupported("sqlite column constraint unrecognized")),
