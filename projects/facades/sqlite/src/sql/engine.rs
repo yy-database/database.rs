@@ -317,6 +317,10 @@ pub struct Engine {
     parameters: Vec<Cell>,
     /// `PRAGMA foreign_keys`, enabled at session start like better-sqlite3.
     foreign_keys: bool,
+    /// Rowid of the most recent row a statement wrote successfully, like
+    /// `sqlite3_last_insert_rowid`. It starts at 0 for every connection and
+    /// only changes when an insert writes at least one row.
+    last_insert_rowid: i64,
 }
 
 impl Engine {
@@ -338,6 +342,7 @@ impl Engine {
             indexes: BTreeMap::new(),
             parameters: Vec::new(),
             foreign_keys: true,
+            last_insert_rowid: 0,
         };
         engine.load_catalog()?;
         Ok(engine)
@@ -481,6 +486,17 @@ impl Engine {
         self.writer.pages()
     }
 
+    /// Rowid of the last row this connection inserted successfully, mirroring
+    /// `sqlite3_last_insert_rowid`.
+    ///
+    /// A statement that inserts several rows reports the last row it wrote. If
+    /// a later row fails and the statement rolls back, the value stays at the
+    /// last row that did pass, because SQLite records it row by row. Statements
+    /// that insert no row leave it untouched.
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.last_insert_rowid
+    }
+
     /// Configured page size.
     pub fn page_size(&self) -> u32 {
         self.writer.page_size() as u32
@@ -613,6 +629,7 @@ impl Engine {
                 let check_shape = ScopeShape { columns: Vec::new() };
                 let check_budget = Budget::new();
                 let mut rowids = Vec::with_capacity(slots_by_row.len());
+                let mut last_written: Option<i64> = None;
                 let mut returned: Vec<Vec<Cell>> = Vec::new();
                 let mut failure = None;
                 for slots in &slots_by_row {
@@ -658,6 +675,11 @@ impl Engine {
                     if failure.is_some() {
                         break;
                     }
+                    // The row passed the writer's NOT NULL / UNIQUE / PRIMARY
+                    // KEY checks and this statement's CHECK constraints, so
+                    // SQLite would have recorded its rowid already. A later
+                    // failure rolls the row back but does not undo the record.
+                    last_written = Some(rowid);
                     if let Some(plan) = &returning {
                         match plan.eval(&cells, &ctx) {
                             Ok(row) => returned.push(row),
@@ -677,6 +699,9 @@ impl Engine {
                     if let Err(error) = self.check_insert_foreign_keys(def, &rowids, "insert") {
                         failure = Some(error);
                     }
+                }
+                if let Some(rowid) = last_written {
+                    self.last_insert_rowid = rowid;
                 }
                 if let Some(error) = failure {
                     let _ = self.writer.rollback();
@@ -6457,6 +6482,62 @@ mod tests {
         engine.execute_one("CREATE TABLE defaults_only(a INTEGER DEFAULT 9)").expect("defaults table");
         engine.execute_with_parameters("INSERT INTO defaults_only DEFAULT VALUES", &[Cell::Integer(6)]).expect("default values");
         assert_eq!(engine.execute_one("SELECT a FROM defaults_only").expect("default row").rows, vec![vec![Cell::Integer(9)]]);
+    }
+
+    #[test]
+    fn last_insert_rowid_follows_sqlite_row_by_row() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        assert_eq!(engine.last_insert_rowid(), 0);
+        engine.execute_one("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT NOT NULL CHECK(length(a) > 0))").expect("create t");
+        engine.execute_one("CREATE TABLE plain(a TEXT)").expect("create plain");
+
+        engine.execute_one("INSERT INTO t(a) VALUES ('x')").expect("single insert");
+        assert_eq!(engine.last_insert_rowid(), 1);
+        engine.execute_one("INSERT INTO t(a) VALUES ('y'), ('z')").expect("multi insert");
+        assert_eq!(engine.last_insert_rowid(), 3);
+        engine.execute_one("INSERT INTO t(id, a) VALUES (99, 'q')").expect("explicit rowid");
+        assert_eq!(engine.last_insert_rowid(), 99);
+
+        // Not one row of this statement passes, so the previous value stands.
+        assert!(engine.execute_one("INSERT INTO t(a) VALUES ('')").is_err());
+        assert_eq!(engine.last_insert_rowid(), 99);
+
+        // The first tuple passes and records rowid 100, the second fails, and
+        // the rollback removes the row without undoing that record.
+        assert!(engine.execute_one("INSERT INTO t(a) VALUES ('p'), ('')").is_err());
+        assert_eq!(engine.last_insert_rowid(), 100);
+        assert_eq!(engine.execute_one("SELECT count(*) FROM t").expect("count").rows, vec![vec![Cell::Integer(4)]]);
+        assert_eq!(
+            engine.execute_one("SELECT id FROM t ORDER BY id").expect("rowids").rows,
+            vec![
+                vec![Cell::Integer(1)],
+                vec![Cell::Integer(2)],
+                vec![Cell::Integer(3)],
+                vec![Cell::Integer(99)]
+            ]
+        );
+
+        // The rolled-back rowid 100 is reused before the statement rolls back
+        // again, so the recorded value stays at 100.
+        assert!(engine.execute_one("INSERT INTO t(a) VALUES ('p'), (NULL)").is_err());
+        assert_eq!(engine.last_insert_rowid(), 100);
+
+        engine.execute_one("INSERT INTO plain(a) VALUES ('k'), ('l')").expect("plain multi insert");
+        assert_eq!(engine.last_insert_rowid(), 2);
+
+        // Updates and deletes never move the recorded rowid.
+        engine.execute_one("UPDATE t SET a = 'u' WHERE id = 2").expect("update");
+        engine.execute_one("DELETE FROM t WHERE id = 2").expect("delete");
+        assert_eq!(engine.last_insert_rowid(), 2);
+
+        // A reopened image is a fresh connection, so the value starts over.
+        let path = std::env::temp_dir().join(format!("sqlite-engine-rowid-{}.db", std::process::id()));
+        std::fs::write(&path, engine.snapshot()).expect("write image");
+        drop(engine);
+        let writer = SqliteWriter::open(&path).expect("open image");
+        let reopened = Engine::from_writer(writer).expect("rebuild catalog");
+        assert_eq!(reopened.last_insert_rowid(), 0);
+        std::fs::remove_file(&path).expect("cleanup image");
     }
 
     #[test]
