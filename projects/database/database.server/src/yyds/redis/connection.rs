@@ -10,10 +10,11 @@
 //! listener restart.
 
 use std::{
+    collections::HashMap,
     io::{self, Read, Write},
     net::TcpStream,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -22,7 +23,7 @@ use std::{
 use database_execution::cluster::KeyValueExecutor;
 use database_query::cluster_kv::{KeyValueAction, KeyValueCommand, KeyValueResult};
 use database_storage::cluster_kv::now_unix_ms;
-use database_types::cluster::Namespace;
+use database_types::cluster::{FenceToken, Namespace};
 
 use super::{
     bind::{BindError, BoundAction, BoundCommand, SetCondition, SetExpiry, bind, bind_mget, bind_set},
@@ -121,19 +122,159 @@ impl ConnectionState {
     }
 }
 
+/// 进程内键访问计时器，供 `OBJECT IDLETIME` 使用。
+///
+/// 只保存每个键「最近一次命中」的单调时钟时刻，不写入 `.yykv`：`Record` 与 v3 落盘
+/// 格式都不带访问元数据，塞进记录会改变落盘字节并破坏格式兼容。计时器因此随监听器
+/// 进程存在，重启后归零——这与真机一致，Redis 的 RDB 同样不保存访问时间，加载后对象
+/// 从零重新计时。
+#[derive(Debug, Default)]
+pub struct KeyAccessTracker {
+    last_access: Mutex<HashMap<(Namespace, Vec<u8>), Instant>>,
+}
+
+impl KeyAccessTracker {
+    /// 创建一个空计时器，通常由监听器启动时创建并在各连接间共享。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次命中，把该键的空闲起点推进到当前时刻。
+    fn mark(&self, namespace: &Namespace, key: &[u8]) {
+        let mut entries = self.last_access.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.insert((namespace.clone(), key.to_vec()), Instant::now());
+    }
+
+    /// 键不再可见时丢弃记录，避免同名键重新创建后读出上一轮的空闲时长。
+    fn forget(&self, namespace: &Namespace, key: &[u8]) {
+        let mut entries = self.last_access.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.remove(&(namespace.clone(), key.to_vec()));
+    }
+
+    /// 空闲秒数。没有记录的键按「刚刚加载」处理并返回 `0`，对应重启后的起始状态。
+    fn idle_seconds(&self, namespace: &Namespace, key: &[u8]) -> u64 {
+        let entries = self.last_access.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.get(&(namespace.clone(), key.to_vec())).map_or(0, |last| last.elapsed().as_secs())
+    }
+}
+
+/// 包装执行器，在每条键值命令返回后更新访问计时。
+///
+/// 读命中与写命中统一在这里刷新空闲起点，不必在每个协议分支里各写一次 `mark`。键变为
+/// 不可见时丢弃记录。`OBJECT` 子命令改用未包装的执行器查键，因此保持真机的
+/// `LOOKUP_NOTOUCH` 语义：查询空闲时间不会把空闲时间清零。
+#[derive(Debug)]
+struct TrackedExecutor<'a> {
+    inner: &'a dyn KeyValueExecutor,
+    tracker: &'a KeyAccessTracker,
+}
+
+impl TrackedExecutor<'_> {
+    /// 依据一次键值命令的结果更新计时。执行失败时保持原记录，不猜测存储状态。
+    fn observe(&self, namespace: &Namespace, key: &[u8], destination: Option<&[u8]>, result: &KeyValueResult) {
+        match result {
+            KeyValueResult::Get(Some(_))
+            | KeyValueResult::GetSet(_)
+            | KeyValueResult::Put { .. }
+            // `PutIfAbsent` 返回 `None` 表示旧键仍在，条件写失败本身也是一次命中。
+            | KeyValueResult::PutIfAbsent { .. }
+            | KeyValueResult::Increment { .. }
+            | KeyValueResult::Exists(true) => self.tracker.mark(namespace, key),
+            KeyValueResult::PutIfPresent { revision: Some(_) } => self.tracker.mark(namespace, key),
+            KeyValueResult::Get(None)
+            | KeyValueResult::Exists(false)
+            | KeyValueResult::GetDelete(_)
+            | KeyValueResult::Delete { .. }
+            | KeyValueResult::PutIfPresent { revision: None } => self.tracker.forget(namespace, key),
+            KeyValueResult::Expiry { present, .. } => {
+                if *present {
+                    self.tracker.mark(namespace, key)
+                }
+                else {
+                    self.tracker.forget(namespace, key)
+                }
+            }
+            KeyValueResult::ExpiryChanged { applied } => {
+                // 未生效时无法区分「键不存在」与「本来就没有过期时间」，保留原记录。
+                if *applied {
+                    self.tracker.mark(namespace, key)
+                }
+            }
+            KeyValueResult::Rename { source_present, applied } => {
+                if *applied {
+                    self.tracker.forget(namespace, key);
+                    if let Some(destination) = destination {
+                        self.tracker.mark(namespace, destination);
+                    }
+                }
+                else if *source_present {
+                    self.tracker.mark(namespace, key);
+                }
+                else {
+                    self.tracker.forget(namespace, key);
+                }
+            }
+        }
+    }
+}
+
+impl KeyValueExecutor for TrackedExecutor<'_> {
+    fn execute(&self, fence: Option<&FenceToken>, command: KeyValueCommand) -> database_types::cluster::Result<KeyValueResult> {
+        // 命令会被移交给内层执行器，计时所需字段先复制出来。
+        let namespace = command.namespace.clone();
+        let key = command.key.clone();
+        let destination = match &command.action {
+            KeyValueAction::Rename { destination, .. } => Some(destination.clone()),
+            _ => None,
+        };
+        let result = self.inner.execute(fence, command);
+        if let Ok(value) = &result {
+            self.observe(&namespace, &key, destination.as_deref(), value);
+        }
+        result
+    }
+
+    fn execute_read_batch(
+        &self,
+        fence: Option<&FenceToken>,
+        commands: &[KeyValueCommand],
+    ) -> database_types::cluster::Result<Vec<KeyValueResult>> {
+        let result = self.inner.execute_read_batch(fence, commands);
+        if let Ok(results) = &result {
+            for (command, value) in commands.iter().zip(results) {
+                self.observe(&command.namespace, &command.key, None, value);
+            }
+        }
+        result
+    }
+
+    fn execute_scan(
+        &self,
+        fence: Option<&FenceToken>,
+        namespace: &Namespace,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        before: Option<&[u8]>,
+        limit: usize,
+    ) -> database_types::cluster::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // 扫描不指向单个键，保持原样透传。
+        self.inner.execute_scan(fence, namespace, prefix, after, before, limit)
+    }
+}
+
 /// Serves one bounded RESP2 connection with a 30-second I/O timeout.
 /// Only PING, ECHO and QUIT are supported. Database commands require a binder.
 pub fn serve_connection(stream: TcpStream, limits: RequestLimits) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    serve_io(stream, limits, None)
+    serve_io(stream, limits, None, Arc::new(KeyAccessTracker::new()))
 }
 
 /// Serves a node-owned connection with cooperative cancellation of all socket I/O.
 pub fn serve_cancellable(stream: TcpStream, limits: RequestLimits, stopping: Arc<AtomicBool>) -> io::Result<()> {
     stream.set_nonblocking(true)?;
-    serve_io(CancellableSocket { stream, stopping }, limits, None)
+    serve_io(CancellableSocket { stream, stopping }, limits, None, Arc::new(KeyAccessTracker::new()))
 }
 
 /// Serves a node-owned RESP2 connection using the YYDS key/value execution contract.
@@ -144,7 +285,23 @@ pub fn serve_cancellable_with_executor(
     executor: Arc<dyn KeyValueExecutor>,
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
-    serve_io(CancellableSocket { stream, stopping }, limits, Some(executor))
+    serve_io(CancellableSocket { stream, stopping }, limits, Some(executor), Arc::new(KeyAccessTracker::new()))
+}
+
+/// Serves a node-owned RESP2 connection while sharing one access tracker with its listener.
+///
+/// The tracker holds `OBJECT IDLETIME` state, which is per-object in Redis and therefore
+/// has to be shared by every connection of the same listener rather than recreated per
+/// socket.
+pub fn serve_cancellable_with_executor_and_tracker(
+    stream: TcpStream,
+    limits: RequestLimits,
+    stopping: Arc<AtomicBool>,
+    executor: Arc<dyn KeyValueExecutor>,
+    tracker: Arc<KeyAccessTracker>,
+) -> io::Result<()> {
+    stream.set_nonblocking(true)?;
+    serve_io(CancellableSocket { stream, stopping }, limits, Some(executor), tracker)
 }
 
 struct CancellableSocket {
@@ -189,17 +346,34 @@ impl Write for CancellableSocket {
     }
 }
 
-fn serve_io(mut stream: impl Read + Write, limits: RequestLimits, executor: Option<Arc<dyn KeyValueExecutor>>) -> io::Result<()> {
+fn serve_io(
+    mut stream: impl Read + Write,
+    limits: RequestLimits,
+    executor: Option<Arc<dyn KeyValueExecutor>>,
+    tracker: Arc<KeyAccessTracker>,
+) -> io::Result<()> {
     let mut pending = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut namespace = Namespace("redis:0".into());
     let mut state = ConnectionState::new();
+    // 所有普通命令走包装执行器以刷新访问计时，`OBJECT` 与 `WATCH` 需要不记时地查键，
+    // 因此另保留一个未包装的执行器视图。
+    let tracked = executor.as_deref().map(|inner| TrackedExecutor { inner, tracker: tracker.as_ref() });
+    let tracked_view: Option<&dyn KeyValueExecutor> = tracked.as_ref().map(|wrapper| wrapper as &dyn KeyValueExecutor);
     loop {
         loop {
             match decode_request(&pending, limits) {
                 Ok(Some(request)) => {
                     let consumed = request.consumed;
-                    let result = respond(&mut stream as &mut dyn Write, &request, executor.as_deref(), &mut namespace, &mut state);
+                    let result = respond(
+                        &mut stream as &mut dyn Write,
+                        &request,
+                        tracked_view,
+                        executor.as_deref(),
+                        tracker.as_ref(),
+                        &mut namespace,
+                        &mut state,
+                    );
                     if !result? {
                         return Ok(());
                     }
@@ -431,10 +605,86 @@ fn handle_unwatch(stream: &mut dyn Write, count: usize, state: &mut ConnectionSt
     stream.write_all(b"+OK\r\n")
 }
 
+/// `OBJECT IDLETIME` / `OBJECT REFCOUNT` / `OBJECT FREQ`.
+///
+/// 三个子命令先按真机的 `LOOKUP_NOTOUCH` 口径查键：缺键回 null（RESP2 `$-1`、RESP3 `_`），
+/// 查询本身不刷新访问计时。这里用未包装的执行器，因此 `OBJECT IDLETIME` 不会把空闲
+/// 时间清零。
+fn handle_object(
+    stream: &mut dyn Write,
+    request: &Request<'_>,
+    probe: Option<&dyn KeyValueExecutor>,
+    tracker: &KeyAccessTracker,
+    namespace: &Namespace,
+    protocol: u8,
+) -> io::Result<()> {
+    let count = request.arguments.len();
+    let subcommand = request.arguments.get(1).copied().unwrap_or(b"");
+    if count < 2 {
+        stream.write_all(b"-ERR wrong number of arguments for 'object' command\r\n")?;
+        return Ok(());
+    }
+    let known = subcommand.eq_ignore_ascii_case(b"IDLETIME")
+        || subcommand.eq_ignore_ascii_case(b"REFCOUNT")
+        || subcommand.eq_ignore_ascii_case(b"FREQ");
+    if !known || count != 3 {
+        write_error(
+            stream,
+            &format!(
+                "Unknown subcommand or wrong number of arguments for '{}'. Try OBJECT HELP.",
+                String::from_utf8_lossy(subcommand)
+            ),
+        )?;
+        return Ok(());
+    }
+    let Some(executor) = probe
+    else {
+        stream.write_all(b"-ERR unsupported command\r\n")?;
+        return Ok(());
+    };
+    let key = request.arguments[2];
+    let present = match executor.execute(
+        None,
+        KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::Get },
+    ) {
+        Ok(KeyValueResult::Get(value)) => value.is_some(),
+        Ok(_) => {
+            write_error(stream, "OBJECT lookup returned an unexpected result")?;
+            return Ok(());
+        }
+        Err(error) => {
+            write_error(stream, &error.to_string())?;
+            return Ok(());
+        }
+    };
+    if !present {
+        return write_null(stream, protocol);
+    }
+    if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
+        // 纯内存计时：不写 `.yykv`、不升格式版本，重启后从零开始，与真机 RDB 的行为一致。
+        write!(stream, ":{}\r\n", tracker.idle_seconds(namespace, key))
+    }
+    else if subcommand.eq_ignore_ascii_case(b"REFCOUNT") {
+        // 这是由存储结构推出的结果，不是写死的常量：每条记录在 `Record` 里独占自己的
+        // 值字节，既没有共享对象表也没有引用计数表，所以每个存在的键恰好只有一个引用。
+        // 引入对象共享会改变表示与落盘口径，故不实现。
+        stream.write_all(b":1\r\n")
+    }
+    else {
+        // 网关没有淘汰策略配置面，恒为 LRU 口径：不做频率追踪，也不编造一个假计数。
+        write_error(
+            stream,
+            "An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+        )
+    }
+}
+
 fn respond(
     stream: &mut dyn Write,
     request: &Request<'_>,
     executor: Option<&dyn KeyValueExecutor>,
+    probe: Option<&dyn KeyValueExecutor>,
+    tracker: &KeyAccessTracker,
     namespace: &mut Namespace,
     state: &mut ConnectionState,
 ) -> io::Result<bool> {
@@ -471,8 +721,9 @@ fn respond(
         // Optimistic locking: any write to a watched key since WATCH abandons the whole
         // transaction before a single queued command runs. The reply is the nil array.
         if !state.watched.is_empty() {
-            let modified = match executor {
-                Some(executor) => watched_keys_modified(executor, &state.watched),
+            // 版本比对只读取值，不刷新访问计时，否则 `EXEC` 前的探测会把空闲时间清零。
+            let modified = match probe {
+                Some(probe) => watched_keys_modified(probe, &state.watched),
                 None => Ok(true),
             };
             match modified {
@@ -493,7 +744,7 @@ fn respond(
                 }
             }
         }
-        execute_transaction(stream, executor, namespace, state)?;
+        execute_transaction(stream, executor, probe, tracker, namespace, state)?;
         return Ok(true);
     }
 
@@ -516,7 +767,7 @@ fn respond(
     // ---- Optimistic locking control: WATCH / UNWATCH. `WATCH` must run before `MULTI`,
     // while `UNWATCH` inside a `MULTI` is queued like any other command, as upstream does.
     if command.eq_ignore_ascii_case(b"WATCH") {
-        handle_watch(stream, request, executor, namespace, state)?;
+        handle_watch(stream, request, probe, namespace, state)?;
         return Ok(true);
     }
 
@@ -1197,6 +1448,9 @@ fn respond(
         }
         write_bulk(stream, &value)?;
     }
+    else if command.eq_ignore_ascii_case(b"OBJECT") {
+        handle_object(stream, request, probe, tracker, namespace, state.protocol)?;
+    }
     else if command.eq_ignore_ascii_case(b"RENAME") || command.eq_ignore_ascii_case(b"RENAMENX") {
         // Session / token rotation: the record moves together with its remaining deadline in
         // one shard-local durable commit, so no read-write-delete window can lose it and the
@@ -1291,6 +1545,8 @@ fn respond(
 fn execute_transaction(
     stream: &mut dyn Write,
     executor: Option<&dyn KeyValueExecutor>,
+    probe: Option<&dyn KeyValueExecutor>,
+    tracker: &KeyAccessTracker,
     namespace: &mut Namespace,
     state: &mut ConnectionState,
 ) -> io::Result<()> {
@@ -1314,7 +1570,15 @@ fn execute_transaction(
         // KV records, so queued commands see and write it through the executor like any
         // other state.
         let mut inner_state = ConnectionState { protocol, ..ConnectionState::new() };
-        let _ = respond(&mut buf as &mut dyn Write, &inner_request, executor, &mut inner_namespace, &mut inner_state);
+        let _ = respond(
+            &mut buf as &mut dyn Write,
+            &inner_request,
+            executor,
+            probe,
+            tracker,
+            &mut inner_namespace,
+            &mut inner_state,
+        );
         stream.write_all(&buf)?;
     }
     Ok(())
@@ -1439,6 +1703,17 @@ fn validate_command_for_queue(
             else {
                 return Err(b"-ERR syntax error\r\n".to_vec());
             }
+        }
+        return Ok(());
+    }
+    // OBJECT: at least a subcommand, needs executor. The subcommand name and the key
+    // argument are runtime checks and stay deferred to EXEC, like upstream.
+    if command.eq_ignore_ascii_case(b"OBJECT") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if count < 2 {
+            return Err(b"-ERR wrong number of arguments for 'object' command\r\n".to_vec());
         }
         return Ok(());
     }
