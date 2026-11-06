@@ -2475,3 +2475,123 @@ fn sort_commands() {
     send(&mut client, &["SORT"]);
     expect_error(&mut client, "ERR wrong number of arguments for 'sort' command");
 }
+
+/// `BITFIELD` / `BITFIELD_RO` cover signed and unsigned widths, `#` offsets,
+/// all three overflow policies and the create-on-write rules.
+#[test]
+fn bitfield_commands() {
+    fn expect_values(client: &mut TcpStream, expected: &[Option<i64>]) {
+        match read_reply(client) {
+            Reply::Array(Some(items)) => {
+                assert_eq!(items.len(), expected.len());
+                for (item, wanted) in items.iter().zip(expected) {
+                    match (item, wanted) {
+                        (Reply::Integer(value), Some(wanted)) => assert_eq!(*value, *wanted),
+                        (Reply::Bulk(None), None) => {}
+                        other => panic!("unexpected bitfield reply {other:?}"),
+                    }
+                }
+            }
+            other => panic!("unexpected bitfield reply {other:?}"),
+        }
+    }
+
+    let (mut client, _server) = memory_server("redis-bitfield");
+    send(&mut client, &["BITFIELD", "bf", "SET", "u8", "0", "255", "GET", "u8", "0"]);
+    expect_values(&mut client, &[Some(0), Some(255)]);
+    send(&mut client, &["TYPE", "bf"]);
+    expect_status(&mut client, "string");
+    send(&mut client, &["GET", "bf"]);
+    match read_reply(&mut client) {
+        Reply::Bulk(Some(bytes)) => assert_eq!(bytes, vec![0xff]),
+        other => panic!("expected bulk 0xff, got {}", describe(&other)),
+    }
+
+    // 无符号回绕：200 + 100 在 u8 上落到 44。
+    send(&mut client, &["BITFIELD", "cnt", "SET", "u8", "0", "200"]);
+    expect_values(&mut client, &[Some(0)]);
+    send(&mut client, &["BITFIELD", "cnt", "INCRBY", "u8", "0", "100"]);
+    expect_values(&mut client, &[Some(44)]);
+    send(&mut client, &["BITFIELD", "cnt", "GET", "u8", "0"]);
+    expect_values(&mut client, &[Some(44)]);
+
+    send(&mut client, &["BITFIELD", "cnt", "SET", "u8", "0", "200"]);
+    expect_values(&mut client, &[Some(44)]);
+    send(&mut client, &["BITFIELD", "cnt", "OVERFLOW", "SAT", "INCRBY", "u8", "0", "100"]);
+    expect_values(&mut client, &[Some(255)]);
+    send(&mut client, &["BITFIELD", "cnt", "SET", "u8", "0", "200"]);
+    expect_values(&mut client, &[Some(255)]);
+    send(&mut client, &["BITFIELD", "cnt", "OVERFLOW", "FAIL", "INCRBY", "u8", "0", "100"]);
+    expect_values(&mut client, &[None]);
+    send(&mut client, &["BITFIELD", "cnt", "GET", "u8", "0"]);
+    expect_values(&mut client, &[Some(200)]);
+
+    // 有符号回绕与饱和，下限 -128 与上限 127。
+    send(&mut client, &["BITFIELD", "s", "SET", "i8", "0", "-128", "INCRBY", "i8", "0", "-1"]);
+    expect_values(&mut client, &[Some(0), Some(127)]);
+    send(&mut client, &["BITFIELD", "s", "SET", "i8", "0", "127"]);
+    expect_values(&mut client, &[Some(127)]);
+    send(&mut client, &["BITFIELD", "s", "OVERFLOW", "SAT", "INCRBY", "i8", "0", "1"]);
+    expect_values(&mut client, &[Some(127)]);
+    send(&mut client, &["BITFIELD", "s", "OVERFLOW", "FAIL", "INCRBY", "i8", "0", "1"]);
+    expect_values(&mut client, &[None]);
+
+    // u1 只有一位，1 + 1 回绕到 0。
+    send(&mut client, &["BITFIELD", "one", "SET", "u1", "0", "1", "INCRBY", "u1", "0", "1"]);
+    expect_values(&mut client, &[Some(0), Some(0)]);
+    send(&mut client, &["BITFIELD", "one", "GET", "u1", "0"]);
+    expect_values(&mut client, &[Some(0)]);
+
+    // i64 边界：加一从最大值回绕到最小值。
+    send(&mut client, &["BITFIELD", "wide", "INCRBY", "i64", "0", "9223372036854775807"]);
+    expect_values(&mut client, &[Some(9223372036854775807)]);
+    send(&mut client, &["BITFIELD", "wide", "INCRBY", "i64", "0", "1"]);
+    expect_values(&mut client, &[Some(-9223372036854775808)]);
+
+    // `#` 偏移按编码宽度倍乘，#1 与位偏移 8 等价。
+    send(&mut client, &["BITFIELD", "hashy", "SET", "u8", "#1", "7", "GET", "u8", "8"]);
+    expect_values(&mut client, &[Some(0), Some(7)]);
+    send(&mut client, &["BITFIELD", "hashy", "GET", "u8", "#1"]);
+    expect_values(&mut client, &[Some(7)]);
+
+    // 只读 GET 不创建键，写入路径保留原有 TTL。
+    send(&mut client, &["BITFIELD", "absent", "GET", "u8", "0"]);
+    expect_values(&mut client, &[Some(0)]);
+    send(&mut client, &["EXISTS", "absent"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["BITFIELD_RO", "absent", "GET", "u8", "0"]);
+    expect_values(&mut client, &[Some(0)]);
+    send(&mut client, &["SET", "keep", "abc", "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["BITFIELD", "keep", "INCRBY", "u8", "0", "1"]);
+    expect_values(&mut client, &[Some(98)]);
+    send(&mut client, &["TTL", "keep"]);
+    assert_eq!(expect_integer(&mut client), 100);
+
+    // 越界写入按需增长并补零，SET 的返回值是旧值。
+    send(&mut client, &["BITFIELD", "grow", "SET", "u8", "0", "256"]);
+    expect_values(&mut client, &[Some(0)]);
+    send(&mut client, &["BITFIELD", "grow", "GET", "u8", "0"]);
+    expect_values(&mut client, &[Some(0)]);
+
+    send(&mut client, &["HSET", "h", "f", "1"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["BITFIELD", "h", "GET", "u8", "0"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["BITFIELD_RO", "keep", "SET", "u8", "0", "1"]);
+    expect_error(&mut client, "ERR BITFIELD_RO only supports the GET subcommand");
+    send(&mut client, &["BITFIELD", "bf", "GET", "u64", "0"]);
+    expect_error(&mut client, "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.");
+    send(&mut client, &["BITFIELD", "bf", "GET", "i65", "0"]);
+    expect_error(&mut client, "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.");
+    send(&mut client, &["BITFIELD", "bf", "GET", "u8", "-1"]);
+    expect_error(&mut client, "ERR bit offset is not an integer or out of range");
+    send(&mut client, &["BITFIELD", "bf", "SET", "u8", "0", "x"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["BITFIELD", "bf", "OVERFLOW", "PREV", "INCRBY", "u8", "0", "1"]);
+    expect_error(&mut client, "ERR Invalid OVERFLOW type specified");
+    send(&mut client, &["BITFIELD", "bf", "BOGUS", "u8", "0"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["BITFIELD"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'bitfield' command");
+}

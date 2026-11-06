@@ -356,6 +356,8 @@ pub(crate) fn is_zset_command(command: &[u8]) -> bool {
         b"ZINTERCARD",
         b"SORT",
         b"SORT_RO",
+        b"BITFIELD",
+        b"BITFIELD_RO",
     ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
@@ -2569,6 +2571,267 @@ fn handle_sort(
     Ok(())
 }
 
+/// 位域编码：有符号 `iN` 或无符号 `uN`。
+#[derive(Clone, Copy)]
+struct BitEncoding {
+    signed: bool,
+    bits: u32,
+}
+
+/// 位域溢出策略，默认 `WRAP`。
+#[derive(Clone, Copy, PartialEq)]
+enum BitOverflow {
+    Wrap,
+    Sat,
+    Fail,
+}
+
+/// 一条 `BITFIELD` 子命令。
+enum BitFieldOp {
+    Get { encoding: BitEncoding, offset: u64 },
+    Set { encoding: BitEncoding, offset: u64, value: i64 },
+    Incr {
+        encoding: BitEncoding,
+        offset: u64,
+        increment: i64,
+        overflow: BitOverflow,
+    },
+}
+
+const MAX_BIT_OFFSET: u64 = 0xffff_ffff;
+
+/// 解析 `iN` / `uN`，无符号上限 `u63`，有符号上限 `i64`。
+fn parse_bit_encoding(raw: &[u8]) -> Option<BitEncoding> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let mut characters = text.chars();
+    let signed = match characters.next()? {
+        'i' | 'I' => true,
+        'u' | 'U' => false,
+        _ => return None,
+    };
+    let bits = characters.as_str().parse::<u32>().ok()?;
+    let limit = if signed { 64 } else { 63 };
+    (bits >= 1 && bits <= limit).then_some(BitEncoding { signed, bits })
+}
+
+/// 解析偏移：纯数字按位计，`#n` 按编码宽度倍乘。
+fn parse_bitfield_offset(raw: &[u8], bits: u32) -> Option<u64> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let value = match text.strip_prefix('#') {
+        Some(rest) => rest.parse::<i64>().ok()?.checked_mul(bits as i64)?,
+        None => text.parse::<i64>().ok()?,
+    };
+    (value >= 0 && value as u64 <= MAX_BIT_OFFSET).then_some(value as u64)
+}
+
+/// 解析整条 `BITFIELD`：语法与编码校验先于任何写入。
+fn parse_bitfield_ops(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    readonly: bool,
+) -> io::Result<Option<Vec<BitFieldOp>>> {
+    let mut operations = Vec::new();
+    let mut overflow = BitOverflow::Wrap;
+    let mut index = 2;
+    while index < arguments.len() {
+        let keyword = arguments[index];
+        if keyword.eq_ignore_ascii_case(b"OVERFLOW") {
+            let Some(raw) = arguments.get(index + 1)
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            };
+            if raw.eq_ignore_ascii_case(b"WRAP") {
+                overflow = BitOverflow::Wrap;
+            }
+            else if raw.eq_ignore_ascii_case(b"SAT") {
+                overflow = BitOverflow::Sat;
+            }
+            else if raw.eq_ignore_ascii_case(b"FAIL") {
+                overflow = BitOverflow::Fail;
+            }
+            else {
+                write_error(stream, "Invalid OVERFLOW type specified")?;
+                return Ok(None);
+            }
+            index += 2;
+            continue;
+        }
+        let writing = keyword.eq_ignore_ascii_case(b"SET") || keyword.eq_ignore_ascii_case(b"INCRBY");
+        if readonly && writing {
+            write_error(stream, "BITFIELD_RO only supports the GET subcommand")?;
+            return Ok(None);
+        }
+        let needs = if keyword.eq_ignore_ascii_case(b"GET") { 3 } else if writing { 4 } else { 0 };
+        if needs == 0 {
+            write_error(stream, "syntax error")?;
+            return Ok(None);
+        }
+        if index + needs > arguments.len() {
+            write_error(stream, "syntax error")?;
+            return Ok(None);
+        }
+        let Some(encoding) = parse_bit_encoding(arguments[index + 1])
+        else {
+            write_error(stream, "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.")?;
+            return Ok(None);
+        };
+        let Some(offset) = parse_bitfield_offset(arguments[index + 2], encoding.bits)
+        else {
+            write_error(stream, "bit offset is not an integer or out of range")?;
+            return Ok(None);
+        };
+        if keyword.eq_ignore_ascii_case(b"GET") {
+            operations.push(BitFieldOp::Get { encoding, offset });
+        }
+        else {
+            let Some(value) = parse_index(arguments[index + 3])
+            else {
+                write_error(stream, "value is not an integer or out of range")?;
+                return Ok(None);
+            };
+            if keyword.eq_ignore_ascii_case(b"SET") {
+                operations.push(BitFieldOp::Set { encoding, offset, value });
+            }
+            else {
+                operations.push(BitFieldOp::Incr { encoding, offset, increment: value, overflow });
+            }
+        }
+        index += needs;
+    }
+    Ok(Some(operations))
+}
+
+/// 读取一个位域值，缺失的位按 0 参与。
+fn read_bitfield(body: &[u8], offset: u64, encoding: BitEncoding) -> i128 {
+    let mut raw = 0_u128;
+    for step in 0..encoding.bits as u64 {
+        let position = offset + step;
+        let byte = (position / 8) as usize;
+        let bit = if byte < body.len() { (body[byte] >> (7 - (position % 8))) & 1 } else { 0 };
+        raw = (raw << 1) | bit as u128;
+    }
+    if encoding.signed && raw >= (1_u128 << (encoding.bits - 1)) {
+        raw as i128 - (1_i128 << encoding.bits)
+    }
+    else {
+        raw as i128
+    }
+}
+
+/// 写入一个位域值，必要时按位增长并补零。
+fn write_bitfield(body: &mut Vec<u8>, offset: u64, encoding: BitEncoding, value: i128) {
+    let bits = encoding.bits;
+    let mask = (1_u128 << bits) - 1;
+    let raw = (value as u128) & mask;
+    let needed = ((offset + bits as u64 + 7) / 8) as usize;
+    if body.len() < needed {
+        body.resize(needed, 0);
+    }
+    for step in 0..bits as u64 {
+        let position = offset + step;
+        let byte = (position / 8) as usize;
+        let bit = ((raw >> (bits as u64 - 1 - step)) & 1) as u8;
+        let shift = 7 - (position % 8);
+        if bit == 1 {
+            body[byte] |= 1 << shift;
+        }
+        else {
+            body[byte] &= !(1 << shift);
+        }
+    }
+}
+
+/// 位域的取值区间与溢出处理；`FAIL` 返回 `None`。
+fn normalize_bitfield(value: i128, encoding: BitEncoding, overflow: BitOverflow) -> Option<i128> {
+    let (minimum, maximum) = if encoding.signed {
+        (-(1_i128 << (encoding.bits - 1)), (1_i128 << (encoding.bits - 1)) - 1)
+    }
+    else {
+        (0, (1_i128 << encoding.bits) - 1)
+    };
+    if value >= minimum && value <= maximum {
+        return Some(value);
+    }
+    match overflow {
+        BitOverflow::Fail => None,
+        BitOverflow::Sat => Some(value.clamp(minimum, maximum)),
+        BitOverflow::Wrap => {
+            let span = maximum - minimum + 1;
+            Some(minimum + ((value - minimum) % span + span) % span)
+        }
+    }
+}
+
+/// 执行 `BITFIELD` / `BITFIELD_RO`。
+fn handle_bitfield(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    arguments: &[&[u8]],
+    readonly: bool,
+) -> io::Result<()> {
+    let name = if readonly { "bitfield_ro" } else { "bitfield" };
+    if arguments.len() < 2 {
+        return write_arity_error(stream, name);
+    }
+    let key = arguments[1];
+    let Some(operations) = parse_bitfield_ops(stream, arguments, readonly)?
+    else {
+        return Ok(());
+    };
+    let kind = match find_kind(executor, base, key) {
+        Ok(kind) => kind,
+        Err(message) => return write_storage_error(stream, &message),
+    };
+    if let Some(found) = kind {
+        if found != KeyKind::String {
+            return write_wrong_type(stream);
+        }
+    }
+    let mut body = match load_value(executor, &KeyKind::String.namespace(base), key) {
+        Ok(value) => value.unwrap_or_default(),
+        Err(message) => return write_storage_error(stream, &message),
+    };
+    let mut results: Vec<Option<i128>> = Vec::with_capacity(operations.len());
+    let mut changed = false;
+    for operation in operations {
+        match operation {
+            BitFieldOp::Get { encoding, offset } => results.push(Some(read_bitfield(&body, offset, encoding))),
+            BitFieldOp::Set { encoding, offset, value } => {
+                let previous = read_bitfield(&body, offset, encoding);
+                write_bitfield(&mut body, offset, encoding, value as i128);
+                changed = true;
+                results.push(Some(previous));
+            }
+            BitFieldOp::Incr { encoding, offset, increment, overflow } => {
+                let previous = read_bitfield(&body, offset, encoding);
+                match normalize_bitfield(previous + increment as i128, encoding, overflow) {
+                    Some(value) => {
+                        write_bitfield(&mut body, offset, encoding, value);
+                        changed = true;
+                        results.push(Some(value));
+                    }
+                    None => results.push(None),
+                }
+            }
+        }
+    }
+    if changed {
+        if let Err(message) = store_value(executor, &KeyKind::String.namespace(base), key, body) {
+            return write_storage_error(stream, &message);
+        }
+    }
+    write_array_header(stream, results.len())?;
+    for result in results {
+        match result {
+            Some(value) => write_integer(stream, value as i64)?,
+            None => stream.write_all(b"$-1\r\n")?,
+        }
+    }
+    Ok(())
+}
+
 /// `ZADD` / `ZSCORE` / `ZREM` / `ZCARD` / `ZRANGE` 及排序族、排名、计数与扫描的分派入口。
 pub(crate) fn handle_zset(
     stream: &mut dyn io::Write,
@@ -2582,6 +2845,9 @@ pub(crate) fn handle_zset(
     else {
         return write_error(stream, "unsupported command");
     };
+    if command.eq_ignore_ascii_case(b"BITFIELD") || command.eq_ignore_ascii_case(b"BITFIELD_RO") {
+        return handle_bitfield(stream, executor, base, &request.arguments, command.eq_ignore_ascii_case(b"BITFIELD_RO"));
+    }
     if command.eq_ignore_ascii_case(b"SORT") || command.eq_ignore_ascii_case(b"SORT_RO") {
         return handle_sort(stream, executor, base, &request.arguments, command.eq_ignore_ascii_case(b"SORT_RO"));
     }
