@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "projects/database/*",
+    "projects/facades/*",
     "projects/odm/*",
     "projects/searcher/*",
 ]
