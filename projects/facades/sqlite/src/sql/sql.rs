@@ -68,6 +68,38 @@ use crate::{ColumnSpec, WriteValue};
 
 use super::error::SqlError;
 
+/// Removes every `schema.` qualifier from `sql` while keeping the rest of the
+/// text byte for byte. SQLite stores the objects of an attached database with
+/// the schema qualifier removed, so a database attached under another name
+/// later still reloads.
+pub fn strip_schema_qualifiers(sql: &str, schema: &str) -> String {
+    let Ok((tokens, offsets)) = tokenize(sql) else { return sql.to_string() };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let matches_schema = match token {
+            Token::Word(word) | Token::Quoted(word) => word.eq_ignore_ascii_case(schema),
+            _ => false,
+        };
+        if !matches_schema || !matches!(tokens.get(index + 1), Some(Token::Dot)) {
+            continue;
+        }
+        let start = offsets.get(index).copied().unwrap_or(0);
+        let end = offsets.get(index + 1).copied().map(|dot| dot + 1).unwrap_or(start);
+        ranges.push((start, end));
+    }
+    if ranges.is_empty() {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        out.push_str(sql.get(cursor..start).unwrap_or_default());
+        cursor = end;
+    }
+    out.push_str(sql.get(cursor..).unwrap_or_default());
+    out
+}
+
 /// One literal value parsed from a `VALUES` tuple or a `DEFAULT` clause.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Literal {
@@ -206,6 +238,8 @@ pub enum JoinKind {
 /// One table reference in a `FROM` clause.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableRef {
+    /// Optional `schema.` qualifier of the table name.
+    pub schema: Option<String>,
     /// Table name as written; empty for a derived table.
     pub name: String,
     /// `AS` / bare alias as written.
@@ -1193,6 +1227,8 @@ pub enum TriggerEvent {
 pub enum Statement {
     /// `CREATE TABLE ...`.
     CreateTable {
+        /// Optional `schema.` qualifier of the table name.
+        schema: Option<String>,
         /// Table name as written.
         name: String,
         /// `IF NOT EXISTS` was present.
@@ -1215,6 +1251,8 @@ pub enum Statement {
     },
     /// `CREATE VIEW ... AS SELECT ...`.
     CreateView {
+        /// Optional `schema.` qualifier of the view name.
+        schema: Option<String>,
         /// View name as written.
         name: String,
         /// `IF NOT EXISTS` was present.
@@ -1228,6 +1266,8 @@ pub enum Statement {
     },
     /// `CREATE TRIGGER ... BEGIN ... END`.
     CreateTrigger {
+        /// Optional `schema.` qualifier of the trigger name.
+        schema: Option<String>,
         /// Trigger name as written.
         name: String,
         /// `IF NOT EXISTS` was present.
@@ -1236,6 +1276,8 @@ pub enum Statement {
         timing: TriggerTiming,
         /// Statement event that fires the trigger.
         event: TriggerEvent,
+        /// Optional `schema.` qualifier of the table the trigger is attached to.
+        table_schema: Option<String>,
         /// Table the trigger is attached to.
         table: String,
         /// Optional `WHEN` predicate, evaluated before the body.
@@ -1247,6 +1289,8 @@ pub enum Statement {
     },
     /// `DROP TRIGGER [IF EXISTS] name`.
     DropTrigger {
+        /// Optional `schema.` qualifier of the trigger name.
+        schema: Option<String>,
         /// Trigger name as written.
         name: String,
         /// `IF EXISTS` was present.
@@ -1254,6 +1298,8 @@ pub enum Statement {
     },
     /// `DROP VIEW [IF EXISTS] name`.
     DropView {
+        /// Optional `schema.` qualifier of the view name.
+        schema: Option<String>,
         /// View name as written.
         name: String,
         /// `IF EXISTS` was present.
@@ -1261,6 +1307,8 @@ pub enum Statement {
     },
     /// `CREATE [UNIQUE] INDEX ... ON ... (...)`.
     CreateIndex {
+        /// Optional `schema.` qualifier of the index name.
+        schema: Option<String>,
         /// Index name as written.
         name: String,
         /// Indexed table name as written.
@@ -1276,6 +1324,8 @@ pub enum Statement {
     },
     /// `INSERT INTO ... VALUES ...` or `INSERT INTO ... DEFAULT VALUES`.
     Insert {
+        /// Optional `schema.` qualifier of the target table.
+        schema: Option<String>,
         /// Target table name as written.
         table: String,
         /// Optional explicit column list.
@@ -1289,6 +1339,8 @@ pub enum Statement {
     },
     /// `UPDATE t [AS alias] SET c = expr [, ...] [WHERE expr] [RETURNING ...]`.
     Update {
+        /// Optional `schema.` qualifier of the target table.
+        schema: Option<String>,
         /// Target table name as written.
         table: String,
         /// `AS alias` of the update target, when one was written.
@@ -1302,6 +1354,8 @@ pub enum Statement {
     },
     /// `DROP TABLE [IF EXISTS] t`.
     DropTable {
+        /// Optional `schema.` qualifier of the table name.
+        schema: Option<String>,
         /// Table name as written.
         name: String,
         /// `IF EXISTS` was present.
@@ -1309,6 +1363,8 @@ pub enum Statement {
     },
     /// `DROP INDEX [IF EXISTS] name`.
     DropIndex {
+        /// Optional `schema.` qualifier of the index name.
+        schema: Option<String>,
         /// Index name as written.
         name: String,
         /// `IF EXISTS` was present.
@@ -1316,6 +1372,8 @@ pub enum Statement {
     },
     /// `ALTER TABLE t RENAME ...`, `ADD [COLUMN] ...` or `DROP [COLUMN] ...`.
     AlterTable {
+        /// Optional `schema.` qualifier of the table name.
+        schema: Option<String>,
         /// Table name as written.
         table: String,
         /// The one alteration being applied.
@@ -1323,6 +1381,8 @@ pub enum Statement {
     },
     /// `DELETE FROM t [AS alias] [WHERE expr] [RETURNING ...]`.
     Delete {
+        /// Optional `schema.` qualifier of the target table.
+        schema: Option<String>,
         /// Target table name as written.
         table: String,
         /// `AS alias` of the delete target, when one was written.
@@ -1351,10 +1411,24 @@ pub enum Statement {
     },
     /// `PRAGMA name [= value]` or `PRAGMA name(value)`.
     Pragma {
+        /// Optional `schema.` qualifier of the pragma name.
+        schema: Option<String>,
         /// Pragma name as written.
         name: String,
         /// Value as written, when the statement sets the pragma.
         value: Option<String>,
+    },
+    /// `ATTACH [DATABASE] 'file' AS name`.
+    Attach {
+        /// Database file as written, already unquoted.
+        file: String,
+        /// Schema name as written.
+        name: String,
+    },
+    /// `DETACH [DATABASE] name`.
+    Detach {
+        /// Schema name as written.
+        name: String,
     },
     /// `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE` and
     /// `ROLLBACK TO SAVEPOINT`.
@@ -1410,6 +1484,8 @@ impl Statement {
             Self::AlterTable { .. } => "alter-table",
             Self::Select { .. } => "select",
             Self::Pragma { .. } => "pragma",
+            Self::Attach { .. } => "attach",
+            Self::Detach { .. } => "detach",
             Self::Transaction { action } => match action {
                 TransactionAction::Begin => "begin",
                 TransactionAction::Commit => "commit",
@@ -2182,6 +2258,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Reads `[schema.]name`, keeping the optional `schema.` qualifier so the
+    /// engine can route the statement to an attached database.
+    fn qualified_name(&mut self) -> Result<(Option<String>, String), SqlError> {
+        let first = self.name()?;
+        if self.peek() == Some(&Token::Dot) {
+            self.at += 1;
+            let second = self.name()?;
+            Ok((Some(first), second))
+        }
+        else {
+            Ok((None, first))
+        }
+    }
+
     /// Reads the `(col, ...)` list of `JOIN ... USING`. An empty list is a
     /// syntax error in SQLite, so it is rejected here too.
     fn using_columns(&mut self) -> Result<Vec<String>, SqlError> {
@@ -2874,7 +2964,7 @@ impl<'a> Parser<'a> {
         else {
             None
         };
-        let name = if query.is_some() { String::new() } else { self.name()? };
+        let (schema, name) = if query.is_some() { (None, String::new()) } else { self.qualified_name()? };
         let alias = if self.eat_word("as") {
             Some(self.name()?)
         }
@@ -2885,7 +2975,7 @@ impl<'a> Parser<'a> {
             let bare = matches!(self.peek(), Some(Token::Word(word)) if !is_clause_keyword(word));
             if bare { Some(self.name()?) } else { None }
         };
-        Ok(TableRef { name, alias, query, join: None, on: None, using: None, natural: false })
+        Ok(TableRef { schema, name, alias, query, join: None, on: None, using: None, natural: false })
     }
 
     /// Reads `WITH [RECURSIVE] name [(col, ...)] AS (select) [, ...] select`.
@@ -3023,6 +3113,14 @@ impl<'a> Parser<'a> {
             self.kind = Some("pragma");
             return self.pragma();
         }
+        if self.eat_word("attach") {
+            self.kind = Some("attach");
+            return self.attach();
+        }
+        if self.eat_word("detach") {
+            self.kind = Some("detach");
+            return self.detach_statement();
+        }
         if self.peek_keyword("select") {
             self.kind = Some("select");
             self.at += 1;
@@ -3108,8 +3206,7 @@ impl<'a> Parser<'a> {
 
     /// Reads `PRAGMA <name> [= value]` or `PRAGMA <name>(value)`.
     fn pragma(&mut self) -> Result<Statement, SqlError> {
-        let name = self.name()?;
-        self.reject_qualified(&name)?;
+        let (schema, name) = self.qualified_name()?;
         let value = if matches!(self.peek(), Some(Token::Operator(operator)) if operator == "=") {
             self.at += 1;
             Some(self.pragma_value()?)
@@ -3124,7 +3221,7 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_end("PRAGMA")?;
-        Ok(Statement::Pragma { name, value })
+        Ok(Statement::Pragma { schema, name, value })
     }
 
     /// Reads one pragma value as written: a word, a quoted name, or an integer.
@@ -3139,6 +3236,29 @@ impl<'a> Parser<'a> {
             Some(token) => Err(self.error("syntax", format!("expected a pragma value but found {}", token.describe()))),
             None => Err(self.error("syntax", "expected a pragma value but the statement ended")),
         }
+    }
+
+    /// Reads `ATTACH [DATABASE] 'file' AS name`.
+    fn attach(&mut self) -> Result<Statement, SqlError> {
+        self.eat_word("database");
+        let file = match self.next() {
+            Some(Token::Text(text)) => text,
+            Some(token) => return Err(self.error("syntax", format!("expected a string database file but found {}", token.describe()))),
+            None => return Err(self.error("syntax", "expected a string database file but the statement ended")),
+        };
+        self.expect_word("as")?;
+        let name = self.name()?;
+        self.expect_end("ATTACH")?;
+        Ok(Statement::Attach { file, name })
+    }
+
+    /// Reads `DETACH [DATABASE] name`.
+    fn detach_statement(&mut self) -> Result<Statement, SqlError> {
+        self.eat_word("database");
+        let name = self.name()?;
+        self.reject_qualified(&name)?;
+        self.expect_end("DETACH")?;
+        Ok(Statement::Detach { name })
     }
 
     /// Reads `VIEW [IF NOT EXISTS] <name> [(a, b)] AS <select>`.
@@ -3156,8 +3276,7 @@ impl<'a> Parser<'a> {
             false
         };
         let name_token = self.at;
-        let name = self.name()?;
-        self.reject_qualified(&name)?;
+        let (schema, name) = self.qualified_name()?;
         // The token gap after the name preserves its verbatim spelling before
         // the optional column list or `AS`.
         let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
@@ -3201,7 +3320,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_end("CREATE VIEW")?;
         let sql = self.canonical_create_sql("CREATE VIEW", name_token, name_gap_end);
-        Ok(Statement::CreateView { name, if_not_exists, columns, query: Box::new(query), sql })
+        Ok(Statement::CreateView { schema, name, if_not_exists, columns, query: Box::new(query), sql })
     }
 
     /// Reads `TRIGGER [IF NOT EXISTS] <name> <timing> <event> ON <table>
@@ -3216,8 +3335,7 @@ impl<'a> Parser<'a> {
             false
         };
         let name_token = self.at;
-        let name = self.name()?;
-        self.reject_qualified(&name)?;
+        let (schema, name) = self.qualified_name()?;
         let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
         let timing = if self.eat_word("before") {
             TriggerTiming::Before
@@ -3262,8 +3380,7 @@ impl<'a> Parser<'a> {
             return Err(self.error("unsupported-clause", format!("expected `INSERT`, `UPDATE` or `DELETE` in the trigger definition but found {found}")));
         };
         self.expect_word("on")?;
-        let table = self.name()?;
-        self.reject_qualified(&table)?;
+        let (table_schema, table) = self.qualified_name()?;
         if self.eat_word("for") {
             self.expect_word("each")?;
             self.expect_word("row")?;
@@ -3289,7 +3406,7 @@ impl<'a> Parser<'a> {
             body.push(self.statement()?);
         }
         let sql = self.canonical_create_sql("CREATE TRIGGER", name_token, name_gap_end);
-        Ok(Statement::CreateTrigger { name, if_not_exists, timing, event, table, when, body, sql })
+        Ok(Statement::CreateTrigger { schema, name, if_not_exists, timing, event, table_schema, table, when, body, sql })
     }
 
     /// Reads `DROP TABLE [IF EXISTS] name` and `DROP INDEX [IF EXISTS] name`.
@@ -3340,14 +3457,13 @@ impl<'a> Parser<'a> {
         else {
             false
         };
-        let name = self.name()?;
-        self.reject_qualified(&name)?;
+        let (schema, name) = self.qualified_name()?;
         self.expect_end(label)?;
         Ok(match object {
-            Object::Table => Statement::DropTable { name, if_exists },
-            Object::Index => Statement::DropIndex { name, if_exists },
-            Object::View => Statement::DropView { name, if_exists },
-            Object::Trigger => Statement::DropTrigger { name, if_exists },
+            Object::Table => Statement::DropTable { schema, name, if_exists },
+            Object::Index => Statement::DropIndex { schema, name, if_exists },
+            Object::View => Statement::DropView { schema, name, if_exists },
+            Object::Trigger => Statement::DropTrigger { schema, name, if_exists },
         })
     }
 
@@ -3357,8 +3473,7 @@ impl<'a> Parser<'a> {
     fn alter_table(&mut self) -> Result<Statement, SqlError> {
         self.kind = Some("alter-table");
         self.expect_word("table")?;
-        let table = self.name()?;
-        self.reject_qualified(&table)?;
+        let (schema, table) = self.qualified_name()?;
         let action = if self.eat_word("rename") {
             if self.eat_word("column") {
                 let old = self.name()?;
@@ -3403,7 +3518,7 @@ impl<'a> Parser<'a> {
             return Err(error);
         };
         self.expect_end("ALTER TABLE")?;
-        Ok(Statement::AlterTable { table, action })
+        Ok(Statement::AlterTable { schema, table, action })
     }
 
     /// Rejects a `schema.object` qualifier. SQLite accepts it on `DROP TABLE`
@@ -3442,7 +3557,10 @@ impl<'a> Parser<'a> {
             false
         };
         let name_token = self.at;
-        let name = self.name()?;
+        let (schema, name) = self.qualified_name()?;
+        if temp && schema.is_some() {
+            return Err(self.error("syntax", "temporary table name must be unqualified"));
+        }
         let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
         self.expect_char(&Token::LParen)?;
         let mut columns = Vec::new();
@@ -3525,7 +3643,7 @@ impl<'a> Parser<'a> {
             strict = true;
         }
         let sql = self.canonical_create_sql("CREATE TABLE", name_token, name_gap_end);
-        Ok(Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, temp, sql })
+        Ok(Statement::CreateTable { schema, name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, temp, sql })
     }
 
     /// Reads `CHECK ( expr )` after an optional `CONSTRAINT name`, and keeps the
@@ -3572,7 +3690,7 @@ impl<'a> Parser<'a> {
             false
         };
         let name_token = self.at;
-        let name = self.name()?;
+        let (schema, name) = self.qualified_name()?;
         let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
         self.expect_word("on")?;
         let table = self.name()?;
@@ -3606,7 +3724,7 @@ impl<'a> Parser<'a> {
             None | Some(Token::Semi) => {
                 let prefix = if unique { "CREATE UNIQUE INDEX" } else { "CREATE INDEX" };
                 let sql = self.canonical_create_sql(prefix, name_token, name_gap_end);
-                Ok(Statement::CreateIndex { name, table, if_not_exists, unique, columns, sql })
+                Ok(Statement::CreateIndex { schema, name, table, if_not_exists, unique, columns, sql })
             }
             Some(token) => {
                 let mut error = self.error(
@@ -3991,7 +4109,7 @@ impl<'a> Parser<'a> {
 
     fn insert(&mut self) -> Result<Statement, SqlError> {
         self.expect_word("into")?;
-        let table = self.name()?;
+        let (schema, table) = self.qualified_name()?;
         let columns = if self.peek() == Some(&Token::LParen) {
             self.at += 1;
             let mut names = Vec::new();
@@ -4020,7 +4138,7 @@ impl<'a> Parser<'a> {
             self.expect_word("default")?;
             self.expect_word("values")?;
             let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
-            return Ok(Statement::Insert { table, columns, rows: Vec::new(), default_values: true, returning });
+            return Ok(Statement::Insert { schema, table, columns, rows: Vec::new(), default_values: true, returning });
         }
         self.expect_word("values")?;
         let mut rows = Vec::new();
@@ -4049,7 +4167,7 @@ impl<'a> Parser<'a> {
             break;
         }
         let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
-        Ok(Statement::Insert { table, columns, rows, default_values: false, returning })
+        Ok(Statement::Insert { schema, table, columns, rows, default_values: false, returning })
     }
 
     /// Rejects a clause that SQLite does not accept on `UPDATE` / `DELETE`.
@@ -4111,7 +4229,7 @@ impl<'a> Parser<'a> {
             error.clause = Some("OR".to_string());
             return Err(error);
         }
-        let table = self.name()?;
+        let (schema, table) = self.qualified_name()?;
         let alias = if self.eat_word("as") { Some(self.name()?) } else { None };
         self.expect_word("set")?;
         let mut assignments = Vec::new();
@@ -4153,17 +4271,17 @@ impl<'a> Parser<'a> {
         let filter = if self.eat_word("where") { Some(self.or_expr()?) } else { None };
         let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
         self.statement_ends("UPDATE")?;
-        Ok(Statement::Update { table, alias, assignments, filter, returning })
+        Ok(Statement::Update { schema, table, alias, assignments, filter, returning })
     }
 
     fn delete(&mut self) -> Result<Statement, SqlError> {
         self.expect_word("from")?;
-        let table = self.name()?;
+        let (schema, table) = self.qualified_name()?;
         let alias = if self.eat_word("as") { Some(self.name()?) } else { None };
         let filter = if self.eat_word("where") { Some(self.or_expr()?) } else { None };
         let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
         self.statement_ends("DELETE")?;
-        Ok(Statement::Delete { table, alias, filter, returning })
+        Ok(Statement::Delete { schema, table, alias, filter, returning })
     }
 
     fn select(&mut self) -> Result<Statement, SqlError> {
