@@ -14,9 +14,11 @@
 //! | `SELECT` | one or more comma-separated table references, `count(*)`, `*`, or an explicit column list, with optional `WHERE`, `ORDER BY` and `LIMIT` |
 //!
 //! `WHERE` accepts plain predicates only: `=`, `<>`, `!=`, `<`, `>`, `<=`, `>=`,
-//! `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `BETWEEN` / `NOT BETWEEN`,
-//! parenthesized groups, column references and literals.
-//! `ORDER BY` accepts one or more columns with `ASC` / `DESC`.
+//! `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `IS [NOT] DISTINCT FROM`,
+//! `LIKE` / `GLOB` (with `NOT`), `BETWEEN` / `NOT BETWEEN`, parenthesized groups,
+//! column references and literals.
+//! `ORDER BY` accepts one or more columns with `ASC` / `DESC` and an optional
+//! `NULLS FIRST` / `NULLS LAST`.
 //!
 //! A `FROM` clause may list several tables separated by commas, each with an
 //! optional `AS` alias (`t1 AS a`, `t1 a`). The comma form means a Cartesian
@@ -547,6 +549,10 @@ pub struct OrderKey {
     pub expr: Expr,
     /// `DESC` was written.
     pub descending: bool,
+    /// `NULLS FIRST` (`Some(true)`) or `NULLS LAST` (`Some(false)`); `None`
+    /// keeps SQLite's default, which sorts `NULL` below every value and therefore
+    /// puts them first for `ASC` and last for `DESC`.
+    pub nulls_first: Option<bool>,
 }
 
 /// Window frame unit. `GROUPS` is deliberately absent: it is rejected at
@@ -883,6 +889,24 @@ pub enum Expr {
         /// Target type.
         target: CastType,
     },
+    /// `x IS DISTINCT FROM y` or `x IS NOT DISTINCT FROM y`.
+    IsDistinct {
+        /// Left operand.
+        left: Box<Expr>,
+        /// Right operand.
+        right: Box<Expr>,
+        /// `IS NOT DISTINCT FROM` was written.
+        negated: bool,
+    },
+    /// `x GLOB y` or `x NOT GLOB y`.
+    Glob {
+        /// Tested value.
+        value: Box<Expr>,
+        /// Case-sensitive pattern with `*`, `?` and `[...]` classes.
+        pattern: Box<Expr>,
+        /// `NOT GLOB` was written.
+        negated: bool,
+    },
     /// `x LIKE y`, `x NOT LIKE y`, optionally with `ESCAPE`.
     Like {
         /// Tested value.
@@ -1011,6 +1035,12 @@ impl Expr {
             }
             Self::Alias { name, .. } => name.clone(),
             Self::Cast { value, target } => format!("CAST({} AS {})", value.label(), target.name()),
+            Self::Glob { value, pattern, negated } => {
+                format!("{} {}GLOB {}", value.label(), if *negated { "NOT " } else { "" }, pattern.label())
+            }
+            Self::IsDistinct { left, right, negated } => {
+                format!("{} IS {}DISTINCT FROM {}", left.label(), if *negated { "NOT " } else { "" }, right.label())
+            }
             Self::Like { value, pattern, negated, escape } => {
                 let mut text = format!("{} {}LIKE {}", value.label(), if *negated { "NOT " } else { "" }, pattern.label());
                 if let Some(escape) = escape {
@@ -2557,6 +2587,11 @@ impl<'a> Parser<'a> {
         }
         if self.eat_word("is") {
             let negated = self.eat_word("not");
+            if self.eat_word("distinct") {
+                self.expect_word("from")?;
+                let right = self.bitwise_expr()?;
+                return Ok(Expr::IsDistinct { left: Box::new(left), right: Box::new(right), negated });
+            }
             if self.eat_word("null") {
                 return Ok(Expr::IsNull { value: Box::new(left), negated });
             }
@@ -2569,7 +2604,7 @@ impl<'a> Parser<'a> {
                 return Ok(Expr::IsTruth { value: Box::new(left), truth: false, negated });
             }
             let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of input".to_string());
-            return Err(self.error("syntax", format!("expected `null`, `true` or `false` after `IS` but found {found}")));
+            return Err(self.error("syntax", format!("expected `null`, `true`, `false` or `distinct` after `IS` but found {found}")));
         }
         // `BETWEEN` is lowered to `>= low AND <= high`, so it carries the same
         // three-valued rules as the comparison and conjunction nodes and needs
@@ -2607,6 +2642,15 @@ impl<'a> Parser<'a> {
             let pattern = self.bitwise_expr()?;
             let escape = if self.eat_word("escape") { Some(Box::new(self.bitwise_expr()?)) } else { None };
             return Ok(Expr::Like { value: Box::new(left), pattern: Box::new(pattern), negated: negated_like, escape });
+        }
+        // `GLOB` shares the comparison precedence and needs no `ESCAPE`.
+        let negated_glob = self.not_followed_by("glob");
+        if negated_glob {
+            self.at += 1;
+        }
+        if self.eat_word("glob") {
+            let pattern = self.bitwise_expr()?;
+            return Ok(Expr::Glob { value: Box::new(left), pattern: Box::new(pattern), negated: negated_glob });
         }
         Ok(left)
     }
@@ -3092,7 +3136,22 @@ impl<'a> Parser<'a> {
             self.eat_word("asc");
             false
         };
-        Ok(OrderKey { expr, descending })
+        let nulls_first = if self.eat_word("nulls") {
+            if self.eat_word("first") {
+                Some(true)
+            }
+            else if self.eat_word("last") {
+                Some(false)
+            }
+            else {
+                let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of input".to_string());
+                return Err(self.error("syntax", format!("expected `FIRST` or `LAST` after `NULLS` but found {found}")));
+            }
+        }
+        else {
+            None
+        };
+        Ok(OrderKey { expr, descending, nulls_first })
     }
 
     /// Reads a column reference, optionally qualified as `table.column`.
@@ -5030,6 +5089,8 @@ fn expr_references(expr: &Expr, name: &str) -> bool {
         Expr::Unary { value, .. } => expr_references(value, name),
         Expr::Binary { left, right, .. } => expr_references(left, name) || expr_references(right, name),
         Expr::Compare { left, right, .. } => expr_references(left, name) || expr_references(right, name),
+        Expr::IsDistinct { left, right, .. } => expr_references(left, name) || expr_references(right, name),
+        Expr::Glob { value, pattern, .. } => expr_references(value, name) || expr_references(pattern, name),
         Expr::IsNull { value, .. } | Expr::IsTruth { value, .. } => expr_references(value, name),
         Expr::Not(inner) => expr_references(inner, name),
         Expr::And(left, right) | Expr::Or(left, right) => expr_references(left, name) || expr_references(right, name),
