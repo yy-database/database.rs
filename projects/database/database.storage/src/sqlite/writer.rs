@@ -1184,6 +1184,20 @@ impl SqliteWriter {
         Ok(())
     }
 
+    /// Replaces the stored `CREATE VIEW` text, used by `ALTER TABLE RENAME`
+    /// so a view keeps following the table or column it references.
+    pub fn rewrite_view_sql(&mut self, view: &str, sql: &str) -> Result<()> {
+        let rows = self.master_rows()?;
+        let Some(row) = rows.iter().find(|row| row.kind == "view" && eq_ignore_ascii_case(&row.name, view))
+        else {
+            return Err(Error::Unsupported("sqlite view does not exist"));
+        };
+        let (rowid, name) = (row.rowid, row.name.clone());
+        self.rewrite_master_row(rowid, &name, &name, Some(sql))?;
+        self.bump_cookie();
+        Ok(())
+    }
+
     /// Renames a table in the catalog: the table row, its `sql` text, the
     /// `tbl_name` and `sql` of every attached index, the automatic index names
     /// and the matching `sqlite_sequence` row.

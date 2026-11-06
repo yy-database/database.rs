@@ -1264,6 +1264,9 @@ pub enum Statement {
         columns: Option<Vec<String>>,
         /// The query the view stores and re-runs on every read.
         query: Box<Statement>,
+        /// `TEMP`: the view lives in `sqlite_temp_master` and disappears with
+        /// the connection.
+        temp: bool,
         /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
         sql: String,
     },
@@ -2056,6 +2059,146 @@ pub fn rewrite_create_index_column(sql: &str, old: &str, new: &str) -> Option<St
             continue;
         }
         targets.push(index);
+    }
+    Some(splice(sql, identifier_splices(sql, &tokens, &offsets, &targets, new)))
+}
+
+/// Token index just after the top-level `AS` of a stored `CREATE VIEW`.
+fn view_query_start(tokens: &[Token]) -> Option<usize> {
+    let name = create_object_name(tokens, "view")?;
+    let mut depth = 0usize;
+    for index in name + 1..tokens.len() {
+        match tokens[index] {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Word(ref word) if depth == 0 && word.eq_ignore_ascii_case("as") => return Some(index + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The identifier token that names a table at `at`, skipping a `schema.`
+/// qualifier.
+fn table_name_token(tokens: &[Token], at: usize) -> Option<usize> {
+    match tokens.get(at) {
+        Some(Token::Word(_)) | Some(Token::Quoted(_)) => {
+            if matches!(tokens.get(at + 1), Some(Token::Dot))
+                && matches!(tokens.get(at + 2), Some(Token::Word(_)) | Some(Token::Quoted(_)))
+            {
+                Some(at + 2)
+            }
+            else {
+                Some(at)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Token indexes of every table reference inside one view query. `FROM`
+/// lists are comma separated and every `JOIN` introduces one more source.
+fn view_table_tokens(tokens: &[Token], start: usize) -> Vec<usize> {
+    let mut targets = Vec::new();
+    let mut depth = 0usize;
+    let mut from: Option<usize> = None;
+    let mut at = start;
+    while at < tokens.len() {
+        match &tokens[at] {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth = depth.saturating_sub(1);
+                if from.is_some_and(|level| depth < level) {
+                    from = None;
+                }
+            }
+            Token::Comma if from == Some(depth) => {
+                if let Some(index) = table_name_token(tokens, at + 1) {
+                    targets.push(index);
+                }
+            }
+            Token::Word(word) => {
+                let lower = word.to_ascii_lowercase();
+                match lower.as_str() {
+                    "from" => {
+                        from = Some(depth);
+                        if let Some(index) = table_name_token(tokens, at + 1) {
+                            targets.push(index);
+                        }
+                    }
+                    "join" => {
+                        if let Some(index) = table_name_token(tokens, at + 1) {
+                            targets.push(index);
+                        }
+                    }
+                    "where" | "group" | "order" | "having" | "window" | "limit" | "union" | "intersect" | "except" => {
+                        if from == Some(depth) {
+                            from = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    targets
+}
+
+/// Rewrites every table reference to `old` in a stored `CREATE VIEW`, quoting
+/// the new name the way SQLite does (`from "t2"`). Only the query is touched;
+/// the view name and its declared output columns keep their bytes.
+pub fn rewrite_view_table(sql: &str, old: &str, new: &str) -> Option<String> {
+    let (tokens, offsets) = tokenize(sql).ok()?;
+    let start = view_query_start(&tokens)?;
+    let mut targets = view_table_tokens(&tokens, start);
+    for index in start..tokens.len() {
+        if identifier_eq(&tokens[index], old) && matches!(tokens.get(index + 1), Some(Token::Dot)) {
+            targets.push(index);
+        }
+    }
+    targets.retain(|index| identifier_eq(&tokens[*index], old));
+    targets.sort_unstable();
+    targets.dedup();
+    if targets.is_empty() {
+        return None;
+    }
+    let quoted = format!("\"{}\"", new.replace('"', "\"\""));
+    let replacements = targets
+        .iter()
+        .map(|index| {
+            let start = offsets[*index];
+            (start, token_end(sql, &tokens[*index], start), quoted.clone())
+        })
+        .collect();
+    Some(splice(sql, replacements))
+}
+
+/// Rewrites every column reference to `old` in a stored `CREATE VIEW`.
+/// Aliases (`expr AS old`), function names and table references keep their
+/// bytes, exactly like SQLite's column rename.
+pub fn rewrite_view_column(sql: &str, old: &str, new: &str) -> Option<String> {
+    let (tokens, offsets) = tokenize(sql).ok()?;
+    let start = view_query_start(&tokens)?;
+    let tables = view_table_tokens(&tokens, start);
+    let mut targets = Vec::new();
+    for index in start..tokens.len() {
+        if !identifier_eq(&tokens[index], old) || tables.contains(&index) {
+            continue;
+        }
+        // A name directly followed by `(` is a function call, not a column.
+        if matches!(tokens.get(index + 1), Some(Token::LParen)) {
+            continue;
+        }
+        // `expr AS alias` names the output, never the source column.
+        if index > 0 && matches!(tokens.get(index - 1), Some(Token::Word(word)) if word.eq_ignore_ascii_case("as")) {
+            continue;
+        }
+        targets.push(index);
+    }
+    if targets.is_empty() {
+        return None;
     }
     Some(splice(sql, identifier_splices(sql, &tokens, &offsets, &targets, new)))
 }
@@ -3073,7 +3216,11 @@ impl<'a> Parser<'a> {
                     self.kind = Some("create-table");
                     return self.create_table(true);
                 }
-                return Err(self.error("unsupported-clause", "`TEMP` is only accepted on `CREATE TABLE`"));
+                if self.eat_word("view") {
+                    self.kind = Some("create-view");
+                    return self.create_view(true);
+                }
+                return Err(self.error("unsupported-clause", "`TEMP` is only accepted on `CREATE TABLE` and `CREATE VIEW`"));
             }
             if self.eat_word("unique") {
                 self.kind = Some("create-index");
@@ -3085,7 +3232,7 @@ impl<'a> Parser<'a> {
             }
             if self.eat_word("view") {
                 self.kind = Some("create-view");
-                return self.create_view();
+                return self.create_view(false);
             }
             if self.eat_word("trigger") {
                 self.kind = Some("create-trigger");
@@ -3269,7 +3416,7 @@ impl<'a> Parser<'a> {
     /// The query is parsed once here and kept as an ordinary `SELECT`, so a
     /// later read re-evaluates it through the same evaluator as any other
     /// query. As in SQLite, the base tables are not resolved at DDL time.
-    fn create_view(&mut self) -> Result<Statement, SqlError> {
+    fn create_view(&mut self, temp: bool) -> Result<Statement, SqlError> {
         let if_not_exists = if self.eat_word("if") {
             self.expect_word("not")?;
             self.expect_word("exists")?;
@@ -3323,7 +3470,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_end("CREATE VIEW")?;
         let sql = self.canonical_create_sql("CREATE VIEW", name_token, name_gap_end);
-        Ok(Statement::CreateView { schema, name, if_not_exists, columns, query: Box::new(query), sql })
+        Ok(Statement::CreateView { schema, name, if_not_exists, columns, query: Box::new(query), temp, sql })
     }
 
     /// Reads `TRIGGER [IF NOT EXISTS] <name> <timing> <event> ON <table>
@@ -4415,10 +4562,23 @@ impl<'a> Parser<'a> {
         else {
             let mut names = Vec::new();
             loop {
+                // SQLite names an unaliased projection after the exact input
+                // span (`a + b`, `'x'`, `1.50`), so the span is captured before
+                // the expression consumes its tokens.
+                let start = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
                 let mut item = self.or_expr()?;
+                let end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
                 if self.eat_word("as") {
                     let name = self.name()?;
                     item = Expr::Alias { value: Box::new(item), name };
+                }
+                else if !matches!(&item, Expr::Column(_)) {
+                    // A bare column keeps the schema's own spelling; every
+                    // other expression keeps the bytes written in the query.
+                    let text = self.source.get(start..end).unwrap_or_default().trim();
+                    if !text.is_empty() {
+                        item = Expr::Alias { value: Box::new(item), name: text.to_string() };
+                    }
                 }
                 names.push(item);
                 // A projection with no `FROM` ends at a clause keyword, a set
