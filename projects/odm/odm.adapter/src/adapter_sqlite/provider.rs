@@ -4,20 +4,22 @@
 //! 本模块只负责持有连接、做参数/结果类型映射与错误转译。不引入 `rusqlite`，
 //! 也不在本 crate 里实现任何 SQL 语义。
 //!
-//! 门面当前尚未提供、因此仍 fail-closed 的能力：
+//! 连接形态：
 //!
-//! - **文件打开**：`Engine` 只有 `new`（建空库），没有从既有 format-3 镜像构造的
-//!   入口；`SqliteWriter::open` 能读既有镜像，但 `Engine` 没有 `from_writer`。
-//! - **事务**：`Engine` 没有 `begin` / `commit` / `rollback`，事务只在
-//!   `SqliteWriter` 内部使用。适配器的 `begin_immediate` / `commit` / `rollback`
-//!   因此无法映射，`authority_commit` 与 Managed Push 的原子提交同样受阻。
-//! - **`last_insert_rowid`**：门面只回 `columns` / `rows` / `affected`，没有取值
-//!   入口，该字段恒为 `0`。
+//! - **内存库**：`Engine::new` 建空镜像。
+//! - **文件库**：既有镜像经 `SqliteWriter::open` + `Engine::from_writer` 装回；
+//!   新文件先建空镜像，首次写入时再落盘。每条写语句在非事务状态下写回，
+//!   `commit` 后也写回。
+//! - **事务**：门面的 `BEGIN` / `COMMIT` / `ROLLBACK` 语句直接驱动
+//!   `Engine` 的 writer 快照层，不再 fail-closed。
 
-use std::{path::Path, sync::Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use database_formats::sqlite::{ENGINE_LIBRARY_VERSION, ENGINE_LIBRARY_VERSION_NUMBER};
-use sqlite::{Cell, Engine, SchemaObjectKind, SqlError, Statement, TableLimits, parse, read_schema};
+use sqlite::{Cell, Engine, SchemaObjectKind, SqlError, SqliteWriter, Statement, TableLimits, parse, read_schema};
 
 /// One SQLite storage-class value with lossless integer and binary payloads.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,16 +139,13 @@ impl std::fmt::Display for SqliteError {
 
 impl std::error::Error for SqliteError {}
 
-/// 门面缺口：点名缺的能力、门面坐标与需要的最小复现。
-fn facade_gap(action: &str, capability: &str, coordinate: &str, repro: &str) -> SqliteError {
-    SqliteError::policy(format!("iris-adapter-sqlite: {action} requires `{capability}` from the sqlite facade at {coordinate}; repro: {repro}"))
-}
-
 /// SQLite handle backed by the `sqlite` product facade.
 ///
 /// Historically named `RusqliteProvider`; the type alias keeps call sites compiling.
 pub struct SqliteProvider {
     engine: Mutex<Engine>,
+    /// File the image is written back to, `None` for in-memory databases.
+    path: Option<PathBuf>,
 }
 
 /// Historical name kept as a type alias during the facade cutover.
@@ -162,19 +161,34 @@ impl SqliteProvider {
     /// Open an in-memory SQLite database backed by the facade engine.
     pub fn open_in_memory() -> Result<Self, SqliteError> {
         let engine = Engine::new(None).map_err(map_sql_error)?;
-        Ok(Self { engine: Mutex::new(engine) })
+        Ok(Self { engine: Mutex::new(engine), path: None })
     }
 
     /// Open or create a file-backed SQLite database.
     ///
-    /// 门面还没有把既有镜像装回 `Engine` 的入口，这里保持 fail-closed 并点名缺口。
+    /// An existing format-3 image is read with `SqliteWriter::open` and wrapped
+    /// by `Engine::from_writer`; a missing file starts as a blank image and is
+    /// written back on the first mutation.
     pub fn open(path: &Path) -> Result<Self, SqliteError> {
-        Err(facade_gap(
-            "open",
-            "Engine::from_writer",
-            "projects/facades/sqlite/src/sql/engine.rs Engine::new (blank image only)",
-            &format!("SqliteWriter::open({}) then execute a SELECT", path.display()),
-        ))
+        let engine = if path.exists() {
+            let writer = SqliteWriter::open(path).map_err(|error| SqliteError::policy(format!("sqlite facade image read: {error}")))?;
+            Engine::from_writer(writer).map_err(map_sql_error)?
+        }
+        else {
+            Engine::new(None).map_err(map_sql_error)?
+        };
+        Ok(Self { engine: Mutex::new(engine), path: Some(path.to_path_buf()) })
+    }
+
+    /// Writes the in-memory image back to the file when the handle is
+    /// file-backed and no explicit transaction is open.
+    fn persist(engine: &mut Engine, path: Option<&Path>) -> Result<(), SqliteError> {
+        if let Some(path) = path {
+            if !engine.in_transaction() {
+                engine.save(path).map_err(map_sql_error)?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns the product facade library version label (not an official SQLite build).
@@ -194,50 +208,53 @@ impl SqliteProvider {
             return Err(SqliteError::policy(format!("execute_one expects exactly one statement but found {}", statements.len())));
         }
         let cells = params.iter().map(to_cell).collect::<Result<Vec<_>, _>>()?;
-        let mut results = self.engine.lock().expect("sqlite mutex").execute_with_parameters(sql, &cells).map_err(map_sql_error)?;
+        let mut engine = self.engine.lock().expect("sqlite mutex");
+        let mut results = engine.execute_with_parameters(sql, &cells).map_err(map_sql_error)?;
+        let last_insert_rowid = engine.last_insert_rowid();
         let result = results.pop().expect("single statement returns one result");
+        Self::persist(&mut engine, self.path.as_deref())?;
         Ok(StatementResult {
             columns: result.columns,
             rows: result.rows.into_iter().map(|row| row.into_iter().map(from_cell).collect()).collect(),
             changes: result.affected as u64,
-            last_insert_rowid: 0,
+            last_insert_rowid,
         })
     }
 
     /// Executes a multi-statement batch and discards result rows.
     pub fn execute_batch(&self, sql: &str) -> Result<(), SqliteError> {
-        self.engine.lock().expect("sqlite mutex").execute(sql).map_err(map_sql_error)?;
-        Ok(())
+        let mut engine = self.engine.lock().expect("sqlite mutex");
+        engine.execute(sql).map_err(map_sql_error)?;
+        Self::persist(&mut engine, self.path.as_deref())
     }
 
     /// Starts an immediate write transaction.
     pub fn begin_immediate(&self) -> Result<(), SqliteError> {
-        Err(facade_gap(
-            "begin_immediate",
-            "Engine::begin / Engine::commit / Engine::rollback",
-            "projects/facades/sqlite/src/sql/engine.rs Engine (no transaction methods)",
-            "Engine::new(None), execute INSERT, roll back, then SELECT sees the rolled-back row",
-        ))
+        let mut engine = self.engine.lock().expect("sqlite mutex");
+        engine.execute_one("BEGIN IMMEDIATE").map_err(map_sql_error)?;
+        Ok(())
     }
 
     /// Commits the active transaction.
     pub fn commit(&self) -> Result<(), SqliteError> {
-        Err(facade_gap(
-            "commit",
-            "Engine::begin / Engine::commit / Engine::rollback",
-            "projects/facades/sqlite/src/sql/engine.rs Engine (no transaction methods)",
-            "Engine::new(None), begin, execute INSERT, commit, reopen the writer and read the row",
-        ))
+        let mut engine = self.engine.lock().expect("sqlite mutex");
+        engine.execute_one("COMMIT").map_err(map_sql_error)?;
+        if let Some(path) = self.path.as_deref() {
+            engine.save(path).map_err(map_sql_error)?;
+        }
+        Ok(())
     }
 
     /// Rolls back the active transaction.
     pub fn rollback(&self) -> Result<(), SqliteError> {
-        Err(facade_gap(
-            "rollback",
-            "Engine::begin / Engine::commit / Engine::rollback",
-            "projects/facades/sqlite/src/sql/engine.rs Engine (no transaction methods)",
-            "Engine::new(None), begin, execute INSERT, roll back, then SELECT finds no row",
-        ))
+        let mut engine = self.engine.lock().expect("sqlite mutex");
+        engine.execute_one("ROLLBACK").map_err(map_sql_error)?;
+        Ok(())
+    }
+
+    /// Whether an explicit transaction is currently open.
+    pub fn in_transaction(&self) -> bool {
+        self.engine.lock().expect("sqlite mutex").in_transaction()
     }
 
     /// Inspects live catalog metadata.

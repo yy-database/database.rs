@@ -68,16 +68,13 @@ fn returning_and_scalar_functions_flow_through_the_facade() {
 }
 
 #[test]
-fn instr_names_the_facade_function_gap() {
+fn instr_returns_the_match_offset() {
     let provider = SqliteProvider::open_in_memory().unwrap();
     provider.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);").unwrap();
     provider.execute_one("INSERT INTO users(id, name) VALUES (1, 'grace')", &[]).unwrap();
 
-    // 缺口坐标：`projects/facades/sqlite/src/sql/sql.rs` 的
-    // `ScalarFunction::from_name` 未登记 `instr`，`execute.rs` 的 JSON 路径
-    // 下推依赖它。最小复现：`SELECT instr(name, ?1) FROM users`。
-    let failure = provider.execute_one("SELECT instr(name, ?1) FROM users", &[text("a")]).expect_err("instr is not registered");
-    assert!(failure.to_string().contains("no such function: instr"), "{failure}");
+    let matched = provider.execute_one("SELECT instr(name, ?1) FROM users", &[text("a")]).unwrap();
+    assert_eq!(matched.rows, [vec![integer(3)]]);
 }
 
 #[test]
@@ -91,19 +88,13 @@ fn unique_violation_surfaces_the_facade_message() {
 }
 
 #[test]
-fn parameterized_insert_names_the_facade_literal_gap() {
+fn parameterized_insert_binds_values() {
     let provider = SqliteProvider::open_in_memory().unwrap();
     provider.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);").unwrap();
 
-    // 缺口坐标：`projects/facades/sqlite/src/sql/sql.rs` 的 `fn insert` 用
-    // `self.literal()` 解析 `VALUES` 元组，因此 `?` 占位符在 INSERT 里被拒。
-    // 最小复现：`INSERT INTO users(id) VALUES (?)` 绑定一个整数参数。
-    let failure = provider
-        .execute_one("INSERT INTO users(id) VALUES (?1)", &[integer(1)])
-        .expect_err("facade INSERT VALUES does not accept parameters yet");
-    let message = failure.to_string();
-    assert!(message.contains("expected a literal"), "{message}");
-    assert!(message.contains("?"), "{message}");
+    provider.execute_one("INSERT INTO users(id, name) VALUES (?1, ?2)", &[integer(7), text("grace")]).unwrap();
+    let inserted = provider.execute_one("SELECT id, name FROM users", &[]).unwrap();
+    assert_eq!(inserted.rows, [vec![integer(7), text("grace")]]);
 }
 
 #[test]
@@ -131,24 +122,58 @@ fn catalog_reports_columns_types_nullability_and_primary_key() {
 }
 
 #[test]
-fn file_open_names_the_missing_engine_image_entry() {
+fn file_backed_open_persists_across_reopen() {
     let path = std::env::temp_dir()
         .join(format!("iris-sqlite-file-open-{}.db", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-    let error = SqliteSource::open(&path).expect_err("file open waits on the facade image entry");
-    let message = error.to_string();
-    assert!(message.contains("Engine::from_writer"), "{message}");
-    assert!(message.contains("repro:"), "{message}");
-    assert!(!path.exists(), "fail-closed open must not create an engine file");
+    {
+        let provider = SqliteProvider::open(&path).unwrap();
+        provider.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);").unwrap();
+        provider.execute_one("INSERT INTO users(id, name) VALUES (1, 'ada')", &[]).unwrap();
+    }
+    assert!(path.exists(), "the first mutation must write the image back");
+    let reopened = SqliteProvider::open(&path).unwrap();
+    let found = reopened.execute_one("SELECT id, name FROM users WHERE id = ?1", &[integer(1)]).unwrap();
+    assert_eq!(found.rows, [vec![integer(1), text("ada")]]);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
-fn transactions_name_the_missing_engine_transaction_entry() {
+fn transactions_commit_and_roll_back_through_the_facade() {
     let provider = SqliteProvider::open_in_memory().unwrap();
-    for error in [provider.begin_immediate().unwrap_err(), provider.commit().unwrap_err(), provider.rollback().unwrap_err()] {
-        let message = error.to_string();
-        assert!(message.contains("Engine::begin"), "{message}");
-        assert!(message.contains("repro:"), "{message}");
-    }
+    provider.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);").unwrap();
+
+    provider.begin_immediate().unwrap();
+    provider.execute_one("INSERT INTO users(id, name) VALUES (1, 'ada')", &[]).unwrap();
+    provider.rollback().unwrap();
+    let after_rollback = provider.execute_one("SELECT id FROM users", &[]).unwrap();
+    assert!(after_rollback.rows.is_empty(), "rollback must discard the insert");
+
+    provider.begin_immediate().unwrap();
+    provider.execute_one("INSERT INTO users(id, name) VALUES (2, 'grace')", &[]).unwrap();
+    provider.commit().unwrap();
+    let after_commit = provider.execute_one("SELECT id FROM users", &[]).unwrap();
+    assert_eq!(after_commit.rows, [vec![integer(2)]]);
+}
+
+#[test]
+fn distinct_collapses_duplicate_rows_through_the_facade() {
+    let provider = SqliteProvider::open_in_memory().unwrap();
+    provider.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);").unwrap();
+    provider.execute_one("INSERT INTO users(id, name, age) VALUES (1, 'ada', 36)", &[]).unwrap();
+    provider.execute_one("INSERT INTO users(id, name, age) VALUES (2, 'ada', 36)", &[]).unwrap();
+    provider.execute_one("INSERT INTO users(id, name, age) VALUES (3, 'grace', 41)", &[]).unwrap();
+
+    let distinct = provider.execute_one("SELECT DISTINCT name, age FROM users", &[]).unwrap();
+    assert_eq!(distinct.columns, ["name", "age"]);
+    assert_eq!(distinct.rows.len(), 2, "duplicate projections must collapse");
+}
+
+#[test]
+fn insert_reports_last_insert_rowid() {
+    let provider = SqliteProvider::open_in_memory().unwrap();
+    provider.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);").unwrap();
+    let inserted = provider.execute_one("INSERT INTO users(id, name) VALUES (7, 'ada')", &[]).unwrap();
+    assert_eq!(inserted.last_insert_rowid, 7);
 }
 
 #[test]
