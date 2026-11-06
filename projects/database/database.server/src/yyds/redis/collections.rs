@@ -349,6 +349,11 @@ pub(crate) fn is_zset_command(command: &[u8]) -> bool {
         b"ZREMRANGEBYRANK",
         b"ZREMRANGEBYSCORE",
         b"ZSCAN",
+        b"ZUNIONSTORE",
+        b"ZINTERSTORE",
+        b"ZDIFF",
+        b"ZDIFFSTORE",
+        b"ZINTERCARD",
     ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
@@ -2073,6 +2078,237 @@ fn write_zscan_page(
     Ok(())
 }
 
+/// zset 集合运算的方式。
+#[derive(Clone, Copy, PartialEq)]
+enum ZSetOp {
+    Union,
+    Inter,
+    Diff,
+}
+
+/// zset 同一成员在多键出现时的聚合方式，默认 `SUM`。
+#[derive(Clone, Copy, PartialEq)]
+enum ZSetAggregate {
+    Sum,
+    Min,
+    Max,
+}
+
+impl ZSetAggregate {
+    fn combine(self, left: f64, right: f64) -> f64 {
+        let value = match self {
+            ZSetAggregate::Sum => left + right,
+            ZSetAggregate::Min => left.min(right),
+            ZSetAggregate::Max => left.max(right),
+        };
+        // 真机把聚合得到的 NaN 归零，避免非有限值进入编码层。
+        if value.is_nan() { 0.0 } else { value }
+    }
+}
+
+/// `ZUNIONSTORE` / `ZINTERSTORE` 解析后的键、权重与聚合方式。
+struct ZSetStorePlan {
+    keys: Vec<Vec<u8>>,
+    weights: Vec<f64>,
+    aggregate: ZSetAggregate,
+}
+
+fn parse_positive_usize(raw: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let value = text.parse::<i64>().ok()?;
+    (value > 0).then_some(value as usize)
+}
+
+/// 解析 `ZUNIONSTORE` / `ZINTERSTORE` 的 `numkeys`、键列表与可选选项。
+fn parse_zset_store_plan(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+) -> io::Result<Option<ZSetStorePlan>> {
+    let Some(numkeys) = parse_positive_usize(arguments[2])
+    else {
+        write_error(stream, "at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE")?;
+        return Ok(None);
+    };
+    if arguments.len() < 3 + numkeys {
+        write_error(stream, "syntax error")?;
+        return Ok(None);
+    }
+    let keys = arguments[3..3 + numkeys].iter().map(|key| key.to_vec()).collect();
+    let mut weights = vec![1.0_f64; numkeys];
+    let mut aggregate = ZSetAggregate::Sum;
+    let mut index = 3 + numkeys;
+    while index < arguments.len() {
+        if arguments[index].eq_ignore_ascii_case(b"WEIGHTS") {
+            if index + numkeys >= arguments.len() {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            }
+            for slot in 0..numkeys {
+                let Some(weight) = parse_score(arguments[index + 1 + slot])
+                else {
+                    write_error(stream, "weight value is not a float")?;
+                    return Ok(None);
+                };
+                weights[slot] = weight;
+            }
+            index += 1 + numkeys;
+        }
+        else if arguments[index].eq_ignore_ascii_case(b"AGGREGATE") {
+            let Some(raw) = arguments.get(index + 1)
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            };
+            if raw.eq_ignore_ascii_case(b"SUM") {
+                aggregate = ZSetAggregate::Sum;
+            }
+            else if raw.eq_ignore_ascii_case(b"MIN") {
+                aggregate = ZSetAggregate::Min;
+            }
+            else if raw.eq_ignore_ascii_case(b"MAX") {
+                aggregate = ZSetAggregate::Max;
+            }
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            }
+            index += 2;
+        }
+        else {
+            write_error(stream, "syntax error")?;
+            return Ok(None);
+        }
+    }
+    Ok(Some(ZSetStorePlan { keys, weights, aggregate }))
+}
+
+/// 读取多个 zset 并校验类型；任一键类型不合法时整条命令按真机回 `WRONGTYPE`。
+fn load_zsets(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    keys: &[Vec<u8>],
+) -> io::Result<Option<Vec<Vec<(Vec<u8>, f64)>>>> {
+    let mut sets = Vec::with_capacity(keys.len());
+    for key in keys {
+        match load_zset(stream, executor, base, key)? {
+            Loaded::Missing => sets.push(Vec::new()),
+            Loaded::Found(entries) => sets.push(entries),
+            Loaded::Rejected => return Ok(None),
+        }
+    }
+    Ok(Some(sets))
+}
+
+/// 按真机语义计算并集、交集或差集，结果按分数升序、同分按成员字节排序。
+fn combine_zsets(
+    sets: &[Vec<(Vec<u8>, f64)>],
+    weights: &[f64],
+    aggregate: ZSetAggregate,
+    op: ZSetOp,
+) -> Vec<(Vec<u8>, f64)> {
+    let weighted = |score: f64, weight: f64| {
+        let value = score * weight;
+        if value.is_nan() { 0.0 } else { value }
+    };
+    let lookup = |set: &Vec<(Vec<u8>, f64)>, member: &[u8]| -> Option<f64> {
+        set.iter().find(|(candidate, _)| candidate.as_slice() == member).map(|(_, score)| *score)
+    };
+    let mut result: Vec<(Vec<u8>, f64)> = Vec::new();
+    match op {
+        ZSetOp::Union => {
+            for (index, set) in sets.iter().enumerate() {
+                let weight = weights.get(index).copied().unwrap_or(1.0);
+                for (member, score) in set {
+                    let value = weighted(*score, weight);
+                    match result.iter_mut().find(|(existing, _)| existing == member) {
+                        Some(entry) => entry.1 = aggregate.combine(entry.1, value),
+                        None => result.push((member.clone(), value)),
+                    }
+                }
+            }
+        }
+        ZSetOp::Inter => {
+            let Some(first) = sets.first()
+            else {
+                return Vec::new();
+            };
+            for (member, score) in first {
+                let mut combined = weighted(*score, weights.first().copied().unwrap_or(1.0));
+                let mut present = true;
+                for (index, set) in sets.iter().enumerate().skip(1) {
+                    let Some(other) = lookup(set, member)
+                    else {
+                        present = false;
+                        break;
+                    };
+                    combined = aggregate.combine(combined, weighted(other, weights.get(index).copied().unwrap_or(1.0)));
+                }
+                if present {
+                    result.push((member.clone(), combined));
+                }
+            }
+        }
+        ZSetOp::Diff => {
+            let Some(first) = sets.first()
+            else {
+                return Vec::new();
+            };
+            for (member, score) in first {
+                if !sets.iter().skip(1).any(|set| lookup(set, member).is_some()) {
+                    result.push((member.clone(), *score));
+                }
+            }
+        }
+    }
+    sort_zset(&mut result);
+    result
+}
+
+/// 覆盖写入 `*STORE` 目标：先清掉全部类型表示，空结果直接删除目标。
+fn store_zset_result(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    destination: &[u8],
+    entries: &[(Vec<u8>, f64)],
+) -> io::Result<()> {
+    if let Err(message) = remove_all_kinds(executor, base, destination) {
+        return write_storage_error(stream, &message);
+    }
+    if entries.is_empty() {
+        return write_integer(stream, 0);
+    }
+    let Some(bytes) = encode_zset(entries)
+    else {
+        return write_error(stream, "zset exceeds the storage limit");
+    };
+    if let Err(message) = store_fresh_value(executor, &KeyKind::ZSet.namespace(base), destination, bytes) {
+        return write_storage_error(stream, &message);
+    }
+    write_integer(stream, entries.len() as i64)
+}
+
+/// 解析 `ZDIFF` / `ZDIFFSTORE` 的 `numkeys` 与键列表，`numkeys` 位于 `numkeys_index`。
+fn parse_diff_keys(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    name: &str,
+    numkeys_index: usize,
+) -> io::Result<Option<(Vec<Vec<u8>>, usize)>> {
+    let Some(numkeys) = parse_positive_usize(arguments[numkeys_index])
+    else {
+        write_error(stream, &format!("at least 1 input key is needed for {name}"))?;
+        return Ok(None);
+    };
+    if arguments.len() < numkeys_index + 1 + numkeys {
+        write_error(stream, "syntax error")?;
+        return Ok(None);
+    }
+    let keys = arguments[numkeys_index + 1..numkeys_index + 1 + numkeys].iter().map(|key| key.to_vec()).collect();
+    Ok(Some((keys, numkeys_index + 1 + numkeys)))
+}
+
 /// `ZADD` / `ZSCORE` / `ZREM` / `ZCARD` / `ZRANGE` 及排序族、排名、计数与扫描的分派入口。
 pub(crate) fn handle_zset(
     stream: &mut dyn io::Write,
@@ -2086,6 +2322,114 @@ pub(crate) fn handle_zset(
     else {
         return write_error(stream, "unsupported command");
     };
+    if command.eq_ignore_ascii_case(b"ZUNIONSTORE") || command.eq_ignore_ascii_case(b"ZINTERSTORE") {
+        let union = command.eq_ignore_ascii_case(b"ZUNIONSTORE");
+        if request.arguments.len() < 4 {
+            return write_arity_error(stream, if union { "zunionstore" } else { "zinterstore" });
+        }
+        let destination = request.arguments[1];
+        let Some(plan) = parse_zset_store_plan(stream, &request.arguments)?
+        else {
+            return Ok(());
+        };
+        let Some(sets) = load_zsets(stream, executor, base, &plan.keys)?
+        else {
+            return Ok(());
+        };
+        let result = combine_zsets(&sets, &plan.weights, plan.aggregate, if union { ZSetOp::Union } else { ZSetOp::Inter });
+        return store_zset_result(stream, executor, base, destination, &result);
+    }
+    if command.eq_ignore_ascii_case(b"ZDIFF") || command.eq_ignore_ascii_case(b"ZDIFFSTORE") {
+        let store = command.eq_ignore_ascii_case(b"ZDIFFSTORE");
+        if store {
+            if request.arguments.len() < 4 {
+                return write_arity_error(stream, "zdiffstore");
+            }
+        }
+        else if request.arguments.len() < 3 {
+            return write_arity_error(stream, "zdiff");
+        }
+        let name = if store { "ZDIFFSTORE" } else { "ZDIFF" };
+        let numkeys_index = if store { 2 } else { 1 };
+        let Some((keys, next)) = parse_diff_keys(stream, &request.arguments, name, numkeys_index)?
+        else {
+            return Ok(());
+        };
+        let mut with_scores = false;
+        if store {
+            if next != request.arguments.len() {
+                return write_error(stream, "syntax error");
+            }
+        }
+        else {
+            match request.arguments.len() - next {
+                0 => {}
+                1 if request.arguments[next].eq_ignore_ascii_case(b"WITHSCORES") => with_scores = true,
+                _ => return write_error(stream, "syntax error"),
+            }
+        }
+        let Some(sets) = load_zsets(stream, executor, base, &keys)?
+        else {
+            return Ok(());
+        };
+        let weights = vec![1.0_f64; keys.len()];
+        let result = combine_zsets(&sets, &weights, ZSetAggregate::Sum, ZSetOp::Diff);
+        if store {
+            return store_zset_result(stream, executor, base, request.arguments[1], &result);
+        }
+        write_array_header(stream, if with_scores { result.len() * 2 } else { result.len() })?;
+        for (member, score) in &result {
+            write_bulk(stream, member)?;
+            if with_scores {
+                write_bulk(stream, score.to_string().as_bytes())?;
+            }
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"ZINTERCARD") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "zintercard");
+        }
+        let Some(numkeys) = parse_positive_usize(request.arguments[1])
+        else {
+            return write_error(stream, "numkeys should be greater than 0");
+        };
+        if request.arguments.len() < 2 + numkeys {
+            return write_error(stream, "Number of keys can't be greater than number of args");
+        }
+        let keys: Vec<Vec<u8>> = request.arguments[2..2 + numkeys].iter().map(|key| key.to_vec()).collect();
+        let mut limit: usize = 0;
+        match request.arguments.len() - (2 + numkeys) {
+            0 => {}
+            2 if request.arguments[2 + numkeys].eq_ignore_ascii_case(b"LIMIT") => {
+                let Some(value) = parse_index(request.arguments[3 + numkeys])
+                else {
+                    return write_error(stream, "value is not an integer or out of range");
+                };
+                if value < 0 {
+                    return write_error(stream, "LIMIT can't be negative");
+                }
+                limit = value as usize;
+            }
+            _ => return write_error(stream, "syntax error"),
+        }
+        let Some(sets) = load_zsets(stream, executor, base, &keys)?
+        else {
+            return Ok(());
+        };
+        let mut cardinality = 0_usize;
+        if let Some(first) = sets.first() {
+            for (member, _) in first {
+                if sets.iter().skip(1).all(|set| set.iter().any(|(candidate, _)| candidate == member)) {
+                    cardinality += 1;
+                    if limit > 0 && cardinality >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        return write_integer(stream, cardinality as i64);
+    }
     if command.eq_ignore_ascii_case(b"ZADD") {
         if request.arguments.len() < 4 || (request.arguments.len() - 2) % 2 != 0 {
             return write_arity_error(stream, "zadd");

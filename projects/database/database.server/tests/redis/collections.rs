@@ -2239,3 +2239,139 @@ fn restart_preserves_types_and_contents() {
     send(&mut second, &["EXISTS", "rn"]);
     assert_eq!(expect_integer(&mut second), 0);
 }
+
+/// `ZUNIONSTORE` / `ZINTERSTORE` / `ZDIFF` / `ZDIFFSTORE` / `ZINTERCARD` cover
+/// weights, aggregation, overwrite semantics and cross-type rejection.
+#[test]
+fn zset_set_operations() {
+    let (mut client, _server) = memory_server("redis-zset-algebra");
+    send(&mut client, &["ZADD", "z1", "1", "a", "2", "b", "3", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZADD", "z2", "3", "b", "4", "c", "5", "d"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZADD", "z3", "5", "c", "6", "e"]);
+    assert_eq!(expect_integer(&mut client), 2);
+
+    send(&mut client, &["ZUNIONSTORE", "dst", "2", "z1", "z2"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZRANGE", "dst", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "1", "b", "5", "d", "5", "c", "7"]);
+    send(&mut client, &["TYPE", "dst"]);
+    expect_status(&mut client, "zset");
+
+    // WEIGHTS 先逐键乘，之后才聚合。
+    send(&mut client, &["ZUNIONSTORE", "dst", "2", "z1", "z2", "WEIGHTS", "2", "1"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZRANGE", "dst", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "2", "d", "5", "b", "7", "c", "10"]);
+
+    send(&mut client, &["ZUNIONSTORE", "dst", "2", "z1", "z2", "AGGREGATE", "MAX"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZRANGE", "dst", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "1", "b", "3", "c", "4", "d", "5"]);
+
+    send(&mut client, &["ZINTERSTORE", "dst", "2", "z1", "z2"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZRANGE", "dst", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["b", "5", "c", "7"]);
+
+    send(&mut client, &["ZINTERSTORE", "dst", "2", "z1", "z2", "WEIGHTS", "3", "1", "AGGREGATE", "MIN"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZRANGE", "dst", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["b", "3", "c", "4"]);
+
+    // 差集保留第一个键的分数，其余键只参与去重。
+    send(&mut client, &["ZDIFF", "2", "z1", "z2"]);
+    expect_array(&mut client, &["a"]);
+    send(&mut client, &["ZDIFF", "2", "z1", "z2", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "1"]);
+    send(&mut client, &["ZDIFF", "2", "z1", "z3"]);
+    expect_array(&mut client, &["a", "b"]);
+    send(&mut client, &["ZDIFF", "2", "z1", "no-such-key"]);
+    expect_array(&mut client, &["a", "b", "c"]);
+    send(&mut client, &["ZDIFFSTORE", "dst", "2", "z1", "z3"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZRANGE", "dst", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "1", "b", "2"]);
+
+    send(&mut client, &["ZINTERCARD", "2", "z1", "z2"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZINTERCARD", "2", "z1", "z2", "LIMIT", "1"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZINTERCARD", "2", "z1", "z2", "LIMIT", "0"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZINTERCARD", "1", "z1"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZINTERCARD", "2", "z1", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    // 空交集删除目标，覆盖写入清掉目标原有的 TTL 与类型。
+    send(&mut client, &["SET", "dst", "old", "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["ZINTERSTORE", "dst", "2", "z1", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "dst"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SET", "dst", "old", "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["ZUNIONSTORE", "dst", "1", "z1"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["TTL", "dst"]);
+    assert_eq!(expect_integer(&mut client), -1);
+
+    // 目标同时作为源时，先按源读取再覆盖。
+    send(&mut client, &["ZUNIONSTORE", "z1", "2", "z1", "z2"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZRANGE", "z1", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "1", "b", "5", "d", "5", "c", "7"]);
+
+    // 任一源键类型非法即整体 WRONGTYPE。
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    for arguments in [
+        ["ZUNIONSTORE", "dst", "2", "z2", "str"].as_slice(),
+        ["ZINTERSTORE", "dst", "2", "z2", "str"].as_slice(),
+        ["ZDIFF", "2", "z2", "str"].as_slice(),
+        ["ZDIFFSTORE", "dst", "2", "z2", "str"].as_slice(),
+        ["ZINTERCARD", "2", "z2", "str"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, WRONGTYPE);
+    }
+
+    // numkeys / WEIGHTS / AGGREGATE / LIMIT 的参数校验。
+    send(&mut client, &["ZUNIONSTORE", "dst", "0", "z2"]);
+    expect_error(&mut client, "ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE");
+    send(&mut client, &["ZINTERSTORE", "dst", "0", "z2"]);
+    expect_error(&mut client, "ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE");
+    send(&mut client, &["ZUNIONSTORE", "dst", "2", "z2"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZUNIONSTORE", "dst", "2", "z2", "z3", "WEIGHTS", "1"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZUNIONSTORE", "dst", "2", "z2", "z3", "WEIGHTS", "1", "x"]);
+    expect_error(&mut client, "ERR weight value is not a float");
+    send(&mut client, &["ZUNIONSTORE", "dst", "2", "z2", "z3", "AGGREGATE", "AVG"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZUNIONSTORE", "dst", "1", "z2", "z3"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZUNIONSTORE", "dst"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'zunionstore' command");
+    send(&mut client, &["ZDIFF", "0", "z2"]);
+    expect_error(&mut client, "ERR at least 1 input key is needed for ZDIFF");
+    send(&mut client, &["ZDIFFSTORE", "dst", "0", "z2"]);
+    expect_error(&mut client, "ERR at least 1 input key is needed for ZDIFFSTORE");
+    send(&mut client, &["ZDIFF", "2", "z2", "z3", "SCORES"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZDIFFSTORE", "dst", "2", "z2", "z3", "WITHSCORES"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZINTERCARD", "0", "z2"]);
+    expect_error(&mut client, "ERR numkeys should be greater than 0");
+    send(&mut client, &["ZINTERCARD", "2", "z2"]);
+    expect_error(&mut client, "ERR Number of keys can't be greater than number of args");
+    send(&mut client, &["ZINTERCARD", "2", "z2", "z3", "LIMIT", "-1"]);
+    expect_error(&mut client, "ERR LIMIT can't be negative");
+    send(&mut client, &["ZINTERCARD", "2", "z2", "z3", "LIMIT", "x"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["ZINTERCARD", "2", "z2", "z3", "LIMIT"]);
+    expect_error(&mut client, "ERR syntax error");
+}
