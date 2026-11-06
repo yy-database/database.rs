@@ -12,7 +12,6 @@ enum Operation {
         entity: String,
         #[serde(rename = "where")]
         filter: Option<WhereEq>,
-        #[allow(dead_code)]
         take: Option<u32>,
     },
     FindUnique {
@@ -65,12 +64,15 @@ pub fn encode_request_json(json: &str) -> Result<bind::BoundParameters, String> 
 
 fn encode_operation(op: &Operation) -> Result<String, String> {
     match op {
-        Operation::FindMany { entity, filter, take: _ } => {
-            let pipeline = match filter {
-                None => format!("{entity}.collect()"),
-                Some(pred) => format!("{entity}.filter(x => x.{field}{cmp}).collect()", field = pred.field, cmp = cmp_suffix(&pred.value)?),
+        Operation::FindMany { entity, filter, take } => {
+            let stage = match filter {
+                None => entity.clone(),
+                Some(pred) => format!("{entity}.filter(x => x.{field}{cmp})", field = pred.field, cmp = cmp_suffix(&pred.value)?),
             };
-            Ok(pipeline)
+            Ok(match take {
+                Some(take) => format!("{stage}.take({take}).collect()"),
+                None => format!("{stage}.collect()"),
+            })
         }
         Operation::FindUnique { entity, filter } => {
             let pipeline = format!("{entity}.filter(x => x.{field}{cmp}).collect()", field = filter.field, cmp = cmp_suffix(&filter.value)?);
@@ -105,6 +107,26 @@ mod tests {
         let bound = encode_request_json(request).expect("request");
         assert_eq!(bound.source, "User.filter(x => x.active == true).collect()");
         assert!(bound.value_parameters.is_empty());
+    }
+
+    #[test]
+    fn find_many_honors_take_in_the_pipeline() {
+        let request = r#"{
+            "identity": { "operationId": "User.findMany", "contractFingerprint": "fp" },
+            "operation": { "kind": "find-many", "entity": "User", "where": { "field": "active", "value": true }, "take": 10 }
+        }"#;
+        let bound = encode_request_json(request).expect("request");
+        assert_eq!(bound.source, "User.filter(x => x.active).take(10).collect()");
+    }
+
+    #[test]
+    fn find_many_without_where_still_applies_take() {
+        let request = r#"{
+            "identity": { "operationId": "User.findMany", "contractFingerprint": "fp" },
+            "operation": { "kind": "find-many", "entity": "User", "take": 5 }
+        }"#;
+        let bound = encode_request_json(request).expect("request");
+        assert_eq!(bound.source, "User.take(5).collect()");
     }
 
     #[test]
