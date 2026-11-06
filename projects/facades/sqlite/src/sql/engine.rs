@@ -14,10 +14,10 @@ use crate::{
 use super::error::SqlError;
 use super::json_string;
 use super::sql::{
-    AggregateFunction, AlterAction, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm, Expr, FrameEdge,
-    FrameUnits, IndexColumn, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, UnaryOp,
-    WindowFunction, WindowSpec, parse, rewrite_create_index_column, rewrite_create_index_table, rewrite_create_table_column,
-    rewrite_create_table_name, statement_references,
+    AggregateFunction, AlterAction, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm, Expr,
+    ForeignKey, FrameEdge, FrameUnits, IndexColumn, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems,
+    Statement, TableRef, UnaryOp, WindowFunction, WindowSpec, parse, rewrite_create_index_column, rewrite_create_index_table,
+    rewrite_create_table_column, rewrite_create_table_name, statement_references,
 };
 
 /// One cell surfaced to the host.
@@ -94,6 +94,47 @@ struct TableDef {
     primary_key: Vec<usize>,
     /// `CHECK` constraints, table- and column-level, in declaration order.
     checks: Vec<CheckDef>,
+    /// `REFERENCES` clauses, table- and column-level, in declaration order.
+    foreign_keys: Vec<ForeignKeyDef>,
+}
+
+/// One resolved `REFERENCES` clause of a table.
+#[derive(Clone)]
+struct ForeignKeyDef {
+    /// Child column positions in key order.
+    columns: Vec<usize>,
+    /// Lowercase parent table name.
+    parent: String,
+    /// Parent table name as written for diagnostics.
+    parent_display: String,
+    /// Parent column names as written; empty means the parent primary key.
+    parent_columns: Vec<String>,
+}
+
+impl TableDef {
+    /// Column positions of this table's primary key, or `None` when it has no
+    /// primary key at all.
+    fn primary_key_positions(&self) -> Option<Vec<usize>> {
+        if let Some(alias) = self.rowid_alias {
+            return Some(vec![alias]);
+        }
+        if !self.primary_key.is_empty() {
+            return Some(self.primary_key.clone());
+        }
+        let declared: Vec<usize> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .map(|(position, _)| position)
+            .collect();
+        if declared.is_empty() {
+            None
+        }
+        else {
+            Some(declared)
+        }
+    }
 }
 
 /// One resolved `CHECK` constraint of a table.
@@ -274,6 +315,8 @@ pub struct Engine {
     /// Values bound to `?` / `:name` placeholders for the statement currently
     /// executing, in declaration order.
     parameters: Vec<Cell>,
+    /// `PRAGMA foreign_keys`, enabled at session start like better-sqlite3.
+    foreign_keys: bool,
 }
 
 impl Engine {
@@ -281,7 +324,14 @@ impl Engine {
     pub fn new(page_size: Option<u32>) -> Result<Self, SqlError> {
         let page_size = page_size.unwrap_or(4096) as usize;
         let writer = SqliteWriter::create(page_size).map_err(|error| SqlError::new("storage", error.to_string()))?;
-        Ok(Self { writer, tables: Vec::new(), table_lookup: BTreeMap::new(), indexes: BTreeMap::new(), parameters: Vec::new() })
+        Ok(Self {
+            writer,
+            tables: Vec::new(),
+            table_lookup: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+            parameters: Vec::new(),
+            foreign_keys: true,
+        })
     }
 
     /// Executes exactly one statement.
@@ -400,7 +450,7 @@ impl Engine {
 
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         match statement {
-            Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, sql } => {
+            Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, sql } => {
                 let key = name.to_ascii_lowercase();
                 check_reserved_object_name(&name, "create-table")?;
                 if self.indexes.contains_key(&key) {
@@ -433,6 +483,10 @@ impl Engine {
                 // column fails the statement instead of leaving a half-built
                 // table behind, exactly like upstream.
                 let resolved_checks = resolve_checks(&name, &columns, &checks, "create-table")?;
+                // A `FOREIGN KEY (...)` list naming a missing child column is
+                // rejected at DDL time, exactly like SQLite; the parent tables
+                // may still be created later.
+                let resolved_foreign_keys = resolve_foreign_keys(&columns, &foreign_keys)?;
                 self.writer
                     .create_table_with_primary_key_sql(&name, &columns, &primary_key, Some(&sql))
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
@@ -447,6 +501,7 @@ impl Engine {
                     primary_key_index,
                     primary_key: key_positions,
                     checks: resolved_checks,
+                    foreign_keys: resolved_foreign_keys,
                 });
                 Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
@@ -533,6 +588,15 @@ impl Engine {
                         }
                     }
                     rowids.push(rowid);
+                }
+                // Referential checks run after every row is written and before
+                // the transaction commits: a failing statement leaves no row
+                // behind, and a self-reference may point at a later row of the
+                // same statement.
+                if failure.is_none() && self.foreign_keys {
+                    if let Err(error) = self.check_insert_foreign_keys(def, &rowids, "insert") {
+                        failure = Some(error);
+                    }
                 }
                 if let Some(error) = failure {
                     let _ = self.writer.rollback();
@@ -644,11 +708,22 @@ impl Engine {
                 let budget = Budget::new();
                 let needs_index = self.has_indexes(def, &key);
                 let plan = self.plan_update(def, &key, &targets, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget)?;
+                // Old row values are needed to tell which referenced keys this
+                // statement rewrites, so they are read before the transaction.
+                let old_rows = self.live_rows(def, "update")?;
+                let assigned: Vec<bool> =
+                    def.columns.iter().enumerate().map(|(index, _)| targets.iter().any(|(target, _)| *target == index)).collect();
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
                 for (rowid, values) in &plan.writes {
                     if let Err(error) = self.writer.update(&table, *rowid, values) {
                         let _ = self.writer.rollback();
                         return Err(write_failure(error, "update", def));
+                    }
+                }
+                if self.foreign_keys {
+                    if let Err(error) = self.check_update_foreign_keys(def, &plan, &old_rows, &assigned, "update") {
+                        let _ = self.writer.rollback();
+                        return Err(error);
                     }
                 }
                 self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
@@ -682,11 +757,20 @@ impl Engine {
                 let budget = Budget::new();
                 let needs_index = self.has_indexes(def, &key);
                 let plan = self.plan_delete(def, predicate.as_ref(), returning.as_ref(), &shape.scope, &budget)?;
+                // The deleted rows' referenced keys are only visible before the
+                // removal, so the snapshot is taken ahead of the transaction.
+                let old_rows = self.live_rows(def, "delete")?;
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
                 for rowid in &plan.removed {
                     if let Err(error) = self.writer.delete(&table, *rowid) {
                         let _ = self.writer.rollback();
                         return Err(write_failure(error, "delete", def));
+                    }
+                }
+                if self.foreign_keys {
+                    if let Err(error) = self.check_delete_foreign_keys(def, &old_rows, &plan.removed, "delete") {
+                        let _ = self.writer.rollback();
+                        return Err(error);
                     }
                 }
                 self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
@@ -701,6 +785,37 @@ impl Engine {
                     rows: plan.returning,
                     affected: plan.removed.len(),
                 })
+            }
+            Statement::Pragma { name, value } => {
+                if !name.eq_ignore_ascii_case("foreign_keys") {
+                    return Err(SqlError::new(
+                        "unsupported-pragma",
+                        format!("unsupported pragma `{name}`; this engine supports `foreign_keys` only"),
+                    )
+                    .in_clause("PRAGMA")
+                    .in_statement("pragma"));
+                }
+                match value {
+                    None => Ok(ExecResult {
+                        statement: "pragma",
+                        columns: vec!["foreign_keys".to_string()],
+                        rows: vec![vec![Cell::Integer(i64::from(self.foreign_keys))]],
+                        affected: 0,
+                    }),
+                    Some(text) => {
+                        // SQLite reads the value as a boolean: `on` / `true`
+                        // / `yes` and any positive integer enable it, `off` /
+                        // `false` / `no` / zero and non-numeric text disable
+                        // it.
+                        let lower = text.to_ascii_lowercase();
+                        self.foreign_keys = match lower.as_str() {
+                            "on" | "true" | "yes" => true,
+                            "off" | "false" | "no" => false,
+                            _ => lower.parse::<i64>().map(|value| value > 0).unwrap_or(false),
+                        };
+                        Ok(ExecResult { statement: "pragma", columns: Vec::new(), rows: Vec::new(), affected: 0 })
+                    }
+                }
             }
             Statement::DropTable { name, if_exists } => {
                 if is_schema_table(&name) {
@@ -1020,6 +1135,232 @@ impl Engine {
         }
         rows.sort_by_key(|(rowid, _)| *rowid);
         Ok(rows)
+    }
+
+    /// Resolves one foreign key against the live catalog: the parent table
+    /// position and the parent key column positions.
+    ///
+    /// A missing parent table and a parent key that is not unique both report
+    /// the codes SQLite uses (`SQLITE_ERROR`), because the same statements
+    /// fail identically in the reference engine.
+    fn foreign_key_parent(&self, child: &TableDef, key: &ForeignKeyDef, statement: &'static str) -> Result<(usize, Vec<usize>), SqlError> {
+        let parent_position = *self
+            .table_lookup
+            .get(&key.parent)
+            .ok_or_else(|| SqlError::new("SQLITE_ERROR", format!("no such table: main.{}", key.parent_display)).in_statement(statement))?;
+        let parent = &self.tables[parent_position];
+        let positions = if key.parent_columns.is_empty() {
+            parent
+                .primary_key_positions()
+                .ok_or_else(|| foreign_key_mismatch(child, key, statement))?
+        }
+        else {
+            let mut positions = Vec::with_capacity(key.parent_columns.len());
+            for name in &key.parent_columns {
+                let position = parent
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| foreign_key_mismatch(child, key, statement))?;
+                positions.push(position);
+            }
+            positions
+        };
+        if positions.len() != key.columns.len() || !self.parent_key_is_unique(parent, &positions) {
+            return Err(foreign_key_mismatch(child, key, statement));
+        }
+        Ok((parent_position, positions))
+    }
+
+    /// Whether `positions` identifies at most one parent row: the primary key,
+    /// a column-level `UNIQUE` / `PRIMARY KEY`, or an explicit unique index.
+    fn parent_key_is_unique(&self, parent: &TableDef, positions: &[usize]) -> bool {
+        if let Some(alias) = parent.rowid_alias {
+            if positions == [alias] {
+                return true;
+            }
+        }
+        if !parent.primary_key.is_empty() && same_positions(&parent.primary_key, positions) {
+            return true;
+        }
+        let declared: Vec<usize> = parent
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .map(|(position, _)| position)
+            .collect();
+        if !declared.is_empty() && same_positions(&declared, positions) {
+            return true;
+        }
+        if positions.len() == 1 && parent.columns[positions[0]].unique {
+            return true;
+        }
+        if positions.iter().all(|position| parent.columns[*position].unique) {
+            return true;
+        }
+        let parent_key = parent.name.to_ascii_lowercase();
+        self.indexes
+            .values()
+            .any(|index| index.table == parent_key && index.unique && same_positions(&index.columns, positions))
+    }
+
+    /// Every foreign key in the catalog that references `parent`, as
+    /// `(child table position, key)` pairs; the child may be `parent` itself.
+    fn referencing_foreign_keys(&self, parent: &str) -> Vec<(usize, ForeignKeyDef)> {
+        let mut found = Vec::new();
+        for (position, table) in self.tables.iter().enumerate() {
+            for key in &table.foreign_keys {
+                if key.parent.eq_ignore_ascii_case(parent) {
+                    found.push((position, key.clone()));
+                }
+            }
+        }
+        found
+    }
+
+    /// Verifies the rows an `INSERT` just wrote against every foreign key of
+    /// their table. The check runs after the writes so a self-reference may
+    /// point at a later row of the same statement.
+    fn check_insert_foreign_keys(&self, def: &TableDef, rowids: &[i64], statement: &'static str) -> Result<(), SqlError> {
+        if def.foreign_keys.is_empty() {
+            return Ok(());
+        }
+        let live = self.live_rows(def, statement)?;
+        for key in &def.foreign_keys {
+            let (parent_position, parent_columns) = self.foreign_key_parent(def, key, statement)?;
+            let parent = &self.tables[parent_position];
+            let parent_rows = self.live_rows(parent, statement)?;
+            for (rowid, cells) in &live {
+                if !rowids.contains(rowid) {
+                    continue;
+                }
+                let values = pick(cells, &key.columns);
+                // A NULL in any child key column satisfies the constraint.
+                if values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                    continue;
+                }
+                if !parent_rows.iter().any(|(_, parent_cells)| keys_equal(&values, parent_cells, &parent_columns)) {
+                    return Err(foreign_key_violation(statement));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies an `UPDATE` against both sides of every foreign key it touches.
+    ///
+    /// Child keys are re-checked only when the statement assigns one of their
+    /// columns. Referenced parent keys are re-checked only when the statement
+    /// assigns one of their columns, and then only child rows still holding a
+    /// value the update removed are examined.
+    fn check_update_foreign_keys(
+        &self,
+        def: &TableDef,
+        plan: &UpdatePlan,
+        old_rows: &[(i64, Vec<Cell>)],
+        assigned: &[bool],
+        statement: &'static str,
+    ) -> Result<(), SqlError> {
+        for key in &def.foreign_keys {
+            if !key.columns.iter().any(|position| assigned[*position]) {
+                continue;
+            }
+            let (parent_position, parent_columns) = self.foreign_key_parent(def, key, statement)?;
+            let parent_rows = self.live_rows(&self.tables[parent_position], statement)?;
+            for (rowid, values) in &plan.writes {
+                let old = row_of(old_rows, *rowid);
+                let next = apply_assignment(old, values);
+                let child_values = pick(&next, &key.columns);
+                if child_values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                    continue;
+                }
+                if !parent_rows.iter().any(|(_, parent_cells)| keys_equal(&child_values, parent_cells, &parent_columns)) {
+                    return Err(foreign_key_violation(statement));
+                }
+            }
+        }
+        for (child_position, key) in self.referencing_foreign_keys(&def.name) {
+            let child = &self.tables[child_position];
+            let (parent_position, parent_columns) = self.foreign_key_parent(child, &key, statement)?;
+            if !parent_columns.iter().any(|position| assigned.get(*position).copied().unwrap_or(false)) {
+                continue;
+            }
+            let mut changed: Vec<Vec<Cell>> = Vec::new();
+            for (rowid, values) in &plan.writes {
+                let old = row_of(old_rows, *rowid);
+                let old_values = pick(old, &parent_columns);
+                if old_values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                    continue;
+                }
+                let next = apply_assignment(old, values);
+                let new_values = pick(&next, &parent_columns);
+                if !cells_equal(&old_values, &new_values) {
+                    changed.push(old_values);
+                }
+            }
+            if changed.is_empty() {
+                continue;
+            }
+            let parent_rows = self.live_rows(&self.tables[parent_position], statement)?;
+            let child_rows = self.live_rows(child, statement)?;
+            for (_, child_cells) in &child_rows {
+                let child_values = pick(child_cells, &key.columns);
+                if child_values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                    continue;
+                }
+                if changed.iter().any(|value| cells_equal(value, &child_values))
+                    && !parent_rows.iter().any(|(_, parent_cells)| keys_equal(&child_values, parent_cells, &parent_columns))
+                {
+                    return Err(foreign_key_violation(statement));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies a `DELETE`: its own foreign keys are still resolved (a malformed
+    /// or missing parent fails the statement like SQLite), and every child row
+    /// that referenced a removed parent key is looked for after the removal.
+    fn check_delete_foreign_keys(
+        &self,
+        def: &TableDef,
+        old_rows: &[(i64, Vec<Cell>)],
+        removed: &[i64],
+        statement: &'static str,
+    ) -> Result<(), SqlError> {
+        for key in &def.foreign_keys {
+            self.foreign_key_parent(def, key, statement)?;
+        }
+        for (child_position, key) in self.referencing_foreign_keys(&def.name) {
+            let child = &self.tables[child_position];
+            let (_, parent_columns) = self.foreign_key_parent(child, &key, statement)?;
+            let mut gone: Vec<Vec<Cell>> = Vec::new();
+            for (rowid, cells) in old_rows {
+                if !removed.contains(rowid) {
+                    continue;
+                }
+                let values = pick(cells, &parent_columns);
+                if values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                    continue;
+                }
+                gone.push(values);
+            }
+            if gone.is_empty() {
+                continue;
+            }
+            let child_rows = self.live_rows(child, statement)?;
+            for (_, child_cells) in &child_rows {
+                let child_values = pick(child_cells, &key.columns);
+                if child_values.iter().any(|cell| matches!(cell, Cell::Null)) {
+                    continue;
+                }
+                if gone.iter().any(|value| cells_equal(value, &child_values)) {
+                    return Err(foreign_key_violation(statement));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every uniqueness rule an `UPDATE` has to re-check, in the order SQLite
@@ -5054,6 +5395,7 @@ fn resolve_checks(
         primary_key_index: false,
         primary_key: Vec::new(),
         checks: Vec::new(),
+        foreign_keys: Vec::new(),
     };
     let source = Source {
         label: table.to_string(),
@@ -5078,6 +5420,81 @@ fn resolve_checks(
         resolved.push(CheckDef { name: check.name.clone(), expr, text: check.text.clone() });
     }
     Ok(resolved)
+}
+
+/// Resolves every `REFERENCES` clause of one `CREATE TABLE` against the
+/// declared child columns.
+///
+/// Only the child side is validated here: SQLite allows a foreign key to name a
+/// parent table that does not exist yet, and reports an undeclared child column
+/// as `SQLITE_ERROR` with the same message the reference engine uses.
+fn resolve_foreign_keys(columns: &[ColumnSpec], keys: &[ForeignKey]) -> Result<Vec<ForeignKeyDef>, SqlError> {
+    let mut resolved = Vec::with_capacity(keys.len());
+    for key in keys {
+        let mut positions = Vec::with_capacity(key.columns.len());
+        for name in &key.columns {
+            let position = columns.iter().position(|column| column.name.eq_ignore_ascii_case(name)).ok_or_else(|| {
+                SqlError::new("SQLITE_ERROR", format!("unknown column \"{name}\" in foreign key definition")).in_statement("create-table")
+            })?;
+            positions.push(position);
+        }
+        resolved.push(ForeignKeyDef {
+            columns: positions,
+            parent: key.parent.to_ascii_lowercase(),
+            parent_display: key.parent.clone(),
+            parent_columns: key.parent_columns.clone(),
+        });
+    }
+    Ok(resolved)
+}
+
+/// The error SQLite raises when a parent key is not a unique key of its table.
+fn foreign_key_mismatch(child: &TableDef, key: &ForeignKeyDef, statement: &'static str) -> SqlError {
+    SqlError::new(
+        "SQLITE_ERROR",
+        format!("foreign key mismatch - \"{}\" referencing \"{}\"", child.name, key.parent_display),
+    )
+    .in_statement(statement)
+}
+
+/// The error SQLite raises when a non-NULL child key has no parent row.
+fn foreign_key_violation(statement: &'static str) -> SqlError {
+    SqlError::new("SQLITE_CONSTRAINT_FOREIGNKEY", "FOREIGN KEY constraint failed").in_statement(statement)
+}
+
+/// Selects the cells at `positions` from one decoded row.
+fn pick(cells: &[Cell], positions: &[usize]) -> Vec<Cell> {
+    positions.iter().map(|position| cells[*position].clone()).collect()
+}
+
+/// Whether one child key equals the parent key held by `parent_cells`.
+fn keys_equal(child_values: &[Cell], parent_cells: &[Cell], parent_columns: &[usize]) -> bool {
+    child_values.iter().zip(parent_columns.iter()).all(|(child, position)| compare_cells(child, &parent_cells[*position]) == Ordering::Equal)
+}
+
+/// Copies one pre-statement row and applies an `UPDATE` assignment to it.
+fn apply_assignment(old: &[Cell], values: &[UpdateValue]) -> Vec<Cell> {
+    let mut next = old.to_vec();
+    for (index, value) in values.iter().enumerate() {
+        if let UpdateValue::Set(value) = value {
+            next[index] = write_value_cell(value);
+        }
+    }
+    next
+}
+
+/// The pre-statement cells of one rowid; the plan only contains live rowids.
+fn row_of<'a>(rows: &'a [(i64, Vec<Cell>)], rowid: i64) -> &'a [Cell] {
+    rows.iter().find(|(id, _)| *id == rowid).map(|(_, cells)| cells.as_slice()).unwrap_or(&[])
+}
+
+/// Whether two column-position lists name the same key, ignoring order.
+fn same_positions(left: &[usize], right: &[usize]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
 }
 
 /// Builds the row a `CHECK` is evaluated against right after an insert.
@@ -6419,5 +6836,125 @@ mod tests {
             engine.execute_one("SELECT b AS a FROM t ORDER BY t.a").expect("qualified order").rows,
             vec![vec![Cell::Integer(8)], vec![Cell::Integer(9)], vec![Cell::Integer(7)]]
         );
+    }
+
+    #[test]
+    fn pragma_foreign_keys_reports_and_switches_session_state() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        // better-sqlite3 opens every connection with foreign keys enabled.
+        let queried = engine.execute_one("PRAGMA foreign_keys").expect("query");
+        assert_eq!(queried.statement, "pragma");
+        assert_eq!(queried.columns, vec!["foreign_keys".to_string()]);
+        assert_eq!(queried.rows, vec![vec![Cell::Integer(1)]]);
+        let disabled = engine.execute_one("PRAGMA foreign_keys = OFF").expect("disable");
+        assert!(disabled.columns.is_empty());
+        assert!(disabled.rows.is_empty());
+        let queried = engine.execute_one("PRAGMA foreign_keys").expect("query");
+        assert_eq!(queried.rows, vec![vec![Cell::Integer(0)]]);
+        engine.execute_one("PRAGMA foreign_keys(ON)").expect("parenthesized form");
+        let queried = engine.execute_one("PRAGMA foreign_keys").expect("query");
+        assert_eq!(queried.rows, vec![vec![Cell::Integer(1)]]);
+        engine.execute_one("PRAGMA foreign_keys = 0").expect("set zero");
+        let queried = engine.execute_one("PRAGMA foreign_keys").expect("query");
+        assert_eq!(queried.rows, vec![vec![Cell::Integer(0)]]);
+    }
+
+    #[test]
+    fn foreign_keys_reject_orphans_and_removed_references() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute_one("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)").expect("create parent");
+        engine.execute_one("CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))").expect("create child");
+        engine.execute_one("INSERT INTO parent VALUES (1, 'a'), (2, 'b')").expect("parent rows");
+        engine.execute_one("INSERT INTO child VALUES (10, 1)").expect("child row");
+        let orphan = engine.execute_one("INSERT INTO child VALUES (11, 99)").expect_err("orphan");
+        assert_eq!(orphan.code, "SQLITE_CONSTRAINT_FOREIGNKEY");
+        assert_eq!(orphan.message, "FOREIGN KEY constraint failed");
+        engine.execute_one("INSERT INTO child VALUES (12, NULL)").expect("null key passes");
+        let removed = engine.execute_one("DELETE FROM parent WHERE id = 1").expect_err("referenced delete");
+        assert_eq!(removed.code, "SQLITE_CONSTRAINT_FOREIGNKEY");
+        let rewritten = engine.execute_one("UPDATE parent SET id = 7 WHERE id = 1").expect_err("referenced update");
+        assert_eq!(rewritten.code, "SQLITE_CONSTRAINT_FOREIGNKEY");
+        // Assigning an unrelated parent column does not rewrite the key.
+        engine.execute_one("UPDATE parent SET name = 'c' WHERE id = 1").expect("non-key update");
+        let child_update = engine.execute_one("UPDATE child SET pid = 88 WHERE id = 10").expect_err("child update");
+        assert_eq!(child_update.code, "SQLITE_CONSTRAINT_FOREIGNKEY");
+        engine.execute_one("UPDATE child SET pid = NULL WHERE id = 10").expect("child update to null");
+        // The failed statements left no trace, like SQLite's implicit rollback.
+        assert_eq!(engine.execute_one("SELECT count(*) FROM child").expect("count").rows, vec![vec![Cell::Integer(2)]]);
+        // Disabling the pragma lets every previously rejected statement pass.
+        engine.execute_one("PRAGMA foreign_keys = OFF").expect("disable");
+        engine.execute_one("INSERT INTO child VALUES (11, 99)").expect("orphan allowed");
+        engine.execute_one("DELETE FROM parent WHERE id = 1").expect("referenced delete allowed");
+        engine.execute_one("UPDATE parent SET id = 7 WHERE id = 2").expect("referenced update allowed");
+    }
+
+    #[test]
+    fn foreign_keys_report_missing_parents_and_mismatched_keys() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        // A forward reference is legal at DDL time; the DML fails until the
+        // parent exists.
+        engine.execute_one("CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))").expect("forward reference");
+        let missing = engine.execute_one("INSERT INTO child VALUES (1, NULL)").expect_err("missing parent");
+        assert_eq!(missing.code, "SQLITE_ERROR");
+        assert_eq!(missing.message, "no such table: main.parent");
+        let invalid = engine.execute_one("CREATE TABLE bad (id INTEGER PRIMARY KEY, FOREIGN KEY (ghost) REFERENCES parent(id))").expect_err("bad child column");
+        assert_eq!(invalid.code, "SQLITE_ERROR");
+        assert_eq!(invalid.message, "unknown column \"ghost\" in foreign key definition");
+        engine.execute_one("CREATE TABLE parent (id INTEGER)").expect("parent without a key");
+        let mismatch = engine.execute_one("INSERT INTO child VALUES (2, NULL)").expect_err("mismatch");
+        assert_eq!(mismatch.code, "SQLITE_ERROR");
+        assert_eq!(mismatch.message, "foreign key mismatch - \"child\" referencing \"parent\"");
+    }
+
+    #[test]
+    fn composite_foreign_keys_use_the_parent_primary_key() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute_one("CREATE TABLE parent (a INTEGER, b INTEGER, PRIMARY KEY (a, b))").expect("composite parent");
+        engine.execute_one("CREATE TABLE child (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES parent)").expect("composite child");
+        engine.execute_one("INSERT INTO parent VALUES (1, 2)").expect("parent row");
+        engine.execute_one("INSERT INTO child VALUES (1, 1, 2)").expect("matching composite");
+        let orphan = engine.execute_one("INSERT INTO child VALUES (2, 1, 3)").expect_err("composite orphan");
+        assert_eq!(orphan.code, "SQLITE_CONSTRAINT_FOREIGNKEY");
+        engine.execute_one("INSERT INTO child VALUES (3, 1, NULL)").expect("partial null passes");
+        let partial = engine.execute_one("CREATE TABLE single (id INTEGER PRIMARY KEY, x INTEGER, FOREIGN KEY (x) REFERENCES parent(a))").expect("create single");
+        assert_eq!(partial.statement, "create-table");
+        let mismatch = engine.execute_one("INSERT INTO single VALUES (1, 1)").expect_err("single column against a composite key");
+        assert_eq!(mismatch.code, "SQLITE_ERROR");
+        assert_eq!(mismatch.message, "foreign key mismatch - \"single\" referencing \"parent\"");
+    }
+
+    #[test]
+    fn self_references_may_point_at_later_rows_of_the_same_statement() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute_one("CREATE TABLE t (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id))").expect("create");
+        engine.execute_one("INSERT INTO t VALUES (1, NULL), (2, 1)").expect("parent first");
+        engine.execute_one("INSERT INTO t VALUES (3, 4), (4, NULL)").expect("child first");
+        let orphan = engine.execute_one("INSERT INTO t VALUES (5, 9)").expect_err("self orphan");
+        assert_eq!(orphan.code, "SQLITE_CONSTRAINT_FOREIGNKEY");
+    }
+
+    #[test]
+    fn cascading_and_deferred_foreign_keys_are_rejected_explicitly() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute_one("CREATE TABLE parent (id INTEGER PRIMARY KEY)").expect("create parent");
+        let cascade = engine
+            .execute_one("CREATE TABLE c1 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)")
+            .expect_err("cascade");
+        assert_eq!(cascade.code, "unsupported-foreign-key-action");
+        assert_eq!(cascade.clause.as_deref(), Some("CASCADE"));
+        let set_null = engine
+            .execute_one("CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE SET NULL)")
+            .expect_err("set null");
+        assert_eq!(set_null.code, "unsupported-foreign-key-action");
+        let deferred = engine
+            .execute_one("CREATE TABLE c3 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+            .expect_err("deferred");
+        assert_eq!(deferred.code, "unsupported-deferred-foreign-key");
+        // Immediate deferral spellings keep working.
+        engine.execute_one("CREATE TABLE c4 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) NOT DEFERRABLE)").expect("not deferrable");
+        let added = engine
+            .execute_one("ALTER TABLE c4 ADD COLUMN other INTEGER REFERENCES parent(id)")
+            .expect_err("add column with a foreign key");
+        assert_eq!(added.code, "unsupported-column-constraint");
     }
 }

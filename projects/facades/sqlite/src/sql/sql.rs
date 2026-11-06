@@ -613,6 +613,37 @@ pub struct CheckConstraint {
     pub text: String,
 }
 
+/// One `REFERENCES` clause, from a column constraint or a table-level
+/// `FOREIGN KEY (...) REFERENCES ...`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKey {
+    /// Child columns in key order.
+    pub columns: Vec<String>,
+    /// Parent table name as written.
+    pub parent: String,
+    /// Parent columns in key order; empty means the parent's primary key.
+    pub parent_columns: Vec<String>,
+    /// `ON DELETE` action; `NO ACTION` when absent.
+    pub on_delete: ForeignKeyAction,
+    /// `ON UPDATE` action; `NO ACTION` when absent.
+    pub on_update: ForeignKeyAction,
+}
+
+/// Referential action written after `ON DELETE` / `ON UPDATE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignKeyAction {
+    /// `NO ACTION`.
+    NoAction,
+    /// `RESTRICT`, which SQLite checks immediately like `NO ACTION`.
+    Restrict,
+    /// `SET NULL`, not implemented by this engine.
+    SetNull,
+    /// `SET DEFAULT`, not implemented by this engine.
+    SetDefault,
+    /// `CASCADE`, not implemented by this engine.
+    Cascade,
+}
+
 /// Trailing `LIMIT` / `OFFSET` of a `SELECT`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Limit {
@@ -1121,6 +1152,8 @@ pub enum Statement {
         primary_key: Vec<String>,
         /// Table- and column-level `CHECK` constraints.
         checks: Vec<CheckConstraint>,
+        /// Table- and column-level `REFERENCES` clauses, in declaration order.
+        foreign_keys: Vec<ForeignKey>,
         /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
         sql: String,
     },
@@ -1214,6 +1247,13 @@ pub enum Statement {
         /// Optional row limit of the whole query.
         limit: Option<Limit>,
     },
+    /// `PRAGMA name [= value]` or `PRAGMA name(value)`.
+    Pragma {
+        /// Pragma name as written.
+        name: String,
+        /// Value as written, when the statement sets the pragma.
+        value: Option<String>,
+    },
 }
 
 /// AST equality, needed because a subquery can appear inside an expression.
@@ -1240,6 +1280,7 @@ impl Statement {
             Self::DropIndex { .. } => "drop-index",
             Self::AlterTable { .. } => "alter-table",
             Self::Select { .. } => "select",
+            Self::Pragma { .. } => "pragma",
         }
     }
 }
@@ -2757,6 +2798,10 @@ impl<'a> Parser<'a> {
         if self.eat_word("alter") {
             return self.alter_table();
         }
+        if self.eat_word("pragma") {
+            self.kind = Some("pragma");
+            return self.pragma();
+        }
         if self.peek_keyword("select") {
             self.kind = Some("select");
             self.at += 1;
@@ -2770,9 +2815,44 @@ impl<'a> Parser<'a> {
         Err(self.error(
             "unsupported-statement",
             format!(
-                "unsupported statement starting at {found}; this engine accepts `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`, `DROP TABLE`, `DROP INDEX`, `ALTER TABLE`, and `SELECT` only"
+                "unsupported statement starting at {found}; this engine accepts `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`, `DROP TABLE`, `DROP INDEX`, `ALTER TABLE`, `PRAGMA foreign_keys`, and `SELECT` only"
             ),
         ))
+    }
+
+    /// Reads `PRAGMA <name> [= value]` or `PRAGMA <name>(value)`.
+    fn pragma(&mut self) -> Result<Statement, SqlError> {
+        let name = self.name()?;
+        self.reject_qualified(&name)?;
+        let value = if matches!(self.peek(), Some(Token::Operator(operator)) if operator == "=") {
+            self.at += 1;
+            Some(self.pragma_value()?)
+        }
+        else if self.peek() == Some(&Token::LParen) {
+            self.at += 1;
+            let value = self.pragma_value()?;
+            self.expect_char(&Token::RParen)?;
+            Some(value)
+        }
+        else {
+            None
+        };
+        self.expect_end("PRAGMA")?;
+        Ok(Statement::Pragma { name, value })
+    }
+
+    /// Reads one pragma value as written: a word, a quoted name, or an integer.
+    fn pragma_value(&mut self) -> Result<String, SqlError> {
+        match self.peek() {
+            Some(Token::Word(_)) | Some(Token::Quoted(_)) => self.name(),
+            Some(Token::Int(value)) => {
+                let value = *value;
+                self.at += 1;
+                Ok(value.to_string())
+            }
+            Some(token) => Err(self.error("syntax", format!("expected a pragma value but found {}", token.describe()))),
+            None => Err(self.error("syntax", "expected a pragma value but the statement ended")),
+        }
     }
 
     /// Reads `DROP TABLE [IF EXISTS] name` and `DROP INDEX [IF EXISTS] name`.
@@ -2843,7 +2923,16 @@ impl<'a> Parser<'a> {
             self.eat_word("column");
             let start = self.offset();
             let mut checks = Vec::new();
-            let column = self.column_spec(&mut checks)?;
+            let mut foreign_keys = Vec::new();
+            let column = self.column_spec(&mut checks, &mut foreign_keys)?;
+            if let Some(key) = foreign_keys.first() {
+                let mut error = self.error(
+                    "unsupported-column-constraint",
+                    format!("adding the foreign key on `{}` with `ALTER TABLE ADD COLUMN` is not supported", key.columns.join(", ")),
+                );
+                error.clause = Some("REFERENCES".to_string());
+                return Err(error);
+            }
             let end = self.offset();
             let sql = self.source.get(start..end).unwrap_or_default().trim_end().to_string();
             AlterAction::AddColumn { column, checks, sql }
@@ -2903,6 +2992,7 @@ impl<'a> Parser<'a> {
         let mut columns = Vec::new();
         let mut primary_key: Vec<String> = Vec::new();
         let mut checks: Vec<CheckConstraint> = Vec::new();
+        let mut foreign_keys: Vec<ForeignKey> = Vec::new();
         loop {
             let constraint = if self.eat_word("constraint") { Some(self.name()?) } else { None };
             if self.peek_keyword("primary") {
@@ -2931,10 +3021,15 @@ impl<'a> Parser<'a> {
             else if self.peek_keyword("check") {
                 checks.push(self.check_constraint(constraint)?);
             }
-            else if matches!(self.peek_word(), Some(word) if {
-                let lower = word.to_ascii_lowercase();
-                matches!(lower.as_str(), "unique" | "foreign")
-            }) {
+            else if self.eat_word("foreign") {
+                // Table-level `[CONSTRAINT name] FOREIGN KEY (a, b)
+                // REFERENCES parent [(x, y)]`.
+                self.expect_word("key")?;
+                let columns = self.column_list()?;
+                self.expect_word("references")?;
+                foreign_keys.push(self.references_clause(columns)?);
+            }
+            else if self.peek_keyword("unique") {
                 let clause = self.peek_word().unwrap_or_default().to_string();
                 let mut error = self.error("unsupported-column-constraint", format!("unsupported table constraint `{clause}`"));
                 error.clause = Some(clause.to_ascii_uppercase());
@@ -2950,7 +3045,7 @@ impl<'a> Parser<'a> {
                 return Err(error);
             }
             else {
-                columns.push(self.column_spec(&mut checks)?);
+                columns.push(self.column_spec(&mut checks, &mut foreign_keys)?);
             }
             match self.peek() {
                 Some(Token::Comma) => {
@@ -2965,7 +3060,7 @@ impl<'a> Parser<'a> {
             }
         }
         let sql = self.raw_statement();
-        Ok(Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, sql })
+        Ok(Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, sql })
     }
 
     /// Reads `CHECK ( expr )` after an optional `CONSTRAINT name`, and keeps the
@@ -3045,7 +3140,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn column_spec(&mut self, checks: &mut Vec<CheckConstraint>) -> Result<ColumnSpec, SqlError> {
+    fn column_spec(&mut self, checks: &mut Vec<CheckConstraint>, foreign_keys: &mut Vec<ForeignKey>) -> Result<ColumnSpec, SqlError> {
         let name = self.name()?;
         let declared_type = self.declared_type()?;
         let mut spec = ColumnSpec {
@@ -3085,12 +3180,17 @@ impl<'a> Parser<'a> {
                 spec.default_value = Some(self.literal()?.to_write_value());
             }
             else if self.peek_keyword("constraint") {
-                // Column-level `CONSTRAINT name CHECK (...)`; other named
-                // constraints stay rejected.
+                // Column-level `CONSTRAINT name CHECK (...)` or
+                // `CONSTRAINT name REFERENCES ...`; other named constraints
+                // stay rejected.
                 self.at += 1;
                 let constraint = self.name()?;
                 if self.peek_keyword("check") {
                     checks.push(self.check_constraint(Some(constraint))?);
+                }
+                else if self.peek_keyword("references") {
+                    self.at += 1;
+                    foreign_keys.push(self.references_clause(vec![spec.name.clone()])?);
                 }
                 else {
                     let mut error = self.error(
@@ -3105,9 +3205,12 @@ impl<'a> Parser<'a> {
                 self.at -= 1;
                 checks.push(self.check_constraint(None)?);
             }
-            else if self.eat_word("references") || self.eat_word("collate") {
+            else if self.eat_word("references") {
+                foreign_keys.push(self.references_clause(vec![spec.name.clone()])?);
+            }
+            else if self.eat_word("collate") {
                 let mut error = self.error("unsupported-column-constraint", format!("unsupported column constraint in `{}`", spec.name));
-                error.clause = Some(self.constraint_name());
+                error.clause = Some("COLLATE".to_string());
                 return Err(error);
             }
             else if self.eat_word("generated") {
@@ -3123,6 +3226,118 @@ impl<'a> Parser<'a> {
             return Err(self.error("autoincrement-integer-primary-key", "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"));
         }
         Ok(spec)
+    }
+
+    /// Reads `REFERENCES parent [(col, ...)]` plus the optional `ON DELETE` /
+    /// `ON UPDATE` actions and deferral clauses.
+    ///
+    /// `CASCADE`, `SET NULL` and `SET DEFAULT` are rejected here: this engine
+    /// checks foreign keys immediately and never rewrites the child row, so
+    /// accepting the action would silently drop its effect. `DEFERRABLE
+    /// INITIALLY DEFERRED` is rejected for the same reason.
+    fn references_clause(&mut self, columns: Vec<String>) -> Result<ForeignKey, SqlError> {
+        let parent = self.name()?;
+        self.reject_qualified(&parent)?;
+        let parent_columns = if self.peek() == Some(&Token::LParen) { self.column_list()? } else { Vec::new() };
+        let mut key = ForeignKey {
+            columns,
+            parent,
+            parent_columns,
+            on_delete: ForeignKeyAction::NoAction,
+            on_update: ForeignKeyAction::NoAction,
+        };
+        loop {
+            if self.eat_word("on") {
+                if self.eat_word("delete") {
+                    key.on_delete = self.foreign_key_action("DELETE")?;
+                }
+                else if self.eat_word("update") {
+                    key.on_update = self.foreign_key_action("UPDATE")?;
+                }
+                else {
+                    return Err(self.error("syntax", "expected `DELETE` or `UPDATE` after `ON` in a foreign key"));
+                }
+            }
+            else if self.peek_keyword("not")
+                && matches!(self.tokens.get(self.at + 1), Some(Token::Word(word)) if word.eq_ignore_ascii_case("deferrable"))
+            {
+                // `NOT DEFERRABLE` is the default and has no effect here.
+                self.at += 2;
+            }
+            else if self.eat_word("deferrable") {
+                if self.eat_word("initially") {
+                    if self.eat_word("deferred") {
+                        let mut error = self.error(
+                            "unsupported-deferred-foreign-key",
+                            "`DEFERRABLE INITIALLY DEFERRED` is not supported: foreign keys are checked immediately",
+                        );
+                        error.clause = Some("DEFERRABLE".to_string());
+                        return Err(error);
+                    }
+                    self.expect_word("immediate")?;
+                }
+            }
+            else {
+                break;
+            }
+        }
+        Ok(key)
+    }
+
+    /// Reads one referential action after `ON DELETE` / `ON UPDATE`.
+    fn foreign_key_action(&mut self, clause: &str) -> Result<ForeignKeyAction, SqlError> {
+        if self.eat_word("no") {
+            self.expect_word("action")?;
+            Ok(ForeignKeyAction::NoAction)
+        }
+        else if self.eat_word("restrict") {
+            Ok(ForeignKeyAction::Restrict)
+        }
+        else if self.eat_word("cascade") {
+            Err(self.unsupported_foreign_key_action(clause, "CASCADE"))
+        }
+        else if self.eat_word("set") {
+            if self.eat_word("null") {
+                Err(self.unsupported_foreign_key_action(clause, "SET NULL"))
+            }
+            else if self.eat_word("default") {
+                Err(self.unsupported_foreign_key_action(clause, "SET DEFAULT"))
+            }
+            else {
+                Err(self.error("syntax", format!("expected `NULL` or `DEFAULT` after `SET` in `ON {clause}`")))
+            }
+        }
+        else {
+            Err(self.error("syntax", format!("expected a referential action after `ON {clause}`")))
+        }
+    }
+
+    fn unsupported_foreign_key_action(&self, clause: &str, action: &str) -> SqlError {
+        let mut error = self.error(
+            "unsupported-foreign-key-action",
+            format!("`ON {clause} {action}` is not supported: cascading referential actions are not implemented"),
+        );
+        error.clause = Some(action.to_string());
+        error
+    }
+
+    /// Reads a parenthesized column-name list, as in `(a, b)`.
+    fn column_list(&mut self) -> Result<Vec<String>, SqlError> {
+        self.expect_char(&Token::LParen)?;
+        if self.peek() == Some(&Token::RParen) {
+            return Err(self.error("syntax", "near \")\": syntax error"));
+        }
+        let mut names = Vec::new();
+        loop {
+            names.push(self.name()?);
+            if self.peek() == Some(&Token::Comma) {
+                self.at += 1;
+                continue;
+            }
+            break;
+        }
+        self.expect_char(&Token::RParen)?;
+        Ok(names)
     }
 
     /// Reads a column's declared type: type-name words plus an optional
