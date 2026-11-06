@@ -4,7 +4,7 @@
 //! never opens a file and never imports an upstream SQLite engine.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ColumnSpec, DropIndexOutcome, RecordLimits, SchemaObjectKind, SqliteWriter, TableLimits, TextEncoding, UpdateValue, decode_library_version,
@@ -82,6 +82,7 @@ impl ExecResult {
     }
 }
 
+#[derive(Clone)]
 struct TableDef {
     /// Name exactly as written in `CREATE TABLE`.
     name: String,
@@ -100,6 +101,23 @@ struct TableDef {
     /// `STRICT` table option was present, so every non-NULL value has to
     /// conform to its column's declared type after affinity.
     strict: bool,
+    /// The table belongs to the temp schema and is not stored in the image.
+    temp: bool,
+}
+
+/// One `CREATE TEMP TABLE` and its in-memory rows.
+struct TempTable {
+    def: TableDef,
+    /// `sqlite_temp_master.sql` text: the statement without `TEMP`, exactly
+    /// like SQLite stores it.
+    sql: String,
+    /// Root page of the temp b-tree, allocated the same way SQLite's temp
+    /// database allocates pages.
+    rootpage: u32,
+    /// `sqlite_temp_master.rowid`, a monotonic insertion counter.
+    master_rowid: i64,
+    /// Declared column values keyed by rowid, in ascending rowid order.
+    rows: BTreeMap<i64, Vec<Cell>>,
 }
 
 /// One resolved `REFERENCES` clause of a table.
@@ -141,7 +159,7 @@ impl TableDef {
     }
 }
 
-/// One resolved `CHECK` constraint of a table.
+#[derive(Clone)]
 struct CheckDef {
     /// `CONSTRAINT name CHECK (...)` name, echoed instead of the expression.
     name: Option<String>,
@@ -390,6 +408,21 @@ pub struct Engine {
     views: BTreeMap<String, ViewDef>,
     /// Triggers keyed by lowercase name, shared with the other object names.
     triggers: BTreeMap<String, TriggerDef>,
+    /// `CREATE TEMP TABLE` definitions and their rows. Temp tables live in a
+    /// separate schema that disappears with the connection, so they never
+    /// touch the persistent image or `sqlite_master`.
+    temp_tables: Vec<TempTable>,
+    /// Lowercase temp table name to its position in [`Engine::temp_tables`].
+    /// Lookups search this map before [`Engine::table_lookup`], matching
+    /// SQLite's schema search order.
+    temp_lookup: BTreeMap<String, usize>,
+    /// First unallocated page of the temp database, starting at 2 like every
+    /// fresh SQLite database.
+    temp_next_page: u32,
+    /// Pages freed by `DROP TABLE` and reusable by the next temp object.
+    temp_free_pages: BTreeSet<u32>,
+    /// Next `sqlite_temp_master.rowid`, monotonic like SQLite's.
+    temp_next_rowid: i64,
     /// Lowercase names of the triggers whose body is executing right now.
     /// With SQLite's default `recursive_triggers = OFF` a trigger program is
     /// not re-invoked by changes it caused itself, directly or indirectly,
@@ -436,6 +469,11 @@ impl Engine {
             indexes: BTreeMap::new(),
             views: BTreeMap::new(),
             triggers: BTreeMap::new(),
+            temp_tables: Vec::new(),
+            temp_lookup: BTreeMap::new(),
+            temp_next_page: 2,
+            temp_free_pages: BTreeSet::new(),
+            temp_next_rowid: 1,
             active_triggers: Vec::new(),
             parameters: Vec::new(),
             foreign_keys: true,
@@ -650,6 +688,7 @@ impl Engine {
             checks: resolved_checks,
             foreign_keys: resolved_foreign_keys,
             strict,
+            temp: false,
         })
     }
 
@@ -755,7 +794,20 @@ impl Engine {
                 }
                 Ok((master_labels(), rows, true))
             }
-            SystemTable::TempMaster => Ok((master_labels(), Vec::new(), true)),
+            SystemTable::TempMaster => {
+                let mut rows = Vec::with_capacity(self.temp_tables.len());
+                for table in &self.temp_tables {
+                    rows.push(vec![
+                        Cell::Text("table".to_string()),
+                        Cell::Text(table.def.name.clone()),
+                        Cell::Text(table.def.name.clone()),
+                        Cell::Integer(i64::from(table.rootpage)),
+                        Cell::Text(table.sql.clone()),
+                        Cell::Integer(table.master_rowid),
+                    ]);
+                }
+                Ok((master_labels(), rows, true))
+            }
             SystemTable::Sequence => {
                 let present = self
                     .writer
@@ -840,9 +892,38 @@ impl Engine {
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         match statement {
             Statement::Transaction { action } => self.transaction(action),
-            Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, sql } => {
+            Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, temp, sql } => {
                 let key = name.to_ascii_lowercase();
                 check_reserved_object_name(&name, "create-table")?;
+                if temp {
+                    // The temp schema owns a separate namespace: a main object
+                    // with the same name can coexist and temp wins in name
+                    // resolution.
+                    if self.temp_lookup.contains_key(&key) {
+                        if if_not_exists {
+                            return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 0 });
+                        }
+                        return Err(SqlError::new("table-exists", format!("table `{name}` already exists")).in_statement("create-table"));
+                    }
+                    let mut def = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict)?;
+                    def.temp = true;
+                    // SQLite reuses a freed temp page when one is available
+                    // and otherwise extends the temp database by one page.
+                    let rootpage = match self.temp_free_pages.pop_first() {
+                        Some(page) => page,
+                        None => {
+                            let page = self.temp_next_page;
+                            self.temp_next_page += 1;
+                            page
+                        }
+                    };
+                    let master_rowid = self.temp_next_rowid;
+                    self.temp_next_rowid += 1;
+                    let position = self.temp_tables.len();
+                    self.temp_lookup.insert(key, position);
+                    self.temp_tables.push(TempTable { def, sql, rootpage, master_rowid, rows: BTreeMap::new() });
+                    return Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 1 });
+                }
                 if self.indexes.contains_key(&key) {
                     return Err(SqlError::new("index-exists", format!("there is already an index named `{name}`")).in_statement("create-table"));
                 }
@@ -978,11 +1059,24 @@ impl Engine {
                 if self.views.contains_key(&key) {
                     return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("insert"));
                 }
-                let position = *self
-                    .table_lookup
-                    .get(&key)
-                    .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("insert"))?;
-                let def = &self.tables[position];
+                let temp_position = self.temp_lookup.get(&key).copied();
+                let main_position = match temp_position {
+                    Some(_) => None,
+                    None => Some(
+                        *self
+                            .table_lookup
+                            .get(&key)
+                            .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("insert"))?,
+                    ),
+                };
+                // Temp tables are mutated in memory, so their definition is
+                // cloned: the loop below needs the catalog while it borrows
+                // the temp row map mutably.
+                let def_storage = match temp_position {
+                    Some(position) => self.temp_tables[position].def.clone(),
+                    None => self.tables[main_position.expect("main table resolved")].clone(),
+                };
+                let def = &def_storage;
                 let returning_shape = TargetShape::new(def, &table);
                 let returning = match &returning {
                     Some(items) => Some(returning_shape.plan(def, items, "insert")?),
@@ -1020,7 +1114,12 @@ impl Engine {
                 }
                 // One row at a time inside a transaction: a failing `CHECK`
                 // must undo every row of a multi-row statement, as SQLite does.
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                // Temp tables snapshot their row map instead of opening one.
+                let temp_snapshot = temp_position.map(|position| self.temp_tables[position].rows.clone());
+                if temp_position.is_none() {
+                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                }
+                let temp_keys = if temp_position.is_some() { self.unique_keys(def, &key) } else { Vec::new() };
                 let check_shape = ScopeShape { columns: Vec::new() };
                 let check_budget = Budget::new();
                 let mut rowids = Vec::with_capacity(slots_by_row.len());
@@ -1028,11 +1127,23 @@ impl Engine {
                 let mut returned: Vec<Vec<Cell>> = Vec::new();
                 let mut failure = None;
                 for slots in &slots_by_row {
-                    let rowid = match self.writer.insert(&table, slots) {
-                        Ok(rowid) => rowid,
-                        Err(error) => {
-                            failure = Some(SqlError::new("storage", error.to_string()).in_statement("insert"));
-                            break;
+                    let rowid = if let Some(position) = temp_position {
+                        let table = &mut self.temp_tables[position];
+                        match temp_insert_row(def, &mut table.rows, slots, &temp_keys) {
+                            Ok(rowid) => rowid,
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    else {
+                        match self.writer.insert(&table, slots) {
+                            Ok(rowid) => rowid,
+                            Err(error) => {
+                                failure = Some(SqlError::new("storage", error.to_string()).in_statement("insert"));
+                                break;
+                            }
                         }
                     };
                     let cells = check_row(def, slots, rowid);
@@ -1099,10 +1210,17 @@ impl Engine {
                     self.last_insert_rowid = rowid;
                 }
                 if let Some(error) = failure {
-                    let _ = self.writer.rollback();
+                    match (temp_position, temp_snapshot) {
+                        (Some(position), Some(snapshot)) => self.temp_tables[position].rows = snapshot,
+                        _ => {
+                            let _ = self.writer.rollback();
+                        }
+                    }
                     return Err(error);
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                if temp_position.is_none() {
+                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                }
                 // Explicit indexes and the automatic ones built for column-level
                 // `PRIMARY KEY` / `UNIQUE` both live only as key sets until they
                 // are materialized into b-tree pages, so a write to either kind
@@ -1114,7 +1232,7 @@ impl Engine {
                         .iter()
                         .enumerate()
                         .any(|(position, column)| (column.primary_key || column.unique) && Some(position) != aliased);
-                if constraint_indexed || self.indexes.values().any(|index| index.table == key) {
+                if temp_position.is_none() && (constraint_indexed || self.indexes.values().any(|index| index.table == key)) {
                     self.writer
                         .materialize_indexes()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
@@ -1189,11 +1307,20 @@ impl Engine {
                 if self.views.contains_key(&key) {
                     return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("update"));
                 }
-                let position = *self
-                    .table_lookup
-                    .get(&key)
-                    .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("update"))?;
-                let def = &self.tables[position];
+                let temp_position = self.temp_lookup.get(&key).copied();
+                let main_position = match temp_position {
+                    Some(_) => None,
+                    None => Some(
+                        *self.table_lookup.get(&key).ok_or_else(|| {
+                            SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("update")
+                        })?,
+                    ),
+                };
+                let def_storage = match temp_position {
+                    Some(position) => self.temp_tables[position].def.clone(),
+                    None => self.tables[main_position.expect("main table resolved")].clone(),
+                };
+                let def = &def_storage;
                 let shape = TargetShape::new(def, alias.as_deref().unwrap_or(&table));
                 let mut targets: Vec<(usize, ResolvedExpr)> = Vec::with_capacity(assignments.len());
                 for assignment in &assignments {
@@ -1231,21 +1358,41 @@ impl Engine {
                         }
                     }
                 }
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
-                for (rowid, values) in &plan.writes {
-                    if let Err(error) = self.writer.update(&table, *rowid, values) {
-                        let _ = self.writer.rollback();
-                        return Err(write_failure(error, "update", def));
+                if let Some(position) = temp_position {
+                    let table = &mut self.temp_tables[position];
+                    for (rowid, values) in &plan.writes {
+                        let cells = table
+                            .rows
+                            .get_mut(rowid)
+                            .ok_or_else(|| SqlError::new("storage", "temp row disappeared").in_statement("update"))?;
+                        for (slot, value) in values.iter().enumerate() {
+                            if let crate::UpdateValue::Set(value) = value {
+                                cells[slot] = write_value_cell(value);
+                            }
+                        }
+                    }
+                }
+                else {
+                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
+                    for (rowid, values) in &plan.writes {
+                        if let Err(error) = self.writer.update(&table, *rowid, values) {
+                            let _ = self.writer.rollback();
+                            return Err(write_failure(error, "update", def));
+                        }
                     }
                 }
                 if self.foreign_keys {
                     if let Err(error) = self.check_update_foreign_keys(def, &plan, &old_rows, &assigned, "update") {
-                        let _ = self.writer.rollback();
+                        if temp_position.is_none() {
+                            let _ = self.writer.rollback();
+                        }
                         return Err(error);
                     }
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
-                if needs_index {
+                if temp_position.is_none() {
+                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
+                }
+                if temp_position.is_none() && needs_index {
                     self.writer
                         .materialize_indexes()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
@@ -1263,11 +1410,24 @@ impl Engine {
                 if self.views.contains_key(&key) {
                     return Err(SqlError::new("readonly-view", format!("cannot modify `{table}` because it is a view")).in_statement("delete"));
                 }
-                let position = *self
-                    .table_lookup
-                    .get(&key)
-                    .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("delete"))?;
-                let def = &self.tables[position];
+                let temp_position = self.temp_lookup.get(&key).copied();
+                let main_position = match temp_position {
+                    Some(_) => None,
+                    None => Some(
+                        *self
+                            .table_lookup
+                            .get(&key)
+                            .ok_or_else(|| SqlError::new("unknown-table", format!("unknown table `{table}`")).in_statement("delete"))?,
+                    ),
+                };
+                // Temp rows are removed from the in-memory map, so their
+                // definition is cloned to keep the catalog readable while the
+                // map is borrowed mutably.
+                let def_storage = match temp_position {
+                    Some(position) => self.temp_tables[position].def.clone(),
+                    None => self.tables[main_position.expect("main table resolved")].clone(),
+                };
+                let def = &def_storage;
                 let shape = TargetShape::new(def, alias.as_deref().unwrap_or(&table));
                 let predicate = shape.resolve_optional(filter.as_ref(), "delete")?;
                 let returning_shape = TargetShape::new(def, &table);
@@ -1281,21 +1441,40 @@ impl Engine {
                 // The deleted rows' referenced keys are only visible before the
                 // removal, so the snapshot is taken ahead of the transaction.
                 let old_rows = self.live_rows(def, "delete")?;
-                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
-                for rowid in &plan.removed {
-                    if let Err(error) = self.writer.delete(&table, *rowid) {
-                        let _ = self.writer.rollback();
-                        return Err(write_failure(error, "delete", def));
+                // A temp table snapshots its row map instead of opening a
+                // writer transaction, so a failing referential check undoes the
+                // removal exactly like a rollback would.
+                let temp_snapshot = temp_position.map(|position| self.temp_tables[position].rows.clone());
+                if let Some(position) = temp_position {
+                    let table = &mut self.temp_tables[position];
+                    for rowid in &plan.removed {
+                        table.rows.remove(rowid);
+                    }
+                }
+                else {
+                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
+                    for rowid in &plan.removed {
+                        if let Err(error) = self.writer.delete(&table, *rowid) {
+                            let _ = self.writer.rollback();
+                            return Err(write_failure(error, "delete", def));
+                        }
                     }
                 }
                 if self.foreign_keys {
                     if let Err(error) = self.check_delete_foreign_keys(def, &old_rows, &plan.removed, "delete") {
-                        let _ = self.writer.rollback();
+                        match (temp_position, temp_snapshot) {
+                            (Some(position), Some(snapshot)) => self.temp_tables[position].rows = snapshot,
+                            _ => {
+                                let _ = self.writer.rollback();
+                            }
+                        }
                         return Err(error);
                     }
                 }
-                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
-                if needs_index {
+                if temp_position.is_none() {
+                    self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
+                }
+                if temp_position.is_none() && needs_index {
                     self.writer
                         .materialize_indexes()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
@@ -1341,6 +1520,18 @@ impl Engine {
             Statement::DropTable { name, if_exists } => {
                 if is_schema_table(&name) {
                     return Err(SqlError::new("readonly-system-table", format!("table {name} may not be dropped")).in_statement("drop-table"));
+                }
+                let key = name.to_ascii_lowercase();
+                // The temp schema is searched before main, so `DROP TABLE`
+                // removes the temp object when both schemas share the name.
+                if let Some(position) = self.temp_lookup.get(&key).copied() {
+                    let dropped = self.temp_tables.remove(position);
+                    // The freed page goes back to the temp allocator, so the
+                    // next temp table reuses it like SQLite does.
+                    self.temp_free_pages.insert(dropped.rootpage);
+                    self.temp_lookup.remove(&key);
+                    self.reindex_temp_tables();
+                    return Ok(ExecResult { statement: "drop-table", columns: Vec::new(), rows: Vec::new(), affected: 1 });
                 }
                 let objects = self.schema_objects("drop-table")?;
                 let present = objects.iter().any(|object| object.kind == SchemaObjectKind::Table && object.name.eq_ignore_ascii_case(&name));
@@ -1432,6 +1623,14 @@ impl Engine {
         self.table_lookup.clear();
         for (position, table) in self.tables.iter().enumerate() {
             self.table_lookup.insert(table.name.to_ascii_lowercase(), position);
+        }
+    }
+
+    /// Rebuilds the temp schema name map after a temp table is removed.
+    fn reindex_temp_tables(&mut self) {
+        self.temp_lookup.clear();
+        for (position, table) in self.temp_tables.iter().enumerate() {
+            self.temp_lookup.insert(table.def.name.to_ascii_lowercase(), position);
         }
     }
 
@@ -1761,6 +1960,13 @@ impl Engine {
 
     /// Reads every row of `def`, decoded and sorted by rowid.
     fn live_rows(&self, def: &TableDef, statement: &'static str) -> Result<Vec<(i64, Vec<Cell>)>, SqlError> {
+        if def.temp {
+            let position = *self
+                .temp_lookup
+                .get(&def.name.to_ascii_lowercase())
+                .ok_or_else(|| SqlError::new("storage", format!("temp table `{}` disappeared", def.name)).in_statement(statement))?;
+            return Ok(self.temp_tables[position].rows.iter().map(|(rowid, cells)| (*rowid, cells.clone())).collect());
+        }
         let stored = self
             .writer
             .table_rows(&def.name, TableLimits::default())
@@ -2023,7 +2229,7 @@ impl Engine {
             }
         }
         for index in self.indexes.values() {
-            if index.table == table_key && index.unique {
+            if !def.temp && index.table == table_key && index.unique {
                 keys.push(UniqueKey::Columns(index.columns.clone(), label(&index.columns)));
             }
         }
@@ -2039,7 +2245,7 @@ impl Engine {
                 .iter()
                 .enumerate()
                 .any(|(position, column)| (column.primary_key || column.unique) && Some(position) != def.rowid_alias)
-            || self.indexes.values().any(|index| index.table == table_key)
+            || (!def.temp && self.indexes.values().any(|index| index.table == table_key))
     }
 
     /// Plans one `UPDATE` without touching storage: every right-hand side is
@@ -2261,6 +2467,19 @@ impl Engine {
                         None => result.columns.clone(),
                     };
                     (SourceColumns::Materialized { names, rowid: false }, result.rows)
+                }
+                else if let Some(position) = self.temp_lookup.get(&key).copied() {
+                    let def = &self.temp_tables[position].def;
+                    let decoded = self.temp_tables[position]
+                        .rows
+                        .iter()
+                        .map(|(rowid, cells)| {
+                            let mut cells = cells.clone();
+                            cells.push(Cell::Integer(*rowid));
+                            cells
+                        })
+                        .collect::<Vec<Vec<Cell>>>();
+                    (SourceColumns::Table(def), decoded)
                 }
                 else {
                     let position = *self
@@ -4146,6 +4365,7 @@ impl<'a> Relation<'a> {
 
 /// A projection / `WHERE` / `ORDER BY` expression with every column resolved
 /// to a merged row index.
+#[derive(Clone)]
 enum ResolvedExpr {
     /// Value of a bound parameter placeholder, or `NULL` when the host did not
     /// supply one for that slot.
@@ -6443,6 +6663,7 @@ fn resolve_checks(
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         strict: false,
+        temp: false,
     };
     let source = Source {
         label: table.to_string(),
@@ -6715,6 +6936,45 @@ fn cell_write_value(cell: &Cell) -> crate::WriteValue {
         Cell::Text(value) => crate::WriteValue::Text(value.clone()),
         Cell::Blob(value) => crate::WriteValue::Blob(value.clone()),
     }
+}
+
+/// Inserts one row into an in-memory temp table and returns its rowid.
+///
+/// The rowid is explicit when the table has an `INTEGER PRIMARY KEY` alias and
+/// the statement supplied one, and `max(rowid) + 1` otherwise. NOT NULL and the
+/// primary key / UNIQUE keys are enforced here because temp tables never reach
+/// the format-3 writer.
+fn temp_insert_row(
+    def: &TableDef,
+    rows: &mut BTreeMap<i64, Vec<Cell>>,
+    slots: &[Option<crate::WriteValue>],
+    keys: &[UniqueKey],
+) -> Result<i64, SqlError> {
+    let mut rowid = rows.keys().next_back().copied().unwrap_or(0) + 1;
+    if let Some(alias) = def.rowid_alias {
+        match slots.get(alias).and_then(|slot| slot.as_ref()) {
+            Some(crate::WriteValue::Integer(value)) => rowid = *value,
+            Some(crate::WriteValue::Null) | None => {}
+            Some(_) => return Err(SqlError::new("datatype-mismatch", "datatype mismatch").in_statement("insert")),
+        }
+    }
+    let cells = check_row(def, slots, rowid);
+    // `check_row` appends the rowid as a hidden slot for CHECK/RETURNING
+    // evaluation; the stored temp row keeps only the declared columns and the
+    // row map key carries the rowid.
+    let cells: Vec<Cell> = cells.into_iter().take(def.columns.len()).collect();
+    for (position, column) in def.columns.iter().enumerate() {
+        if column.not_null && matches!(cells[position], Cell::Null) {
+            return Err(SqlError::new("constraint-failed", format!("NOT NULL constraint failed: {}.{}", def.name, column.name))
+                .in_statement("insert"));
+        }
+    }
+    let live: Vec<(i64, Vec<Cell>)> = rows.iter().map(|(rowid, cells)| (*rowid, cells.clone())).collect();
+    if let Some(label) = unique_conflict(keys, &cells, rowid, &live, i64::MIN) {
+        return Err(SqlError::new("unique-constraint", format!("UNIQUE constraint failed: {label}")).in_statement("insert"));
+    }
+    rows.insert(rowid, cells);
+    Ok(rowid)
 }
 
 /// Reports the first uniqueness rule the candidate row violates against the
@@ -8246,6 +8506,51 @@ mod tests {
         );
         engine.execute("CREATE TABLE z (a TEXT CHECK (a <> ''), b TEXT)").expect("column check");
         engine.execute_one("ALTER TABLE z DROP COLUMN a").expect("column check belongs to the column");
+    }
+
+    #[test]
+    fn temp_tables_shadow_main_and_vanish_with_the_engine() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TEMP TABLE t (a INTEGER PRIMARY KEY, b TEXT)").expect("create temp");
+        assert_eq!(
+            engine.execute_one("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_temp_master").expect("temp master").rows,
+            vec![vec![
+                text("table"),
+                text("t"),
+                text("t"),
+                Cell::Integer(2),
+                text("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"),
+            ]]
+        );
+        assert!(engine.execute_one("SELECT name FROM sqlite_master").expect("master").rows.is_empty());
+        // Both schemas may own the name, and the temp table answers first.
+        engine.execute("CREATE TABLE t (a INTEGER)").expect("main create");
+        engine.execute("INSERT INTO t VALUES (9, 'temp')").expect("temp insert");
+        assert_eq!(engine.execute_one("SELECT b FROM t").expect("select").rows, vec![vec![text("temp")]]);
+        engine.execute_one("UPDATE t SET b = 'changed'").expect("temp update");
+        assert_eq!(engine.execute_one("SELECT b FROM t").expect("select").rows, vec![vec![text("changed")]]);
+        engine.execute_one("DELETE FROM t").expect("temp delete");
+        assert!(engine.execute_one("SELECT a FROM t").expect("select").rows.is_empty());
+        // `DROP TABLE` removes the temp object first and leaves main alone.
+        engine.execute_one("DROP TABLE t").expect("drop temp");
+        assert!(engine.execute_one("SELECT name FROM sqlite_temp_master").expect("temp master").rows.is_empty());
+        assert_eq!(engine.execute_one("SELECT name FROM sqlite_master").expect("master").rows, vec![vec![text("t")]]);
+        engine.execute("INSERT INTO t VALUES (1)").expect("main insert");
+        // The temp schema belongs to the connection: a fresh engine is empty.
+        let mut fresh = Engine::new(None).expect("fresh engine");
+        assert!(fresh.execute_one("SELECT name FROM sqlite_temp_master").expect("temp master").rows.is_empty());
+    }
+
+    #[test]
+    fn temp_pages_are_reused_after_a_drop() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TEMP TABLE a (x INTEGER); CREATE TEMP TABLE b (y INTEGER)").expect("create");
+        engine.execute_one("DROP TABLE a").expect("drop");
+        engine.execute("CREATE TEMP TABLE c (z INTEGER)").expect("create again");
+        assert_eq!(
+            engine.execute_one("SELECT name, rootpage FROM sqlite_temp_master").expect("temp master").rows,
+            vec![vec![text("b"), Cell::Integer(3)], vec![text("c"), Cell::Integer(2)]]
+        );
     }
 
     #[test]
