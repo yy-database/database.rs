@@ -16,7 +16,7 @@ use super::json_string;
 use super::sql::{
     AggregateFunction, AlterAction, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm, Expr,
     ForeignKey, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore,
-    SelectItems, Statement, TableRef, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column,
+    SelectItems, Statement, TableRef, TransactionAction, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column,
     rewrite_create_index_table, rewrite_create_table_column, rewrite_create_table_name, statement_references,
 };
 
@@ -321,6 +321,17 @@ pub struct Engine {
     /// `sqlite3_last_insert_rowid`. It starts at 0 for every connection and
     /// only changes when an insert writes at least one row.
     last_insert_rowid: i64,
+    /// Open explicit transaction, or `None` in autocommit. Savepoint names are
+    /// stored outermost first.
+    transaction: Option<TransactionState>,
+}
+
+/// Explicit transaction bookkeeping, mirroring the writer's snapshot levels.
+struct TransactionState {
+    /// `BEGIN` opened the transaction rather than a bare `SAVEPOINT`.
+    from_begin: bool,
+    /// Open savepoint names, outermost first.
+    savepoints: Vec<String>,
 }
 
 impl Engine {
@@ -343,9 +354,100 @@ impl Engine {
             parameters: Vec::new(),
             foreign_keys: true,
             last_insert_rowid: 0,
+            transaction: None,
         };
         engine.load_catalog()?;
         Ok(engine)
+    }
+
+    /// Applies one explicit transaction control statement. Every scope keeps a
+    /// writer snapshot level, so statements stay atomic inside a wider
+    /// transaction and a rollback only undoes the scope it names.
+    fn transaction(&mut self, action: TransactionAction) -> Result<ExecResult, SqlError> {
+        let statement = action_name(&action);
+        match action {
+            TransactionAction::Begin => {
+                if self.transaction.is_some() {
+                    return Err(SqlError::new("transaction-active", "cannot start a transaction within a transaction")
+                        .in_statement("begin"));
+                }
+                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("begin"))?;
+                self.transaction = Some(TransactionState { from_begin: true, savepoints: Vec::new() });
+            }
+            TransactionAction::Commit => {
+                if self.transaction.take().is_none() {
+                    return Err(SqlError::new("transaction-missing", "cannot commit - no transaction is active")
+                        .in_statement("commit"));
+                }
+                self.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("commit"))?;
+            }
+            TransactionAction::Rollback => {
+                if self.transaction.take().is_none() {
+                    return Err(SqlError::new("transaction-missing", "cannot rollback - no transaction is active")
+                        .in_statement("rollback"));
+                }
+                self.writer.rollback_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback"))?;
+                self.reload_catalog()?;
+            }
+            TransactionAction::Savepoint(name) => {
+                if self.transaction.is_none() {
+                    // A savepoint outside `BEGIN` opens its own transaction.
+                    self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                    self.transaction = Some(TransactionState { from_begin: false, savepoints: Vec::new() });
+                }
+                self.writer
+                    .savepoint(&name)
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("savepoint"))?;
+                self.transaction.as_mut().expect("savepoint opened a transaction").savepoints.push(name);
+            }
+            TransactionAction::Release(name) => {
+                let index = self.savepoint_position(&name, "release")?;
+                self.writer
+                    .release(&name)
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
+                let closing = {
+                    let state = self.transaction.as_mut().expect("an open savepoint implies a transaction");
+                    state.savepoints.truncate(index);
+                    state.savepoints.is_empty() && !state.from_begin
+                };
+                if closing {
+                    // Releasing the last savepoint of a transaction that no
+                    // `BEGIN` opened commits it, as in SQLite.
+                    self.writer.commit_all().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("release"))?;
+                    self.transaction = None;
+                }
+            }
+            TransactionAction::RollbackTo(name) => {
+                let index = self.savepoint_position(&name, "rollback-to")?;
+                self.writer
+                    .rollback_to(&name)
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("rollback-to"))?;
+                self.reload_catalog()?;
+                self.transaction.as_mut().expect("an open savepoint implies a transaction").savepoints.truncate(index + 1);
+            }
+        }
+        Ok(ExecResult { statement, columns: Vec::new(), rows: Vec::new(), affected: 0 })
+    }
+
+    /// Finds an open savepoint by name and reports SQLite's missing-savepoint
+    /// error when it is absent. Names are case insensitive.
+    fn savepoint_position(&self, name: &str, statement: &'static str) -> Result<usize, SqlError> {
+        let missing = || SqlError::new("savepoint-missing", format!("no such savepoint: {name}")).in_statement(statement);
+        let state = self.transaction.as_ref().ok_or_else(missing)?;
+        state
+            .savepoints
+            .iter()
+            .rposition(|saved| saved.eq_ignore_ascii_case(name))
+            .ok_or_else(missing)
+    }
+
+    /// Rebuilds the in-memory catalog after storage rolled back, so schema
+    /// changes undone by the rollback also disappear from later statements.
+    fn reload_catalog(&mut self) -> Result<(), SqlError> {
+        self.tables.clear();
+        self.table_lookup.clear();
+        self.indexes.clear();
+        self.load_catalog()
     }
 
     /// Replays the stored `CREATE TABLE` / `CREATE INDEX` text of every
@@ -563,6 +665,7 @@ impl Engine {
 
     fn run_statement(&mut self, statement: Statement) -> Result<ExecResult, SqlError> {
         match statement {
+            Statement::Transaction { action } => self.transaction(action),
             Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, sql } => {
                 let key = name.to_ascii_lowercase();
                 check_reserved_object_name(&name, "create-table")?;
@@ -1683,7 +1786,7 @@ impl Engine {
         if !compounds.is_empty() {
             return self.compound_select(first, compounds, order, limit, outer, budget, ctes);
         }
-        let SelectCore { items, from, filter, group, having, windows: named } = first;
+        let SelectCore { distinct, items, from, filter, group, having, windows: named } = first;
         // Each `FROM` item becomes one source over already materialized rows:
         // a base table is decoded from storage, a CTE comes from the `WITH`
         // environment, and a derived table is evaluated once through this same
@@ -1907,8 +2010,9 @@ impl Engine {
         }
 
         // A `LIMIT` may stop the product early only when no sort, join, aggregate
-        // or window is pending.
-        let take = if keys.is_empty() && !joined && !grouped && !windowed {
+        // or window is pending. `DISTINCT` reads every row because collapsing
+        // duplicates before `LIMIT` needs the whole set.
+        let take = if keys.is_empty() && !joined && !grouped && !windowed && !*distinct {
             match limit {
                 Some((offset, Some(count))) => offset.saturating_add(count),
                 _ => usize::MAX,
@@ -2010,6 +2114,9 @@ impl Engine {
                 decorated.sort_by(|left, right| compare_ordered(&window_keys[left.2], &window_keys[right.2], &window_desc));
             }
             let mut out: Vec<Vec<Cell>> = decorated.into_iter().map(|(_, cells, _)| cells).collect();
+            if *distinct {
+                out = retain_first_distinct(out);
+            }
             truncate_rows(&mut out, limit);
             return Ok(ExecResult { statement: "select", columns: labels, rows: out, affected: 0 });
         }
@@ -2054,6 +2161,43 @@ impl Engine {
             // Without a trailing `ORDER BY`, SQLite's row order is the first
             // window's sort order, with later windows breaking its ties.
             order.sort_by(|left, right| compare_ordered(&window_keys[*left], &window_keys[*right], &window_desc));
+        }
+        if *distinct && !matches!(items, SelectItems::CountAll) {
+            // Every row's output has to be materialized before `LIMIT`, because
+            // `DISTINCT` collapses duplicates across the whole set.
+            let mut outputs: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+            for (index, row) in rows.iter().enumerate() {
+                let cells = match items {
+                    SelectItems::Named(_) => {
+                        let nodes = projection.as_ref().expect("named projection is resolved up front");
+                        let row_ctx = EvalContext {
+                            engine: self,
+                            outer,
+                            current: &shape,
+                            aggregates: &empty_aggregates,
+                            windows: &window_values,
+                            window_row: index,
+                            budget,
+                            ctes,
+                        };
+                        nodes.iter().map(|node| node.eval(row, &row_ctx)).collect::<Result<Vec<_>, _>>()?
+                    }
+                    SelectItems::Star => relation.visible_row(row),
+                    SelectItems::CountAll => unreachable!("count(*) keeps a single row"),
+                };
+                outputs.push(cells);
+            }
+            let mut seen: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+            let mut kept: Vec<usize> = Vec::with_capacity(rows.len());
+            for &index in &order {
+                if !seen.contains(&outputs[index]) {
+                    seen.push(outputs[index].clone());
+                    kept.push(index);
+                }
+            }
+            let (start, end) = limit_range(kept.len(), limit);
+            let out: Vec<Vec<Cell>> = kept[start..end].iter().map(|index| outputs[*index].clone()).collect();
+            return Ok(ExecResult { statement: "select", columns: labels, rows: out, affected: 0 });
         }
         let (start, end) = limit_range(rows.len(), limit);
         let mut final_rows: Vec<Vec<Cell>> = Vec::with_capacity(end.saturating_sub(start));
@@ -4465,6 +4609,19 @@ fn limit_range(len: usize, limit: Option<(usize, Option<usize>)>) -> (usize, usi
     }
 }
 
+/// Statement name reported for one transaction action, matching
+/// [`Statement::name`].
+fn action_name(action: &TransactionAction) -> &'static str {
+    match action {
+        TransactionAction::Begin => "begin",
+        TransactionAction::Commit => "commit",
+        TransactionAction::Rollback => "rollback",
+        TransactionAction::Savepoint(_) => "savepoint",
+        TransactionAction::Release(_) => "release",
+        TransactionAction::RollbackTo(_) => "rollback-to",
+    }
+}
+
 /// Drops the rows a limit pair hides.
 fn truncate_rows(rows: &mut Vec<Vec<Cell>>, limit: Option<(usize, Option<usize>)>) {
     if let Some(limit) = limit {
@@ -4472,6 +4629,22 @@ fn truncate_rows(rows: &mut Vec<Vec<Cell>>, limit: Option<(usize, Option<usize>)
         rows.truncate(end);
         rows.drain(..start);
     }
+}
+
+/// Keeps the first row for every distinct output value, preserving order.
+///
+/// Values are compared with `Cell`'s own equality, the same semantics grouping
+/// uses, so integers and reals stay distinct exactly as SQLite keeps them.
+fn retain_first_distinct(rows: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
+    let mut seen: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !seen.contains(&row) {
+            seen.push(row.clone());
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// Computes one whole-result aggregate over the filtered rows.
@@ -5384,6 +5557,21 @@ fn arithmetic(op: BinaryOp, left: &Cell, right: &Cell) -> Cell {
                 None => Cell::Real(left as f64 / right as f64),
             },
             (left, right) => Cell::Real(number_f64(left) / number_f64(right)),
+        },
+        // `%` converts both operands to 64-bit integers, keeps the dividend's
+        // sign, returns a real when either operand was real, and yields NULL
+        // when the truncated divisor is zero.
+        BinaryOp::Modulo => {
+            let real = matches!(&left, Number::Real(_)) || matches!(&right, Number::Real(_));
+            let (left, right) = (number_i64(left), number_i64(right));
+            if right == 0 {
+                Cell::Null
+            }
+            else {
+                // `i64::MIN % -1` overflows, and SQLite answers `0` for it.
+                let remainder = left.checked_rem(right).unwrap_or(0);
+                if real { Cell::Real(remainder as f64) } else { Cell::Integer(remainder) }
+            }
         },
         // `||` never reaches arithmetic: it is evaluated by its own branch.
         BinaryOp::Concat => Cell::Null,
@@ -7652,5 +7840,42 @@ mod tests {
         assert_eq!(mixed.message, "circular reference: c");
         let self_seed = engine.execute_one("WITH c(x) AS (SELECT x FROM c) SELECT x FROM c").expect_err("seed reads itself");
         assert_eq!(self_seed.message, "circular reference: c");
+    }
+
+    #[test]
+    fn transactions_restore_rows_and_schema() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute("CREATE TABLE t(a INTEGER); BEGIN; INSERT INTO t VALUES (1); CREATE TABLE gone(b INTEGER); ROLLBACK")
+            .expect("script");
+        assert_eq!(engine.execute_one("SELECT count(*) FROM t").expect("read").rows, vec![vec![Cell::Integer(0)]]);
+        assert!(engine.execute_one("SELECT b FROM gone").is_err());
+
+        engine
+            .execute("BEGIN; INSERT INTO t VALUES (2); SAVEPOINT s; INSERT INTO t VALUES (3); ROLLBACK TO s; RELEASE s; COMMIT")
+            .expect("script");
+        assert_eq!(engine.execute_one("SELECT a FROM t").expect("read").rows, vec![vec![Cell::Integer(2)]]);
+        assert_eq!(
+            engine.execute_one("COMMIT").expect_err("no transaction").message,
+            "cannot commit - no transaction is active"
+        );
+    }
+
+    #[test]
+    fn distinct_collapses_before_limit() {
+        let mut engine = engine();
+        assert_eq!(
+            engine.execute_one("SELECT DISTINCT b FROM t ORDER BY b LIMIT 2").expect("select").rows,
+            vec![vec![Cell::Null], vec![Cell::Integer(0)]]
+        );
+    }
+
+    #[test]
+    fn modulo_truncates_operands_and_keeps_the_dividend_sign() {
+        let mut engine = engine();
+        assert_eq!(
+            engine.execute_one("SELECT 7 % 3, -7 % 3, 7.5 % 2, 7 % 2.5, 5 % 0").expect("select").rows,
+            vec![vec![Cell::Integer(1), Cell::Integer(-1), Cell::Real(1.0), Cell::Real(1.0), Cell::Null]]
+        );
     }
 }

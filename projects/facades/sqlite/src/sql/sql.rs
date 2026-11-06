@@ -123,6 +123,9 @@ pub enum SelectItems {
 /// `ORDER BY` / `LIMIT` that may trail a whole compound query.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectCore {
+    /// `DISTINCT` was written: duplicate output rows are collapsed before
+    /// `ORDER BY` and `LIMIT`.
+    pub distinct: bool,
     /// Selected projection.
     pub items: SelectItems,
     /// Source table references in `FROM` order.
@@ -288,8 +291,10 @@ pub enum BinaryOp {
     Subtract,
     /// `*`.
     Multiply,
-    /// `/`.
+    /// `/`; integer division truncates toward zero.
     Divide,
+    /// `%`; the remainder keeps the dividend's sign.
+    Modulo,
     /// `||`: string concatenation, which binds tighter than `*` in SQLite.
     Concat,
     /// `<<`.
@@ -310,6 +315,7 @@ impl BinaryOp {
             Self::Subtract => "-",
             Self::Multiply => "*",
             Self::Divide => "/",
+            Self::Modulo => "%",
             Self::Concat => "||",
             Self::ShiftLeft => "<<",
             Self::ShiftRight => ">>",
@@ -1273,6 +1279,29 @@ pub enum Statement {
         /// Value as written, when the statement sets the pragma.
         value: Option<String>,
     },
+    /// `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE` and
+    /// `ROLLBACK TO SAVEPOINT`.
+    Transaction {
+        /// The one transaction action being applied.
+        action: TransactionAction,
+    },
+}
+
+/// One explicit transaction control statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransactionAction {
+    /// `BEGIN [DEFERRED | IMMEDIATE | EXCLUSIVE] [TRANSACTION]`.
+    Begin,
+    /// `COMMIT [TRANSACTION]` or `END [TRANSACTION]`.
+    Commit,
+    /// `ROLLBACK [TRANSACTION]`; the scope is the whole open transaction.
+    Rollback,
+    /// `SAVEPOINT name`.
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] name`.
+    Release(String),
+    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name`.
+    RollbackTo(String),
 }
 
 /// AST equality, needed because a subquery can appear inside an expression.
@@ -1300,6 +1329,14 @@ impl Statement {
             Self::AlterTable { .. } => "alter-table",
             Self::Select { .. } => "select",
             Self::Pragma { .. } => "pragma",
+            Self::Transaction { action } => match action {
+                TransactionAction::Begin => "begin",
+                TransactionAction::Commit => "commit",
+                TransactionAction::Rollback => "rollback",
+                TransactionAction::Savepoint(_) => "savepoint",
+                TransactionAction::Release(_) => "release",
+                TransactionAction::RollbackTo(_) => "rollback-to",
+            },
         }
     }
 }
@@ -2161,6 +2198,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Some(Token::Star) => BinaryOp::Multiply,
                 Some(Token::Operator(operator)) if operator == "/" => BinaryOp::Divide,
+                Some(Token::Operator(operator)) if operator == "%" => BinaryOp::Modulo,
                 _ => break,
             };
             self.at += 1;
@@ -2791,13 +2829,78 @@ impl<'a> Parser<'a> {
             self.kind = Some("select");
             return self.with_select();
         }
+        if self.eat_word("begin") {
+            self.kind = Some("begin");
+            return self.begin_transaction();
+        }
+        if self.eat_word("commit") || self.eat_word("end") {
+            self.kind = Some("commit");
+            return self.commit_transaction();
+        }
+        if self.eat_word("rollback") {
+            self.kind = Some("rollback");
+            return self.rollback_transaction();
+        }
+        if self.eat_word("savepoint") {
+            self.kind = Some("savepoint");
+            let name = self.savepoint_name()?;
+            self.expect_end("SAVEPOINT")?;
+            return Ok(Statement::Transaction { action: TransactionAction::Savepoint(name) });
+        }
+        if self.eat_word("release") {
+            self.kind = Some("release");
+            self.eat_word("savepoint");
+            let name = self.savepoint_name()?;
+            self.expect_end("RELEASE")?;
+            return Ok(Statement::Transaction { action: TransactionAction::Release(name) });
+        }
         let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
         Err(self.error(
             "unsupported-statement",
             format!(
-                "unsupported statement starting at {found}; this engine accepts `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`, `DROP TABLE`, `DROP INDEX`, `ALTER TABLE`, `PRAGMA foreign_keys`, and `SELECT` only"
+                "unsupported statement starting at {found}; this engine accepts `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`, `DROP TABLE`, `DROP INDEX`, `ALTER TABLE`, `PRAGMA foreign_keys`, transaction control, and `SELECT` only"
             ),
         ))
+    }
+
+    /// Reads `BEGIN [DEFERRED | IMMEDIATE | EXCLUSIVE] [TRANSACTION]`. The
+    /// locking mode is accepted and ignored because this engine serializes
+    /// every writer itself.
+    fn begin_transaction(&mut self) -> Result<Statement, SqlError> {
+        if self.eat_word("deferred") || self.eat_word("immediate") || self.eat_word("exclusive") {
+            // Lock mode has no observable effect here.
+        }
+        self.eat_word("transaction");
+        self.expect_end("BEGIN")?;
+        Ok(Statement::Transaction { action: TransactionAction::Begin })
+    }
+
+    /// Reads `COMMIT [TRANSACTION]` or `END [TRANSACTION]`.
+    fn commit_transaction(&mut self) -> Result<Statement, SqlError> {
+        self.eat_word("transaction");
+        self.expect_end("COMMIT")?;
+        Ok(Statement::Transaction { action: TransactionAction::Commit })
+    }
+
+    /// Reads `ROLLBACK [TRANSACTION] [TO [SAVEPOINT] name]`.
+    fn rollback_transaction(&mut self) -> Result<Statement, SqlError> {
+        self.eat_word("transaction");
+        let action = if self.eat_word("to") {
+            self.eat_word("savepoint");
+            TransactionAction::RollbackTo(self.savepoint_name()?)
+        }
+        else {
+            TransactionAction::Rollback
+        };
+        self.expect_end("ROLLBACK")?;
+        Ok(Statement::Transaction { action })
+    }
+
+    /// Reads a savepoint name: a word or a quoted identifier.
+    fn savepoint_name(&mut self) -> Result<String, SqlError> {
+        let name = self.name()?;
+        self.reject_qualified(&name)?;
+        Ok(name)
     }
 
     /// Reads `PRAGMA <name> [= value]` or `PRAGMA <name>(value)`.
@@ -3741,6 +3844,9 @@ impl<'a> Parser<'a> {
     /// Parses one `SELECT` core, stopping before any set operator or trailing
     /// `ORDER BY` / `LIMIT`.
     fn select_core(&mut self) -> Result<SelectCore, SqlError> {
+        let distinct = self.eat_word("distinct");
+        // `SELECT ALL` is the default and changes nothing.
+        self.eat_word("all");
         let items = if self.peek() == Some(&Token::Star) {
             self.at += 1;
             SelectItems::Star
@@ -3969,7 +4075,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(SelectCore { items, from, filter, group, having, windows })
+        Ok(SelectCore { distinct, items, from, filter, group, having, windows })
     }
 
     /// Consumes a set operator keyword when one follows a core.

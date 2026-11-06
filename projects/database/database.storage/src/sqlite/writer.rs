@@ -122,6 +122,8 @@ struct IndexMeta {
 }
 
 struct Snapshot {
+    /// Savepoint name, or `None` for a plain `begin` level.
+    savepoint: Option<String>,
     pages: Vec<u8>,
     index_entries: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
     without_rowid_entries: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
@@ -142,7 +144,10 @@ pub struct SqliteWriter {
     page_size: usize,
     usable: usize,
     encoding: TextEncoding,
-    snapshot: Option<Snapshot>,
+    /// Open transaction levels, outermost first. A plain `begin` pushes an
+    /// unnamed level and a `savepoint` pushes a named one, so a statement can
+    /// roll itself back without discarding the scope its caller opened.
+    snapshots: Vec<Snapshot>,
     /// Live index keys by `sqlite_master` rowid; rebuilt into pages on save.
     index_entries: std::collections::BTreeMap<i64, std::collections::BTreeSet<Vec<u8>>>,
     /// Live WITHOUT ROWID rows by table `sqlite_master` rowid; rebuilt on save.
@@ -172,7 +177,7 @@ impl SqliteWriter {
             page_size,
             usable,
             encoding,
-            snapshot: None,
+            snapshots: Vec::new(),
             index_entries: std::collections::BTreeMap::new(),
             without_rowid_entries: std::collections::BTreeMap::new(),
             without_rowid_keys: std::collections::BTreeMap::new(),
@@ -181,7 +186,12 @@ impl SqliteWriter {
 
     /// Loads an existing SQLite main file for further mutation.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let pages = fs::read(path.as_ref()).map_err(Error::Io)?;
+        Self::from_pages(fs::read(path.as_ref()).map_err(Error::Io)?)
+    }
+
+    /// Loads an existing SQLite main-file image from raw bytes, so a host that
+    /// already holds the bytes can mutate them without a temporary file.
+    pub fn from_pages(pages: Vec<u8>) -> Result<Self> {
         let page_size = validate_database(&pages)?;
         let usable = page_size - usize::from(pages[20]);
         let encoding = match u32::from_be_bytes(pages[56..60].try_into().map_err(|_| Error::Corrupt("sqlite header too short"))?) {
@@ -194,7 +204,7 @@ impl SqliteWriter {
             page_size,
             usable,
             encoding,
-            snapshot: None,
+            snapshots: Vec::new(),
             index_entries: std::collections::BTreeMap::new(),
             without_rowid_entries: std::collections::BTreeMap::new(),
             without_rowid_keys: std::collections::BTreeMap::new(),
@@ -241,36 +251,101 @@ impl SqliteWriter {
         fs::write(path.as_ref(), &self.pages).map_err(Error::Io)
     }
 
-    /// Starts a transaction; nested transactions are rejected.
+    /// Starts a transaction level. A nested level lets a statement roll itself
+    /// back without discarding the scope its caller opened.
     pub fn begin(&mut self) -> Result<()> {
-        if self.snapshot.is_some() {
-            return Err(Error::Unsupported("sqlite writer already has an open transaction"));
-        }
-        self.snapshot = Some(Snapshot {
-            pages: self.pages.clone(),
-            index_entries: self.index_entries.clone(),
-            without_rowid_entries: self.without_rowid_entries.clone(),
-            without_rowid_keys: self.without_rowid_keys.clone(),
-        });
+        self.push_level(None);
         Ok(())
     }
 
-    /// Commits the open transaction.
+    /// Opens a named savepoint. This also starts a transaction when none is
+    /// open, matching SQLite's `SAVEPOINT` behaviour.
+    pub fn savepoint(&mut self, name: &str) -> Result<()> {
+        self.push_level(Some(name.to_string()));
+        Ok(())
+    }
+
+    /// Commits the innermost open transaction level.
     pub fn commit(&mut self) -> Result<()> {
-        if self.snapshot.take().is_none() {
+        if self.snapshots.pop().is_none() {
             return Err(Error::Unsupported("sqlite writer has no open transaction"));
         }
         Ok(())
     }
 
-    /// Rolls the image back to the state before [`SqliteWriter::begin`].
+    /// Rolls the image back to the state before the innermost `begin`.
     pub fn rollback(&mut self) -> Result<()> {
-        let snapshot = self.snapshot.take().ok_or(Error::Unsupported("sqlite writer has no open transaction"))?;
-        self.pages = snapshot.pages;
-        self.index_entries = snapshot.index_entries;
-        self.without_rowid_entries = snapshot.without_rowid_entries;
-        self.without_rowid_keys = snapshot.without_rowid_keys;
+        if self.snapshots.is_empty() {
+            return Err(Error::Unsupported("sqlite writer has no open transaction"));
+        }
+        let index = self.snapshots.len() - 1;
+        self.restore_level(index);
+        self.snapshots.pop();
         Ok(())
+    }
+
+    /// Commits every open level, ending the whole transaction.
+    pub fn commit_all(&mut self) -> Result<()> {
+        if self.snapshots.is_empty() {
+            return Err(Error::Unsupported("sqlite writer has no open transaction"));
+        }
+        self.snapshots.clear();
+        Ok(())
+    }
+
+    /// Rolls the image back to the state before the outermost level, ending the
+    /// whole transaction.
+    pub fn rollback_all(&mut self) -> Result<()> {
+        if self.snapshots.is_empty() {
+            return Err(Error::Unsupported("sqlite writer has no open transaction"));
+        }
+        self.restore_level(0);
+        self.snapshots.clear();
+        Ok(())
+    }
+
+    /// Releases a savepoint together with every savepoint opened after it.
+    /// Releasing the outermost savepoint also commits the open transaction.
+    pub fn release(&mut self, name: &str) -> Result<()> {
+        let index = self.find_savepoint(name)?;
+        self.snapshots.truncate(index);
+        Ok(())
+    }
+
+    /// Rolls the image back to a savepoint and keeps it open, so the caller can
+    /// continue in the same savepoint scope.
+    pub fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let index = self.find_savepoint(name)?;
+        self.restore_level(index);
+        self.snapshots.truncate(index + 1);
+        Ok(())
+    }
+
+    fn push_level(&mut self, savepoint: Option<String>) {
+        self.snapshots.push(Snapshot {
+            savepoint,
+            pages: self.pages.clone(),
+            index_entries: self.index_entries.clone(),
+            without_rowid_entries: self.without_rowid_entries.clone(),
+            without_rowid_keys: self.without_rowid_keys.clone(),
+        });
+    }
+
+    fn restore_level(&mut self, index: usize) {
+        let snapshot = &self.snapshots[index];
+        self.pages = snapshot.pages.clone();
+        self.index_entries = snapshot.index_entries.clone();
+        self.without_rowid_entries = snapshot.without_rowid_entries.clone();
+        self.without_rowid_keys = snapshot.without_rowid_keys.clone();
+    }
+
+    /// Finds the innermost savepoint with this name. Names are case insensitive,
+    /// as in SQLite.
+    fn find_savepoint(&self, name: &str) -> Result<usize> {
+        self.snapshots
+            .iter()
+            .rposition(|level| level.savepoint.as_deref().is_some_and(|saved| saved.eq_ignore_ascii_case(name)))
+            .ok_or(Error::Unsupported("sqlite savepoint does not exist"))
     }
 
     /// Reads the schema objects through the crate's own reader.
