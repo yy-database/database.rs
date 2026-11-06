@@ -233,9 +233,9 @@ fn insert_documents_without_id_gets_auto_object_id() {
     let command = bson_document(&[bson_string("insert", "users"), bson_string("$db", "test"), bson_array_element("documents", &[inner_doc])]);
 
     let reply = roundtrip(&mut client, 1, &command);
-    let n = extract_int64(&reply, "n");
-    let ok = extract_int32(&reply, "ok");
-    assert_eq!(ok, Some(1), "reply={reply:?}");
+    let n = extract_int32(&reply, "n");
+    let ok = extract_double(&reply, "ok");
+    assert_eq!(ok, Some(1.0), "reply={reply:?}");
     assert_eq!(n, Some(1), "reply={reply:?}");
 
     let _ = client.shutdown(Shutdown::Write);
@@ -283,10 +283,10 @@ fn delete_everything_from_collection() {
     let delete_cmd =
         bson_document(&[bson_string("delete", "users"), bson_string("$db", "test"), bson_array_element("deletes", &[delete_spec])]);
     let reply = roundtrip(&mut client, 2, &delete_cmd);
-    let deleted = extract_int64(&reply, "deletedCount");
-    assert_eq!(deleted, Some(2), "deletedCount after delete: reply={reply:?}");
-    let ok = extract_int32(&reply, "ok");
-    assert_eq!(ok, Some(1));
+    let deleted = extract_int32(&reply, "n");
+    assert_eq!(deleted, Some(2), "n after delete: reply={reply:?}");
+    let ok = extract_double(&reply, "ok");
+    assert_eq!(ok, Some(1.0));
 
     let _ = client.shutdown(Shutdown::Write);
     let _ = server.join();
@@ -303,6 +303,15 @@ fn bson_object_id(key: &str, bytes: [u8; 12]) -> Vec<u8> {
     out.extend_from_slice(key.as_bytes());
     out.push(0);
     out.extend_from_slice(&bytes);
+    out
+}
+
+/// A BSON undefined element: type 0x06 + cstring key, no payload.
+fn bson_undefined_element(key: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0x06);
+    out.extend_from_slice(key.as_bytes());
+    out.push(0);
     out
 }
 
@@ -328,10 +337,10 @@ fn different_databases_isolate_documents_of_same_collection_name() {
 
     let r1 = roundtrip(&mut client, 1, &insert_a);
     let r2 = roundtrip(&mut client, 2, &insert_b);
-    assert_eq!(extract_int32(&r1, "ok"), Some(1));
-    assert_eq!(extract_int64(&r1, "n"), Some(1));
-    assert_eq!(extract_int32(&r2, "ok"), Some(1));
-    assert_eq!(extract_int64(&r2, "n"), Some(1));
+    assert_eq!(extract_double(&r1, "ok"), Some(1.0));
+    assert_eq!(extract_int32(&r1, "n"), Some(1));
+    assert_eq!(extract_double(&r2, "ok"), Some(1.0));
+    assert_eq!(extract_int32(&r2, "n"), Some(1));
 
     // Find Alice from db_A.users by _id → should get 1 doc
     let filter_by_id = bson_document(&[bson_object_id("_id", id_a)]);
@@ -376,8 +385,8 @@ fn delete_nonexistent_object_id_returns_zero_deleted_count() {
         bson_document(&[bson_string("delete", "things"), bson_string("$db", "test"), bson_array_element("deletes", &[delete_spec])]);
 
     let reply = roundtrip(&mut client, 1, &delete_cmd);
-    assert_eq!(extract_int32(&reply, "ok"), Some(1));
-    assert_eq!(extract_int64(&reply, "deletedCount"), Some(0), "deleting missing _id must report 0");
+    assert_eq!(extract_double(&reply, "ok"), Some(1.0));
+    assert_eq!(extract_int32(&reply, "n"), Some(0), "deleting missing _id must report 0");
 
     let _ = client.shutdown(Shutdown::Write);
     let _ = server.join();
@@ -394,8 +403,8 @@ fn insert_without_id_auto_generates_object_id() {
     let insert_cmd =
         bson_document(&[bson_string("insert", "auto_col"), bson_string("$db", "test"), bson_array_element("documents", &[inner_doc])]);
     let reply = roundtrip(&mut client, 1, &insert_cmd);
-    assert_eq!(extract_int32(&reply, "ok"), Some(1));
-    assert_eq!(extract_int64(&reply, "n"), Some(1));
+    assert_eq!(extract_double(&reply, "ok"), Some(1.0));
+    assert_eq!(extract_int32(&reply, "n"), Some(1));
 
     // Find it back — empty filter scan.
     let empty_filter = bson_document(&[]);
@@ -403,6 +412,77 @@ fn insert_without_id_auto_generates_object_id() {
     let find_reply = roundtrip(&mut client, 2, &find_cmd);
     assert_eq!(extract_int32(&find_reply, "ok"), Some(1));
     assert_eq!(extract_cursor_firstbatch_len(&find_reply), Some(1));
+
+    let _ = client.shutdown(Shutdown::Write);
+    let _ = server.join();
+}
+
+#[test]
+fn write_replies_use_the_reference_field_order_and_types() {
+    // Byte-for-byte contract: `n` (int32) comes first and `ok` is `1.0` (double).
+    // A different order or an int32 `ok` is a wire-level mismatch for drivers.
+    let (mut client, server) = executor_server();
+
+    let insert = bson_document(&[
+        bson_string("insert", "shape_col"),
+        bson_string("$db", "test"),
+        bson_array_element("documents", &[bson_document(&[bson_int32("_id", 1), bson_int32("v", 1)])]),
+    ]);
+    let insert_reply = roundtrip(&mut client, 1, &insert);
+    assert_eq!(hex(&insert_reply), "18000000106e0001000000016f6b00000000000000f03f00");
+
+    let count = bson_document(&[bson_string("count", "shape_col"), bson_string("$db", "test"), bson_doc_element("query", &bson_document(&[]))]);
+    let count_reply = roundtrip(&mut client, 2, &count);
+    assert_eq!(hex(&count_reply), "18000000106e0001000000016f6b00000000000000f03f00");
+
+    let delete = bson_document(&[
+        bson_string("delete", "shape_col"),
+        bson_string("$db", "test"),
+        bson_array_element("deletes", &[bson_document(&[bson_doc_element("q", &bson_document(&[])), bson_int32("limit", 0)])]),
+    ]);
+    let delete_reply = roundtrip(&mut client, 3, &delete);
+    assert_eq!(hex(&delete_reply), "18000000106e0001000000016f6b00000000000000f03f00");
+
+    let _ = client.shutdown(Shutdown::Write);
+    let _ = server.join();
+}
+
+#[test]
+fn insert_with_undefined_id_reports_undefined_key_value() {
+    // `mongod` reports the offending `_id` verbatim in `keyValue`; an undefined
+    // `_id` must therefore come back as BSON undefined (0x06), not as a string.
+    let (mut client, server) = executor_server();
+
+    let first = bson_document(&[bson_undefined_element("_id"), bson_int32("b", 1)]);
+    let second = bson_document(&[bson_undefined_element("_id"), bson_int32("b", 2)]);
+    let insert_first =
+        bson_document(&[bson_string("insert", "undef_col"), bson_string("$db", "test"), bson_array_element("documents", &[first])]);
+    let insert_second =
+        bson_document(&[bson_string("insert", "undef_col"), bson_string("$db", "test"), bson_array_element("documents", &[second])]);
+
+    let r1 = roundtrip(&mut client, 1, &insert_first);
+    let r2 = roundtrip(&mut client, 2, &insert_second);
+    assert_eq!(extract_int32(&r1, "n"), Some(1), "reply={r1:?}");
+    assert_eq!(extract_double(&r1, "ok"), Some(1.0), "reply={r1:?}");
+    assert_eq!(extract_int32(&r2, "n"), Some(0), "reply={r2:?}");
+    assert_eq!(extract_double(&r2, "ok"), Some(1.0), "reply={r2:?}");
+
+    let write_errors = walk_bson(&r2, |elem| match elem {
+        BsonElem::Array(k, v) if k == "writeErrors" => Some(v.clone()),
+        _ => None,
+    })
+    .expect("a duplicate undefined _id must produce writeErrors");
+    let first_error = walk_bson(&write_errors, |elem| match elem {
+        BsonElem::Document(_, v) => Some(v.clone()),
+        _ => None,
+    })
+    .expect("writeErrors must carry one document");
+    let key_value = extract_document(&first_error, "keyValue").expect("writeErrors carry keyValue");
+    let undefined = walk_bson(&key_value, |elem| match elem {
+        BsonElem::Undefined(k) if k == "_id" => Some(()),
+        _ => None,
+    });
+    assert!(undefined.is_some(), "keyValue must carry BSON undefined: {key_value:?}");
 
     let _ = client.shutdown(Shutdown::Write);
     let _ = server.join();
@@ -425,10 +505,10 @@ fn insert_with_duplicate_id_reports_11000_and_keeps_the_first_document() {
     let r1 = roundtrip(&mut client, 1, &insert_v1);
     let r2 = roundtrip(&mut client, 2, &insert_v2);
 
-    assert_eq!(extract_int32(&r1, "ok"), Some(1));
-    assert_eq!(extract_int64(&r1, "n"), Some(1), "the first insert must be stored");
-    assert_eq!(extract_int32(&r2, "ok"), Some(1), "a write error is still reported with ok=1");
-    assert_eq!(extract_int64(&r2, "n"), Some(0), "the duplicate must not be counted as inserted");
+    assert_eq!(extract_double(&r1, "ok"), Some(1.0));
+    assert_eq!(extract_int32(&r1, "n"), Some(1), "the first insert must be stored");
+    assert_eq!(extract_double(&r2, "ok"), Some(1.0), "a write error is still reported with ok=1");
+    assert_eq!(extract_int32(&r2, "n"), Some(0), "the duplicate must not be counted as inserted");
 
     let write_errors = walk_bson(&r2, |elem| match elem {
         BsonElem::Array(k, v) if k == "writeErrors" => Some(v.clone()),
@@ -440,7 +520,12 @@ fn insert_with_duplicate_id_reports_11000_and_keeps_the_first_document() {
         _ => None,
     })
     .expect("writeErrors must carry one document");
+    assert_eq!(extract_int32(&first_error, "index"), Some(0), "reply={r2:?}");
     assert_eq!(extract_int32(&first_error, "code"), Some(11000), "reply={r2:?}");
+    let key_pattern = extract_document(&first_error, "keyPattern").expect("writeErrors carry keyPattern");
+    assert_eq!(extract_int32(&key_pattern, "_id"), Some(1), "keyPattern={key_pattern:?}");
+    let key_value = extract_document(&first_error, "keyValue").expect("writeErrors carry keyValue");
+    assert_eq!(extract_object_id(&key_value, "_id"), Some(fixed_id), "keyValue={key_value:?}");
 
     // The overwritten document must not be visible: `first` stays, `second` never landed.
     let empty_filter = bson_document(&[]);
@@ -459,9 +544,34 @@ fn insert_with_duplicate_id_reports_11000_and_keeps_the_first_document() {
 // BSON extractors for test assertions
 // ---------------------------------------------------------------------------
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn extract_int32(bson: &[u8], key: &str) -> Option<i32> {
     walk_bson(bson, |elem| match elem {
         BsonElem::Int32(k, v) if k == key => Some(v),
+        _ => None,
+    })
+}
+
+fn extract_double(bson: &[u8], key: &str) -> Option<f64> {
+    walk_bson(bson, |elem| match elem {
+        BsonElem::Double(k, v) if k == key => Some(v),
+        _ => None,
+    })
+}
+
+fn extract_object_id(bson: &[u8], key: &str) -> Option<[u8; 12]> {
+    walk_bson(bson, |elem| match elem {
+        BsonElem::ObjectId(k, v) if k == key => Some(v),
+        _ => None,
+    })
+}
+
+fn extract_document(bson: &[u8], key: &str) -> Option<Vec<u8>> {
+    walk_bson(bson, |elem| match elem {
+        BsonElem::Document(k, v) if k == key => Some(v),
         _ => None,
     })
 }
@@ -497,9 +607,12 @@ fn extract_cursor_firstbatch_len(bson: &[u8]) -> Option<usize> {
 // Minimal BSON walker for test use.
 #[derive(Debug)]
 enum BsonElem<'a> {
+    Double(&'a str, f64),
     Int32(&'a str, i32),
     Int64(&'a str, i64),
     String(&'a str, &'a str),
+    ObjectId(&'a str, [u8; 12]),
+    Undefined(&'a str),
     Document(&'a str, Vec<u8>),
     Array(&'a str, Vec<u8>),
 }
@@ -534,8 +647,18 @@ where
                 if cursor + 8 > bson.len() {
                     break;
                 }
-                cursor += 8; // skip double
-                None
+                let value = f64::from_le_bytes([
+                    bson[cursor],
+                    bson[cursor + 1],
+                    bson[cursor + 2],
+                    bson[cursor + 3],
+                    bson[cursor + 4],
+                    bson[cursor + 5],
+                    bson[cursor + 6],
+                    bson[cursor + 7],
+                ]);
+                cursor += 8;
+                f(BsonElem::Double(key, value))
             }
             0x02 => {
                 if cursor + 4 > bson.len() {
@@ -568,6 +691,16 @@ where
                 cursor += sub_len;
                 f(BsonElem::Array(key, bson[sub_start..cursor].to_vec()))
             }
+            0x07 => {
+                if cursor + 12 > bson.len() {
+                    break;
+                }
+                let mut bytes = [0_u8; 12];
+                bytes.copy_from_slice(&bson[cursor..cursor + 12]);
+                cursor += 12;
+                f(BsonElem::ObjectId(key, bytes))
+            }
+            0x06 => f(BsonElem::Undefined(key)),
             0x10 => {
                 if cursor + 4 > bson.len() {
                     break;
@@ -611,8 +744,8 @@ fn insert_reads_documents_from_a_document_sequence_section() {
     let command = bson_document(&[bson_string("insert", "users"), bson_string("$db", "test")]);
     let reply = roundtrip_frame(&mut client, 1, build_op_msg_with_document_sequence(1, &command, "documents", &[document]));
 
-    assert_eq!(extract_int32(&reply, "ok"), Some(1), "reply={reply:?}");
-    assert_eq!(extract_int64(&reply, "n"), Some(1), "the kind-1 section must be folded into `documents`: reply={reply:?}");
+    assert_eq!(extract_double(&reply, "ok"), Some(1.0), "reply={reply:?}");
+    assert_eq!(extract_int32(&reply, "n"), Some(1), "the kind-1 section must be folded into `documents`: reply={reply:?}");
 
     // Reading the document back proves it was stored, not just counted.
     let empty_filter = bson_document(&[]);

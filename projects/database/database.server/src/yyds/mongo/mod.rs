@@ -253,7 +253,25 @@ fn build_error_bson(code: i32, errmsg: &str) -> Vec<u8> {
     doc.push("ok".to_string(), BsonValue::Int32(0));
     doc.push("errmsg".to_string(), BsonValue::String(errmsg.to_string()));
     doc.push("code".to_string(), BsonValue::Int32(code));
+    if let Some(name) = code_name(code) {
+        doc.push("codeName".to_string(), BsonValue::String(name.to_string()));
+    }
     encode_bson(&doc)
+}
+
+/// `mongod` 在错误文档里附带的代码符号名。只列网关会产出的代码，其余保持
+/// 三字段形态，与 `mongod` 对未知符号名的处理一致。
+fn code_name(code: i32) -> Option<&'static str> {
+    match code {
+        2 => Some("BadValue"),
+        73 => Some("InvalidNamespace"),
+        _ => None,
+    }
+}
+
+/// 写入应答的成功标记是 `ok: 1.0`（double），不是整数。
+fn write_ok() -> BsonValue {
+    BsonValue::Double(1.0)
 }
 
 /// A minimal BSON error document returned for commands we deliberately reject.
@@ -343,6 +361,12 @@ fn handle_insert(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) ->
                                 describe_id(&id_val)
                             )),
                         );
+                        let mut key_pattern = BsonDocument::new();
+                        key_pattern.push("_id".to_string(), BsonValue::Int32(1));
+                        err.push("keyPattern".to_string(), BsonValue::Document(key_pattern));
+                        let mut key_value = BsonDocument::new();
+                        key_value.push("_id".to_string(), id_val);
+                        err.push("keyValue".to_string(), BsonValue::Document(key_value));
                         write_errors.push(format!("err{idx}"), BsonValue::Document(err));
                         if ordered {
                             break;
@@ -387,12 +411,12 @@ fn handle_insert(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) ->
     }
 
     let mut resp = BsonDocument::new();
-    resp.push("ok".to_string(), BsonValue::Int32(1));
-    resp.push("n".to_string(), BsonValue::Int64(inserted));
+    resp.push("n".to_string(), count_value(inserted));
     if !write_errors.fields.is_empty() {
         let err_list: Vec<BsonValue> = write_errors.fields.into_iter().map(|(_, v)| v).collect();
         resp.push("writeErrors".to_string(), BsonValue::Array(err_list));
     }
+    resp.push("ok".to_string(), write_ok());
     encode_bson(&resp)
 }
 
@@ -468,8 +492,8 @@ fn handle_count(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) -> 
     let end = if limit > 0 { (start + limit).min(matched) } else { matched };
 
     let mut resp = BsonDocument::new();
-    resp.push("n".to_string(), BsonValue::Int64((end - start) as i64));
-    resp.push("ok".to_string(), BsonValue::Int32(1));
+    resp.push("n".to_string(), count_value((end - start) as i64));
+    resp.push("ok".to_string(), write_ok());
     encode_bson(&resp)
 }
 
@@ -549,7 +573,7 @@ fn handle_get_more(doc: &BsonDocument) -> Vec<u8> {
     cursors.retain(|_, state| state.last_used.elapsed() < CURSOR_IDLE_TIMEOUT);
     let Some(state) = cursors.get_mut(&cursor_id)
     else {
-        return build_error_bson(43, "cursor id not found");
+        return build_error_bson(43, &format!("cursor id {cursor_id} not found"));
     };
     state.last_used = Instant::now();
     let take = if batch_size > 0 { batch_size.min(state.remaining.len()) } else { state.remaining.len() };
@@ -1022,9 +1046,8 @@ fn handle_delete(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) ->
     }
 
     let mut resp = BsonDocument::new();
-    resp.push("ok".to_string(), BsonValue::Int32(1));
-    resp.push("n".to_string(), BsonValue::Int64(deleted));
-    resp.push("deletedCount".to_string(), BsonValue::Int64(deleted));
+    resp.push("n".to_string(), count_value(deleted));
+    resp.push("ok".to_string(), write_ok());
     encode_bson(&resp)
 }
 
