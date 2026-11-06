@@ -1041,6 +1041,144 @@ fn handle_scan(
     Ok(())
 }
 
+/// 收集一个逻辑库下所有现存键，按字节序去重。
+fn collect_keys(executor: &dyn KeyValueExecutor, base: &Namespace) -> Result<Vec<Vec<u8>>, String> {
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for kind in KeyKind::ALL {
+        match executor.execute_scan(None, &kind.namespace(base), &[], None, None, 0) {
+            Ok(records) => keys.extend(records.into_iter().map(|(key, _)| key)),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+/// 进程内伪随机下标，`RANDOMKEY` 用它挑一个键。
+fn random_index(bound: usize) -> usize {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(1);
+    let mut value = nanos ^ 0x9E37_79B9_7F4A_7C15;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    (value as usize) % bound
+}
+
+/// `COPY source destination [DB destination-db] [REPLACE]`。
+///
+/// 按源键的实际类型复制值 blob，目标键先清空全部类型表示再写入；源键的剩余过期时间
+/// 随副本一起复制，与真机一致。
+fn handle_copy(
+    stream: &mut dyn Write,
+    request: &Request<'_>,
+    executor: &dyn KeyValueExecutor,
+    namespace: &Namespace,
+) -> io::Result<()> {
+    if request.arguments.len() < 3 {
+        return write_error(stream, "wrong number of arguments for 'copy' command");
+    }
+    let source = request.arguments[1];
+    let destination = request.arguments[2];
+    let mut destination_database = None;
+    let mut replace = false;
+    let mut index = 3;
+    while index < request.arguments.len() {
+        if request.arguments[index].eq_ignore_ascii_case(b"DB") && index + 1 < request.arguments.len() {
+            let Some(database) = parse_database(request.arguments[index + 1])
+            else {
+                return write_error(stream, "DB index is out of range");
+            };
+            destination_database = Some(database);
+            index += 2;
+        }
+        else if request.arguments[index].eq_ignore_ascii_case(b"REPLACE") {
+            replace = true;
+            index += 1;
+        }
+        else {
+            return write_error(stream, "syntax error");
+        }
+    }
+    let destination_base = match destination_database {
+        Some(database) => Namespace(format!("redis:{database}")),
+        None => namespace.clone(),
+    };
+    if destination_base == *namespace && source == destination {
+        return write_error(stream, "source and destination objects are the same");
+    }
+    let source_kind = match collections::find_kind(executor, namespace, source) {
+        Ok(Some(kind)) => kind,
+        Ok(None) => {
+            stream.write_all(b":0\r\n")?;
+            return Ok(());
+        }
+        Err(message) => return write_error(stream, &message),
+    };
+    let destination_exists = match collections::find_kind(executor, &destination_base, destination) {
+        Ok(exists) => exists.is_some(),
+        Err(message) => return write_error(stream, &message),
+    };
+    if destination_exists && !replace {
+        stream.write_all(b":0\r\n")?;
+        return Ok(());
+    }
+    let source_namespace = source_kind.namespace(namespace);
+    let value = match executor.execute(
+        None,
+        KeyValueCommand { namespace: source_namespace.clone(), key: source.to_vec(), action: KeyValueAction::Get },
+    ) {
+        Ok(KeyValueResult::Get(Some(value))) => value,
+        Ok(KeyValueResult::Get(None)) => {
+            stream.write_all(b":0\r\n")?;
+            return Ok(());
+        }
+        Ok(_) => return write_error(stream, "COPY executor returned unexpected result"),
+        Err(error) => return write_error(stream, &error.to_string()),
+    };
+    let expires_at = match executor.execute(
+        None,
+        KeyValueCommand { namespace: source_namespace, key: source.to_vec(), action: KeyValueAction::GetExpiry },
+    ) {
+        Ok(KeyValueResult::Expiry { expires_at, .. }) => expires_at,
+        Ok(_) => return write_error(stream, "COPY executor returned unexpected result"),
+        Err(error) => return write_error(stream, &error.to_string()),
+    };
+    for kind in KeyKind::ALL {
+        let command = KeyValueCommand {
+            namespace: kind.namespace(&destination_base),
+            key: destination.to_vec(),
+            action: KeyValueAction::Delete,
+        };
+        if let Err(error) = executor.execute(None, command) {
+            return write_error(stream, &error.to_string());
+        }
+    }
+    let destination_namespace = source_kind.namespace(&destination_base);
+    match executor.execute(
+        None,
+        KeyValueCommand { namespace: destination_namespace.clone(), key: destination.to_vec(), action: KeyValueAction::Put(value) },
+    ) {
+        Ok(KeyValueResult::Put { .. }) => {}
+        Ok(_) => return write_error(stream, "COPY executor returned unexpected result"),
+        Err(error) => return write_error(stream, &error.to_string()),
+    }
+    if let Some(expires_at) = expires_at {
+        let command = KeyValueCommand {
+            namespace: destination_namespace,
+            key: destination.to_vec(),
+            action: KeyValueAction::SetExpiry { expires_at },
+        };
+        if let Err(error) = executor.execute(None, command) {
+            return write_error(stream, &error.to_string());
+        }
+    }
+    stream.write_all(b":1\r\n")
+}
+
 /// `OBJECT IDLETIME` / `OBJECT REFCOUNT` / `OBJECT FREQ`.
 ///
 /// 三个子命令先按真机的 `LOOKUP_NOTOUCH` 口径查键：缺键回 null（RESP2 `$-1`、RESP3 `_`），
@@ -2500,6 +2638,153 @@ fn respond(
         }
         write!(stream, ":{removed}\r\n")?;
     }
+    else if command.eq_ignore_ascii_case(b"RANDOMKEY") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 1 {
+            write_error(stream, "wrong number of arguments for 'randomkey' command")?;
+            return Ok(true);
+        }
+        match collect_keys(executor, namespace) {
+            Ok(keys) if keys.is_empty() => write_null(stream, state.protocol)?,
+            Ok(keys) => {
+                let index = random_index(keys.len());
+                write_bulk(stream, &keys[index])?;
+            }
+            Err(message) => write_error(stream, &message)?,
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"DBSIZE") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 1 {
+            write_error(stream, "wrong number of arguments for 'dbsize' command")?;
+            return Ok(true);
+        }
+        match collect_keys(executor, namespace) {
+            Ok(keys) => write!(stream, ":{}\r\n", keys.len())?,
+            Err(message) => write_error(stream, &message)?,
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"FLUSHALL") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count > 2 {
+            write_error(stream, "wrong number of arguments for 'flushall' command")?;
+            return Ok(true);
+        }
+        if count == 2
+            && !request.arguments[1].eq_ignore_ascii_case(b"ASYNC")
+            && !request.arguments[1].eq_ignore_ascii_case(b"SYNC")
+        {
+            write_error(stream, "syntax error")?;
+            return Ok(true);
+        }
+        let mut failure: Option<String> = None;
+        for database in 0..16u32 {
+            let base = Namespace(format!("redis:{database}"));
+            for kind in KeyKind::ALL {
+                let target = kind.namespace(&base);
+                match executor.execute_scan(None, &target, &[], None, None, 0) {
+                    Ok(records) => {
+                        for (key, _) in records {
+                            let command =
+                                KeyValueCommand { namespace: target.clone(), key, action: KeyValueAction::Delete };
+                            if let Err(error) = executor.execute(None, command) {
+                                failure = Some(error.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error.to_string());
+                    }
+                }
+                if failure.is_some() {
+                    break;
+                }
+            }
+            if failure.is_some() {
+                break;
+            }
+        }
+        match failure {
+            Some(message) => write_error(stream, &message)?,
+            None => stream.write_all(b"+OK\r\n")?,
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"COPY") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        handle_copy(stream, request, executor, namespace)?;
+    }
+    else if command.eq_ignore_ascii_case(b"EXPIRETIME") || command.eq_ignore_ascii_case(b"PEXPIRETIME") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 2 {
+            let name = if command.eq_ignore_ascii_case(b"PEXPIRETIME") { "pexpiretime" } else { "expiretime" };
+            write_error(stream, &format!("wrong number of arguments for '{name}' command"))?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        let target = match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Rejected => return Ok(true),
+            Resolved::Missing => {
+                stream.write_all(b":-2\r\n")?;
+                return Ok(true);
+            }
+            Resolved::Kind(kind) => kind.namespace(namespace),
+        };
+        let (present, expires_at) = match executor.execute(
+            None,
+            KeyValueCommand { namespace: target, key: key.to_vec(), action: KeyValueAction::GetExpiry },
+        ) {
+            Ok(KeyValueResult::Expiry { present, expires_at }) => (present, expires_at),
+            Ok(_) => {
+                write_error(stream, "EXPIRETIME executor returned unexpected result")?;
+                return Ok(true);
+            }
+            Err(error) => {
+                write_error(stream, &error.to_string())?;
+                return Ok(true);
+            }
+        };
+        let value = if !present {
+            -2
+        }
+        else {
+            match expires_at {
+                None => -1,
+                Some(deadline) => {
+                    if deadline <= now_unix_ms() {
+                        -2
+                    }
+                    else if command.eq_ignore_ascii_case(b"PEXPIRETIME") {
+                        deadline
+                    }
+                    else {
+                        deadline / 1000
+                    }
+                }
+            }
+        };
+        write!(stream, ":{value}\r\n")?;
+    }
     else if let Some(executor) = executor {
         // --- Generic bind()-backed commands (GET, INCR, DECR, GETDEL, GETSET).
         // Expiry semantics are enforced by the KV layer: expired records read as absent
@@ -2852,6 +3137,40 @@ fn validate_command_for_queue(
     {
         if executor.is_none() {
             return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        return Ok(());
+    }
+    // RANDOMKEY / DBSIZE: exactly 1. FLUSHALL accepts an optional ASYNC / SYNC.
+    if command.eq_ignore_ascii_case(b"RANDOMKEY")
+        || command.eq_ignore_ascii_case(b"DBSIZE")
+        || command.eq_ignore_ascii_case(b"FLUSHALL")
+    {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        let maximum = if command.eq_ignore_ascii_case(b"FLUSHALL") { 2 } else { 1 };
+        if count > maximum {
+            return Err(format!("-ERR wrong number of arguments for '{}' command\r\n", lowercase_command(command)).into_bytes());
+        }
+        return Ok(());
+    }
+    // COPY: at least 3, needs executor. Options are validated at runtime.
+    if command.eq_ignore_ascii_case(b"COPY") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if count < 3 {
+            return Err(b"-ERR wrong number of arguments for 'copy' command\r\n".to_vec());
+        }
+        return Ok(());
+    }
+    // EXPIRETIME / PEXPIRETIME: exactly 2.
+    if command.eq_ignore_ascii_case(b"EXPIRETIME") || command.eq_ignore_ascii_case(b"PEXPIRETIME") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if count != 2 {
+            return Err(format!("-ERR wrong number of arguments for '{}' command\r\n", lowercase_command(command)).into_bytes());
         }
         return Ok(());
     }

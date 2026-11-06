@@ -1957,6 +1957,188 @@ fn list_extras_survive_reopen() {
     assert!((1..=100).contains(&ttl), "list TTL missing after reopen: {ttl}");
 }
 
+/// `DBSIZE` counts keys across every type namespace, `RANDOMKEY` returns an existing key
+/// and `FLUSHALL` clears every logical database.
+#[test]
+fn keyspace_size_random_and_flush() {
+    let (mut client, _server) = memory_server("redis-keyspace");
+    send(&mut client, &["DBSIZE"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["RANDOMKEY"]);
+    assert_eq!(read_bulk_text(&mut client), None);
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SADD", "set", "x"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HSET", "hash", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["RPUSH", "list", "x"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZADD", "zset", "1", "m"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["DBSIZE"]);
+    assert_eq!(expect_integer(&mut client), 5);
+    send(&mut client, &["RANDOMKEY"]);
+    let key = read_bulk_text(&mut client).expect("RANDOMKEY must return one of the existing keys");
+    assert!(["str", "set", "hash", "list", "zset"].contains(&key.as_str()));
+
+    // FLUSHALL also clears other logical databases.
+    send(&mut client, &["SELECT", "1"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SET", "other", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SELECT", "0"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["FLUSHALL"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["DBSIZE"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "str", "set", "hash", "list", "zset"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["RANDOMKEY"]);
+    assert_eq!(read_bulk_text(&mut client), None);
+    send(&mut client, &["SELECT", "1"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["GET", "other"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["FLUSHALL", "ASYNC"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["FLUSHALL", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["RANDOMKEY", "extra"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'randomkey' command");
+}
+
+/// `COPY` duplicates every value type, honours `REPLACE` and copies TTLs across `DB`.
+#[test]
+fn copy_across_keys_and_databases() {
+    let (mut client, _server) = memory_server("redis-copy");
+    send(&mut client, &["SET", "src", "value", "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["COPY", "src", "dst"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["GET", "dst"]);
+    expect_bulk(&mut client, Some("value"));
+    send(&mut client, &["TTL", "dst"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "COPY must copy the source TTL: {ttl}");
+    send(&mut client, &["COPY", "src", "dst"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SET", "dst", "other"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["COPY", "src", "dst", "REPLACE"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["GET", "dst"]);
+    expect_bulk(&mut client, Some("value"));
+    send(&mut client, &["COPY", "missing", "elsewhere"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["COPY", "src", "src"]);
+    expect_error(&mut client, "ERR source and destination objects are the same");
+    send(&mut client, &["COPY", "src", "other", "DB", "99"]);
+    expect_error(&mut client, "ERR DB index is out of range");
+    send(&mut client, &["COPY", "src", "other", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+
+    // Different DB copies keep the value and the TTL.
+    send(&mut client, &["COPY", "src", "remote", "DB", "2"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SELECT", "2"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["GET", "remote"]);
+    expect_bulk(&mut client, Some("value"));
+    send(&mut client, &["TTL", "remote"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "cross-DB COPY must copy the TTL: {ttl}");
+    send(&mut client, &["COPY", "remote", "remote2"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["GET", "remote2"]);
+    expect_bulk(&mut client, Some("value"));
+    send(&mut client, &["SELECT", "0"]);
+    expect_status(&mut client, "OK");
+
+    // Non-string values are copied with their exact representation.
+    send(&mut client, &["SADD", "set", "a", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["COPY", "set", "setcopy"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TYPE", "setcopy"]);
+    expect_status(&mut client, "set");
+    send(&mut client, &["SMEMBERS", "setcopy"]);
+    expect_array(&mut client, &["a", "b"]);
+    send(&mut client, &["ZADD", "zset", "1", "m"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["COPY", "zset", "zsetcopy", "REPLACE"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZSCORE", "zsetcopy", "m"]);
+    expect_bulk(&mut client, Some("1"));
+}
+
+/// `EXPIRETIME` / `PEXPIRETIME` report missing keys, keys without a TTL and absolute
+/// deadlines for every value type.
+#[test]
+fn expiretime_reports_absolute_deadlines() {
+    let (mut client, _server) = memory_server("redis-expiretime");
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    send(&mut client, &["EXPIRETIME", "missing"]);
+    assert_eq!(expect_integer(&mut client), -2);
+    send(&mut client, &["PEXPIRETIME", "missing"]);
+    assert_eq!(expect_integer(&mut client), -2);
+    send(&mut client, &["SET", "k", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["EXPIRETIME", "k"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    send(&mut client, &["PEXPIRETIME", "k"]);
+    assert_eq!(expect_integer(&mut client), -1);
+    send(&mut client, &["SET", "k", "v", "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["EXPIRETIME", "k"]);
+    let seconds = expect_integer(&mut client);
+    assert!(
+        (now_ms / 1000 + 90..=now_ms / 1000 + 110).contains(&seconds),
+        "EXPIRETIME not near the expected deadline: {seconds}"
+    );
+    send(&mut client, &["PEXPIRETIME", "k"]);
+    let milliseconds = expect_integer(&mut client);
+    assert!(
+        (now_ms + 90_000..=now_ms + 110_000).contains(&milliseconds),
+        "PEXPIRETIME not near the expected deadline: {milliseconds}"
+    );
+    send(&mut client, &["SADD", "s", "x"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXPIRE", "s", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXPIRETIME", "s"]);
+    let seconds = expect_integer(&mut client);
+    assert!(seconds > now_ms / 1000, "EXPIRETIME must work on non-string keys: {seconds}");
+}
+
+/// Copy results, key counts and absolute deadlines survive a `FileShard` reopen.
+#[test]
+fn keyspace_extensions_survive_reopen() {
+    let path = temp_path("keyspace-reopen");
+    let (mut first, _first_server) = file_server(&path);
+    send(&mut first, &["SET", "src", "v", "EX", "100"]);
+    expect_status(&mut first, "OK");
+    send(&mut first, &["COPY", "src", "copy"]);
+    assert_eq!(expect_integer(&mut first), 1);
+    send(&mut first, &["SADD", "set", "x"]);
+    assert_eq!(expect_integer(&mut first), 1);
+
+    let (mut second, _second_server) = file_server(&path);
+    send(&mut second, &["DBSIZE"]);
+    assert_eq!(expect_integer(&mut second), 3);
+    send(&mut second, &["GET", "copy"]);
+    expect_bulk(&mut second, Some("v"));
+    send(&mut second, &["TTL", "copy"]);
+    let ttl = expect_integer(&mut second);
+    assert!((1..=100).contains(&ttl), "copied TTL missing after reopen: {ttl}");
+    send(&mut second, &["EXPIRETIME", "copy"]);
+    assert!(expect_integer(&mut second) > 0);
+    send(&mut second, &["RANDOMKEY"]);
+    let key = read_bulk_text(&mut second).expect("RANDOMKEY after reopen");
+    assert!(["src", "copy", "set"].contains(&key.as_str()));
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
