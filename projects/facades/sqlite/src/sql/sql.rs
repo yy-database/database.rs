@@ -401,6 +401,18 @@ pub enum ScalarFunction {
     RandomBlob,
     /// `instr(x, y)`, the one-based character position of `y` inside `x`.
     Instr,
+    /// `trim(x[, y])`，删除 `x` 两端属于字符集 `y` 的字符。
+    Trim,
+    /// `ltrim(x[, y])`，只删除左端。
+    Ltrim,
+    /// `rtrim(x[, y])`，只删除右端。
+    Rtrim,
+    /// `replace(x, y, z)`，把所有 `y` 替换成 `z`。
+    Replace,
+    /// `ifnull(x, y)`，`x` 为 `NULL` 时返回 `y`。
+    IfNull,
+    /// `nullif(x, y)`，两者相等时返回 `NULL`，否则返回 `x`。
+    NullIf,
 }
 
 impl ScalarFunction {
@@ -420,6 +432,12 @@ impl ScalarFunction {
             "random" => Some(Self::Random),
             "randomblob" => Some(Self::RandomBlob),
             "instr" => Some(Self::Instr),
+            "trim" => Some(Self::Trim),
+            "ltrim" => Some(Self::Ltrim),
+            "rtrim" => Some(Self::Rtrim),
+            "replace" => Some(Self::Replace),
+            "ifnull" => Some(Self::IfNull),
+            "nullif" => Some(Self::NullIf),
             _ => None,
         }
     }
@@ -440,6 +458,12 @@ impl ScalarFunction {
             Self::Random => "random",
             Self::RandomBlob => "randomblob",
             Self::Instr => "instr",
+            Self::Trim => "trim",
+            Self::Ltrim => "ltrim",
+            Self::Rtrim => "rtrim",
+            Self::Replace => "replace",
+            Self::IfNull => "ifnull",
+            Self::NullIf => "nullif",
         }
     }
 
@@ -452,6 +476,9 @@ impl ScalarFunction {
             Self::Round | Self::RandomBlob => (1..=2).contains(&count),
             Self::Random => count == 0,
             Self::Instr => count == 2,
+            Self::Trim | Self::Ltrim | Self::Rtrim => (1..=2).contains(&count),
+            Self::Replace => count == 3,
+            Self::IfNull | Self::NullIf => count == 2,
         }
     }
 }
