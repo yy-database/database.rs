@@ -324,15 +324,112 @@ impl Engine {
     pub fn new(page_size: Option<u32>) -> Result<Self, SqlError> {
         let page_size = page_size.unwrap_or(4096) as usize;
         let writer = SqliteWriter::create(page_size).map_err(|error| SqlError::new("storage", error.to_string()))?;
-        Ok(Self {
+        Self::from_writer(writer)
+    }
+
+    /// Wraps an already opened writer and rebuilds the catalog from the
+    /// `sqlite_master` rows of its image, so `SELECT` works on a file opened
+    /// with [`SqliteWriter::open`].
+    pub fn from_writer(writer: SqliteWriter) -> Result<Self, SqlError> {
+        let mut engine = Self {
             writer,
             tables: Vec::new(),
             table_lookup: BTreeMap::new(),
             indexes: BTreeMap::new(),
             parameters: Vec::new(),
             foreign_keys: true,
+        };
+        engine.load_catalog()?;
+        Ok(engine)
+    }
+
+    /// Replays the stored `CREATE TABLE` / `CREATE INDEX` text of every
+    /// schema row into the in-memory catalog without touching storage.
+    fn load_catalog(&mut self) -> Result<(), SqlError> {
+        let objects = self.writer.schema_objects(TableLimits::default()).map_err(storage_error)?;
+        for object in objects {
+            let Some(sql) = object.sql.as_deref() else { continue };
+            let mut statements = parse(sql)?.into_iter();
+            match statements.next() {
+                Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, .. }) => {
+                    let def = Self::catalog_table(name.clone(), columns, primary_key, checks, foreign_keys)?;
+                    let key = name.to_ascii_lowercase();
+                    if !self.table_lookup.contains_key(&key) {
+                        let position = self.tables.len();
+                        self.table_lookup.insert(key, position);
+                        self.tables.push(def);
+                    }
+                }
+                Some(Statement::CreateIndex { name, table, unique, columns, .. }) => {
+                    let positions = match self.tables.iter().find(|def| def.name.eq_ignore_ascii_case(&table)) {
+                        Some(def) => {
+                            let mut positions = Vec::with_capacity(columns.len());
+                            for column in &columns {
+                                match def.columns.iter().position(|existing| existing.name.eq_ignore_ascii_case(&column.name)) {
+                                    Some(position) => positions.push(position),
+                                    None => break,
+                                }
+                            }
+                            positions
+                        }
+                        None => continue,
+                    };
+                    if positions.len() != columns.len() {
+                        continue;
+                    }
+                    self.indexes.insert(name.to_ascii_lowercase(), IndexDef { table: table.to_ascii_lowercase(), columns: positions, unique });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves one parsed `CREATE TABLE` into a catalog entry without
+    /// writing storage, shared by the DDL path and the reopen path.
+    fn catalog_table(
+        name: String,
+        columns: Vec<ColumnSpec>,
+        primary_key: Vec<String>,
+        checks: Vec<CheckConstraint>,
+        foreign_keys: Vec<ForeignKey>,
+    ) -> Result<TableDef, SqlError> {
+        let mut key_positions = Vec::with_capacity(primary_key.len());
+        for column in &primary_key {
+            let position = columns
+                .iter()
+                .position(|existing| existing.name.eq_ignore_ascii_case(column))
+                .ok_or_else(|| {
+                    SqlError::new("unknown-column", format!("unknown column `{column}` in table `{name}`")).in_statement("create-table")
+                })?;
+            key_positions.push(position);
+        }
+        // A lone INTEGER key column is the rowid alias whether the key is
+        // declared inline or as a table constraint.
+        let rowid_alias = match key_positions.as_slice() {
+            [position] if columns[*position].declared_type.eq_ignore_ascii_case("INTEGER") => Some(*position),
+            _ => columns.iter().position(|column| column.primary_key && column.declared_type.eq_ignore_ascii_case("INTEGER")),
+        };
+        let primary_key_index = !primary_key.is_empty() && rowid_alias.is_none();
+        // Checks are resolved before the table exists, so an unknown column
+        // fails the statement instead of leaving a half-built table behind,
+        // exactly like upstream.
+        let resolved_checks = resolve_checks(&name, &columns, &checks, "create-table")?;
+        // A `FOREIGN KEY (...)` list naming a missing child column is rejected
+        // at DDL time, exactly like SQLite; the parent tables may still be
+        // created later.
+        let resolved_foreign_keys = resolve_foreign_keys(&columns, &foreign_keys)?;
+        Ok(TableDef {
+            name,
+            columns,
+            rowid_alias,
+            primary_key_index,
+            primary_key: key_positions,
+            checks: resolved_checks,
+            foreign_keys: resolved_foreign_keys,
         })
     }
+
 
     /// Executes exactly one statement.
     pub fn execute_one(&mut self, statement: &str) -> Result<ExecResult, SqlError> {
@@ -462,31 +559,13 @@ impl Engine {
                     }
                     return Err(SqlError::new("table-exists", format!("table `{name}` already exists")).in_statement("create-table"));
                 }
-                let mut key_positions = Vec::with_capacity(primary_key.len());
-                for column in &primary_key {
-                    let position = columns
-                        .iter()
-                        .position(|existing| existing.name.eq_ignore_ascii_case(column))
-                        .ok_or_else(|| {
-                            SqlError::new("unknown-column", format!("unknown column `{column}` in table `{name}`")).in_statement("create-table")
-                        })?;
-                    key_positions.push(position);
-                }
-                // A lone INTEGER key column is the rowid alias whether the key
-                // is declared inline or as a table constraint.
-                let rowid_alias = match key_positions.as_slice() {
-                    [position] if columns[*position].declared_type.eq_ignore_ascii_case("INTEGER") => Some(*position),
-                    _ => columns.iter().position(|column| column.primary_key && column.declared_type.eq_ignore_ascii_case("INTEGER")),
-                };
-                let primary_key_index = !primary_key.is_empty() && rowid_alias.is_none();
-                // Checks are resolved before the table exists, so an unknown
-                // column fails the statement instead of leaving a half-built
-                // table behind, exactly like upstream.
-                let resolved_checks = resolve_checks(&name, &columns, &checks, "create-table")?;
-                // A `FOREIGN KEY (...)` list naming a missing child column is
-                // rejected at DDL time, exactly like SQLite; the parent tables
-                // may still be created later.
-                let resolved_foreign_keys = resolve_foreign_keys(&columns, &foreign_keys)?;
+                let def = Self::catalog_table(
+                    name.clone(),
+                    columns.clone(),
+                    primary_key.clone(),
+                    checks.clone(),
+                    foreign_keys.clone(),
+                )?;
                 self.writer
                     .create_table_with_primary_key_sql(&name, &columns, &primary_key, Some(&sql))
                     .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
@@ -494,15 +573,7 @@ impl Engine {
                 // order `sqlite_master` reports.
                 let position = self.tables.len();
                 self.table_lookup.insert(key, position);
-                self.tables.push(TableDef {
-                    name,
-                    columns,
-                    rowid_alias,
-                    primary_key_index,
-                    primary_key: key_positions,
-                    checks: resolved_checks,
-                    foreign_keys: resolved_foreign_keys,
-                });
+                self.tables.push(def);
                 Ok(ExecResult { statement: "create-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             Statement::Insert { table, columns, rows, default_values, returning } => {
@@ -5952,6 +6023,41 @@ fn cell_json(cell: &Cell) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_writer_reopens_an_existing_image() {
+        let path = std::env::temp_dir().join(format!("sqlite-engine-reopen-{}.db", std::process::id()));
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine
+            .execute_batch(&[
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT)".to_string(),
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))".to_string(),
+                "CREATE INDEX child_parent ON child(parent_id)".to_string(),
+                "INSERT INTO parent (id, name) VALUES (1, 'ada')".to_string(),
+                "INSERT INTO child (id, parent_id) VALUES (1, 1)".to_string(),
+            ])
+            .expect("seed image");
+        let image = engine.snapshot().to_vec();
+        std::fs::write(&path, &image).expect("write image");
+        drop(engine);
+
+        let writer = SqliteWriter::open(&path).expect("open image");
+        let mut reopened = Engine::from_writer(writer).expect("rebuild catalog");
+        assert_eq!(
+            reopened.execute_one("SELECT id, name FROM parent").expect("parent read").rows,
+            vec![vec![Cell::Integer(1), Cell::Text("ada".to_string())]]
+        );
+        assert_eq!(reopened.execute_one("SELECT count(*) FROM child").expect("child read").rows, vec![vec![Cell::Integer(1)]]);
+        // The rebuilt catalog still carries the foreign key, so an orphan is
+        // rejected exactly as before the file was closed.
+        assert_eq!(
+            reopened.execute_one("INSERT INTO child (id, parent_id) VALUES (2, 9)").expect_err("orphan insert").message,
+            "FOREIGN KEY constraint failed"
+        );
+        // Reading a reopened image never rewrites it.
+        assert_eq!(reopened.snapshot(), image.as_slice());
+        std::fs::remove_file(&path).expect("cleanup image");
+    }
 
     /// Two-column table with one all-`NULL` row, inserted in rowid order.
     fn engine() -> Engine {
