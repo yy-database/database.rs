@@ -193,6 +193,30 @@ fn expect_null_array(client: &mut TcpStream) {
     }
 }
 
+fn expect_scan(client: &mut TcpStream) -> (String, Vec<String>) {
+    match read_reply(client) {
+        Reply::Array(Some(items)) => {
+            assert_eq!(items.len(), 2, "SCAN replies with a cursor and a key list");
+            let cursor = match &items[0] {
+                Reply::Bulk(Some(bytes)) => String::from_utf8(bytes.clone()).unwrap(),
+                other => panic!("expected bulk SCAN cursor, got {}", describe(other)),
+            };
+            let keys = match &items[1] {
+                Reply::Array(Some(entries)) => entries
+                    .iter()
+                    .map(|entry| match entry {
+                        Reply::Bulk(Some(bytes)) => String::from_utf8(bytes.clone()).unwrap(),
+                        other => panic!("expected bulk SCAN key, got {}", describe(other)),
+                    })
+                    .collect(),
+                other => panic!("expected SCAN key array, got {}", describe(other)),
+            };
+            (cursor, keys)
+        }
+        other => panic!("expected SCAN reply, got {}", describe(&other)),
+    }
+}
+
 /// `HSET` counts only newly added fields, updates keep the original position, and
 /// `HGETALL` answers in insertion order.
 #[test]
@@ -650,6 +674,66 @@ fn zset_order_and_key_ops() {
     assert_eq!(expect_integer(&mut client), 0);
 }
 
+/// `SCAN` walks every value type in batches, filters with `MATCH` and ends with cursor
+/// `0`; the cursor is opaque but must round-trip as a decimal string.
+#[test]
+fn scan_cursor_match_and_count() {
+    let (mut client, _server) = memory_server("redis-scan");
+    send(&mut client, &["SET", "s1", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SET", "s2", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["HSET", "h1", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["LPUSH", "l1", "a"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SADD", "set1", "m"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZADD", "z1", "1", "m"]);
+    assert_eq!(expect_integer(&mut client), 1);
+
+    let mut cursor = "0".to_string();
+    let mut seen = Vec::new();
+    let mut rounds = 0;
+    loop {
+        send(&mut client, &["SCAN", &cursor, "COUNT", "2"]);
+        let (next, keys) = expect_scan(&mut client);
+        seen.extend(keys);
+        rounds += 1;
+        assert!(rounds <= 10, "SCAN did not terminate");
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort();
+    assert_eq!(seen, ["h1", "l1", "s1", "s2", "set1", "z1"]);
+
+    send(&mut client, &["SCAN", "0", "MATCH", "s*", "COUNT", "100"]);
+    let (cursor, keys) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert_eq!(keys, ["s1", "s2", "set1"]);
+    send(&mut client, &["SCAN", "0", "MATCH", "h?", "COUNT", "100"]);
+    let (cursor, keys) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert_eq!(keys, ["h1"]);
+    send(&mut client, &["SCAN", "0", "MATCH", "nomatch*", "COUNT", "100"]);
+    let (cursor, keys) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert!(keys.is_empty(), "unexpected MATCH hits: {keys:?}");
+
+    send(&mut client, &["SCAN", "not-a-cursor"]);
+    expect_error(&mut client, "ERR invalid cursor");
+    send(&mut client, &["SCAN", "0", "COUNT", "0"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["SCAN", "0", "BOGUS", "x"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["SCAN", "0", "MATCH"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["SCAN"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'scan' command");
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
@@ -698,4 +782,8 @@ fn restart_preserves_types_and_contents() {
     expect_array(&mut second, &["a", "1", "b", "2"]);
     send(&mut second, &["ZCARD", "pz"]);
     assert_eq!(expect_integer(&mut second), 2);
+    send(&mut second, &["SCAN", "0", "COUNT", "100"]);
+    let (cursor, keys) = expect_scan(&mut second);
+    assert_eq!(cursor, "0");
+    assert_eq!(keys, ["h", "l", "ps", "pz", "s"]);
 }
