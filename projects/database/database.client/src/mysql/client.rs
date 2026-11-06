@@ -35,14 +35,7 @@ pub struct ClientConfig {
 impl ClientConfig {
     /// Build a configuration with the default five-second timeout.
     pub fn new(host: impl Into<String>, port: u16, user: impl Into<String>) -> Self {
-        Self {
-            host: host.into(),
-            port,
-            user: user.into(),
-            password: None,
-            database: None,
-            timeout: Duration::from_secs(5),
-        }
+        Self { host: host.into(), port, user: user.into(), password: None, database: None, timeout: Duration::from_secs(5) }
     }
 
     /// Attach a password.
@@ -113,12 +106,8 @@ impl Connection {
         let greeting = self.read_packet()?;
         let handshake = Handshake::parse(&greeting)?;
 
-        let mut capabilities = CLIENT_LONG_PASSWORD
-            | CLIENT_LONG_FLAG
-            | CLIENT_PROTOCOL_41
-            | CLIENT_TRANSACTIONS
-            | CLIENT_SECURE_CONNECTION
-            | CLIENT_PLUGIN_AUTH;
+        let mut capabilities =
+            CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
         if config.database.is_some() {
             capabilities |= CLIENT_CONNECT_WITH_DB;
         }
@@ -178,17 +167,13 @@ impl Connection {
                             self.write_packet(&[0x02])?;
                             let key_packet = self.read_packet()?;
                             if key_packet.first() != Some(&0x01) {
-                                return Err(Error::Protocol {
-                                    message: "MySQL did not return the caching_sha2 RSA public key".into(),
-                                });
+                                return Err(Error::Protocol { message: "MySQL did not return the caching_sha2 RSA public key".into() });
                             }
                             let encrypted = auth::rsa_encrypt(password, &nonce, &key_packet[1..])?;
                             self.write_packet(&encrypted)?;
                         }
                         other => {
-                            return Err(Error::Protocol {
-                                message: format!("unsupported MySQL auth continuation `{other:?}`"),
-                            });
+                            return Err(Error::Protocol { message: format!("unsupported MySQL auth continuation `{other:?}`") });
                         }
                     }
                 }
@@ -209,10 +194,7 @@ impl Connection {
             let length = usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
             if header[3] != self.next_sequence {
                 return Err(Error::Protocol {
-                    message: format!(
-                        "unexpected MySQL packet sequence {} (expected {})",
-                        header[3], self.next_sequence
-                    ),
+                    message: format!("unexpected MySQL packet sequence {} (expected {})", header[3], self.next_sequence),
                 });
             }
             let mut chunk = vec![0u8; length];
@@ -327,11 +309,7 @@ impl Handshake {
 }
 
 fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
-    format!("{host}:{port}")
-        .to_socket_addrs()
-        .map_err(Error::Io)?
-        .next()
-        .ok_or(Error::Corrupt("MySQL host did not resolve"))
+    format!("{host}:{port}").to_socket_addrs().map_err(Error::Io)?.next().ok_or(Error::Corrupt("MySQL host did not resolve"))
 }
 
 fn take<'a>(payload: &'a [u8], offset: &mut usize, width: usize) -> Result<&'a [u8]> {
