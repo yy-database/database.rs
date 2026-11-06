@@ -354,6 +354,8 @@ pub(crate) fn is_zset_command(command: &[u8]) -> bool {
         b"ZDIFF",
         b"ZDIFFSTORE",
         b"ZINTERCARD",
+        b"SORT",
+        b"SORT_RO",
     ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
@@ -2309,6 +2311,264 @@ fn parse_diff_keys(
     Ok(Some((keys, numkeys_index + 1 + numkeys)))
 }
 
+/// `SORT` / `SORT_RO` 解析后的选项。
+struct SortOptions {
+    by: Option<Vec<u8>>,
+    limit: Option<(usize, Option<usize>)>,
+    get: Vec<Vec<u8>>,
+    descending: bool,
+    alpha: bool,
+    store: Option<Vec<u8>>,
+}
+
+/// 解析 `SORT` 的 `BY` / `LIMIT` / `GET` / `ASC|DESC` / `ALPHA` / `STORE`。
+fn parse_sort_options(stream: &mut dyn io::Write, arguments: &[&[u8]]) -> io::Result<Option<SortOptions>> {
+    let mut options = SortOptions { by: None, limit: None, get: Vec::new(), descending: false, alpha: false, store: None };
+    let mut index = 2;
+    while index < arguments.len() {
+        let option = arguments[index];
+        if option.eq_ignore_ascii_case(b"BY") {
+            let Some(pattern) = arguments.get(index + 1)
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            };
+            options.by = Some(pattern.to_vec());
+            index += 2;
+        }
+        else if option.eq_ignore_ascii_case(b"LIMIT") {
+            if index + 2 >= arguments.len() {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            }
+            let (Some(offset), Some(count)) = (parse_index(arguments[index + 1]), parse_index(arguments[index + 2]))
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            };
+            options.limit = Some((offset.max(0) as usize, (count >= 0).then_some(count as usize)));
+            index += 3;
+        }
+        else if option.eq_ignore_ascii_case(b"GET") {
+            let Some(pattern) = arguments.get(index + 1)
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            };
+            options.get.push(pattern.to_vec());
+            index += 2;
+        }
+        else if option.eq_ignore_ascii_case(b"ASC") {
+            options.descending = false;
+            index += 1;
+        }
+        else if option.eq_ignore_ascii_case(b"DESC") {
+            options.descending = true;
+            index += 1;
+        }
+        else if option.eq_ignore_ascii_case(b"ALPHA") {
+            options.alpha = true;
+            index += 1;
+        }
+        else if option.eq_ignore_ascii_case(b"STORE") {
+            let Some(destination) = arguments.get(index + 1)
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            };
+            options.store = Some(destination.to_vec());
+            index += 2;
+        }
+        else {
+            write_error(stream, "syntax error")?;
+            return Ok(None);
+        }
+    }
+    Ok(Some(options))
+}
+
+/// 读取 `SORT` 的源元素；list 保持顺序，set 与 zset 按真机的遍历顺序（zset 按分数）。
+fn load_sort_elements(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    key: &[u8],
+) -> io::Result<Option<Vec<Vec<u8>>>> {
+    match find_kind(executor, base, key) {
+        Ok(None) => Ok(Some(Vec::new())),
+        Ok(Some(KeyKind::List)) => match load_list(stream, executor, base, key)? {
+            Loaded::Found(elements) => Ok(Some(elements)),
+            _ => Ok(None),
+        },
+        Ok(Some(KeyKind::Set)) => match load_set(stream, executor, base, key)? {
+            Loaded::Found(members) => Ok(Some(members)),
+            _ => Ok(None),
+        },
+        Ok(Some(KeyKind::ZSet)) => match load_zset(stream, executor, base, key)? {
+            Loaded::Found(mut entries) => {
+                sort_zset(&mut entries);
+                Ok(Some(entries.into_iter().map(|(member, _)| member).collect()))
+            }
+            _ => Ok(None),
+        },
+        Ok(Some(_)) => {
+            write_wrong_type(stream)?;
+            Ok(None)
+        }
+        Err(message) => {
+            write_storage_error(stream, &message)?;
+            Ok(None)
+        }
+    }
+}
+
+/// 按 `BY` / `GET` 模式取值：`*` 被元素替换，`->` 后缀表示哈希字段，类型不匹配视为缺失。
+fn lookup_sort_pattern(
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    pattern: &[u8],
+    element: &[u8],
+) -> Option<Vec<u8>> {
+    let mut expanded = Vec::new();
+    for byte in pattern {
+        if *byte == b'*' {
+            expanded.extend_from_slice(element);
+        }
+        else {
+            expanded.push(*byte);
+        }
+    }
+    let (key, field) = match expanded.windows(2).position(|window| window == b"->") {
+        Some(position) => (&expanded[..position], Some(&expanded[position + 2..])),
+        None => (expanded.as_slice(), None),
+    };
+    match (find_kind(executor, base, key), field) {
+        (Ok(Some(KeyKind::String)), None) => load_value(executor, &KeyKind::String.namespace(base), key).ok().flatten(),
+        (Ok(Some(KeyKind::Hash)), Some(field)) => load_value(executor, &KeyKind::Hash.namespace(base), key)
+            .ok()
+            .flatten()
+            .and_then(|bytes| decode_hash(&bytes))
+            .and_then(|fields| fields.into_iter().find(|(candidate, _)| candidate == field).map(|(_, value)| value)),
+        _ => None,
+    }
+}
+
+/// 排序键：`ALPHA` 用字节序，否则为浮点分数。
+enum SortKey {
+    Text(Vec<u8>),
+    Number(f64),
+}
+
+/// 执行 `SORT` / `SORT_RO`。
+fn handle_sort(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    arguments: &[&[u8]],
+    readonly: bool,
+) -> io::Result<()> {
+    let name = if readonly { "sort_ro" } else { "sort" };
+    if arguments.len() < 2 {
+        return write_arity_error(stream, name);
+    }
+    let Some(options) = parse_sort_options(stream, arguments)?
+    else {
+        return Ok(());
+    };
+    if readonly && options.store.is_some() {
+        return write_error(stream, "SORT_RO does not support the STORE option");
+    }
+    let key = arguments[1];
+    let Some(elements) = load_sort_elements(stream, executor, base, key)?
+    else {
+        return Ok(());
+    };
+    let no_sort = options.by.as_ref().is_some_and(|pattern| !pattern.contains(&b'*'));
+    let mut entries: Vec<(Vec<u8>, Option<SortKey>)> = Vec::with_capacity(elements.len());
+    for element in elements {
+        let looked_up = match &options.by {
+            Some(pattern) => lookup_sort_pattern(executor, base, pattern, &element),
+            None => Some(element.clone()),
+        };
+        let sort_key = if no_sort {
+            None
+        }
+        else if options.alpha {
+            Some(SortKey::Text(looked_up.unwrap_or_default()))
+        }
+        else {
+            match looked_up {
+                Some(raw) => match parse_score(&raw) {
+                    Some(value) => Some(SortKey::Number(value)),
+                    None => {
+                        write_error(stream, "One or more scores can't be converted into double")?;
+                        return Ok(());
+                    }
+                },
+                None => Some(SortKey::Number(0.0)),
+            }
+        };
+        entries.push((element, sort_key));
+    }
+    if !no_sort {
+        entries.sort_by(|left, right| {
+            let order = match (&left.1, &right.1) {
+                (Some(SortKey::Text(left_key)), Some(SortKey::Text(right_key))) => left_key.cmp(right_key),
+                (Some(SortKey::Number(left_key)), Some(SortKey::Number(right_key))) => {
+                    left_key.partial_cmp(right_key).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                _ => std::cmp::Ordering::Equal,
+            };
+            if options.descending { order.reverse() } else { order }
+        });
+    }
+    let (offset, count) = options.limit.unwrap_or((0, None));
+    let selected: Vec<&Vec<u8>> = entries.iter().skip(offset).map(|(element, _)| element).take(count.unwrap_or(usize::MAX)).collect();
+    let gather = |element: &Vec<u8>| -> Vec<Option<Vec<u8>>> {
+        if options.get.is_empty() {
+            return vec![Some(element.clone())];
+        }
+        options
+            .get
+            .iter()
+            .map(|pattern| {
+                if pattern.as_slice() == b"#" {
+                    Some(element.clone())
+                }
+                else {
+                    lookup_sort_pattern(executor, base, pattern, element)
+                }
+            })
+            .collect()
+    };
+    let values: Vec<Option<Vec<u8>>> = selected.iter().flat_map(|element| gather(element)).collect();
+    if let Some(destination) = &options.store {
+        if let Err(message) = remove_all_kinds(executor, base, destination) {
+            return write_storage_error(stream, &message);
+        }
+        if values.is_empty() {
+            return write_integer(stream, 0);
+        }
+        let stored: Vec<Vec<u8>> = values.into_iter().map(|value| value.unwrap_or_default()).collect();
+        let Some(bytes) = encode_list(&stored)
+        else {
+            return write_error(stream, "list exceeds the storage limit");
+        };
+        if let Err(message) = store_fresh_value(executor, &KeyKind::List.namespace(base), destination, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_integer(stream, stored.len() as i64);
+    }
+    write_array_header(stream, values.len())?;
+    for value in values {
+        match value {
+            Some(bytes) => write_bulk(stream, &bytes)?,
+            None => stream.write_all(b"$-1\r\n")?,
+        }
+    }
+    Ok(())
+}
+
 /// `ZADD` / `ZSCORE` / `ZREM` / `ZCARD` / `ZRANGE` 及排序族、排名、计数与扫描的分派入口。
 pub(crate) fn handle_zset(
     stream: &mut dyn io::Write,
@@ -2322,6 +2582,9 @@ pub(crate) fn handle_zset(
     else {
         return write_error(stream, "unsupported command");
     };
+    if command.eq_ignore_ascii_case(b"SORT") || command.eq_ignore_ascii_case(b"SORT_RO") {
+        return handle_sort(stream, executor, base, &request.arguments, command.eq_ignore_ascii_case(b"SORT_RO"));
+    }
     if command.eq_ignore_ascii_case(b"ZUNIONSTORE") || command.eq_ignore_ascii_case(b"ZINTERSTORE") {
         let union = command.eq_ignore_ascii_case(b"ZUNIONSTORE");
         if request.arguments.len() < 4 {
