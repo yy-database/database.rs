@@ -1,5 +1,6 @@
 //! Migrated integration tests for `redis`.
 
+mod collections;
 mod gateway;
 mod getex;
 mod object;

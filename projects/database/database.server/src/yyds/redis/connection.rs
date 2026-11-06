@@ -27,6 +27,7 @@ use database_types::cluster::{FenceToken, Namespace};
 
 use super::{
     bind::{BindError, BoundAction, BoundCommand, SetCondition, SetExpiry, bind, bind_mget, bind_set},
+    collections::{self, KeyKind},
     resp::{Request, RequestLimits, decode_request},
 };
 
@@ -442,7 +443,36 @@ fn handle_set(
         Ok(parsed) => parsed,
         Err(error) => return write_set_error(stream, error),
     };
-    let action = match (parsed.condition, parsed.expiry) {
+    // SET 会无条件替换键，因此条件判断必须看到集合类型：`NX` 在 hash 上要回 nil，
+    // `XX` 在 hash 上要照常替换。字符串命名空间为空时 `PutIfPresent` 会误报未命中，
+    // 所以非字符串上的 XX 改走无条件写入。
+    let existing = match resolve_kind(stream, executor, namespace, &parsed.key)? {
+        Resolved::Rejected => return Ok(()),
+        Resolved::Missing => None,
+        Resolved::Kind(kind) => Some(kind),
+    };
+    let condition = match parsed.condition {
+        SetCondition::IfAbsent if existing.is_some() => return write_null(stream, protocol),
+        SetCondition::IfPresent if existing.is_none() => return write_null(stream, protocol),
+        SetCondition::IfPresent if !matches!(existing, Some(KeyKind::String)) => SetCondition::Always,
+        condition => condition,
+    };
+    // `KEEPTTL` 要继承原键的过期时间；字符串由执行器自己保留，集合键需要先读出来再补写。
+    let inherited_expiry = match existing {
+        Some(kind) if parsed.keep_ttl && kind != KeyKind::String => {
+            let command = database_query::cluster_kv::KeyValueCommand {
+                namespace: kind.namespace(namespace),
+                key: parsed.key.clone(),
+                action: database_query::cluster_kv::KeyValueAction::GetExpiry,
+            };
+            match executor.execute(None, command) {
+                Ok(KeyValueResult::Expiry { present: true, expires_at }) => expires_at,
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let action = match (condition, parsed.expiry) {
         (SetCondition::Always, Some(expiry)) => match set_deadline(expiry) {
             Some(expires_at) => database_query::cluster_kv::KeyValueAction::PutExpiring { value: parsed.value, expires_at },
             None => return write_set_error(stream, BindError::InvalidExpire),
@@ -464,7 +494,8 @@ fn handle_set(
         (SetCondition::Always, None) if parsed.keep_ttl => database_query::cluster_kv::KeyValueAction::PutKeepingExpiry(parsed.value),
         (SetCondition::Always, None) => database_query::cluster_kv::KeyValueAction::Put(parsed.value),
     };
-    let result = executor.execute(None, database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: parsed.key, action });
+    let result =
+        executor.execute(None, database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: parsed.key.clone(), action });
     let stored = match result {
         Ok(KeyValueResult::Put { .. }) => true,
         Ok(KeyValueResult::PutIfAbsent { revision }) | Ok(KeyValueResult::PutIfPresent { revision }) => revision.is_some(),
@@ -480,6 +511,19 @@ fn handle_set(
     if !stored {
         // The condition failed: no write happened, so any existing deadline survives.
         write_null(stream, protocol)?;
+        return Ok(());
+    }
+    if let Some(expires_at) = inherited_expiry {
+        let action = database_query::cluster_kv::KeyValueAction::SetExpiry { expires_at };
+        let command = database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: parsed.key.clone(), action };
+        if let Err(error) = executor.execute(None, command) {
+            write_error(stream, &error.to_string())?;
+            return Ok(());
+        }
+    }
+    // 覆盖写成功后清掉旧的集合表示，保证一个逻辑键只有一种类型。
+    if let Err(message) = clear_other_kinds(executor, namespace, &parsed.key) {
+        write_error(stream, &message)?;
         return Ok(());
     }
     stream.write_all(b"+OK\r\n")
@@ -605,6 +649,51 @@ fn handle_unwatch(stream: &mut dyn Write, count: usize, state: &mut ConnectionSt
     stream.write_all(b"+OK\r\n")
 }
 
+/// 跨类型探测一个逻辑键的结果。
+///
+/// `Rejected` 表示错误回复已经写入连接，调用方不得再追加字节。
+enum Resolved {
+    Missing,
+    Kind(KeyKind),
+    Rejected,
+}
+
+/// 探测逻辑键当前类型；探测失败时写成 RESP 错误并返回 `Rejected`。
+fn resolve_kind(
+    stream: &mut dyn Write,
+    executor: &dyn KeyValueExecutor,
+    namespace: &Namespace,
+    key: &[u8],
+) -> io::Result<Resolved> {
+    match collections::find_kind(executor, namespace, key) {
+        Ok(Some(kind)) => Ok(Resolved::Kind(kind)),
+        Ok(None) => Ok(Resolved::Missing),
+        Err(message) => {
+            write_error(stream, &message)?;
+            Ok(Resolved::Rejected)
+        }
+    }
+}
+
+/// 删除同一逻辑键的其它类型表示。
+///
+/// `SET` / `SETEX` 会无条件替换键，而 Redis 的键一次只承载一种类型；写完字符串后必须
+/// 清掉 hash/list 表示，否则 `TYPE`、`EXISTS` 与后续写命令会看到两个并存的值。
+fn clear_other_kinds(executor: &dyn KeyValueExecutor, namespace: &Namespace, key: &[u8]) -> Result<(), String> {
+    for kind in KeyKind::ALL {
+        if kind == KeyKind::String {
+            continue;
+        }
+        let command = KeyValueCommand { namespace: kind.namespace(namespace), key: key.to_vec(), action: KeyValueAction::Delete };
+        match executor.execute(None, command) {
+            Ok(KeyValueResult::Delete { .. }) => {}
+            Ok(_) => return Err("delete returned an unexpected result".into()),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// `OBJECT IDLETIME` / `OBJECT REFCOUNT` / `OBJECT FREQ`.
 ///
 /// 三个子命令先按真机的 `LOOKUP_NOTOUCH` 口径查键：缺键回 null（RESP2 `$-1`、RESP3 `_`），
@@ -643,26 +732,15 @@ fn handle_object(
         return Ok(());
     };
     let key = request.arguments[2];
-    let present = match executor.execute(
-        None,
-        KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::Get },
-    ) {
-        Ok(KeyValueResult::Get(value)) => value.is_some(),
-        Ok(_) => {
-            write_error(stream, "OBJECT lookup returned an unexpected result")?;
-            return Ok(());
-        }
-        Err(error) => {
-            write_error(stream, &error.to_string())?;
-            return Ok(());
-        }
+    // 集合键也参与 `OBJECT`：先解析逻辑键落在哪个类型命名空间，再按该命名空间计时。
+    let target = match resolve_kind(stream, executor, namespace, key)? {
+        Resolved::Missing => return write_null(stream, protocol),
+        Resolved::Kind(kind) => kind.namespace(namespace),
+        Resolved::Rejected => return Ok(()),
     };
-    if !present {
-        return write_null(stream, protocol);
-    }
     if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
         // 纯内存计时：不写 `.yykv`、不升格式版本，重启后从零开始，与真机 RDB 的行为一致。
-        write!(stream, ":{}\r\n", tracker.idle_seconds(namespace, key))
+        write!(stream, ":{}\r\n", tracker.idle_seconds(&target, key))
     }
     else if subcommand.eq_ignore_ascii_case(b"REFCOUNT") {
         // 这是由存储结构推出的结果，不是写死的常量：每条记录在 `Record` 里独占自己的
@@ -898,11 +976,19 @@ fn respond(
             }
         };
         // Non-positive TTLs delete the key, matching Redis.
+        let target = match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Rejected => return Ok(true),
+            Resolved::Missing => {
+                stream.write_all(b":0\r\n")?;
+                return Ok(true);
+            }
+            Resolved::Kind(kind) => kind.namespace(namespace),
+        };
         if delta <= 0 {
             let removed = match executor.execute(
                 None,
                 database_query::cluster_kv::KeyValueCommand {
-                    namespace: namespace.clone(),
+                    namespace: target.clone(),
                     key: key.to_vec(),
                     action: database_query::cluster_kv::KeyValueAction::Delete,
                 },
@@ -925,7 +1011,7 @@ fn respond(
         let applied = match executor.execute(
             None,
             database_query::cluster_kv::KeyValueCommand {
-                namespace: namespace.clone(),
+                namespace: target.clone(),
                 key: key.to_vec(),
                 action: database_query::cluster_kv::KeyValueAction::SetExpiry { expires_at },
             },
@@ -961,11 +1047,19 @@ fn respond(
             }
         };
         // Non-positive absolute deadlines delete the key, matching Redis.
+        let target = match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Rejected => return Ok(true),
+            Resolved::Missing => {
+                stream.write_all(b":0\r\n")?;
+                return Ok(true);
+            }
+            Resolved::Kind(kind) => kind.namespace(namespace),
+        };
         if at <= 0 {
             let removed = match executor.execute(
                 None,
                 database_query::cluster_kv::KeyValueCommand {
-                    namespace: namespace.clone(),
+                    namespace: target.clone(),
                     key: key.to_vec(),
                     action: database_query::cluster_kv::KeyValueAction::Delete,
                 },
@@ -992,7 +1086,7 @@ fn respond(
         let applied = match executor.execute(
             None,
             database_query::cluster_kv::KeyValueCommand {
-                namespace: namespace.clone(),
+                namespace: target.clone(),
                 key: key.to_vec(),
                 action: database_query::cluster_kv::KeyValueAction::SetExpiry { expires_at },
             },
@@ -1026,6 +1120,24 @@ fn respond(
                             write_error(stream, "MGET executor returned an invalid read batch")?;
                             return Ok(true);
                         }
+                        // 字符串缺失的键可能以 hash/list 形式存在，真机对这种情况整条命令回
+                        // WRONGTYPE，而不是把该位置当 nil。
+                        for (command, result) in commands.iter().zip(&results) {
+                            if !matches!(result, KeyValueResult::Get(None)) {
+                                continue;
+                            }
+                            match collections::find_kind(executor, namespace, &command.key) {
+                                Ok(Some(KeyKind::String)) | Ok(None) => {}
+                                Ok(Some(_)) => {
+                                    collections::write_wrong_type(stream)?;
+                                    return Ok(true);
+                                }
+                                Err(message) => {
+                                    write_error(stream, &message)?;
+                                    return Ok(true);
+                                }
+                            }
+                        }
                         write!(stream, "*{}\r\n", results.len())?;
                         for result in results {
                             match result {
@@ -1056,25 +1168,10 @@ fn respond(
         }
         let mut present: i64 = 0;
         for key in &request.arguments[1..] {
-            let result = executor.execute(
-                None,
-                database_query::cluster_kv::KeyValueCommand {
-                    namespace: namespace.clone(),
-                    key: (*key).to_vec(),
-                    action: database_query::cluster_kv::KeyValueAction::Exists,
-                },
-            );
-            match result {
-                Ok(KeyValueResult::Exists(true)) => present += 1,
-                Ok(KeyValueResult::Exists(false)) => {}
-                Ok(_) => {
-                    write_error(stream, "EXISTS executor returned unexpected result")?;
-                    return Ok(true);
-                }
-                Err(error) => {
-                    write_error(stream, &error.to_string())?;
-                    return Ok(true);
-                }
+            match resolve_kind(stream, executor, namespace, key)? {
+                Resolved::Kind(_) => present += 1,
+                Resolved::Missing => {}
+                Resolved::Rejected => return Ok(true),
             }
         }
         write!(stream, ":{present}\r\n")?;
@@ -1090,12 +1187,20 @@ fn respond(
             return Ok(true);
         }
         let key = request.arguments[1];
+        let target = match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Rejected => return Ok(true),
+            Resolved::Missing => {
+                stream.write_all(b":-2\r\n")?;
+                return Ok(true);
+            }
+            Resolved::Kind(kind) => kind.namespace(namespace),
+        };
         // `GetExpiry` reads through the KV layer, so a record whose deadline has passed
         // is already reported as absent.
         let (present, expires_at) = match executor.execute(
             None,
             database_query::cluster_kv::KeyValueCommand {
-                namespace: namespace.clone(),
+                namespace: target,
                 key: key.to_vec(),
                 action: database_query::cluster_kv::KeyValueAction::GetExpiry,
             },
@@ -1144,22 +1249,10 @@ fn respond(
             return Ok(true);
         }
         let key = request.arguments[1];
-        let exists = matches!(
-            executor.execute(
-                None,
-                database_query::cluster_kv::KeyValueCommand {
-                    namespace: namespace.clone(),
-                    key: key.to_vec(),
-                    action: database_query::cluster_kv::KeyValueAction::Exists
-                }
-            ),
-            Ok(KeyValueResult::Exists(true))
-        );
-        if exists {
-            stream.write_all(b"+string\r\n")?;
-        }
-        else {
-            stream.write_all(b"+none\r\n")?;
+        match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Kind(kind) => stream.write_all(format!("+{}\r\n", kind.name()).as_bytes())?,
+            Resolved::Missing => stream.write_all(b"+none\r\n")?,
+            Resolved::Rejected => return Ok(true),
         }
     }
     else if command.eq_ignore_ascii_case(b"STRLEN") {
@@ -1173,6 +1266,14 @@ fn respond(
             return Ok(true);
         }
         let key = request.arguments[1];
+        match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Kind(KeyKind::String) | Resolved::Missing => {}
+            Resolved::Kind(_) => {
+                collections::write_wrong_type(stream)?;
+                return Ok(true);
+            }
+            Resolved::Rejected => return Ok(true),
+        }
         let value = match executor.execute(
             None,
             database_query::cluster_kv::KeyValueCommand {
@@ -1206,6 +1307,14 @@ fn respond(
         }
         let key = request.arguments[1];
         let append = request.arguments[2];
+        match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Kind(KeyKind::String) | Resolved::Missing => {}
+            Resolved::Kind(_) => {
+                collections::write_wrong_type(stream)?;
+                return Ok(true);
+            }
+            Resolved::Rejected => return Ok(true),
+        }
         let current = match executor.execute(
             None,
             database_query::cluster_kv::KeyValueCommand {
@@ -1263,11 +1372,20 @@ fn respond(
                 stream.write_all(b"-ERR wrong number of arguments for 'persist' command\r\n")?;
                 return Ok(true);
             }
+            let key = request.arguments[1];
+            let target = match resolve_kind(stream, executor, namespace, key)? {
+                Resolved::Rejected => return Ok(true),
+                Resolved::Missing => {
+                    stream.write_all(b":0\r\n")?;
+                    return Ok(true);
+                }
+                Resolved::Kind(kind) => kind.namespace(namespace),
+            };
             let applied = match executor.execute(
                 None,
                 database_query::cluster_kv::KeyValueCommand {
-                    namespace: namespace.clone(),
-                    key: request.arguments[1].to_vec(),
+                    namespace: target,
+                    key: key.to_vec(),
                     action: database_query::cluster_kv::KeyValueAction::ClearExpiry,
                 },
             ) {
@@ -1305,7 +1423,14 @@ fn respond(
                 },
             );
             match result {
-                Ok(KeyValueResult::Put { .. }) => stream.write_all(b"+OK\r\n")?,
+                Ok(KeyValueResult::Put { .. }) => {
+                    // SETEX 与 SET 一样无条件替换键，写完后清掉其它类型表示，保持一键一型。
+                    if let Err(message) = clear_other_kinds(executor, namespace, request.arguments[1]) {
+                        write_error(stream, &message)?;
+                        return Ok(true);
+                    }
+                    stream.write_all(b"+OK\r\n")?;
+                }
                 Ok(_) => {
                     write_error(stream, "SETEX executor returned unexpected result")?;
                     return Ok(true);
@@ -1383,6 +1508,15 @@ fn respond(
             }
         }
         let key = request.arguments[1];
+        // GETEX is a string command: a hash/list key is WRONGTYPE rather than nil.
+        match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Kind(KeyKind::String) | Resolved::Missing => {}
+            Resolved::Kind(_) => {
+                collections::write_wrong_type(stream)?;
+                return Ok(true);
+            }
+            Resolved::Rejected => return Ok(true),
+        }
         let value = match executor.execute(
             None,
             database_query::cluster_kv::KeyValueCommand {
@@ -1448,6 +1582,12 @@ fn respond(
         }
         write_bulk(stream, &value)?;
     }
+    else if collections::is_hash_command(command) {
+        collections::handle_hash(stream, request, executor, namespace, state.protocol)?;
+    }
+    else if collections::is_list_command(command) {
+        collections::handle_list(stream, request, executor, namespace, state.protocol)?;
+    }
     else if command.eq_ignore_ascii_case(b"OBJECT") {
         handle_object(stream, request, probe, tracker, namespace, state.protocol)?;
     }
@@ -1484,12 +1624,67 @@ fn respond(
             Err(error) => write_error(stream, &error.to_string())?,
         }
     }
+    else if command.eq_ignore_ascii_case(b"DEL") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count < 2 {
+            stream.write_all(b"-ERR wrong number of arguments for 'del' command\r\n")?;
+            return Ok(true);
+        };
+        // 一个逻辑键可能以字符串、hash 或 list 中的任意一种形式存在，删除要逐类型清理；
+        // 只要其中一种表示被删掉，这次 `DEL` 就对它计 1，与真机的按键计数一致。
+        let mut removed: i64 = 0;
+        for key in &request.arguments[1..] {
+            let mut deleted = false;
+            for kind in KeyKind::ALL {
+                let command = database_query::cluster_kv::KeyValueCommand {
+                    namespace: kind.namespace(namespace),
+                    key: key.to_vec(),
+                    action: database_query::cluster_kv::KeyValueAction::Delete,
+                };
+                match executor.execute(None, command) {
+                    Ok(KeyValueResult::Delete { removed: true }) => deleted = true,
+                    Ok(KeyValueResult::Delete { removed: false }) => {}
+                    Ok(_) => {
+                        write_error(stream, "DEL executor returned unexpected result")?;
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        write_error(stream, &error.to_string())?;
+                        return Ok(true);
+                    }
+                }
+            }
+            if deleted {
+                removed += 1;
+            }
+        }
+        write!(stream, ":{removed}\r\n")?;
+    }
     else if let Some(executor) = executor {
-        // --- Generic bind()-backed commands (GET, DEL, INCR, DECR, GETDEL, GETSET).
+        // --- Generic bind()-backed commands (GET, INCR, DECR, GETDEL, GETSET).
         // Expiry semantics are enforced by the KV layer: expired records read as absent
         // and each action carries its own expiry behaviour.
         match bind(&request.arguments, namespace.0.as_str()) {
             Ok(command) => {
+                // 这些命令只对字符串有效：hash / list 键在真机上回 WRONGTYPE 而不是 nil。
+                // 绑定成功后再探测，保证参数错误优先于类型错误。
+                if matches!(
+                    command.action,
+                    BoundAction::Get | BoundAction::GetDelete | BoundAction::GetSet(_) | BoundAction::IncrementBy(_)
+                ) {
+                    match resolve_kind(stream, executor, namespace, &command.key)? {
+                        Resolved::Kind(KeyKind::String) | Resolved::Missing => {}
+                        Resolved::Kind(_) => {
+                            collections::write_wrong_type(stream)?;
+                            return Ok(true);
+                        }
+                        Resolved::Rejected => return Ok(true),
+                    }
+                }
                 match executor.execute(None, to_kv_command(command)) {
                     Ok(result) => {
                         match result {
@@ -1811,6 +2006,24 @@ fn validate_command_for_queue(
         }
         return Err(b"-ERR unsupported command\r\n".to_vec());
     }
+    // Hash / list value commands: they need the executor. Their arity and type checks
+    // are runtime semantics and stay deferred to EXEC, like upstream queueing.
+    if collections::is_hash_command(command) || collections::is_list_command(command) {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        return Ok(());
+    }
+    // DEL: one or more keys, mirrors the `-2` arity of the upstream command.
+    if command.eq_ignore_ascii_case(b"DEL") {
+        if executor.is_none() {
+            return Err(b"-ERR unsupported command\r\n".to_vec());
+        }
+        if count < 2 {
+            return Err(b"-ERR wrong number of arguments for 'del' command\r\n".to_vec());
+        }
+        return Ok(());
+    }
     // Fall back to bind()'s own syntax checks.
     match bind(arguments, namespace.0.as_str()) {
         Ok(_) => Ok(()),
@@ -1843,13 +2056,13 @@ fn parse_integer(bytes: &[u8]) -> Option<i64> {
     Some(value)
 }
 
-fn write_error(stream: &mut dyn Write, message: &str) -> io::Result<()> {
+pub(crate) fn write_error(stream: &mut dyn Write, message: &str) -> io::Result<()> {
     let sanitized =
         message.chars().map(|character| if matches!(character, '\r' | '\n') { ' ' } else { character }).take(512).collect::<String>();
     write!(stream, "-ERR {sanitized}\r\n")
 }
 
-fn write_bulk(stream: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_bulk(stream: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
     write!(stream, "${}\r\n", bytes.len())?;
     stream.write_all(bytes)?;
     stream.write_all(b"\r\n")
@@ -1860,7 +2073,7 @@ fn write_bulk(stream: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
 /// RESP2 spells a missing bulk value `$-1\r\n`. RESP3 replaced that form with the
 /// dedicated null type `_\r\n`, and a RESP3 parser treats `$-1` as a protocol error,
 /// so the choice has to follow the connection state instead of a fixed literal.
-fn write_null(stream: &mut dyn Write, protocol: u8) -> io::Result<()> {
+pub(crate) fn write_null(stream: &mut dyn Write, protocol: u8) -> io::Result<()> {
     stream.write_all(if protocol == 3 { b"_\r\n" as &[u8] } else { b"$-1\r\n" })
 }
 
@@ -1868,7 +2081,7 @@ fn write_null(stream: &mut dyn Write, protocol: u8) -> io::Result<()> {
 ///
 /// RESP2 spells it `*-1\r\n` (the null array, not the null bulk that `write_null`
 /// emits). RESP3 replaced it with the dedicated null type `_\r\n`.
-fn write_null_array(stream: &mut dyn Write, protocol: u8) -> io::Result<()> {
+pub(crate) fn write_null_array(stream: &mut dyn Write, protocol: u8) -> io::Result<()> {
     stream.write_all(if protocol == 3 { b"_\r\n" as &[u8] } else { b"*-1\r\n" })
 }
 

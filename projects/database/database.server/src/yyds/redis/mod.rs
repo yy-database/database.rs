@@ -9,6 +9,7 @@ use database_query::version_label;
 use database_types::{Error, Result};
 
 pub mod connection;
+mod collections;
 pub mod service;
 
 /// 命令绑定（来自 `database-protocol-redis`）。
