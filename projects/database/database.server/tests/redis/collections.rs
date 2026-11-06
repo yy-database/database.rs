@@ -303,6 +303,23 @@ fn wrong_type_in_both_directions() {
     expect_array(&mut client, &["a"]);
 }
 
+/// `RPOP key count` pops from the tail and replies tail-first, while `LPOP key count`
+/// replies head-first.
+#[test]
+fn list_pop_count_order() {
+    let (mut client, _server) = memory_server("redis-list-pop-count");
+    send(&mut client, &["RPUSH", "r", "a", "b", "c", "d"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["RPOP", "r", "2"]);
+    expect_array(&mut client, &["d", "c"]);
+    send(&mut client, &["LRANGE", "r", "0", "-1"]);
+    expect_array(&mut client, &["a", "b"]);
+    send(&mut client, &["LPOP", "r", "2"]);
+    expect_array(&mut client, &["a", "b"]);
+    send(&mut client, &["EXISTS", "r"]);
+    assert_eq!(expect_integer(&mut client), 0);
+}
+
 /// `LPUSH` prepends each value in order, `LRANGE` handles negative indexes and
 /// out-of-range slices, and pops trim the list down to an absent key.
 #[test]

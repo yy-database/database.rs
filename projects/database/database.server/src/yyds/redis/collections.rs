@@ -547,7 +547,14 @@ pub(crate) fn handle_list(
             Loaded::Rejected => return Ok(()),
         };
         let take = count.min(elements.len());
-        let popped: Vec<Vec<u8>> = if pop_head { elements[..take].to_vec() } else { elements[elements.len() - take..].to_vec() };
+        let popped: Vec<Vec<u8>> = if pop_head {
+            elements[..take].to_vec()
+        }
+        else {
+            // 真机 `RPOP key count` 从表尾开始逐个弹出，回复顺序是尾端在前
+            // （`[a,b,c,d]` 取 2 回 `[d,c]`），因此这里要再倒序一次。
+            elements[elements.len() - take..].iter().rev().cloned().collect()
+        };
         let mut remaining = elements;
         if pop_head {
             remaining.drain(..take);
