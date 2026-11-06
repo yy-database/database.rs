@@ -106,6 +106,9 @@ struct TableDef {
     /// `STRICT` table option was present, so every non-NULL value has to
     /// conform to its column's declared type after affinity.
     strict: bool,
+    /// The table is stored as a primary-key index b-tree and has no implicit
+    /// `rowid`.
+    without_rowid: bool,
     /// The table belongs to the temp schema and is not stored in the image.
     temp: bool,
 }
@@ -165,6 +168,39 @@ impl TableDef {
         else {
             Some(declared)
         }
+    }
+
+    /// Record layout of a WITHOUT ROWID table: stored record position to
+    /// declared column position. SQLite stores the primary-key columns first,
+    /// then the remaining columns in declaration order.
+    fn without_rowid_layout(&self) -> Vec<usize> {
+        let mut layout = self.primary_key_positions().unwrap_or_default();
+        for position in 0..self.columns.len() {
+            if !layout.contains(&position) {
+                layout.push(position);
+            }
+        }
+        layout
+    }
+
+    /// Decodes one WITHOUT ROWID record and maps it back to declaration order.
+    fn decode_without_rowid(&self, payload: &[u8]) -> Result<Vec<Cell>, SqlError> {
+        let layout = self.without_rowid_layout();
+        let mut values = decode_cells(payload)?;
+        // A record written before `ALTER TABLE ADD COLUMN` is short; the
+        // missing trailing record slots read as their declared defaults.
+        while values.len() < layout.len() {
+            let position = layout[values.len()];
+            let column = &self.columns[position];
+            let value = column.default_value.clone().unwrap_or(crate::WriteValue::Null);
+            values.push(write_value_cell(&crate::apply_write_affinity(&column.declared_type, value)));
+        }
+        values.truncate(layout.len());
+        let mut cells = vec![Cell::Null; self.columns.len()];
+        for (record_position, declared_position) in layout.iter().enumerate() {
+            cells[*declared_position] = values[record_position].clone();
+        }
+        Ok(cells)
     }
 }
 
@@ -979,8 +1015,8 @@ impl Engine {
             let Some(sql) = object.sql.as_deref() else { continue };
             let mut statements = parse(sql)?.into_iter();
             match statements.next() {
-                Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, .. }) => {
-                    let def = Self::catalog_table(name.clone(), columns, primary_key, checks, foreign_keys, strict)?;
+                Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, without_rowid, .. }) => {
+                    let def = Self::catalog_table(name.clone(), columns, primary_key, checks, foreign_keys, strict, without_rowid)?;
                     let key = name.to_ascii_lowercase();
                     if !self.table_lookup.contains_key(&key) {
                         let position = self.tables.len();
@@ -1050,11 +1086,12 @@ impl Engine {
     /// writing storage, shared by the DDL path and the reopen path.
     fn catalog_table(
         name: String,
-        columns: Vec<ColumnSpec>,
+        mut columns: Vec<ColumnSpec>,
         primary_key: Vec<String>,
         checks: Vec<CheckConstraint>,
         foreign_keys: Vec<ForeignKey>,
         strict: bool,
+        without_rowid: bool,
     ) -> Result<TableDef, SqlError> {
         if strict {
             // SQLite limits STRICT columns to its five storage classes plus
@@ -1080,17 +1117,50 @@ impl Engine {
                 })?;
             key_positions.push(position);
         }
+        if without_rowid {
+            // A WITHOUT ROWID table needs a primary key: either the table-level
+            // clause or exactly one inline `PRIMARY KEY`. The key columns are
+            // implicitly NOT NULL and are stored first in every record.
+            let inline: Vec<usize> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.primary_key)
+                .map(|(position, _)| position)
+                .collect();
+            if !primary_key.is_empty() && !inline.is_empty() {
+                return Err(SqlError::new("SQLITE_ERROR", format!("table {name} has more than one primary key"))
+                    .in_statement("create-table"));
+            }
+            if key_positions.is_empty() {
+                if inline.len() > 1 {
+                    return Err(SqlError::new("SQLITE_ERROR", format!("table {name} has more than one primary key"))
+                        .in_statement("create-table"));
+                }
+                key_positions = inline;
+            }
+            if key_positions.is_empty() {
+                return Err(SqlError::new("SQLITE_ERROR", format!("PRIMARY KEY missing on table {name}")).in_statement("create-table"));
+            }
+            for position in &key_positions {
+                columns[*position].not_null = true;
+            }
+        }
         // A lone INTEGER key column is the rowid alias whether the key is
         // declared inline or as a table constraint.
-        let rowid_alias = match key_positions.as_slice() {
-            [position] if columns[*position].declared_type.eq_ignore_ascii_case("INTEGER") => Some(*position),
-            _ => columns.iter().position(|column| column.primary_key && column.declared_type.eq_ignore_ascii_case("INTEGER")),
+        let rowid_alias = if without_rowid {
+            None
+        }
+        else {
+            match key_positions.as_slice() {
+                [position] if columns[*position].declared_type.eq_ignore_ascii_case("INTEGER") => Some(*position),
+                _ => columns.iter().position(|column| column.primary_key && column.declared_type.eq_ignore_ascii_case("INTEGER")),
+            }
         };
-        let primary_key_index = !primary_key.is_empty() && rowid_alias.is_none();
+        let primary_key_index = !without_rowid && !primary_key.is_empty() && rowid_alias.is_none();
         // Checks are resolved before the table exists, so an unknown column
         // fails the statement instead of leaving a half-built table behind,
         // exactly like upstream.
-        let resolved_checks = resolve_checks(&name, &columns, &checks, "create-table")?;
+        let resolved_checks = resolve_checks(&name, &columns, &checks, "create-table", without_rowid)?;
         // A `FOREIGN KEY (...)` list naming a missing child column is rejected
         // at DDL time, exactly like SQLite; the parent tables may still be
         // created later.
@@ -1104,6 +1174,7 @@ impl Engine {
             checks: resolved_checks,
             foreign_keys: resolved_foreign_keys,
             strict,
+            without_rowid,
             temp: false,
         })
     }
@@ -1983,8 +2054,16 @@ impl Engine {
             Statement::Transaction { action } => self.transaction(action),
             Statement::Attach { file, name } => self.attach_database(&file, &name),
             Statement::Detach { name } => self.detach_database(&name),
-            Statement::CreateTable { schema: _, name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, temp, sql } => {
+            Statement::CreateTable { schema: _, name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, without_rowid, temp, sql } => {
                 let key = name.to_ascii_lowercase();
+                // A WITHOUT ROWID table's writer call needs the key columns
+                // whether they were declared inline or as a table constraint.
+                let without_rowid_keys: Vec<String> = if primary_key.is_empty() {
+                    columns.iter().filter(|column| column.primary_key).map(|column| column.name.clone()).collect()
+                }
+                else {
+                    primary_key.clone()
+                };
                 check_reserved_object_name(&name, "create-table")?;
                 if temp {
                     // The temp schema owns a separate namespace: a main object
@@ -1996,7 +2075,7 @@ impl Engine {
                         }
                         return Err(SqlError::new("table-exists", format!("table {name} already exists")).in_statement("create-table"));
                     }
-                    let mut def = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict)?;
+                    let mut def = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict, without_rowid)?;
                     def.temp = true;
                     // SQLite reuses a freed temp page when one is available
                     // and otherwise extends the temp database by one page.
@@ -2035,10 +2114,18 @@ impl Engine {
                     checks.clone(),
                     foreign_keys.clone(),
                     strict,
+                    without_rowid,
                 )?;
-                self.writer
-                    .create_table_with_primary_key_sql(&name, &columns, &primary_key, Some(&sql))
-                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+                if without_rowid {
+                    self.writer
+                        .create_table_without_rowid_sql(&name, &columns, &without_rowid_keys, Some(&sql))
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+                }
+                else {
+                    self.writer
+                        .create_table_with_primary_key_sql(&name, &columns, &primary_key, Some(&sql))
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("create-table"))?;
+                }
                 // Appending keeps the catalog in creation order, which is the
                 // order `sqlite_master` reports.
                 let position = self.tables.len();
@@ -2397,7 +2484,9 @@ impl Engine {
                     }
                 }
                 if let Some(rowid) = last_written {
-                    self.last_insert_rowid = rowid;
+                    if !def.without_rowid {
+                        self.last_insert_rowid = rowid;
+                    }
                 }
                 if let Some(error) = failure {
                     match (temp_position, temp_snapshot) {
@@ -2427,6 +2516,11 @@ impl Engine {
                         .materialize_indexes()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
                 }
+                if temp_position.is_none() && def.without_rowid {
+                    self.writer
+                        .materialize_without_rowid()
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
+                }
                 if let Some(plan) = &returning {
                     return Ok(ExecResult {
                         statement: "insert",
@@ -2438,6 +2532,10 @@ impl Engine {
                 if default_values {
                     // `DEFAULT VALUES` reports neither columns nor rows, like
                     // SQLite; the stored row is written the same way.
+                    return Ok(ExecResult { statement: "insert", columns: Vec::new(), rows: Vec::new(), affected: slots_by_row.len() });
+                }
+                if def.without_rowid {
+                    // A WITHOUT ROWID insert has no rowid to report.
                     return Ok(ExecResult { statement: "insert", columns: Vec::new(), rows: Vec::new(), affected: slots_by_row.len() });
                 }
                 let rows = rowids.into_iter().map(|rowid| vec![Cell::Integer(rowid)]).collect();
@@ -2595,7 +2693,16 @@ impl Engine {
                             let old_cells = old_lookup.get(rowid).cloned().unwrap_or_default();
                             self.queue_update_events(&key, def, &trigger_columns, &assigned_names, *rowid, &old_cells, &new_cells);
                         }
-                        if let Err(error) = self.writer.update(&table, *rowid, values) {
+                        let written = if def.without_rowid {
+                            let old_values: Vec<crate::WriteValue> =
+                                old_lookup.get(rowid).cloned().unwrap_or_default().iter().map(cell_write_value).collect();
+                            let new_values: Vec<crate::WriteValue> = new_cells.iter().map(cell_write_value).collect();
+                            self.writer.update_without_rowid(&table, &old_values, &new_values)
+                        }
+                        else {
+                            self.writer.update(&table, *rowid, values)
+                        };
+                        if let Err(error) = written {
                             let _ = self.writer.rollback();
                             return Err(write_failure(error, "update", def));
                         }
@@ -2615,6 +2722,11 @@ impl Engine {
                 if temp_position.is_none() && needs_index {
                     self.writer
                         .materialize_indexes()
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
+                }
+                if temp_position.is_none() && def.without_rowid {
+                    self.writer
+                        .materialize_without_rowid()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("update"))?;
                 }
                 Ok(ExecResult {
@@ -2689,7 +2801,15 @@ impl Engine {
                             let old_cells = old_lookup.get(rowid).cloned().unwrap_or_default();
                             self.queue_delete_events(&key, &trigger_columns, *rowid, &old_cells);
                         }
-                        if let Err(error) = self.writer.delete(&table, *rowid) {
+                        let removed = if def.without_rowid {
+                            let old_values: Vec<crate::WriteValue> =
+                                old_lookup.get(rowid).cloned().unwrap_or_default().iter().map(cell_write_value).collect();
+                            self.writer.delete_without_rowid(&table, &old_values)
+                        }
+                        else {
+                            self.writer.delete(&table, *rowid)
+                        };
+                        if let Err(error) = removed {
                             let _ = self.writer.rollback();
                             return Err(write_failure(error, "delete", def));
                         }
@@ -2712,6 +2832,11 @@ impl Engine {
                 if temp_position.is_none() && needs_index {
                     self.writer
                         .materialize_indexes()
+                        .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
+                }
+                if temp_position.is_none() && def.without_rowid {
+                    self.writer
+                        .materialize_without_rowid()
                         .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("delete"))?;
                 }
                 Ok(ExecResult {
@@ -3142,7 +3267,7 @@ impl Engine {
                 }
                 let mut columns = def.columns.clone();
                 columns.push(column.clone());
-                let resolved = resolve_checks(&def.name, &columns, &checks, "alter-table")?;
+                let resolved = resolve_checks(&def.name, &columns, &checks, "alter-table", def.without_rowid)?;
                 let resolved_foreign_keys = resolve_foreign_keys(&columns, &foreign_keys)?;
                 let open = stored
                     .rfind(')')
@@ -3243,12 +3368,12 @@ impl Engine {
                 let mut statements = parse(&new_sql).map_err(|_| {
                     SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table")
                 })?;
-                let Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, .. }) =
+                let Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, without_rowid, .. }) =
                     statements.drain(..).next()
                 else {
                     return Err(SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"));
                 };
-                let derived = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict)?;
+                let derived = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict, without_rowid)?;
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
                 if let Err(error) = self.writer.drop_column(&def.name, column_position) {
                     let _ = self.writer.rollback();
@@ -3345,6 +3470,19 @@ impl Engine {
                 .get(&def.name.to_ascii_lowercase())
                 .ok_or_else(|| SqlError::new("storage", format!("temp table `{}` disappeared", def.name)).in_statement(statement))?;
             return Ok(self.temp_tables[position].rows.iter().map(|(rowid, cells)| (*rowid, cells.clone())).collect());
+        }
+        if def.without_rowid {
+            // WITHOUT ROWID rows carry no rowid; a scan position is used as
+            // the identity the update / delete planners sort by.
+            let stored = self
+                .writer
+                .without_rowid_rows(&def.name, TableLimits::default())
+                .map_err(|error| SqlError::new("storage", error.to_string()).in_statement(statement))?;
+            let mut rows = Vec::with_capacity(stored.len());
+            for (position, payload) in stored.iter().enumerate() {
+                rows.push((position as i64, def.decode_without_rowid(payload)?));
+            }
+            return Ok(rows);
         }
         let stored = self
             .writer
@@ -5128,6 +5266,15 @@ impl Engine {
         let position = if scope == TableScope::Temp { None } else { self.table_lookup.get(&key).copied() };
         if let Some(position) = position {
             let def = &self.tables[position];
+            if def.without_rowid {
+                let stored = self
+                    .writer
+                    .without_rowid_rows(&def.name, TableLimits::default())
+                    .map_err(|error| SqlError::new("storage", error.to_string()).in_statement("select"))?;
+                let decoded =
+                    stored.iter().map(|payload| def.decode_without_rowid(payload)).collect::<Result<Vec<Vec<Cell>>, SqlError>>()?;
+                return Ok((SourceColumns::Table(def), decoded));
+            }
             let stored = self
                 .writer
                 .table_rows(&def.name, TableLimits::default())
@@ -5528,11 +5675,12 @@ impl<'a> SourceColumns<'a> {
     }
 
     /// A base table is a rowid table, so each of its rows carries one extra,
-    /// unnamed slot holding the rowid. Derived tables and CTEs have no rowid,
-    /// while `sqlite_master` and `sqlite_sequence` do.
+    /// unnamed slot holding the rowid. A WITHOUT ROWID table has none, and
+    /// derived tables and CTEs never do, while `sqlite_master` and
+    /// `sqlite_sequence` do.
     fn hidden_rowid(&self) -> bool {
         match self {
-            Self::Table(_) => true,
+            Self::Table(def) => !def.without_rowid,
             Self::Materialized { rowid, .. } => *rowid,
         }
     }
@@ -8181,6 +8329,7 @@ fn resolve_checks(
     columns: &[ColumnSpec],
     checks: &[CheckConstraint],
     statement: &'static str,
+    without_rowid: bool,
 ) -> Result<Vec<CheckDef>, SqlError> {
     if checks.is_empty() {
         return Ok(Vec::new());
@@ -8198,6 +8347,7 @@ fn resolve_checks(
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         strict: false,
+        without_rowid,
         temp: false,
     };
     let source = Source {

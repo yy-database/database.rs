@@ -1246,6 +1246,9 @@ pub enum Statement {
         foreign_keys: Vec<ForeignKey>,
         /// `STRICT` table option was present.
         strict: bool,
+        /// `WITHOUT ROWID` table option was present: the primary key is the
+        /// table's b-tree key and there is no implicit `rowid`.
+        without_rowid: bool,
         /// `TEMP` / `TEMPORARY`: the table lives in `sqlite_temp_master` and
         /// disappears with the connection.
         temp: bool,
@@ -3792,16 +3795,28 @@ impl<'a> Parser<'a> {
             }
         }
         let mut strict = false;
-        if self.peek() == Some(&Token::Comma)
-            && matches!(self.tokens.get(self.at + 1), Some(Token::Word(word)) if word.eq_ignore_ascii_case("strict"))
-        {
-            self.at += 1;
-        }
-        if self.eat_word("strict") {
-            strict = true;
+        let mut without_rowid = false;
+        loop {
+            if self.eat_word("strict") {
+                strict = true;
+            }
+            else if self.peek_keyword("without") {
+                self.at += 1;
+                self.expect_word("rowid")?;
+                without_rowid = true;
+            }
+            else {
+                break;
+            }
+            if self.peek() == Some(&Token::Comma) {
+                self.at += 1;
+            }
+            else {
+                break;
+            }
         }
         let sql = self.canonical_create_sql("CREATE TABLE", name_token, name_gap_end);
-        Ok(Statement::CreateTable { schema, name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, temp, sql })
+        Ok(Statement::CreateTable { schema, name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, without_rowid, temp, sql })
     }
 
     /// Reads `CHECK ( expr )` after an optional `CONSTRAINT name`, and keeps the
