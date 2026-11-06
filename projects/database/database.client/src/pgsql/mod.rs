@@ -28,6 +28,7 @@ pub mod client;
 
 pub use client::{
     BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Param, Portal, PortalReport, Prepared, Report,
+    TypedColumn, TypedResult,
 };
 
 /// One textual cell from a result set (bytes preserved when non-UTF-8).
@@ -44,6 +45,23 @@ pub enum Cell {
 pub struct QueryResult {
     /// Column names when the server provided a result set.
     pub columns: Vec<String>,
+    /// Row-major cells.
+    pub rows: Vec<Vec<Cell>>,
+    /// Rows affected for DML; `0` for pure queries.
+    pub affected_rows: u64,
+    /// Optional PostgreSQL SQLSTATE when the statement failed at the server.
+    pub sqlstate: Option<String>,
+}
+
+/// Result of an extended-query statement that kept its columns' type OIDs.
+///
+/// A simple-query result set carries labels only, so text cells cannot be
+/// decoded back into typed values without guessing. The extended path keeps
+/// the `RowDescription` OIDs for exactly that.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TypedQueryResult {
+    /// Columns with the server-assigned type OIDs.
+    pub columns: Vec<TypedColumn>,
     /// Row-major cells.
     pub rows: Vec<Vec<Cell>>,
     /// Rows affected for DML; `0` for pure queries.
@@ -91,6 +109,30 @@ impl Session {
     pub fn execute(&mut self, sql: &str) -> Result<u64> {
         Ok(self.query(sql)?.affected_rows)
     }
+
+    /// Run a parameterised statement through the extended protocol.
+    ///
+    /// The parameter types are left unspecified so the server resolves each
+    /// `$n` from its column context, which is why a text NULL still binds to a
+    /// non-text column. Text cells keep the type OIDs of their columns.
+    pub fn query_with_params(&mut self, sql: &str, params: &[Param<'_>]) -> Result<TypedQueryResult> {
+        let results = self.connection.execute_with_param_formats_typed(sql, params, &[], &[]).map_err(map_wire_error)?;
+        Ok(results.into_iter().last().map(convert_typed_result).unwrap_or_default())
+    }
+
+    /// Run a parameterised statement and return its affected-row count.
+    pub fn execute_with_params(&mut self, sql: &str, params: &[Param<'_>]) -> Result<u64> {
+        Ok(self.query_with_params(sql, params)?.affected_rows)
+    }
+}
+
+fn convert_typed_result(result: TypedResult) -> TypedQueryResult {
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| row.into_iter().map(|value| value.map(|text| Cell::Bytes(text.into_bytes())).unwrap_or(Cell::Null)).collect())
+        .collect();
+    TypedQueryResult { columns: result.columns, rows, affected_rows: affected_rows(&result.tag), sqlstate: None }
 }
 
 fn convert_result(result: client::QueryResult) -> QueryResult {
