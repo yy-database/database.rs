@@ -673,6 +673,30 @@ pub enum WindowFunction {
     },
 }
 
+/// One table-level constraint, in written order.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableConstraint {
+    /// `[CONSTRAINT name] PRIMARY KEY (a, b)`.
+    PrimaryKey {
+        /// Key columns in key order.
+        columns: Vec<String>,
+    },
+    /// `[CONSTRAINT name] UNIQUE (a, b)`.
+    Unique {
+        /// Key columns in key order.
+        columns: Vec<String>,
+    },
+}
+
+impl TableConstraint {
+    /// Key columns in key order.
+    pub fn columns(&self) -> &[String] {
+        match self {
+            Self::PrimaryKey { columns, .. } | Self::Unique { columns, .. } => columns,
+        }
+    }
+}
+
 /// One table- or column-level `CHECK` constraint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckConstraint {
@@ -1236,6 +1260,9 @@ pub enum Statement {
         columns: Vec<ColumnSpec>,
         /// Columns of a table-level `PRIMARY KEY (a, b)` clause, in key order.
         primary_key: Vec<String>,
+        /// Table-level constraints in written order, so automatic index
+        /// numbers match SQLite (`sqlite_autoindex_<table>_<n>`).
+        table_constraints: Vec<TableConstraint>,
         /// Table- and column-level `CHECK` constraints.
         checks: Vec<CheckConstraint>,
         /// Table- and column-level `REFERENCES` clauses, in declaration order.
@@ -3639,6 +3666,7 @@ impl<'a> Parser<'a> {
         self.expect_char(&Token::LParen)?;
         let mut columns = Vec::new();
         let mut primary_key: Vec<String> = Vec::new();
+        let mut table_constraints: Vec<TableConstraint> = Vec::new();
         let mut checks: Vec<CheckConstraint> = Vec::new();
         let mut foreign_keys: Vec<ForeignKey> = Vec::new();
         loop {
@@ -3649,8 +3677,9 @@ impl<'a> Parser<'a> {
                 self.at += 1;
                 self.expect_word("key")?;
                 self.expect_char(&Token::LParen)?;
+                let mut key_columns = Vec::new();
                 loop {
-                    primary_key.push(self.name()?);
+                    key_columns.push(self.name()?);
                     match self.peek() {
                         Some(Token::Comma) => {
                             self.at += 1;
@@ -3667,6 +3696,8 @@ impl<'a> Parser<'a> {
                         None => return Err(self.error("syntax", "primary key column list is not closed")),
                     }
                 }
+                primary_key.clone_from(&key_columns);
+                table_constraints.push(TableConstraint::PrimaryKey { columns: key_columns });
             }
             else if self.peek_keyword("check") {
                 checks.push(self.check_constraint(constraint)?);
@@ -3680,10 +3711,11 @@ impl<'a> Parser<'a> {
                 foreign_keys.push(self.references_clause(columns)?);
             }
             else if self.peek_keyword("unique") {
-                let clause = self.peek_word().unwrap_or_default().to_string();
-                let mut error = self.error("unsupported-column-constraint", format!("unsupported table constraint `{clause}`"));
-                error.clause = Some(clause.to_ascii_uppercase());
-                return Err(error);
+                // Table-level `UNIQUE (a, b)`: one `sqlite_autoindex_<table>_<n>`
+                // unique index, numbered in written constraint order.
+                self.at += 1;
+                let unique_columns = self.column_list()?;
+                table_constraints.push(TableConstraint::Unique { columns: unique_columns });
             }
             else if constraint.is_some() {
                 let clause = self.peek_word().unwrap_or_default().to_string();
@@ -3733,7 +3765,20 @@ impl<'a> Parser<'a> {
             }
         }
         let sql = self.canonical_create_sql("CREATE TABLE", name_token, name_gap_end);
-        Ok(Statement::CreateTable { schema, name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, without_rowid, temp, sql })
+        Ok(Statement::CreateTable {
+            schema,
+            name,
+            if_not_exists,
+            columns,
+            primary_key,
+            table_constraints,
+            checks,
+            foreign_keys,
+            strict,
+            without_rowid,
+            temp,
+            sql,
+        })
     }
 
     /// Reads `CHECK ( expr )` after an optional `CONSTRAINT name`, and keeps the

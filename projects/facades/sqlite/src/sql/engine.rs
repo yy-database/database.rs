@@ -22,7 +22,8 @@ use super::{
     sql::{
         AggregateFunction, AlterAction, Assignment, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp,
         CompoundTerm, DropColumnConflict, Expr, ForeignKey, ForeignKeyAction, FrameBound, FrameEdge, FrameUnits, IndexColumn, InsertValue,
-        JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, TransactionAction,
+        JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableConstraint, TableRef,
+        TransactionAction,
         TriggerEvent, TriggerTiming, UnaryOp, WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column,
         rewrite_create_index_table, rewrite_create_table_column, rewrite_create_table_drop_column, rewrite_create_table_name,
         rewrite_view_column, rewrite_view_table, statement_references, strip_schema_qualifiers,
@@ -90,6 +91,16 @@ impl ExecResult {
     }
 }
 
+/// One table-level `PRIMARY KEY` or `UNIQUE` constraint resolved against the
+/// declared columns, in written order.
+#[derive(Clone)]
+struct TableConstraintDef {
+    /// `true` for `PRIMARY KEY`, `false` for `UNIQUE`.
+    primary: bool,
+    /// Key columns in key order.
+    columns: Vec<usize>,
+}
+
 #[derive(Clone)]
 struct TableDef {
     /// Name exactly as written in `CREATE TABLE`.
@@ -102,6 +113,9 @@ struct TableDef {
     /// Column positions of a table-level `PRIMARY KEY (a, b)`, in key order.
     /// Empty for a rowid alias or a table without a table-level key.
     primary_key: Vec<usize>,
+    /// Table-level `PRIMARY KEY` / `UNIQUE` clauses in written order, so
+    /// automatic index numbers match `sqlite_autoindex_<table>_<n>`.
+    table_constraints: Vec<TableConstraintDef>,
     /// `CHECK` constraints, table- and column-level, in declaration order.
     checks: Vec<CheckDef>,
     /// `REFERENCES` clauses, table- and column-level, in declaration order.
@@ -984,8 +998,17 @@ impl Engine {
             };
             let mut statements = parse(sql)?.into_iter();
             match statements.next() {
-                Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, without_rowid, .. }) => {
-                    let def = Self::catalog_table(name.clone(), columns, primary_key, checks, foreign_keys, strict, without_rowid)?;
+                Some(Statement::CreateTable { name, columns, primary_key, table_constraints, checks, foreign_keys, strict, without_rowid, .. }) => {
+                    let def = Self::catalog_table(
+                        name.clone(),
+                        columns,
+                        primary_key,
+                        table_constraints,
+                        checks,
+                        foreign_keys,
+                        strict,
+                        without_rowid,
+                    )?;
                     let key = name.to_ascii_lowercase();
                     if !self.table_lookup.contains_key(&key) {
                         let position = self.tables.len();
@@ -1103,6 +1126,7 @@ impl Engine {
         name: String,
         mut columns: Vec<ColumnSpec>,
         primary_key: Vec<String>,
+        table_constraints: Vec<TableConstraint>,
         checks: Vec<CheckConstraint>,
         foreign_keys: Vec<ForeignKey>,
         strict: bool,
@@ -1128,6 +1152,27 @@ impl Engine {
                 SqlError::new("unknown-column", format!("unknown column `{column}` in table `{name}`")).in_statement("create-table")
             })?;
             key_positions.push(position);
+        }
+        let mut resolved_constraints = Vec::with_capacity(table_constraints.len());
+        for constraint in table_constraints {
+            let mut positions = Vec::with_capacity(constraint.columns().len());
+            for column in constraint.columns() {
+                let position = columns
+                    .iter()
+                    .position(|existing| existing.name.eq_ignore_ascii_case(column))
+                    .ok_or_else(|| SqlError::new("unknown-column", format!("no such column: {column}")).in_statement("create-table"))?;
+                positions.push(position);
+            }
+            resolved_constraints.push(TableConstraintDef {
+                primary: matches!(constraint, TableConstraint::PrimaryKey { .. }),
+                columns: positions,
+            });
+        }
+        if without_rowid && resolved_constraints.iter().any(|constraint| !constraint.primary) {
+            return Err(
+                SqlError::new("unsupported-clause", "UNIQUE constraints on WITHOUT ROWID tables are not supported")
+                    .in_statement("create-table"),
+            );
         }
         if without_rowid {
             // A WITHOUT ROWID table needs a primary key: either the table-level
@@ -1179,6 +1224,7 @@ impl Engine {
             rowid_alias,
             primary_key_index,
             primary_key: key_positions,
+            table_constraints: resolved_constraints,
             checks: resolved_checks,
             foreign_keys: resolved_foreign_keys,
             strict,
@@ -2046,6 +2092,7 @@ impl Engine {
                 if_not_exists,
                 columns,
                 primary_key,
+                table_constraints,
                 checks,
                 foreign_keys,
                 strict,
@@ -2073,7 +2120,8 @@ impl Engine {
                         }
                         return Err(SqlError::new("table-exists", format!("table {name} already exists")).in_statement("create-table"));
                     }
-                    let mut def = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict, without_rowid)?;
+                    let mut def =
+                        Self::catalog_table(name, columns, primary_key, table_constraints, checks, foreign_keys, strict, without_rowid)?;
                     def.temp = true;
                     // SQLite reuses a freed temp page when one is available
                     // and otherwise extends the temp database by one page.
@@ -2109,6 +2157,7 @@ impl Engine {
                     name.clone(),
                     columns.clone(),
                     primary_key.clone(),
+                    table_constraints.clone(),
                     checks.clone(),
                     foreign_keys.clone(),
                     strict,
@@ -2489,18 +2538,11 @@ impl Engine {
                     }
                     self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
                 }
-                // Explicit indexes and the automatic ones built for column-level
-                // `PRIMARY KEY` / `UNIQUE` both live only as key sets until they
-                // are materialized into b-tree pages, so a write to either kind
-                // of indexed table has to rebuild them before the image is read.
-                let aliased = def.rowid_alias;
-                let constraint_indexed = def.primary_key_index
-                    || def
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .any(|(position, column)| (column.primary_key || column.unique) && Some(position) != aliased);
-                if temp_position.is_none() && (constraint_indexed || self.indexes.values().any(|index| index.table == key)) {
+                // Explicit indexes and the automatic ones built for any
+                // `PRIMARY KEY` / `UNIQUE` constraint live only as key sets
+                // until they are materialized into b-tree pages, so a write to
+                // an indexed table has to rebuild them before the image is read.
+                if temp_position.is_none() && self.has_indexes(def, &key) {
                     self.writer.materialize_indexes().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("insert"))?;
                 }
                 if temp_position.is_none() && def.without_rowid {
@@ -3402,12 +3444,22 @@ impl Engine {
                 // positions instead of being patched by hand.
                 let mut statements = parse(&new_sql)
                     .map_err(|_| SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"))?;
-                let Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, without_rowid, .. }) =
-                    statements.drain(..).next()
+                let Some(Statement::CreateTable {
+                    name,
+                    columns,
+                    primary_key,
+                    table_constraints,
+                    checks,
+                    foreign_keys,
+                    strict,
+                    without_rowid,
+                    ..
+                }) = statements.drain(..).next()
                 else {
                     return Err(SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"));
                 };
-                let derived = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict, without_rowid)?;
+                let derived =
+                    Self::catalog_table(name, columns, primary_key, table_constraints, checks, foreign_keys, strict, without_rowid)?;
                 self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
                 if let Err(error) = self.writer.drop_column(&def.name, column_position) {
                     let _ = self.writer.rollback();
@@ -3822,6 +3874,11 @@ impl Engine {
                 keys.push(UniqueKey::Columns(vec![position], label(&[position])));
             }
         }
+        for constraint in &def.table_constraints {
+            if !constraint.primary {
+                keys.push(UniqueKey::Columns(constraint.columns.clone(), label(&constraint.columns)));
+            }
+        }
         for index in self.indexes.values() {
             // Managed indexes are expression or partial, so their uniqueness is
             // enforced while their keys are rebuilt from the live rows.
@@ -3841,6 +3898,7 @@ impl Engine {
                 .iter()
                 .enumerate()
                 .any(|(position, column)| (column.primary_key || column.unique) && Some(position) != def.rowid_alias)
+            || def.table_constraints.iter().any(|constraint| !constraint.primary)
             || (!def.temp && self.indexes.values().any(|index| index.table == table_key))
     }
 
@@ -8412,6 +8470,7 @@ fn resolve_checks(
         rowid_alias: None,
         primary_key_index: false,
         primary_key: Vec::new(),
+        table_constraints: Vec::new(),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         strict: false,
@@ -8542,9 +8601,12 @@ fn autoindex_definitions(def: &TableDef) -> Vec<(usize, Vec<usize>, &'static str
             definitions.push((number, vec![position], if column.primary_key { "pk" } else { "u" }));
         }
     }
-    if !def.primary_key.is_empty() && def.rowid_alias.is_none() {
+    for constraint in &def.table_constraints {
+        if constraint.primary && (def.rowid_alias.is_some() || def.without_rowid) {
+            continue;
+        }
         number += 1;
-        definitions.push((number, def.primary_key.clone(), "pk"));
+        definitions.push((number, constraint.columns.clone(), if constraint.primary { "pk" } else { "u" }));
     }
     definitions
 }

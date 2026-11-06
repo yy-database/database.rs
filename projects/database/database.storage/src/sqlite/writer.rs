@@ -506,10 +506,17 @@ impl SqliteWriter {
                 self.create_index_inner(&auto_name, &mut meta, vec![index], true, true, None)?;
             }
         }
-        if !primary_key.is_empty() && rowid_alias.is_none() {
+        // Table-level constraints follow the inline ones in written order. When
+        // the original text is available it decides the numbering, so a
+        // `UNIQUE` written before a table-level key owns the lower number.
+        let constraints = parse_table_constraints(sql, columns)?;
+        for (primary, positions) in constraints {
+            if primary && rowid_alias.is_some() {
+                continue;
+            }
             auto_number += 1;
             let auto_name = format!("sqlite_autoindex_{name}_{auto_number}");
-            self.create_index_inner(&auto_name, &mut meta, primary_key_positions, true, true, None)?;
+            self.create_index_inner(&auto_name, &mut meta, positions, true, true, None)?;
         }
         // SQLite creates `sqlite_sequence` as the last step of a CREATE TABLE
         // that declares AUTOINCREMENT, after the automatic constraint indexes.
@@ -617,8 +624,12 @@ impl SqliteWriter {
         if columns.iter().filter(|column| column.primary_key).count() > 1 {
             return Err(Error::Unsupported("sqlite table has more than one primary key"));
         }
-        if columns.iter().any(|column| column.unique) {
-            return Err(Error::Unsupported("sqlite UNIQUE columns on WITHOUT ROWID tables are not supported"));
+        let table_unique = match sql {
+            Some(text) => parse_table_constraints(text, columns)?.iter().any(|(primary, _)| !primary),
+            None => false,
+        };
+        if columns.iter().any(|column| column.unique) || table_unique {
+            return Err(Error::Unsupported("sqlite UNIQUE constraints on WITHOUT ROWID tables are not supported"));
         }
         if columns.iter().any(|column| column.autoincrement) {
             return Err(Error::Unsupported("sqlite AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"));
@@ -955,7 +966,7 @@ impl SqliteWriter {
             if index_meta.managed {
                 continue;
             }
-            if index_meta.unique {
+            if index_meta.unique && index_key_has_no_null(&resolved, &index_meta.columns) {
                 let key = encode_index_key(&meta, index_meta, rowid, &resolved, self.encoding)?;
                 if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), None)? {
                     return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
@@ -1061,7 +1072,7 @@ impl SqliteWriter {
             if index_meta.managed {
                 continue;
             }
-            if index_meta.unique {
+            if index_meta.unique && index_key_has_no_null(&owned, &index_meta.columns) {
                 let key = encode_index_key(&meta, index_meta, next_rowid, &owned, self.encoding)?;
                 if self.set_prefix_match(index_meta.master_rowid, &key, index_meta.columns.len(), Some(rowid))? {
                     return Err(Error::Unsupported("sqlite UNIQUE constraint failed"));
@@ -1620,8 +1631,11 @@ impl SqliteWriter {
                     constraint_columns.push(vec![index]);
                 }
             }
-            if !table_key_names.is_empty() && rowid_alias.is_none() {
-                constraint_columns.push(table_key_positions);
+            for (primary, positions) in parse_table_constraints(sql, &meta.columns)? {
+                if primary && rowid_alias.is_some() {
+                    continue;
+                }
+                constraint_columns.push(positions);
             }
         }
         for row in rows.iter().filter(|row| row.kind == "index" && eq_ignore_ascii_case(&row.table_name, table)) {
@@ -3094,6 +3108,12 @@ fn expand_alias(meta: &TableMeta, rowid: i64, values: &[database_formats::sqlite
     owned
 }
 
+/// SQLite lets every row whose unique key contains a `NULL` coexist, because
+/// `NULL` never compares equal to anything.
+fn index_key_has_no_null(values: &[WriteValue], columns: &[usize]) -> bool {
+    columns.iter().all(|column| !matches!(values.get(*column), Some(WriteValue::Null)))
+}
+
 fn encode_index_key(meta: &TableMeta, index: &IndexMeta, rowid: i64, values: &[WriteValue], encoding: TextEncoding) -> Result<Vec<u8>> {
     let mut key: Vec<WriteValue> = index.columns.iter().map(|column| values[*column].clone()).collect();
     let _ = meta;
@@ -3246,7 +3266,8 @@ fn render_literal(value: &WriteValue) -> String {
     }
 }
 
-fn parse_create_table(sql: &str) -> Result<Vec<ColumnSpec>> {
+/// Returns the parenthesised body of a `CREATE TABLE` statement.
+fn create_table_body(sql: &str) -> Result<&str> {
     let trimmed = sql.trim();
     let upper = trimmed.to_ascii_uppercase();
     let Some(start) = upper.find("CREATE TABLE ")
@@ -3265,7 +3286,71 @@ fn parse_create_table(sql: &str) -> Result<Vec<ColumnSpec>> {
     if close <= open {
         return Err(Error::Unsupported("sqlite CREATE TABLE text malformed"));
     }
-    let body = &rest[open + 1..close];
+    Ok(&rest[open + 1..close])
+}
+
+/// True when `text` begins with `keyword` as a whole word.
+fn starts_with_keyword(text: &str, keyword: &str) -> bool {
+    let Some(prefix) = text.get(..keyword.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+    match text.as_bytes().get(keyword.len()) {
+        None => true,
+        Some(next) => next.is_ascii_whitespace() || *next == b'(',
+    }
+}
+
+/// Table-level constraints in written order: `(is_primary_key, key positions)`.
+/// The order decides the `sqlite_autoindex_<table>_<n>` suffix SQLite assigns,
+/// so a `UNIQUE` written before a `PRIMARY KEY` owns the lower number.
+fn parse_table_constraints(sql: &str, columns: &[ColumnSpec]) -> Result<Vec<(bool, Vec<usize>)>> {
+    let body = create_table_body(sql)?;
+    let mut constraints = Vec::new();
+    for fragment in split_top_level(body) {
+        let mut fragment = fragment.trim();
+        // Skip an optional `CONSTRAINT <name>` prefix.
+        if starts_with_keyword(fragment, "CONSTRAINT") {
+            fragment = fragment["CONSTRAINT".len()..].trim_start();
+            if fragment.starts_with('"') {
+                let close = fragment[1..].find('"').map(|index| index + 2).ok_or(Error::Unsupported("sqlite constraint name unterminated"))?;
+                fragment = fragment[close..].trim_start();
+            }
+            else {
+                let end = fragment.find(|character: char| character.is_ascii_whitespace() || character == '(').unwrap_or(fragment.len());
+                fragment = fragment[end..].trim_start();
+            }
+        }
+        let primary = if starts_with_keyword(fragment, "PRIMARY") {
+            true
+        }
+        else if starts_with_keyword(fragment, "UNIQUE") && fragment["UNIQUE".len()..].trim_start().starts_with('(') {
+            false
+        }
+        else {
+            continue;
+        };
+        let open = fragment.find('(').ok_or(Error::Unsupported("sqlite table constraint lacks parentheses"))?;
+        let close = fragment.rfind(')').ok_or(Error::Unsupported("sqlite table constraint lacks closing paren"))?;
+        let inner = &fragment[open + 1..close];
+        let mut positions = Vec::new();
+        for name in split_top_level(inner) {
+            let name = unquote_identifier(&name.trim().to_string())?;
+            let position = columns
+                .iter()
+                .position(|column| eq_ignore_ascii_case(&column.name, &name))
+                .ok_or(Error::Unsupported("sqlite table constraint references unknown column"))?;
+            positions.push(position);
+        }
+        constraints.push((primary, positions));
+    }
+    Ok(constraints)
+}
+
+fn parse_create_table(sql: &str) -> Result<Vec<ColumnSpec>> {
+    let body = create_table_body(sql)?;
     let mut columns = Vec::new();
     for fragment in split_top_level(body) {
         let fragment = fragment.trim();
