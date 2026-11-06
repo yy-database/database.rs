@@ -2683,3 +2683,123 @@ fn list_position_commands() {
     send(&mut client, &["LPOS", "str", "v"]);
     expect_error(&mut client, "WRONGTYPE Operation against a key holding the wrong kind of value");
 }
+
+#[test]
+fn hyperloglog_commands() {
+    let (mut client, _server) = memory_server("redis-hll");
+
+    // 不带元素创建键：真机同样回复 1，并留下一个空的 dense HLL 字符串。
+    send(&mut client, &["PFADD", "hll"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "hll"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFCOUNT", "hll"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["TYPE", "hll"]);
+    expect_status(&mut client, "string");
+    send(&mut client, &["STRLEN", "hll"]);
+    assert_eq!(expect_integer(&mut client), 12304);
+
+    // 首次加入元素改动寄存器，重复加入不再改动。
+    send(&mut client, &["PFADD", "hll", "a", "b", "c"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFCOUNT", "hll"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["PFADD", "hll", "a", "b", "c"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["PFCOUNT", "hll"]);
+    assert_eq!(expect_integer(&mut client), 3);
+
+    // 空字符串也是合法元素。
+    send(&mut client, &["PFADD", "hll", ""]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFCOUNT", "hll"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["PFADD", "hll", "a", "b", "c", ""]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    // 第二个键与前四个元素无交集。
+    send(&mut client, &["PFADD", "hll2", "d", "e", "f"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFCOUNT", "hll2"]);
+    assert_eq!(expect_integer(&mut client), 3);
+
+    // 多键按寄存器取最大值合并后估计，重复键不重复计数。
+    send(&mut client, &["PFCOUNT", "hll", "hll2"]);
+    assert_eq!(expect_integer(&mut client), 7);
+    send(&mut client, &["PFCOUNT", "hll", "hll"]);
+    assert_eq!(expect_integer(&mut client), 4);
+
+    // 目标键也是来源之一，合并结果与多键估计一致。
+    send(&mut client, &["PFMERGE", "dest", "hll", "hll2"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["PFCOUNT", "dest"]);
+    assert_eq!(expect_integer(&mut client), 7);
+    send(&mut client, &["TYPE", "dest"]);
+    expect_status(&mut client, "string");
+    send(&mut client, &["STRLEN", "dest"]);
+    assert_eq!(expect_integer(&mut client), 12304);
+
+    // 全部来源缺失时创建一个空的 HLL。
+    send(&mut client, &["PFMERGE", "empty", "no-such-key", "also-missing"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["PFCOUNT", "empty"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["PFCOUNT", "no-such-key"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    // 修改 HLL 内容不影响既有 TTL，合并写入目标键也保留目标的 TTL。
+    send(&mut client, &["EXPIRE", "hll", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFADD", "hll", "g"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TTL", "hll"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "unexpected HLL TTL after PFADD: {ttl}");
+    send(&mut client, &["EXPIRE", "dest", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFMERGE", "dest", "hll"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["TTL", "dest"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "unexpected HLL TTL after PFMERGE: {ttl}");
+
+    // 大批量元素走 dense 寄存器，估计值与真机公式一致。
+    let items: Vec<String> = (0..1000).map(|index| format!("item-{index}")).collect();
+    let mut arguments: Vec<&str> = vec!["PFADD", "many"];
+    arguments.extend(items.iter().map(String::as_str));
+    send(&mut client, &arguments);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFCOUNT", "many"]);
+    assert_eq!(expect_integer(&mut client), 996);
+
+    // 普通字符串与非 dense 内容走 HLL 专用的类型错误文案。
+    send(&mut client, &["SET", "plain", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["PFADD", "plain", "x"]);
+    expect_error(&mut client, "WRONGTYPE Key is not a valid HyperLogLog string value.");
+    send(&mut client, &["PFCOUNT", "plain"]);
+    expect_error(&mut client, "WRONGTYPE Key is not a valid HyperLogLog string value.");
+    send(&mut client, &["PFCOUNT", "hll", "plain"]);
+    expect_error(&mut client, "WRONGTYPE Key is not a valid HyperLogLog string value.");
+    send(&mut client, &["PFMERGE", "dest", "plain"]);
+    expect_error(&mut client, "WRONGTYPE Key is not a valid HyperLogLog string value.");
+
+    // 非字符串类型走常规 WRONGTYPE。
+    send(&mut client, &["LPUSH", "list", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["PFADD", "list", "v"]);
+    expect_error(&mut client, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    send(&mut client, &["PFCOUNT", "list"]);
+    expect_error(&mut client, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    send(&mut client, &["PFMERGE", "dest", "list"]);
+    expect_error(&mut client, "WRONGTYPE Operation against a key holding the wrong kind of value");
+
+    // arity。
+    send(&mut client, &["PFADD"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'pfadd' command");
+    send(&mut client, &["PFCOUNT"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'pfcount' command");
+    send(&mut client, &["PFMERGE", "dest"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'pfmerge' command");
+}
