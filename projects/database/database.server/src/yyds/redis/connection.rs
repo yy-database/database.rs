@@ -2368,7 +2368,7 @@ fn respond(
         collections::handle_list(stream, request, executor, namespace, state.protocol)?;
     }
     else if collections::is_set_command(command) {
-        collections::handle_set(stream, request, executor, namespace)?;
+        collections::handle_set(stream, request, executor, namespace, state.protocol)?;
     }
     else if collections::is_zset_command(command) {
         collections::handle_zset(stream, request, executor, namespace, state.protocol)?;

@@ -1169,6 +1169,242 @@ fn bit_operations() {
     assert!((1..=100).contains(&ttl), "unexpected string TTL: {ttl}");
 }
 
+fn read_bulk_text(client: &mut TcpStream) -> Option<String> {
+    match read_reply(client) {
+        Reply::Bulk(value) => value.map(|bytes| String::from_utf8(bytes).unwrap()),
+        other => panic!("expected bulk, got {}", describe(&other)),
+    }
+}
+
+fn read_array_text(client: &mut TcpStream) -> Vec<String> {
+    match read_reply(client) {
+        Reply::Array(Some(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Reply::Bulk(Some(bytes)) => String::from_utf8(bytes).unwrap(),
+                other => panic!("expected bulk array element, got {}", describe(&other)),
+            })
+            .collect(),
+        other => panic!("expected array, got {}", describe(&other)),
+    }
+}
+
+/// `SINTER` / `SUNION` / `SDIFF` cover missing keys, empty results and wrong types,
+/// while the `*STORE` variants overwrite the destination and drop its old TTL.
+#[test]
+fn set_algebra_and_store_variants() {
+    let (mut client, _server) = memory_server("redis-set-algebra");
+    send(&mut client, &["SADD", "a", "1", "2", "3"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SADD", "b", "2", "3", "4"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SADD", "c", "3", "5"]);
+    assert_eq!(expect_integer(&mut client), 2);
+
+    send(&mut client, &["SINTER", "a", "b"]);
+    expect_array(&mut client, &["2", "3"]);
+    send(&mut client, &["SUNION", "a", "b", "c"]);
+    expect_array(&mut client, &["1", "2", "3", "4", "5"]);
+    send(&mut client, &["SDIFF", "a", "b"]);
+    expect_array(&mut client, &["1"]);
+    send(&mut client, &["SDIFF", "a", "b", "c"]);
+    expect_array(&mut client, &["1"]);
+
+    // Missing keys behave as empty sets.
+    send(&mut client, &["SINTER", "a", "no-such-key"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["SUNION", "a", "no-such-key"]);
+    expect_array(&mut client, &["1", "2", "3"]);
+    send(&mut client, &["SDIFF", "a", "no-such-key"]);
+    expect_array(&mut client, &["1", "2", "3"]);
+    send(&mut client, &["SDIFF", "no-such-key", "a"]);
+    expect_empty_array(&mut client);
+
+    // Any wrong-typed source rejects the whole command.
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    for arguments in [
+        ["SINTER", "a", "str"].as_slice(),
+        ["SUNION", "a", "str"].as_slice(),
+        ["SDIFF", "a", "str"].as_slice(),
+        ["SINTERSTORE", "dst", "a", "str"].as_slice(),
+        ["SUNIONSTORE", "dst", "a", "str"].as_slice(),
+        ["SDIFFSTORE", "dst", "a", "str"].as_slice(),
+    ] {
+        send(&mut client, arguments);
+        expect_error(&mut client, WRONGTYPE);
+    }
+
+    // Store variants count the result and write it as a set, replacing a string
+    // destination and dropping its TTL.
+    send(&mut client, &["SET", "dst", "old", "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SINTERSTORE", "dst", "a", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["TYPE", "dst"]);
+    expect_status(&mut client, "set");
+    send(&mut client, &["SMEMBERS", "dst"]);
+    expect_array(&mut client, &["2", "3"]);
+    send(&mut client, &["TTL", "dst"]);
+    assert_eq!(expect_integer(&mut client), -1, "STORE must not inherit the destination TTL");
+    send(&mut client, &["SUNIONSTORE", "dst", "a", "c"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["SDIFFSTORE", "dst", "a", "b"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SMEMBERS", "dst"]);
+    expect_array(&mut client, &["1"]);
+
+    // An empty result deletes the destination key entirely.
+    send(&mut client, &["SADD", "dst", "keep"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SADD", "d", "7"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SINTERSTORE", "dst", "a", "d"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "dst"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["TYPE", "dst"]);
+    expect_status(&mut client, "none");
+
+    send(&mut client, &["SINTERSTORE", "dst", "no-such-key", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "dst"]);
+    assert_eq!(expect_integer(&mut client), 0);
+}
+
+/// `SMOVE` moves one member, deletes an emptied source, ignores a missing member and
+/// rejects a wrong-typed destination; `SRANDMEMBER` honours the count sign.
+#[test]
+fn set_move_and_random_member() {
+    let (mut client, _server) = memory_server("redis-set-move-random");
+    send(&mut client, &["SADD", "s1", "a", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["SADD", "s2", "c"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SMOVE", "s1", "s2", "a"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SMEMBERS", "s1"]);
+    expect_array(&mut client, &["b"]);
+    send(&mut client, &["SMEMBERS", "s2"]);
+    expect_array(&mut client, &["c", "a"]);
+    send(&mut client, &["SMOVE", "s1", "s2", "missing"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SMOVE", "no-such-key", "s2", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SMOVE", "s1", "s1", "b"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["SMOVE", "s1", "s1", "gone"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    // Moving the last member deletes the source.
+    send(&mut client, &["SMOVE", "s1", "s2", "b"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "s1"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SMOVE", "s2", "str", "a"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["SMEMBERS", "s2"]);
+    expect_array(&mut client, &["c", "a", "b"]);
+
+    send(&mut client, &["SADD", "r", "x", "y", "z"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["SRANDMEMBER", "r"]);
+    let picked = read_bulk_text(&mut client).expect("SRANDMEMBER without count must return a member");
+    assert!(["x", "y", "z"].contains(&picked.as_str()));
+    send(&mut client, &["SRANDMEMBER", "r", "2"]);
+    let distinct = read_array_text(&mut client);
+    assert_eq!(distinct.len(), 2);
+    let mut unique = distinct.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 2, "positive count must not repeat members");
+    send(&mut client, &["SRANDMEMBER", "r", "10"]);
+    let capped = read_array_text(&mut client);
+    let mut sorted = capped.clone();
+    sorted.sort();
+    assert_eq!(sorted, ["x", "y", "z"]);
+    send(&mut client, &["SRANDMEMBER", "r", "0"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["SRANDMEMBER", "r", "-5"]);
+    let repeated = read_array_text(&mut client);
+    assert_eq!(repeated.len(), 5);
+    assert!(repeated.iter().all(|member| ["x", "y", "z"].contains(&member.as_str())));
+    send(&mut client, &["SRANDMEMBER", "no-such-key"]);
+    assert_eq!(read_bulk_text(&mut client), None);
+    send(&mut client, &["SRANDMEMBER", "no-such-key", "3"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["SRANDMEMBER", "r", "not-a-number"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["SRANDMEMBER", "str"]);
+    expect_error(&mut client, WRONGTYPE);
+}
+
+/// `SSCAN` walks a set in pages, honours `MATCH` and ends with cursor `0`.
+#[test]
+fn set_scan_pages_and_match() {
+    let (mut client, _server) = memory_server("redis-sscan");
+    send(&mut client, &["SADD", "s", "a1", "a2", "b1", "b2"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    let mut cursor = "0".to_string();
+    let mut seen = Vec::new();
+    loop {
+        send(&mut client, &["SSCAN", "s", &cursor, "COUNT", "2"]);
+        let (next, members) = expect_scan(&mut client);
+        seen.extend(members);
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort();
+    assert_eq!(seen, ["a1", "a2", "b1", "b2"]);
+    send(&mut client, &["SSCAN", "s", "0", "MATCH", "a*", "COUNT", "100"]);
+    let (cursor, members) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert_eq!(members, ["a1", "a2"]);
+    send(&mut client, &["SSCAN", "no-such-key", "0"]);
+    let (cursor, members) = expect_scan(&mut client);
+    assert_eq!(cursor, "0");
+    assert!(members.is_empty());
+    send(&mut client, &["SSCAN", "s", "not-a-cursor"]);
+    expect_error(&mut client, "ERR invalid cursor");
+    send(&mut client, &["SET", "str", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SSCAN", "str", "0"]);
+    expect_error(&mut client, WRONGTYPE);
+}
+
+/// Set algebra results and moves survive a `FileShard` reopen with their TTLs.
+#[test]
+fn set_algebra_survives_reopen() {
+    let path = temp_path("set-algebra");
+    let (mut first, _first_server) = file_server(&path);
+    send(&mut first, &["SADD", "a", "1", "2", "3"]);
+    assert_eq!(expect_integer(&mut first), 3);
+    send(&mut first, &["SADD", "b", "2", "3", "4"]);
+    assert_eq!(expect_integer(&mut first), 3);
+    send(&mut first, &["SINTERSTORE", "dst", "a", "b"]);
+    assert_eq!(expect_integer(&mut first), 2);
+    send(&mut first, &["EXPIRE", "dst", "100"]);
+    assert_eq!(expect_integer(&mut first), 1);
+    send(&mut first, &["SADD", "src", "m", "n"]);
+    assert_eq!(expect_integer(&mut first), 2);
+    send(&mut first, &["SMOVE", "src", "dst", "m"]);
+    assert_eq!(expect_integer(&mut first), 1);
+
+    let (mut second, _second_server) = file_server(&path);
+    send(&mut second, &["TYPE", "dst"]);
+    expect_status(&mut second, "set");
+    send(&mut second, &["SMEMBERS", "dst"]);
+    expect_array(&mut second, &["2", "3", "m"]);
+    send(&mut second, &["TTL", "dst"]);
+    let ttl = expect_integer(&mut second);
+    assert!((1..=100).contains(&ttl), "set TTL missing after reopen: {ttl}");
+    send(&mut second, &["SMEMBERS", "src"]);
+    expect_array(&mut second, &["n"]);
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]

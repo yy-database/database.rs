@@ -281,7 +281,22 @@ pub(crate) fn is_list_command(command: &[u8]) -> bool {
 
 /// set 命令名集合。
 pub(crate) fn is_set_command(command: &[u8]) -> bool {
-    for name in [b"SADD".as_slice(), b"SREM", b"SMEMBERS", b"SCARD", b"SISMEMBER"] {
+    for name in [
+        b"SADD".as_slice(),
+        b"SREM",
+        b"SMEMBERS",
+        b"SCARD",
+        b"SISMEMBER",
+        b"SINTER",
+        b"SUNION",
+        b"SDIFF",
+        b"SINTERSTORE",
+        b"SUNIONSTORE",
+        b"SDIFFSTORE",
+        b"SMOVE",
+        b"SRANDMEMBER",
+        b"SSCAN",
+    ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
         }
@@ -828,12 +843,236 @@ pub(crate) fn handle_list(
     }
 }
 
-/// `SADD` / `SREM` / `SMEMBERS` / `SCARD` / `SISMEMBER` 的分派入口。
+/// 集合代数运算。
+#[derive(Clone, Copy)]
+enum SetOp {
+    Inter,
+    Union,
+    Diff,
+}
+
+/// 删除同一逻辑键的全部类型表示，供 `*STORE` 覆盖目标与 `COPY REPLACE` 使用。
+fn remove_all_kinds(executor: &dyn KeyValueExecutor, base: &Namespace, key: &[u8]) -> Result<(), String> {
+    for kind in KeyKind::ALL {
+        remove_value(executor, &kind.namespace(base), key)?;
+    }
+    Ok(())
+}
+
+/// 无条件写入一个值（新记录不带过期时间），对应 `*STORE` 覆盖目标的真机语义。
+fn store_fresh_value(
+    executor: &dyn KeyValueExecutor,
+    namespace: &Namespace,
+    key: &[u8],
+    value: Vec<u8>,
+) -> Result<(), String> {
+    let command = KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action: KeyValueAction::Put(value) };
+    match executor.execute(None, command) {
+        Ok(KeyValueResult::Put { .. }) => Ok(()),
+        Ok(_) => Err("fresh write returned an unexpected result".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// 读取多个集合并校验类型；任一键类型不合法时整条命令按真机回 `WRONGTYPE`。
+fn load_sets(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    keys: &[&[u8]],
+) -> io::Result<Option<Vec<Vec<Vec<u8>>>>> {
+    let mut sets = Vec::with_capacity(keys.len());
+    for key in keys {
+        match load_set(stream, executor, base, key)? {
+            Loaded::Missing => sets.push(Vec::new()),
+            Loaded::Found(members) => sets.push(members),
+            Loaded::Rejected => return Ok(None),
+        }
+    }
+    Ok(Some(sets))
+}
+
+/// 按真机语义计算交集、并集或差集，保留第一个操作数的成员顺序。
+fn apply_set_op(op: SetOp, sets: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
+    match op {
+        SetOp::Union => {
+            let mut union: Vec<Vec<u8>> = Vec::new();
+            for set in sets {
+                for member in set {
+                    if !union.iter().any(|existing| existing == member) {
+                        union.push(member.clone());
+                    }
+                }
+            }
+            union
+        }
+        SetOp::Inter => {
+            let mut result = sets.first().cloned().unwrap_or_default();
+            result.retain(|member| sets.iter().all(|set| set.iter().any(|candidate| candidate == member)));
+            result
+        }
+        SetOp::Diff => {
+            let mut result = sets.first().cloned().unwrap_or_default();
+            for set in &sets[1..] {
+                result.retain(|member| !set.iter().any(|candidate| candidate == member));
+            }
+            result
+        }
+    }
+}
+
+/// 进程内伪随机源：没有引入 `rand` 依赖，用时钟纳秒做种子跑 xorshift64。
+fn random_state() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(1);
+    nanos ^ 0x9E37_79B9_7F4A_7C15
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    let mut value = *state;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    value
+}
+
+/// 解析集合扫描的游标：只接受规范十进制写法。
+fn parse_scan_cursor(stream: &mut dyn io::Write, raw: &[u8]) -> io::Result<Option<usize>> {
+    let text = match std::str::from_utf8(raw) {
+        Ok(text) if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) => text,
+        _ => {
+            write_error(stream, "invalid cursor")?;
+            return Ok(None);
+        }
+    };
+    match text.parse::<usize>() {
+        Ok(cursor) => Ok(Some(cursor)),
+        Err(_) => {
+            write_error(stream, "invalid cursor")?;
+            Ok(None)
+        }
+    }
+}
+
+/// 解析 `MATCH pattern` 与 `COUNT count` 选项。
+fn parse_scan_tail(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    start: usize,
+) -> io::Result<Option<(Option<Vec<u8>>, usize)>> {
+    let mut pattern: Option<Vec<u8>> = None;
+    let mut count = 10usize;
+    let mut index = start;
+    while index < arguments.len() {
+        if index + 1 >= arguments.len() {
+            write_error(stream, "syntax error")?;
+            return Ok(None);
+        }
+        if arguments[index].eq_ignore_ascii_case(b"MATCH") {
+            pattern = Some(arguments[index + 1].to_vec());
+        }
+        else if arguments[index].eq_ignore_ascii_case(b"COUNT") {
+            let Ok(value) = std::str::from_utf8(arguments[index + 1]).unwrap_or("").parse::<u64>()
+            else {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            };
+            if value == 0 {
+                write_error(stream, "syntax error")?;
+                return Ok(None);
+            }
+            count = value.min(usize::MAX as u64) as usize;
+        }
+        else {
+            write_error(stream, "syntax error")?;
+            return Ok(None);
+        }
+        index += 2;
+    }
+    Ok(Some((pattern, count)))
+}
+
+/// 写出一段集合扫描结果：`[next-cursor, [members...]]`。
+fn write_scan_page(
+    stream: &mut dyn io::Write,
+    items: &[Vec<u8>],
+    cursor: usize,
+    count: usize,
+    pattern: Option<&[u8]>,
+) -> io::Result<()> {
+    if cursor >= items.len() {
+        stream.write_all(b"*2\r\n")?;
+        write_bulk(stream, b"0")?;
+        return write_array_header(stream, 0);
+    }
+    let end = cursor.saturating_add(count).min(items.len());
+    let next = if end >= items.len() { "0".to_string() } else { end.to_string() };
+    let matched: Vec<&Vec<u8>> =
+        items[cursor..end].iter().filter(|item| pattern.map_or(true, |pattern| glob_match_local(pattern, item))).collect();
+    stream.write_all(b"*2\r\n")?;
+    write_bulk(stream, next.as_bytes())?;
+    write_array_header(stream, matched.len())?;
+    for item in matched {
+        write_bulk(stream, item)?;
+    }
+    Ok(())
+}
+
+/// 与 `connection::glob_match` 相同的简易 glob，用于集合内扫描。
+fn glob_match_local(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut pattern_index, mut text_index) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while text_index < text.len() {
+        if pattern_index < pattern.len() {
+            match pattern[pattern_index] {
+                b'*' => {
+                    star = Some((pattern_index, text_index));
+                    pattern_index += 1;
+                    continue;
+                }
+                b'?' => {
+                    pattern_index += 1;
+                    text_index += 1;
+                    continue;
+                }
+                b'\\' if pattern_index + 1 < pattern.len() && pattern[pattern_index + 1] == text[text_index] => {
+                    pattern_index += 2;
+                    text_index += 1;
+                    continue;
+                }
+                byte if byte == text[text_index] => {
+                    pattern_index += 1;
+                    text_index += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match star {
+            Some((star_index, resume)) => {
+                pattern_index = star_index + 1;
+                text_index = resume + 1;
+                star = Some((star_index, text_index));
+            }
+            None => return false,
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+/// `SADD` / `SREM` / `SMEMBERS` / `SCARD` / `SISMEMBER` 及集合代数、移动、随机读取与扫描的分派入口。
 pub(crate) fn handle_set(
     stream: &mut dyn io::Write,
     request: &Request<'_>,
     executor: Option<&dyn KeyValueExecutor>,
     base: &Namespace,
+    protocol: u8,
 ) -> io::Result<()> {
     let command = request.arguments[0];
     let Some(executor) = executor
@@ -938,6 +1177,217 @@ pub(crate) fn handle_set(
             Loaded::Found(members) => write_integer(stream, members.len() as i64),
             Loaded::Rejected => Ok(()),
         };
+    }
+    if command.eq_ignore_ascii_case(b"SINTER")
+        || command.eq_ignore_ascii_case(b"SUNION")
+        || command.eq_ignore_ascii_case(b"SDIFF")
+    {
+        if request.arguments.len() < 2 {
+            let name = String::from_utf8_lossy(command).to_ascii_lowercase();
+            return write_arity_error(stream, &name);
+        }
+        let op = if command.eq_ignore_ascii_case(b"SINTER") {
+            SetOp::Inter
+        }
+        else if command.eq_ignore_ascii_case(b"SUNION") {
+            SetOp::Union
+        }
+        else {
+            SetOp::Diff
+        };
+        let keys: Vec<&[u8]> = request.arguments[1..].to_vec();
+        let Some(sets) = load_sets(stream, executor, base, &keys)?
+        else {
+            return Ok(());
+        };
+        let result = apply_set_op(op, &sets);
+        write_array_header(stream, result.len())?;
+        for member in &result {
+            write_bulk(stream, member)?;
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"SINTERSTORE")
+        || command.eq_ignore_ascii_case(b"SUNIONSTORE")
+        || command.eq_ignore_ascii_case(b"SDIFFSTORE")
+    {
+        if request.arguments.len() < 3 {
+            let name = String::from_utf8_lossy(command).to_ascii_lowercase();
+            return write_arity_error(stream, &name);
+        }
+        let op = if command.eq_ignore_ascii_case(b"SINTERSTORE") {
+            SetOp::Inter
+        }
+        else if command.eq_ignore_ascii_case(b"SUNIONSTORE") {
+            SetOp::Union
+        }
+        else {
+            SetOp::Diff
+        };
+        let destination = request.arguments[1];
+        let keys: Vec<&[u8]> = request.arguments[2..].to_vec();
+        let Some(sets) = load_sets(stream, executor, base, &keys)?
+        else {
+            return Ok(());
+        };
+        let result = apply_set_op(op, &sets);
+        // `*STORE` 覆盖目标且不继承旧过期时间；结果为空时目标键整体删除。
+        if let Err(message) = remove_all_kinds(executor, base, destination) {
+            return write_storage_error(stream, &message);
+        }
+        if !result.is_empty() {
+            let Some(bytes) = encode_set(&result)
+            else {
+                return write_error(stream, "set exceeds the storage limit");
+            };
+            if let Err(message) = store_fresh_value(executor, &KeyKind::Set.namespace(base), destination, bytes) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        return write_integer(stream, result.len() as i64);
+    }
+    if command.eq_ignore_ascii_case(b"SMOVE") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "smove");
+        }
+        let source = request.arguments[1];
+        let destination = request.arguments[2];
+        let member = request.arguments[3];
+        if source == destination {
+            return match load_set(stream, executor, base, source)? {
+                Loaded::Missing => write_integer(stream, 0),
+                Loaded::Found(members) => {
+                    write_integer(stream, i64::from(members.iter().any(|existing| existing.as_slice() == member)))
+                }
+                Loaded::Rejected => Ok(()),
+            };
+        }
+        // 源键不存在时真机直接回 0，不再探测目标类型。
+        let mut members = match load_set(stream, executor, base, source)? {
+            Loaded::Missing => return write_integer(stream, 0),
+            Loaded::Found(members) => members,
+            Loaded::Rejected => return Ok(()),
+        };
+        match find_kind(executor, base, destination) {
+            Ok(None) | Ok(Some(KeyKind::Set)) => {}
+            Ok(Some(_)) => return write_wrong_type(stream),
+            Err(message) => return write_storage_error(stream, &message),
+        }
+        let Some(position) = members.iter().position(|existing| existing.as_slice() == member)
+        else {
+            return write_integer(stream, 0);
+        };
+        members.remove(position);
+        if members.is_empty() {
+            if let Err(message) = remove_value(executor, &KeyKind::Set.namespace(base), source) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        else {
+            let Some(bytes) = encode_set(&members)
+            else {
+                return write_error(stream, "set exceeds the storage limit");
+            };
+            if let Err(message) = store_value(executor, &KeyKind::Set.namespace(base), source, bytes) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        let mut destination_members = match load_value(executor, &KeyKind::Set.namespace(base), destination) {
+            Ok(Some(bytes)) => match decode_set(&bytes) {
+                Some(members) => members,
+                None => return write_error(stream, "stored set value is corrupt"),
+            },
+            Ok(None) => Vec::new(),
+            Err(message) => return write_storage_error(stream, &message),
+        };
+        if !destination_members.iter().any(|existing| existing.as_slice() == member) {
+            destination_members.push(member.to_vec());
+        }
+        let Some(bytes) = encode_set(&destination_members)
+        else {
+            return write_error(stream, "set exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::Set.namespace(base), destination, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_integer(stream, 1);
+    }
+    if command.eq_ignore_ascii_case(b"SRANDMEMBER") {
+        if request.arguments.len() < 2 || request.arguments.len() > 3 {
+            return write_arity_error(stream, "srandmember");
+        }
+        let key = request.arguments[1];
+        let members = match load_set(stream, executor, base, key)? {
+            Loaded::Missing => {
+                return if request.arguments.len() == 3 {
+                    write_array_header(stream, 0)
+                }
+                else {
+                    write_null(stream, protocol)
+                };
+            }
+            Loaded::Found(members) => members,
+            Loaded::Rejected => return Ok(()),
+        };
+        let count = match request.arguments.get(2) {
+            None => {
+                if members.is_empty() {
+                    return write_null(stream, protocol);
+                }
+                let mut state = random_state();
+                let index = (next_random(&mut state) as usize) % members.len();
+                return write_bulk(stream, &members[index]);
+            }
+            Some(raw) => match parse_index(raw) {
+                Some(count) => count,
+                None => return write_error(stream, "value is not an integer or out of range"),
+            },
+        };
+        if count >= 0 {
+            let take = (count as usize).min(members.len());
+            let mut order: Vec<usize> = (0..members.len()).collect();
+            let mut state = random_state();
+            // Fisher-Yates 洗牌后取前 take 个，保证不重复。
+            for index in (1..order.len()).rev() {
+                let swap = (next_random(&mut state) as usize) % (index + 1);
+                order.swap(index, swap);
+            }
+            write_array_header(stream, take)?;
+            for index in order.into_iter().take(take) {
+                write_bulk(stream, &members[index])?;
+            }
+            return Ok(());
+        }
+        if members.is_empty() {
+            return write_array_header(stream, 0);
+        }
+        write_array_header(stream, count.unsigned_abs() as usize)?;
+        let mut state = random_state();
+        for _ in 0..count.unsigned_abs() {
+            let index = (next_random(&mut state) as usize) % members.len();
+            write_bulk(stream, &members[index])?;
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"SSCAN") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "sscan");
+        }
+        let Some(cursor) = parse_scan_cursor(stream, request.arguments[2])?
+        else {
+            return Ok(());
+        };
+        let Some((pattern, count)) = parse_scan_tail(stream, &request.arguments, 3)?
+        else {
+            return Ok(());
+        };
+        let key = request.arguments[1];
+        let members = match load_set(stream, executor, base, key)? {
+            Loaded::Missing => Vec::new(),
+            Loaded::Found(members) => members,
+            Loaded::Rejected => return Ok(()),
+        };
+        return write_scan_page(stream, &members, cursor, count, pattern.as_deref());
     }
     // SISMEMBER
     if request.arguments.len() != 3 {
