@@ -1,0 +1,2001 @@
+{
+    "version": 1,
+    "cases": [
+        {
+            "id": "bson.encode.empty",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {},
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "0500000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.empty",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0500000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {}
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.int32",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberInt": "5"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "0c0000001061000500000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.int32",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0c0000001061000500000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberInt": "5"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.int32_min",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberInt": "-2147483648"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "0c0000001061000000008000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.int32_min",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0c0000001061000000008000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberInt": "-2147483648"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.int32_max",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberInt": "2147483647"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "0c000000106100ffffff7f00"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.int32_max",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0c000000106100ffffff7f00",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberInt": "2147483647"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.int64_big",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberLong": "9007199254740993"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000126100010000000000200000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.int64_big",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000126100010000000000200000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberLong": "9007199254740993"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.int64_min",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberLong": "-9223372036854775808"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000126100000000000000008000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.int64_min",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000126100000000000000008000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberLong": "-9223372036854775808"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.int64_max",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberLong": "9223372036854775807"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000126100ffffffffffffff7f00"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.int64_max",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000126100ffffffffffffff7f00",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberLong": "9223372036854775807"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.double_zero",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberDouble": "0.0"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000016100000000000000000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.double_zero",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000016100000000000000000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberDouble": "0.0"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.double_negative_zero",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberDouble": "-0.0"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000016100000000000000008000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.double_negative_zero",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000016100000000000000008000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberDouble": "-0.0"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.double_positive",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberDouble": "1.5"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000016100000000000000f83f00"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.double_positive",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000016100000000000000f83f00",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberDouble": "1.5"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.double_negative",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberDouble": "-2.5"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "1000000001610000000000000004c000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.double_negative",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "1000000001610000000000000004c000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberDouble": "-2.5"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.double_round",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberDouble": "100.0"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000016100000000000000594000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.double_round",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000016100000000000000594000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberDouble": "100.0"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.bool_true",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": true
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "090000000861000100"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.bool_true",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "090000000861000100",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": true
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.bool_false",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": false
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "090000000861000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.bool_false",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "090000000861000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": false
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.null",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": null
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "080000000a610000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.null",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "080000000a610000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": null
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.object_id",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$oid": "00112233445566778899aabb"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "1400000007610000112233445566778899aabb00"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.object_id",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "1400000007610000112233445566778899aabb00",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$oid": "00112233445566778899aabb"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.binary_empty",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$binary": {
+                                "base64": "",
+                                "subType": "00"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "0d000000056100000000000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.binary_empty",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0d000000056100000000000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$binary": {
+                                "base64": "",
+                                "subType": "00"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.binary_one",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQ==",
+                                "subType": "00"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "0e00000005610001000000000100"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.binary_one",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0e00000005610001000000000100",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQ==",
+                                "subType": "00"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.binary_three",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQID",
+                                "subType": "00"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000056100030000000001020300"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.binary_three",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000056100030000000001020300",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQID",
+                                "subType": "00"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.binary_five",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AAECAwQ=",
+                                "subType": "00"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "120000000561000500000000000102030400"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.binary_five",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "120000000561000500000000000102030400",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AAECAwQ=",
+                                "subType": "00"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.binary_legacy_02",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQID",
+                                "subType": "02"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "1400000005610007000000020300000001020300"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.binary_legacy_02",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "1400000005610007000000020300000001020300",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQID",
+                                "subType": "02"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.binary_legacy_02_long",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AAECAwQ=",
+                                "subType": "02"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "16000000056100090000000205000000000102030400"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.binary_legacy_02_long",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "16000000056100090000000205000000000102030400",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AAECAwQ=",
+                                "subType": "02"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.binary_subtype_05",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQID",
+                                "subType": "05"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000056100030000000501020300"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.binary_subtype_05",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000056100030000000501020300",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQID",
+                                "subType": "05"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.binary_subtype_80",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQID",
+                                "subType": "80"
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "10000000056100030000008001020300"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.binary_subtype_80",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "10000000056100030000008001020300",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$binary": {
+                                "base64": "AQID",
+                                "subType": "80"
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.string_empty",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": ""
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "0d000000026100010000000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.string_empty",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "0d000000026100010000000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": ""
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.string_ascii",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": "hello"
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "120000000261000600000068656c6c6f0000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.string_ascii",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "120000000261000600000068656c6c6f0000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": "hello"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.string_utf8",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": "中文"
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "1300000002610007000000e4b8ade696870000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.string_utf8",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "1300000002610007000000e4b8ade696870000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": "中文"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.string_emoji",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": "🙂"
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "1100000002610005000000f09f99820000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.string_emoji",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "1100000002610005000000f09f99820000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": "🙂"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.nested_document",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "b": {
+                                "$numberInt": "7"
+                            },
+                            "c": "x"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "1d00000003610015000000106200070000000263000200000078000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.nested_document",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "1d00000003610015000000106200070000000263000200000078000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "b": {
+                                "$numberInt": "7"
+                            },
+                            "c": "x"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.nested_array",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": [
+                            {
+                                "$numberInt": "1"
+                            },
+                            {
+                                "$numberInt": "2"
+                            },
+                            {
+                                "$numberInt": "3"
+                            }
+                        ]
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "220000000461001a0000001030000100000010310002000000103200030000000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.nested_array",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "220000000461001a0000001030000100000010310002000000103200030000000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": [
+                            {
+                                "$numberInt": "1"
+                            },
+                            {
+                                "$numberInt": "2"
+                            },
+                            {
+                                "$numberInt": "3"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.mixed_array",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": [
+                            {
+                                "$numberInt": "1"
+                            },
+                            "two",
+                            null,
+                            true,
+                            {
+                                "b": {
+                                    "$numberInt": "2"
+                                }
+                            }
+                        ]
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "350000000461002d000000103000010000000231000400000074776f000a3200083300010334000c00000010620002000000000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.mixed_array",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "350000000461002d000000103000010000000231000400000074776f000a3200083300010334000c00000010620002000000000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": [
+                            {
+                                "$numberInt": "1"
+                            },
+                            "two",
+                            null,
+                            true,
+                            {
+                                "b": {
+                                    "$numberInt": "2"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.all_types",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "$numberInt": "1"
+                        },
+                        "b": {
+                            "$numberLong": "2"
+                        },
+                        "c": {
+                            "$numberDouble": "3.5"
+                        },
+                        "d": "four",
+                        "e": true,
+                        "f": null,
+                        "g": {
+                            "$oid": "ffeeddccbbaa998877665544"
+                        },
+                        "h": {
+                            "$binary": {
+                                "base64": "AQIDBA==",
+                                "subType": "00"
+                            }
+                        },
+                        "i": [
+                            {
+                                "$numberInt": "5"
+                            }
+                        ]
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "5f0000001061000100000012620002000000000000000163000000000000000c4002640005000000666f757200086500010a6600076700ffeeddccbbaa9988776655440568000400000000010203040469000c000000103000050000000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.all_types",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "5f0000001061000100000012620002000000000000000163000000000000000c4002640005000000666f757200086500010a6600076700ffeeddccbbaa9988776655440568000400000000010203040469000c000000103000050000000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "$numberInt": "1"
+                        },
+                        "b": {
+                            "$numberLong": "2"
+                        },
+                        "c": {
+                            "$numberDouble": "3.5"
+                        },
+                        "d": "four",
+                        "e": true,
+                        "f": null,
+                        "g": {
+                            "$oid": "ffeeddccbbaa998877665544"
+                        },
+                        "h": {
+                            "$binary": {
+                                "base64": "AQIDBA==",
+                                "subType": "00"
+                            }
+                        },
+                        "i": [
+                            {
+                                "$numberInt": "5"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.many_fields",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "f00": {
+                            "$numberInt": "0"
+                        },
+                        "f01": {
+                            "$numberInt": "1"
+                        },
+                        "f02": {
+                            "$numberInt": "2"
+                        },
+                        "f03": {
+                            "$numberInt": "3"
+                        },
+                        "f04": {
+                            "$numberInt": "4"
+                        },
+                        "f05": {
+                            "$numberInt": "5"
+                        },
+                        "f06": {
+                            "$numberInt": "6"
+                        },
+                        "f07": {
+                            "$numberInt": "7"
+                        },
+                        "f08": {
+                            "$numberInt": "8"
+                        },
+                        "f09": {
+                            "$numberInt": "9"
+                        },
+                        "f10": {
+                            "$numberInt": "10"
+                        },
+                        "f11": {
+                            "$numberInt": "11"
+                        },
+                        "f12": {
+                            "$numberInt": "12"
+                        },
+                        "f13": {
+                            "$numberInt": "13"
+                        },
+                        "f14": {
+                            "$numberInt": "14"
+                        },
+                        "f15": {
+                            "$numberInt": "15"
+                        },
+                        "f16": {
+                            "$numberInt": "16"
+                        },
+                        "f17": {
+                            "$numberInt": "17"
+                        },
+                        "f18": {
+                            "$numberInt": "18"
+                        },
+                        "f19": {
+                            "$numberInt": "19"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "b900000010663030000000000010663031000100000010663032000200000010663033000300000010663034000400000010663035000500000010663036000600000010663037000700000010663038000800000010663039000900000010663130000a00000010663131000b00000010663132000c00000010663133000d00000010663134000e00000010663135000f00000010663136001000000010663137001100000010663138001200000010663139001300000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.many_fields",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "b900000010663030000000000010663031000100000010663032000200000010663033000300000010663034000400000010663035000500000010663036000600000010663037000700000010663038000800000010663039000900000010663130000a00000010663131000b00000010663132000c00000010663133000d00000010663134000e00000010663135000f00000010663136001000000010663137001100000010663138001200000010663139001300000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "f00": {
+                            "$numberInt": "0"
+                        },
+                        "f01": {
+                            "$numberInt": "1"
+                        },
+                        "f02": {
+                            "$numberInt": "2"
+                        },
+                        "f03": {
+                            "$numberInt": "3"
+                        },
+                        "f04": {
+                            "$numberInt": "4"
+                        },
+                        "f05": {
+                            "$numberInt": "5"
+                        },
+                        "f06": {
+                            "$numberInt": "6"
+                        },
+                        "f07": {
+                            "$numberInt": "7"
+                        },
+                        "f08": {
+                            "$numberInt": "8"
+                        },
+                        "f09": {
+                            "$numberInt": "9"
+                        },
+                        "f10": {
+                            "$numberInt": "10"
+                        },
+                        "f11": {
+                            "$numberInt": "11"
+                        },
+                        "f12": {
+                            "$numberInt": "12"
+                        },
+                        "f13": {
+                            "$numberInt": "13"
+                        },
+                        "f14": {
+                            "$numberInt": "14"
+                        },
+                        "f15": {
+                            "$numberInt": "15"
+                        },
+                        "f16": {
+                            "$numberInt": "16"
+                        },
+                        "f17": {
+                            "$numberInt": "17"
+                        },
+                        "f18": {
+                            "$numberInt": "18"
+                        },
+                        "f19": {
+                            "$numberInt": "19"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.deep_eight",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": {
+                            "child": {
+                                "child": {
+                                    "child": {
+                                        "child": {
+                                            "child": {
+                                                "child": {
+                                                    "child": {
+                                                        "child": {
+                                                            "leaf": {
+                                                                "$numberInt": "1"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "770000000361006f000000036368696c640063000000036368696c640057000000036368696c64004b000000036368696c64003f000000036368696c640033000000036368696c640027000000036368696c64001b000000036368696c64000f000000106c656166000100000000000000000000000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.deep_eight",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "770000000361006f000000036368696c640063000000036368696c640057000000036368696c64004b000000036368696c64003f000000036368696c640033000000036368696c640027000000036368696c64001b000000036368696c64000f000000106c656166000100000000000000000000000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": {
+                            "child": {
+                                "child": {
+                                    "child": {
+                                        "child": {
+                                            "child": {
+                                                "child": {
+                                                    "child": {
+                                                        "child": {
+                                                            "leaf": {
+                                                                "$numberInt": "1"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "bson.encode.large_string",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeDocument",
+                    "document": {
+                        "a": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                        "b": {
+                            "$numberInt": "9"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "141000000261000110000078787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878001062000900000000"
+                }
+            ]
+        },
+        {
+            "id": "bson.decode.large_string",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeDocument",
+                    "hex": "141000000261000110000078787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878001062000900000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "a": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                        "b": {
+                            "$numberInt": "9"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "opmsg.encode.ping",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeOpMsg",
+                    "document": {
+                        "ping": {
+                            "$numberInt": "1"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "00000000000f0000001070696e67000100000000"
+                }
+            ]
+        },
+        {
+            "id": "opmsg.decode.ping",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeOpMsg",
+                    "hex": "00000000000f0000001070696e67000100000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "ping": {
+                            "$numberInt": "1"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "opmsg.encode.find",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeOpMsg",
+                    "document": {
+                        "$db": "app",
+                        "find": "items"
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "000000000022000000022464620004000000617070000266696e6400060000006974656d730000"
+                }
+            ]
+        },
+        {
+            "id": "opmsg.decode.find",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeOpMsg",
+                    "hex": "000000000022000000022464620004000000617070000266696e6400060000006974656d730000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "$db": "app",
+                        "find": "items"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "opmsg.encode.filtered",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeOpMsg",
+                    "document": {
+                        "$db": "app",
+                        "filter": {
+                            "a": {
+                                "$numberInt": "5"
+                            }
+                        },
+                        "find": "items",
+                        "limit": {
+                            "$numberInt": "1"
+                        }
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "000000000041000000022464620004000000617070000366696c746572000c00000010610005000000000266696e6400060000006974656d7300106c696d6974000100000000"
+                }
+            ]
+        },
+        {
+            "id": "opmsg.decode.filtered",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeOpMsg",
+                    "hex": "000000000041000000022464620004000000617070000366696c746572000c00000010610005000000000266696e6400060000006974656d7300106c696d6974000100000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "$db": "app",
+                        "filter": {
+                            "a": {
+                                "$numberInt": "5"
+                            }
+                        },
+                        "find": "items",
+                        "limit": {
+                            "$numberInt": "1"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "opmsg.encode.insert",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "encodeOpMsg",
+                    "document": {
+                        "$db": "app",
+                        "insert": "items"
+                    },
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": "0000000000240000000224646200040000006170700002696e7365727400060000006974656d730000"
+                }
+            ]
+        },
+        {
+            "id": "opmsg.decode.insert",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeOpMsg",
+                    "hex": "0000000000240000000224646200040000006170700002696e7365727400060000006974656d730000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "$db": "app",
+                        "insert": "items"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "opmsg.decode.document_sequence",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeOpMsg",
+                    "hex": "0000000000240000000224646200040000006170700002696e7365727400060000006974656d730000013c000000646f63756d656e74730017000000105f696400010000000276000200000061000017000000105f6964000200000002760002000000620000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "$db": "app",
+                        "insert": "items",
+                        "documents": [
+                            {
+                                "_id": {
+                                    "$numberInt": "1"
+                                },
+                                "v": "a"
+                            },
+                            {
+                                "_id": {
+                                    "$numberInt": "2"
+                                },
+                                "v": "b"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "id": "opquery.decode.plain",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeOpQuery",
+                    "hex": "000000006170702e6974656d730000000000ffffffff0f0000001070696e67000100000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "ping": {
+                            "$numberInt": "1"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "opquery.decode.wrapped",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeOpQuery",
+                    "hex": "000000006170702e6974656d730000000000ffffffff2500000003247175657279000f0000001070696e6700010000000010666f6f000200000000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "ping": {
+                            "$numberInt": "1"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "id": "opquery.decode.find",
+            "surface": "bson",
+            "program": [
+                {
+                    "op": "decodeOpQuery",
+                    "hex": "000000006170702e6974656d730000000000ffffffff22000000022464620004000000617070000266696e6400060000006974656d730000",
+                    "as": "r"
+                }
+            ],
+            "checks": [
+                {
+                    "at": "/r",
+                    "equals": {
+                        "$db": "app",
+                        "find": "items"
+                    }
+                }
+            ]
+        }
+    ]
+}

@@ -835,7 +835,7 @@ fn scalar_key(value: &BsonValue) -> String {
         BsonValue::String(text) => format!("s:{text}"),
         BsonValue::Bool(flag) => format!("b:{flag}"),
         BsonValue::ObjectId(bytes) => format!("o:{bytes:?}"),
-        BsonValue::Binary(bytes) => format!("y:{bytes:?}"),
+        BsonValue::Binary(data) => format!("y:{data:?}"),
         other => format!("x:{other:?}"),
     }
 }
@@ -854,6 +854,8 @@ fn number_of(value: &BsonValue) -> Option<f64> {
 /// (null, numbers, strings, documents, arrays, binary, object ids, booleans).
 fn compare_values(left: &BsonValue, right: &BsonValue) -> Ordering {
     let rank = |value: &BsonValue| match value {
+        // Undefined 已废弃，真机也不再产出，这里只给它一个稳定且低于 Null 的槽位。
+        BsonValue::Undefined => 0,
         BsonValue::Null => 1,
         BsonValue::Int32(_) | BsonValue::Int64(_) | BsonValue::Double(_) => 2,
         BsonValue::String(_) => 3,
@@ -875,7 +877,7 @@ fn compare_values(left: &BsonValue, right: &BsonValue) -> Ordering {
         (BsonValue::String(left), BsonValue::String(right)) => left.cmp(right),
         (BsonValue::Bool(left), BsonValue::Bool(right)) => left.cmp(right),
         (BsonValue::ObjectId(left), BsonValue::ObjectId(right)) => left.cmp(right),
-        (BsonValue::Binary(left), BsonValue::Binary(right)) => left.cmp(right),
+        (BsonValue::Binary(left), BsonValue::Binary(right)) => (left.subtype, &left.bytes).cmp(&(right.subtype, &right.bytes)),
         (BsonValue::Document(left), BsonValue::Document(right)) => encode_bson(left).cmp(&encode_bson(right)),
         (BsonValue::Array(left), BsonValue::Array(right)) => {
             for (left, right) in left.iter().zip(right.iter()) {
