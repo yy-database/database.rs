@@ -1,4 +1,4 @@
-//! 移植自 MongoDB 仓 `tests/cases/bson.json` 的 82 条字节用例。
+//! 移植自 MongoDB 仓 `tests/cases/bson.json` 的字节用例，并补齐全部 BSON 类型。
 //!
 //! 期望值原样保留：BSON 文档按字节比对，解码结果按扩展 JSON 比对，解码后
 //! 再编码必须与输入字节完全一致。断言不放宽。
@@ -6,6 +6,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use database_protocol_mongo::{
     bson::{BsonDocument, BsonValue, double_bits, encode_bson, integral_value, parse_bson, value_to_key},
+    decimal128::Decimal128,
     wire::{decode_op_msg_command, decode_op_query_command, encode_op_msg_body},
 };
 use serde_json::{Map, Value};
@@ -41,7 +42,7 @@ impl Op {
 fn ports_every_fixture_case() {
     let root: Value = serde_json::from_str(CASES).expect("fixture is valid json");
     let cases = root["cases"].as_array().expect("fixture has cases");
-    assert_eq!(cases.len(), 82, "夹具条数必须与 MongoDB 仓一致");
+    assert_eq!(cases.len(), 98, "夹具条数必须与新增的 BSON 类型用例一致");
 
     for case in cases {
         let id = case["id"].as_str().expect("case id");
@@ -134,6 +135,64 @@ fn rejects_negative_and_invalid_lengths() {
     assert!(parse_bson(&hex_to_bytes("0f0000000561000300000000010200")).is_err());
 }
 
+/// 类型位次与 `mongod 8.0.9` 的 `sort` 顺序一致：`MinKey` 最小、`MaxKey` 最大。
+#[test]
+fn orders_values_like_mongod() {
+    let ordered = [
+        BsonValue::MinKey,
+        BsonValue::Undefined,
+        BsonValue::Null,
+        BsonValue::Int32(0),
+        BsonValue::String("a".to_string()),
+        BsonValue::Document(BsonDocument::new()),
+        BsonValue::Array(Vec::new()),
+        BsonValue::Binary(database_protocol_mongo::bson::BinaryData::new(0, Vec::new())),
+        BsonValue::ObjectId([0; 12]),
+        BsonValue::Bool(false),
+        BsonValue::DateTime(0),
+        BsonValue::Timestamp { t: 0, i: 0 },
+        BsonValue::Regex { pattern: String::new(), options: String::new() },
+        BsonValue::Code(String::new()),
+        BsonValue::CodeWithScope { code: String::new(), scope: BsonDocument::new() },
+        BsonValue::MaxKey,
+    ];
+    for pair in ordered.windows(2) {
+        assert_eq!(pair[0].compare(&pair[1]), std::cmp::Ordering::Less, "{:?} must sort before {:?}", pair[0], pair[1]);
+    }
+
+    // Date 按毫秒比较，Timestamp 按 (t, i) 比较。
+    assert_eq!(BsonValue::DateTime(1).compare(&BsonValue::DateTime(2)), std::cmp::Ordering::Less);
+    assert_eq!(BsonValue::Timestamp { t: 1, i: 2 }.compare(&BsonValue::Timestamp { t: 1, i: 5 }), std::cmp::Ordering::Less);
+    assert_eq!(BsonValue::Timestamp { t: 2, i: 0 }.compare(&BsonValue::Timestamp { t: 1, i: 5 }), std::cmp::Ordering::Greater);
+
+    // Symbol 与同文本的 String 数值相等，键空间也共用。
+    assert_eq!(BsonValue::Symbol("sym".to_string()).compare(&BsonValue::String("sym".to_string())), std::cmp::Ordering::Equal);
+    assert_eq!(value_to_key(&BsonValue::Symbol("sym".to_string())), value_to_key(&BsonValue::String("sym".to_string())));
+}
+
+/// decimal128 文本与字节双向一致，数值相等归并到同一键。
+#[test]
+fn decimal128_text_and_keys_round_trip() {
+    for text in ["1.5", "-2", "1E+3", "0.001", "1.234567890123456789012345678901234", "0.00", "-0.00", "Infinity", "-Infinity", "NaN"] {
+        let decimal = Decimal128::from_str(text).unwrap_or_else(|| panic!("{text} parses"));
+        assert_eq!(decimal.as_str(), text, "{text} prints back");
+        let reparsed = parse_bson(&{
+            let mut document = BsonDocument::new();
+            document.push("a", BsonValue::Decimal128(decimal));
+            encode_bson(&document)
+        })
+        .expect("decimal decodes");
+        assert_eq!(reparsed.fields()[0].1, BsonValue::Decimal128(decimal), "{text} round-trips through bytes");
+    }
+
+    assert_eq!(
+        value_to_key(&BsonValue::Decimal128(Decimal128::from_str("1.5").unwrap())),
+        value_to_key(&BsonValue::Decimal128(Decimal128::from_str("1.50").unwrap()))
+    );
+    assert_eq!(value_to_key(&BsonValue::Decimal128(Decimal128::from_str("1.0").unwrap())), value_to_key(&BsonValue::Int32(1)));
+    assert_eq!(value_to_key(&BsonValue::Decimal128(Decimal128::from_str("-0.00").unwrap())), value_to_key(&BsonValue::Int32(0)));
+}
+
 fn document_from_json(value: &Value) -> BsonDocument {
     let map = value.as_object().expect("document must be a json object");
     let mut document = BsonDocument::new();
@@ -146,6 +205,14 @@ fn document_from_json(value: &Value) -> BsonDocument {
 fn value_from_json(value: &Value) -> BsonValue {
     match value {
         Value::Object(map) => {
+            if map.len() == 2 {
+                if let (Some(code), Some(scope)) = (map.get("$code"), map.get("$scope")) {
+                    return BsonValue::CodeWithScope {
+                        code: code.as_str().expect("$code is a string").to_string(),
+                        scope: document_from_json(scope),
+                    };
+                }
+            }
             if map.len() == 1 {
                 if let Some(tag) = map.keys().next() {
                     if let Some(parsed) = tagged_value(tag, &map[tag]) {
@@ -168,6 +235,9 @@ fn tagged_value(tag: &str, payload: &Value) -> Option<BsonValue> {
         "$numberInt" => Some(BsonValue::Int32(payload.as_str().expect("$numberInt is a string").parse().expect("i32"))),
         "$numberLong" => Some(BsonValue::Int64(payload.as_str().expect("$numberLong is a string").parse().expect("i64"))),
         "$numberDouble" => Some(BsonValue::Double(payload.as_str().expect("$numberDouble is a string").parse().expect("f64"))),
+        "$numberDecimal" => {
+            Some(BsonValue::Decimal128(Decimal128::from_str(payload.as_str().expect("$numberDecimal is a string")).expect("valid decimal128")))
+        }
         "$oid" => {
             let bytes = hex_to_bytes(payload.as_str().expect("$oid is a string"));
             let bytes: [u8; 12] = bytes.try_into().expect("object id is 12 bytes");
@@ -180,6 +250,36 @@ fn tagged_value(tag: &str, payload: &Value) -> Option<BsonValue> {
             Some(BsonValue::Binary(database_protocol_mongo::bson::BinaryData::new(subtype, bytes)))
         }
         "$undefined" => Some(BsonValue::Undefined),
+        "$date" => {
+            let milliseconds = payload.as_object()?.get("$numberLong")?.as_str()?.parse().expect("$date.$numberLong is an i64");
+            Some(BsonValue::DateTime(milliseconds))
+        }
+        "$timestamp" => {
+            let body = payload.as_object().expect("$timestamp is an object");
+            Some(BsonValue::Timestamp {
+                t: body["t"].as_u64().expect("$timestamp.t") as u32,
+                i: body["i"].as_u64().expect("$timestamp.i") as u32,
+            })
+        }
+        "$minKey" => Some(BsonValue::MinKey),
+        "$maxKey" => Some(BsonValue::MaxKey),
+        "$symbol" => Some(BsonValue::Symbol(payload.as_str().expect("$symbol is a string").to_string())),
+        "$regularExpression" => {
+            let body = payload.as_object().expect("$regularExpression is an object");
+            Some(BsonValue::Regex {
+                pattern: body["pattern"].as_str().expect("pattern").to_string(),
+                options: body["options"].as_str().expect("options").to_string(),
+            })
+        }
+        "$code" => Some(BsonValue::Code(payload.as_str().expect("$code is a string").to_string())),
+        "$dbPointer" => {
+            let body = payload.as_object().expect("$dbPointer is an object");
+            let bytes = hex_to_bytes(body["$id"]["$oid"].as_str().expect("$dbPointer.$id.$oid"));
+            Some(BsonValue::DbPointer {
+                namespace: body["$ref"].as_str().expect("$dbPointer.$ref").to_string(),
+                id: bytes.try_into().expect("object id is 12 bytes"),
+            })
+        }
         _ => None,
     }
 }
@@ -217,12 +317,56 @@ fn value_to_json(value: &BsonValue) -> Value {
             wrapper.insert("$binary".to_string(), Value::Object(binary));
             Value::Object(wrapper)
         }
+        BsonValue::DateTime(milliseconds) => {
+            let mut inner = Map::new();
+            inner.insert("$numberLong".to_string(), Value::String(milliseconds.to_string()));
+            tagged_object("$date", Value::Object(inner))
+        }
+        BsonValue::Timestamp { t, i } => {
+            let mut body = Map::new();
+            body.insert("t".to_string(), Value::Number((*t).into()));
+            body.insert("i".to_string(), Value::Number((*i).into()));
+            tagged_object("$timestamp", Value::Object(body))
+        }
+        BsonValue::Decimal128(number) => tagged_json("$numberDecimal", number.as_str()),
+        BsonValue::Symbol(text) => tagged_json("$symbol", text.clone()),
+        BsonValue::Regex { pattern, options } => {
+            let mut body = Map::new();
+            body.insert("pattern".to_string(), Value::String(pattern.clone()));
+            body.insert("options".to_string(), Value::String(options.clone()));
+            tagged_object("$regularExpression", Value::Object(body))
+        }
+        BsonValue::Code(code) => tagged_json("$code", code.clone()),
+        BsonValue::CodeWithScope { code, scope } => {
+            let mut body = Map::new();
+            body.insert("$code".to_string(), Value::String(code.clone()));
+            body.insert("$scope".to_string(), document_to_json(scope));
+            Value::Object(body)
+        }
+        BsonValue::DbPointer { namespace, id } => {
+            let mut identifier = Map::new();
+            identifier.insert("$oid".to_string(), Value::String(bytes_to_hex(id)));
+            let mut body = Map::new();
+            body.insert("$ref".to_string(), Value::String(namespace.clone()));
+            body.insert("$id".to_string(), Value::Object(identifier));
+            tagged_object("$dbPointer", Value::Object(body))
+        }
+        BsonValue::MinKey => tagged_number("$minKey", 1),
+        BsonValue::MaxKey => tagged_number("$maxKey", 1),
     }
 }
 
 fn tagged_json(tag: &str, payload: String) -> Value {
+    tagged_object(tag, Value::String(payload))
+}
+
+fn tagged_number(tag: &str, payload: i64) -> Value {
+    tagged_object(tag, Value::Number(payload.into()))
+}
+
+fn tagged_object(tag: &str, payload: Value) -> Value {
     let mut map = Map::new();
-    map.insert(tag.to_string(), Value::String(payload));
+    map.insert(tag.to_string(), payload);
     Value::Object(map)
 }
 

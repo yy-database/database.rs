@@ -1,10 +1,20 @@
 //! 足以支撑 MongoDB OP_MSG 线处理的 BSON 文档序列化 / 解析。
 //!
-//! 覆盖元素类型：Document (0x03)、Array (0x04)、String (0x02)、Int32 (0x10)、
-//! Int64 (0x12)、Double (0x01)、Bool (0x08)、Null (0x0A)、Undefined (0x06)、
-//! ObjectId (0x07) 与 Binary (0x05，保留子类型)。
+//! 覆盖 BSON 规范的全部元素类型：Document (0x03)、Array (0x04)、String (0x02)、
+//! Int32 (0x10)、Int64 (0x12)、Double (0x01)、Decimal128 (0x13)、Bool (0x08)、
+//! Null (0x0A)、Undefined (0x06)、ObjectId (0x07)、Binary (0x05，保留子类型)、
+//! Date (0x09)、Timestamp (0x11)、Regex (0x0B)、Code (0x0D)、CodeWScope (0x0F)、
+//! DbPointer (0x0C)、Symbol (0x0E)、MinKey (0xFF) 与 MaxKey (0x7F)。
+//!
+//! `mongod 8.0.9` 会把这些类型原样回显在 `find` / `explain` 应答里，缺任何一种
+//! 都会让真机应答整条不可解码。
 
-use std::io::{self, Cursor, Read, Write};
+use std::{
+    cmp::Ordering,
+    io::{self, Cursor, Read, Write},
+};
+
+use crate::decimal128::Decimal128;
 
 /// 带子类型的二进制载荷。
 ///
@@ -54,6 +64,191 @@ pub enum BsonValue {
     ObjectId([u8; 12]),
     /// Binary payload (0x05) 连同其子类型。
     Binary(BinaryData),
+    /// BSON Date (0x09)：自 Unix 纪元起的毫秒数，始终按 UTC 解释。
+    DateTime(i64),
+    /// BSON Timestamp (0x11)：秒级时间戳 `t` 与自增计数 `i`。
+    ///
+    /// 线上字节先写 `i` 再写 `t`，但排序与比较按 `(t, i)` 字典序进行。
+    Timestamp {
+        /// 自 Unix 纪元起的秒数。
+        t: u32,
+        /// 同一秒内的自增计数。
+        i: u32,
+    },
+    /// Decimal128 (0x13)。
+    Decimal128(Decimal128),
+    /// 正则表达式 (0x0B)：模式与选项分开存储，选项按 `mongod` 的字母序回显。
+    Regex {
+        /// 正则模式，不含分隔符。
+        pattern: String,
+        /// 选项字母（`i`、`m`、`s`、`x` 等）。
+        options: String,
+    },
+    /// JavaScript 代码 (0x0D)。
+    Code(String),
+    /// 带作用域的 JavaScript 代码 (0x0F)。
+    CodeWithScope {
+        /// 代码文本。
+        code: String,
+        /// 代码作用域文档。
+        scope: BsonDocument,
+    },
+    /// 已废弃的 DBPointer (0x0C)：命名空间与目标 ObjectId。
+    DbPointer {
+        /// 目标命名空间 `<database>.<collection>`。
+        namespace: String,
+        /// 目标文档的 ObjectId。
+        id: [u8; 12],
+    },
+    /// 已废弃的 Symbol (0x0E)，文本语义与 String 相同。
+    Symbol(String),
+    /// MinKey (0xFF)：小于任何其他值。
+    MinKey,
+    /// MaxKey (0x7F)：大于任何其他值。
+    MaxKey,
+}
+
+impl BsonValue {
+    /// BSON 规范里的类型排序位次。
+    ///
+    /// 顺序取自 `mongod 8.0.9` 的 `sort` 结果：`MinKey` 最小、`MaxKey` 最大，
+    /// `Date` 排在 `Bool` 之后、`Timestamp` 之前，`Regex` / `Code` / `CodeWScope`
+    /// 依次排在其后。`Symbol` 与 `String` 同位次并按文本比较。
+    fn type_rank(&self) -> u8 {
+        match self {
+            Self::MinKey => 0,
+            Self::Undefined => 1,
+            Self::Null => 2,
+            Self::Double(_) | Self::Int32(_) | Self::Int64(_) | Self::Decimal128(_) => 3,
+            Self::String(_) | Self::Symbol(_) => 4,
+            Self::Document(_) => 5,
+            Self::Array(_) => 6,
+            Self::Binary(_) => 7,
+            Self::ObjectId(_) => 8,
+            Self::Bool(_) => 9,
+            Self::DateTime(_) => 10,
+            Self::Timestamp { .. } => 11,
+            Self::Regex { .. } => 12,
+            // DBPointer 已废弃且真机排序位次无法用现代驱动构造语料，这里固定在
+            // Regex 与 Code 之间，保证比较是全序。
+            Self::DbPointer { .. } => 13,
+            Self::Code(_) => 14,
+            Self::CodeWithScope { .. } => 15,
+            Self::MaxKey => 16,
+        }
+    }
+
+    /// BSON 规范比较顺序。
+    ///
+    /// `MinKey < 一切 < MaxKey`；`Date` 按毫秒比较；`Timestamp` 按 `(t, i)` 比较；
+    /// 各数值类型共用一个数值空间；`Symbol` 与同文本的 `String` 相等。该顺序
+    /// 直接决定索引键与 `sort` 的结果。
+    pub fn compare(&self, other: &BsonValue) -> Ordering {
+        let left_rank = self.type_rank();
+        let right_rank = other.type_rank();
+        if left_rank != right_rank {
+            return left_rank.cmp(&right_rank);
+        }
+        match (self, other) {
+            (Self::Double(_) | Self::Int32(_) | Self::Int64(_) | Self::Decimal128(_), _) => compare_numbers(self, other),
+            (Self::String(left), Self::String(right)) | (Self::Symbol(left), Self::Symbol(right)) => left.cmp(right),
+            (Self::String(left), Self::Symbol(right)) | (Self::Symbol(left), Self::String(right)) => left.cmp(right),
+            (Self::Document(left), Self::Document(right)) => compare_documents(left, right),
+            (Self::Array(left), Self::Array(right)) => {
+                for (left, right) in left.iter().zip(right.iter()) {
+                    let ordering = left.compare(right);
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                left.len().cmp(&right.len())
+            }
+            (Self::Binary(left), Self::Binary(right)) => {
+                (left.bytes.len(), left.subtype, &left.bytes).cmp(&(right.bytes.len(), right.subtype, &right.bytes))
+            }
+            (Self::ObjectId(left), Self::ObjectId(right)) => left.cmp(right),
+            (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
+            (Self::DateTime(left), Self::DateTime(right)) => left.cmp(right),
+            (Self::Timestamp { t: left_t, i: left_i }, Self::Timestamp { t: right_t, i: right_i }) => {
+                left_t.cmp(right_t).then(left_i.cmp(right_i))
+            }
+            (Self::Regex { pattern: left_pattern, options: left_options }, Self::Regex { pattern: right_pattern, options: right_options }) => {
+                left_pattern.cmp(right_pattern).then(left_options.cmp(right_options))
+            }
+            (Self::Code(left), Self::Code(right)) => left.cmp(right),
+            (Self::CodeWithScope { code: left_code, scope: left_scope }, Self::CodeWithScope { code: right_code, scope: right_scope }) => {
+                left_code.cmp(right_code).then_with(|| compare_documents(left_scope, right_scope))
+            }
+            (Self::DbPointer { namespace: left, id: left_id }, Self::DbPointer { namespace: right, id: right_id }) => {
+                left.cmp(right).then(left_id.cmp(right_id))
+            }
+            _ => Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for BsonValue {
+    /// 始终返回 [`BsonValue::compare`] 的结果，`NaN` 与跨类型值也有确定位次。
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.compare(other))
+    }
+}
+
+/// 同一数值空间内的比较：整数对整数精确比较，其余按 `f64`，decimal128 内部
+/// 按十进制精确比较。
+fn compare_numbers(left: &BsonValue, right: &BsonValue) -> Ordering {
+    match (left, right) {
+        (BsonValue::Decimal128(left), BsonValue::Decimal128(right)) => left.compare(right),
+        (BsonValue::Decimal128(left), _) => compare_f64(left.as_f64(), number_to_f64(right)),
+        (_, BsonValue::Decimal128(right)) => compare_f64(number_to_f64(left), right.as_f64()),
+        _ => match (integral_of(left), integral_of(right)) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => compare_f64(number_to_f64(left), number_to_f64(right)),
+        },
+    }
+}
+
+/// 数值变体的 `f64` 近似；非数值返回 `NaN`。
+fn number_to_f64(value: &BsonValue) -> f64 {
+    match value {
+        BsonValue::Int32(number) => *number as f64,
+        BsonValue::Int64(number) => *number as f64,
+        BsonValue::Double(number) => *number,
+        BsonValue::Decimal128(number) => number.as_f64(),
+        _ => f64::NAN,
+    }
+}
+
+/// 精确整数视图，供整数与整数比较使用。
+fn integral_of(value: &BsonValue) -> Option<i64> {
+    match value {
+        BsonValue::Int32(number) => Some(*number as i64),
+        BsonValue::Int64(number) => Some(*number),
+        BsonValue::Double(number) => integral_value(*number),
+        BsonValue::Decimal128(number) => number.as_i64(),
+        _ => None,
+    }
+}
+
+/// `NaN` 排在所有数值之前，与 `mongod` 的排序一致。
+fn compare_f64(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// 文档比较：先比字段名，再比字段值，最后比字段数量。
+fn compare_documents(left: &BsonDocument, right: &BsonDocument) -> Ordering {
+    for ((left_key, left_value), (right_key, right_value)) in left.fields.iter().zip(right.fields.iter()) {
+        let ordering = left_key.cmp(right_key).then_with(|| left_value.compare(right_value));
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.fields.len().cmp(&right.fields.len())
 }
 
 /// A BSON document preserves field insertion order (unlike a HashMap) because BSON
@@ -201,6 +396,65 @@ fn encode_field<W: Write>(writer: &mut W, key: &str, value: &BsonValue) -> io::R
             write_cstring(writer, key)?;
             writer.write_all(&v.to_le_bytes())?;
         }
+        BsonValue::DateTime(v) => {
+            writer.write_all(&0x09_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+            writer.write_all(&v.to_le_bytes())?;
+        }
+        BsonValue::Timestamp { t, i } => {
+            writer.write_all(&0x11_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+            // 线上顺序是先 `i` 后 `t`。
+            writer.write_all(&i.to_le_bytes())?;
+            writer.write_all(&t.to_le_bytes())?;
+        }
+        BsonValue::Decimal128(v) => {
+            writer.write_all(&0x13_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+            writer.write_all(&v.bytes())?;
+        }
+        BsonValue::Regex { pattern, options } => {
+            writer.write_all(&0x0B_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+            write_cstring(writer, pattern)?;
+            write_cstring(writer, options)?;
+        }
+        BsonValue::Code(code) => {
+            writer.write_all(&0x0D_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+            write_string(writer, code)?;
+        }
+        BsonValue::CodeWithScope { code, scope } => {
+            writer.write_all(&0x0F_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+            // 总长度包含自身 4 字节，后面紧跟代码字符串与作用域文档。
+            let mut payload = Vec::new();
+            payload.write_all(&0_u32.to_le_bytes())?;
+            write_string(&mut payload, code)?;
+            encode_document(&mut payload, scope)?;
+            let total = payload.len() as u32;
+            writer.write_all(&total.to_le_bytes())?;
+            writer.write_all(&payload[4..])?;
+        }
+        BsonValue::DbPointer { namespace, id } => {
+            writer.write_all(&0x0C_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+            write_string(writer, namespace)?;
+            writer.write_all(id)?;
+        }
+        BsonValue::Symbol(text) => {
+            writer.write_all(&0x0E_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+            write_string(writer, text)?;
+        }
+        BsonValue::MinKey => {
+            writer.write_all(&0xFF_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+        }
+        BsonValue::MaxKey => {
+            writer.write_all(&0x7F_u8.to_le_bytes())?;
+            write_cstring(writer, key)?;
+        }
     }
     Ok(())
 }
@@ -304,9 +558,42 @@ fn parse_value<R: Read>(cursor: &mut R, elem_type: u8) -> Result<BsonValue, Bson
             Ok(BsonValue::ObjectId(bytes))
         }
         0x08 => Ok(BsonValue::Bool(read_u8(cursor)? != 0)),
+        0x09 => Ok(BsonValue::DateTime(read_i64(cursor)?)),
         0x0A => Ok(BsonValue::Null),
+        0x0B => Ok(BsonValue::Regex { pattern: read_cstring(cursor)?, options: read_cstring(cursor)? }),
+        0x0C => {
+            let namespace = read_string(cursor)?;
+            let mut id = [0_u8; 12];
+            cursor.read_exact(&mut id)?;
+            Ok(BsonValue::DbPointer { namespace, id })
+        }
+        0x0D => Ok(BsonValue::Code(read_string(cursor)?)),
+        0x0E => Ok(BsonValue::Symbol(read_string(cursor)?)),
+        0x0F => {
+            let len = read_i32(cursor)?;
+            if len < 4 {
+                return Err(BsonError::Malformed("BSON code-with-scope is shorter than its length field".into()));
+            }
+            let mut buf = vec![0_u8; (len - 4) as usize];
+            cursor.read_exact(&mut buf)?;
+            let mut inner = Cursor::new(buf.as_slice());
+            let code = read_string(&mut inner)?;
+            let scope = parse_sub_document(&mut inner)?;
+            if inner.position() as usize != buf.len() {
+                return Err(BsonError::Malformed("BSON code-with-scope length mismatch".into()));
+            }
+            Ok(BsonValue::CodeWithScope { code, scope })
+        }
         0x10 => Ok(BsonValue::Int32(read_i32(cursor)?)),
+        0x11 => Ok(BsonValue::Timestamp { i: read_i32(cursor)? as u32, t: read_i32(cursor)? as u32 }),
         0x12 => Ok(BsonValue::Int64(read_i64(cursor)?)),
+        0x13 => {
+            let mut bytes = [0_u8; 16];
+            cursor.read_exact(&mut bytes)?;
+            Ok(BsonValue::Decimal128(Decimal128::from_bytes(bytes)))
+        }
+        0x7F => Ok(BsonValue::MaxKey),
+        0xFF => Ok(BsonValue::MinKey),
         other => Err(BsonError::Malformed(format!("unsupported BSON element type {other:#x}"))),
     }
 }
@@ -391,9 +678,10 @@ fn read_string<R: Read>(r: &mut R) -> Result<String, BsonError> {
 /// 把 BSON 值序列化为稳定键字节，供文档经 KV 存储路由。
 /// 不同类型使用不同编码前缀，避免两个不同的 MongoDB 值撞上同一字节模式。
 ///
-/// 数值共用同一键空间：MongoDB 按数值比较 `int32`、`int64` 与 `double`，
-/// 因此 `1`、`1.0` 与 `NumberLong(1)` 必须落到同一份文档，并作为 `_id`
-/// 判重时相撞。整数值统一编码为整数键，只有带小数的 double 用位模式键。
+/// 数值共用同一键空间：MongoDB 按数值比较 `int32`、`int64`、`double` 与
+/// `decimal128`，因此 `1`、`1.0`、`NumberLong(1)` 与 `NumberDecimal("1.0")`
+/// 必须落到同一份文档，并作为 `_id` 判重时相撞。整数值统一编码为整数键，
+/// 只有非整数用类型前缀键。`Symbol` 与同文本的 `String` 也共用键空间。
 pub fn value_to_key(value: &BsonValue) -> Vec<u8> {
     let mut out = Vec::new();
     match value {
@@ -401,7 +689,7 @@ pub fn value_to_key(value: &BsonValue) -> Vec<u8> {
             out.push(b'o');
             out.extend_from_slice(bytes);
         }
-        BsonValue::String(s) => {
+        BsonValue::String(s) | BsonValue::Symbol(s) => {
             out.push(b's');
             out.extend_from_slice(s.as_bytes());
         }
@@ -414,6 +702,31 @@ pub fn value_to_key(value: &BsonValue) -> Vec<u8> {
                 out.extend_from_slice(&double_bits(*v).to_be_bytes());
             }
         },
+        BsonValue::Decimal128(v) => match v.as_i64() {
+            Some(integer) => out.extend_from_slice(&integral_key(integer)),
+            None => {
+                out.push(b'D');
+                let (sign, exponent, coefficient) = v.key_parts();
+                out.push(sign);
+                out.extend_from_slice(&exponent.to_be_bytes());
+                out.extend_from_slice(&coefficient.to_be_bytes());
+            }
+        },
+        BsonValue::DateTime(v) => {
+            out.push(b't');
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        BsonValue::Timestamp { t, i } => {
+            out.push(b'T');
+            out.extend_from_slice(&t.to_be_bytes());
+            out.extend_from_slice(&i.to_be_bytes());
+        }
+        BsonValue::MinKey => {
+            out.push(b'm');
+        }
+        BsonValue::MaxKey => {
+            out.push(b'M');
+        }
         BsonValue::Bool(v) => {
             out.push(b'b');
             out.push(if *v { 1 } else { 0 });

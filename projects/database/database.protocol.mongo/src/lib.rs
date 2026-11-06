@@ -2,4 +2,5 @@
 #![deny(missing_docs)]
 
 pub mod bson;
+pub mod decimal128;
 pub mod wire;
