@@ -261,7 +261,19 @@ pub(crate) fn decode_zset(bytes: &[u8]) -> Option<Vec<(Vec<u8>, f64)>> {
 
 /// hash 命令名集合。
 pub(crate) fn is_hash_command(command: &[u8]) -> bool {
-    for name in [b"HSET".as_slice(), b"HGET", b"HGETALL", b"HDEL", b"HLEN", b"HINCRBY"] {
+    for name in [
+        b"HSET".as_slice(),
+        b"HGET",
+        b"HGETALL",
+        b"HDEL",
+        b"HLEN",
+        b"HINCRBY",
+        b"HKEYS",
+        b"HVALS",
+        b"HEXISTS",
+        b"HINCRBYFLOAT",
+        b"HSCAN",
+    ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
         }
@@ -664,6 +676,105 @@ pub(crate) fn handle_hash(
             return write_storage_error(stream, &message);
         }
         return write_integer(stream, updated);
+    }
+    if command.eq_ignore_ascii_case(b"HKEYS") || command.eq_ignore_ascii_case(b"HVALS") {
+        let by_name = command.eq_ignore_ascii_case(b"HKEYS");
+        if request.arguments.len() != 2 {
+            let name = if by_name { "hkeys" } else { "hvals" };
+            return write_arity_error(stream, name);
+        }
+        let key = request.arguments[1];
+        let fields = match load_hash(stream, executor, base, key)? {
+            Loaded::Missing => Vec::new(),
+            Loaded::Found(fields) => fields,
+            Loaded::Rejected => return Ok(()),
+        };
+        write_array_header(stream, fields.len())?;
+        for (field, value) in &fields {
+            write_bulk(stream, if by_name { field } else { value })?;
+        }
+        return Ok(());
+    }
+    if command.eq_ignore_ascii_case(b"HEXISTS") {
+        if request.arguments.len() != 3 {
+            return write_arity_error(stream, "hexists");
+        }
+        let key = request.arguments[1];
+        return match load_hash(stream, executor, base, key)? {
+            Loaded::Missing => write_integer(stream, 0),
+            Loaded::Found(fields) => {
+                write_integer(stream, i64::from(fields.iter().any(|(name, _)| name.as_slice() == request.arguments[2])))
+            }
+            Loaded::Rejected => Ok(()),
+        };
+    }
+    if command.eq_ignore_ascii_case(b"HINCRBYFLOAT") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "hincrbyfloat");
+        }
+        let Some(increment) = parse_float_literal(std::str::from_utf8(request.arguments[3]).unwrap_or(""))
+        else {
+            return write_error(stream, "value is not a valid float");
+        };
+        let key = request.arguments[1];
+        match find_kind(executor, base, key) {
+            Ok(None) | Ok(Some(KeyKind::Hash)) => {}
+            Ok(Some(_)) => return write_wrong_type(stream),
+            Err(message) => return write_storage_error(stream, &message),
+        }
+        let mut fields = match load_value(executor, &KeyKind::Hash.namespace(base), key) {
+            Ok(Some(bytes)) => match decode_hash(&bytes) {
+                Some(fields) => fields,
+                None => return write_error(stream, "stored hash value is corrupt"),
+            },
+            Ok(None) => Vec::new(),
+            Err(message) => return write_storage_error(stream, &message),
+        };
+        let field = request.arguments[2].to_vec();
+        let current = match fields.iter().find(|(name, _)| *name == field) {
+            Some((_, value)) => match parse_float_literal(std::str::from_utf8(value).unwrap_or("")) {
+                Some(current) => current,
+                None => return write_error(stream, "hash value is not a float"),
+            },
+            None => 0.0,
+        };
+        let updated = current + increment;
+        if !updated.is_finite() {
+            return write_error(stream, "increment would produce NaN or Infinity");
+        }
+        let encoded = updated.to_string().into_bytes();
+        match fields.iter_mut().find(|(name, _)| *name == field) {
+            Some(entry) => entry.1 = encoded.clone(),
+            None => fields.push((field, encoded.clone())),
+        }
+        let Some(bytes) = encode_hash(&fields)
+        else {
+            return write_error(stream, "hash exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::Hash.namespace(base), key, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_bulk(stream, &encoded);
+    }
+    if command.eq_ignore_ascii_case(b"HSCAN") {
+        if request.arguments.len() < 3 {
+            return write_arity_error(stream, "hscan");
+        }
+        let Some(cursor) = parse_scan_cursor(stream, request.arguments[2])?
+        else {
+            return Ok(());
+        };
+        let Some((pattern, count)) = parse_scan_tail(stream, &request.arguments, 3)?
+        else {
+            return Ok(());
+        };
+        let key = request.arguments[1];
+        let fields = match load_hash(stream, executor, base, key)? {
+            Loaded::Missing => Vec::new(),
+            Loaded::Found(fields) => fields,
+            Loaded::Rejected => return Ok(()),
+        };
+        return write_hscan_page(stream, &fields, cursor, count, pattern.as_deref());
     }
     // HLEN
     if request.arguments.len() != 2 {
@@ -1610,6 +1721,35 @@ fn parse_lex_options(
         }
     }
     Ok(Some(limit))
+}
+
+/// 写出一段 hash 扫描结果：`[next-cursor, [field, value, ...]]`。
+fn write_hscan_page(
+    stream: &mut dyn io::Write,
+    fields: &[(Vec<u8>, Vec<u8>)],
+    cursor: usize,
+    count: usize,
+    pattern: Option<&[u8]>,
+) -> io::Result<()> {
+    if cursor >= fields.len() {
+        stream.write_all(b"*2\r\n")?;
+        write_bulk(stream, b"0")?;
+        return write_array_header(stream, 0);
+    }
+    let end = cursor.saturating_add(count).min(fields.len());
+    let next = if end >= fields.len() { "0".to_string() } else { end.to_string() };
+    let matched: Vec<&(Vec<u8>, Vec<u8>)> = fields[cursor..end]
+        .iter()
+        .filter(|(field, _)| pattern.map_or(true, |pattern| glob_match_local(pattern, field)))
+        .collect();
+    stream.write_all(b"*2\r\n")?;
+    write_bulk(stream, next.as_bytes())?;
+    write_array_header(stream, matched.len() * 2)?;
+    for (field, value) in matched {
+        write_bulk(stream, field)?;
+        write_bulk(stream, value)?;
+    }
+    Ok(())
 }
 
 /// 写出一段 zset 扫描结果：`[next-cursor, [member, score, ...]]`。
