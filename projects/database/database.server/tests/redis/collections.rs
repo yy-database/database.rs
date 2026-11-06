@@ -435,6 +435,65 @@ fn key_operations_cover_new_types() {
     expect_error(&mut client, WRONGTYPE);
 }
 
+/// `HINCRBY` starts missing fields at zero and rejects non-hash keys and non-integer
+/// field values, while `LINDEX` supports negative indexes and out-of-range nils.
+#[test]
+fn hash_incrby_and_list_index() {
+    let (mut client, _server) = memory_server("redis-hincrby-lindex");
+    send(&mut client, &["HINCRBY", "h", "f", "5"]);
+    assert_eq!(expect_integer(&mut client), 5);
+    send(&mut client, &["HINCRBY", "h", "f", "-2"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["HINCRBY", "h", "missing", "7"]);
+    assert_eq!(expect_integer(&mut client), 7);
+    send(&mut client, &["TYPE", "h"]);
+    expect_status(&mut client, "hash");
+    send(&mut client, &["HSET", "h", "text", "abc"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["HINCRBY", "h", "text", "1"]);
+    expect_error(&mut client, "ERR hash value is not an integer");
+    send(&mut client, &["HINCRBY", "h", "f", "1.5"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["SET", "s", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["HINCRBY", "s", "f", "1"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["EXISTS", "h"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXPIRE", "h", "100"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TTL", "h"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "unexpected hash TTL: {ttl}");
+    send(&mut client, &["PERSIST", "h"]);
+    assert_eq!(expect_integer(&mut client), 1);
+
+    send(&mut client, &["RPUSH", "l", "a", "b", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["LINDEX", "l", "0"]);
+    expect_bulk(&mut client, Some("a"));
+    send(&mut client, &["LINDEX", "l", "-1"]);
+    expect_bulk(&mut client, Some("c"));
+    send(&mut client, &["LINDEX", "l", "-3"]);
+    expect_bulk(&mut client, Some("a"));
+    send(&mut client, &["LINDEX", "l", "3"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["LINDEX", "l", "-4"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["LINDEX", "no-such-key", "0"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["LINDEX", "l", "not-a-number"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+    send(&mut client, &["HINCRBY", "l", "f", "1"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["TYPE", "l"]);
+    expect_status(&mut client, "list");
+    send(&mut client, &["DEL", "h", "l"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["EXISTS", "h", "l"]);
+    assert_eq!(expect_integer(&mut client), 0);
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
@@ -447,6 +506,8 @@ fn restart_preserves_types_and_contents() {
     assert_eq!(expect_integer(&mut first), 2);
     send(&mut first, &["LPUSH", "l", "a", "b"]);
     assert_eq!(expect_integer(&mut first), 2);
+    send(&mut first, &["HINCRBY", "h", "f3", "9"]);
+    assert_eq!(expect_integer(&mut first), 9);
 
     let (mut second, _second_server) = file_server(&path);
     send(&mut second, &["TYPE", "s"]);
@@ -458,9 +519,11 @@ fn restart_preserves_types_and_contents() {
     send(&mut second, &["GET", "s"]);
     expect_bulk(&mut second, Some("v"));
     send(&mut second, &["HGETALL", "h"]);
-    expect_array(&mut second, &["f1", "v1", "f2", "v2"]);
+    expect_array(&mut second, &["f1", "v1", "f2", "v2", "f3", "9"]);
     send(&mut second, &["LRANGE", "l", "0", "-1"]);
     expect_array(&mut second, &["b", "a"]);
+    send(&mut second, &["LINDEX", "l", "-1"]);
+    expect_bulk(&mut second, Some("a"));
     send(&mut second, &["GET", "h"]);
     expect_error(&mut second, WRONGTYPE);
 }
