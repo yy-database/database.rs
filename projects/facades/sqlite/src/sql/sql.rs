@@ -731,11 +731,12 @@ pub enum ForeignKeyAction {
     NoAction,
     /// `RESTRICT`, which SQLite checks immediately like `NO ACTION`.
     Restrict,
-    /// `SET NULL`, not implemented by this engine.
+    /// `SET NULL`: child key columns become `NULL` when the parent key changes.
     SetNull,
-    /// `SET DEFAULT`, not implemented by this engine.
+    /// `SET DEFAULT`: child key columns take their declared defaults when the
+    /// parent key changes.
     SetDefault,
-    /// `CASCADE`, not implemented by this engine.
+    /// `CASCADE`: child rows follow the parent key rewrite or removal.
     Cascade,
 }
 
@@ -4091,14 +4092,14 @@ impl<'a> Parser<'a> {
             Ok(ForeignKeyAction::Restrict)
         }
         else if self.eat_word("cascade") {
-            Err(self.unsupported_foreign_key_action(clause, "CASCADE"))
+            Ok(ForeignKeyAction::Cascade)
         }
         else if self.eat_word("set") {
             if self.eat_word("null") {
-                Err(self.unsupported_foreign_key_action(clause, "SET NULL"))
+                Ok(ForeignKeyAction::SetNull)
             }
             else if self.eat_word("default") {
-                Err(self.unsupported_foreign_key_action(clause, "SET DEFAULT"))
+                Ok(ForeignKeyAction::SetDefault)
             }
             else {
                 Err(self.error("syntax", format!("expected `NULL` or `DEFAULT` after `SET` in `ON {clause}`")))
@@ -4107,15 +4108,6 @@ impl<'a> Parser<'a> {
         else {
             Err(self.error("syntax", format!("expected a referential action after `ON {clause}`")))
         }
-    }
-
-    fn unsupported_foreign_key_action(&self, clause: &str, action: &str) -> SqlError {
-        let mut error = self.error(
-            "unsupported-foreign-key-action",
-            format!("`ON {clause} {action}` is not supported: cascading referential actions are not implemented"),
-        );
-        error.clause = Some(action.to_string());
-        error
     }
 
     /// Reads a parenthesized column-name list, as in `(a, b)`.
