@@ -6,6 +6,8 @@
 //! |-----------|-------|
 //! | `CREATE TABLE` | column list with `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT` |
 //! | `CREATE INDEX` | single or multi-column index, optional `UNIQUE` and `IF NOT EXISTS` |
+//! | `CREATE VIEW` | `CREATE VIEW name AS SELECT ...`, re-evaluated on every read |
+//! | `CREATE TRIGGER` | `BEFORE` / `AFTER` `INSERT` / `UPDATE [OF cols]` / `DELETE` on one table, one or more body statements |
 //! | `INSERT` | optional column list, one or more `VALUES` tuples, optional `RETURNING` |
 //! | `UPDATE` | optional `AS` alias, one `SET c = expr` per column (bare left-hand side), optional `WHERE` and `RETURNING` |
 //! | `DELETE` | optional `AS` alias, optional `WHERE` and `RETURNING` |
@@ -29,11 +31,11 @@
 //!
 //! Anything else (functions in `FROM`, row-value `SET (a, b) = (...)`,
 //! `UPDATE OR ...` conflict policies, `SET c = DEFAULT`, `RETURNING *, ...`,
-//! `ORDER BY` / `LIMIT` on `UPDATE` and `DELETE`, `FOREIGN KEY`, views,
-//! triggers, `ALTER`, `DROP`, `WITH RECURSIVE`, the `GROUPS` / `EXCLUDE` frame
-//! units) is rejected with a structured error instead of being silently
-//! approximated. Every rejection carries the statement kind, the offending
-//! clause when one is recognized, and the byte offset inside the input.
+//! `ORDER BY` / `LIMIT` on `UPDATE` and `DELETE`, `ALTER`, `WITH RECURSIVE`,
+//! the `GROUPS` / `EXCLUDE` frame units) is rejected with a structured error
+//! instead of being silently approximated. Every rejection carries the
+//! statement kind, the offending clause when one is recognized, and the byte
+//! offset inside the input.
 //!
 //! ## Transitional shapes
 //!
@@ -1164,6 +1166,28 @@ pub enum AlterAction {
     },
 }
 
+/// When a trigger body runs relative to the statement that fired it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerTiming {
+    /// Before the event statement.
+    Before,
+    /// After the event statement.
+    After,
+    /// In place of the event statement on a view.
+    InsteadOf,
+}
+
+/// Which statement event fires a trigger.
+#[derive(Clone, Debug)]
+pub enum TriggerEvent {
+    /// `INSERT` on the table.
+    Insert,
+    /// `UPDATE`, optionally restricted to the listed columns.
+    Update(Vec<String>),
+    /// `DELETE` on the table.
+    Delete,
+}
+
 /// One parsed statement.
 #[derive(Clone, Debug)]
 pub enum Statement {
@@ -1198,6 +1222,32 @@ pub enum Statement {
         query: Box<Statement>,
         /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
         sql: String,
+    },
+    /// `CREATE TRIGGER ... BEGIN ... END`.
+    CreateTrigger {
+        /// Trigger name as written.
+        name: String,
+        /// `IF NOT EXISTS` was present.
+        if_not_exists: bool,
+        /// `BEFORE`, `AFTER` or `INSTEAD OF`.
+        timing: TriggerTiming,
+        /// Statement event that fires the trigger.
+        event: TriggerEvent,
+        /// Table the trigger is attached to.
+        table: String,
+        /// Optional `WHEN` predicate, evaluated before the body.
+        when: Option<Expr>,
+        /// Body statements in source order.
+        body: Vec<Statement>,
+        /// Source text kept verbatim in `sqlite_master.sql`.
+        sql: String,
+    },
+    /// `DROP TRIGGER [IF EXISTS] name`.
+    DropTrigger {
+        /// Trigger name as written.
+        name: String,
+        /// `IF EXISTS` was present.
+        if_exists: bool,
     },
     /// `DROP VIEW [IF EXISTS] name`.
     DropView {
@@ -1345,6 +1395,8 @@ impl Statement {
         match self {
             Self::CreateTable { .. } => "create-table",
             Self::CreateView { .. } => "create-view",
+            Self::CreateTrigger { .. } => "create-trigger",
+            Self::DropTrigger { .. } => "drop-trigger",
             Self::DropView { .. } => "drop-view",
             Self::CreateIndex { .. } => "create-index",
             Self::Insert { .. } => "insert",
@@ -2802,14 +2854,6 @@ impl<'a> Parser<'a> {
             )
     }
 
-    /// Source text of the statement being parsed, trimmed and without its
-    /// terminating semicolon, exactly as SQLite stores it in `sqlite_master`.
-    fn raw_statement(&self) -> String {
-        let start = self.offsets.get(self.statement_start).copied().unwrap_or(0);
-        let end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
-        self.source[start..end].trim().to_string()
-    }
-
     fn statement(&mut self) -> Result<Statement, SqlError> {
         self.statement_start = self.at;
         if self.eat_word("create") {
@@ -2824,6 +2868,10 @@ impl<'a> Parser<'a> {
             if self.eat_word("view") {
                 self.kind = Some("create-view");
                 return self.create_view();
+            }
+            if self.eat_word("trigger") {
+                self.kind = Some("create-trigger");
+                return self.create_trigger();
             }
             self.kind = Some("create-table");
             return self.create_table();
@@ -3031,12 +3079,101 @@ impl<'a> Parser<'a> {
         Ok(Statement::CreateView { name, if_not_exists, columns, query: Box::new(query), sql })
     }
 
+    /// Reads `TRIGGER [IF NOT EXISTS] <name> <timing> <event> ON <table>
+    /// [FOR EACH ROW] [WHEN <expr>] BEGIN <statement> ; ... END`.
+    fn create_trigger(&mut self) -> Result<Statement, SqlError> {
+        let if_not_exists = if self.eat_word("if") {
+            self.expect_word("not")?;
+            self.expect_word("exists")?;
+            true
+        }
+        else {
+            false
+        };
+        let name_token = self.at;
+        let name = self.name()?;
+        self.reject_qualified(&name)?;
+        let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
+        let timing = if self.eat_word("before") {
+            TriggerTiming::Before
+        }
+        else if self.eat_word("after") {
+            TriggerTiming::After
+        }
+        else if self.eat_word("instead") {
+            self.expect_word("of")?;
+            TriggerTiming::InsteadOf
+        }
+        else {
+            let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
+            return Err(self.error(
+                "unsupported-clause",
+                format!("expected `BEFORE`, `AFTER` or `INSTEAD OF` in the trigger definition but found {found}"),
+            ));
+        };
+        let event = if self.eat_word("insert") {
+            TriggerEvent::Insert
+        }
+        else if self.eat_word("update") {
+            let mut columns = Vec::new();
+            if self.eat_word("of") {
+                loop {
+                    columns.push(self.name()?);
+                    if self.peek() == Some(&Token::Comma) {
+                        self.at += 1;
+                    }
+                    else {
+                        break;
+                    }
+                }
+            }
+            TriggerEvent::Update(columns)
+        }
+        else if self.eat_word("delete") {
+            TriggerEvent::Delete
+        }
+        else {
+            let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
+            return Err(self.error("unsupported-clause", format!("expected `INSERT`, `UPDATE` or `DELETE` in the trigger definition but found {found}")));
+        };
+        self.expect_word("on")?;
+        let table = self.name()?;
+        self.reject_qualified(&table)?;
+        if self.eat_word("for") {
+            self.expect_word("each")?;
+            self.expect_word("row")?;
+        }
+        let when = if self.eat_word("when") {
+            Some(self.or_expr()?)
+        }
+        else {
+            None
+        };
+        self.expect_word("begin")?;
+        let mut body = Vec::new();
+        loop {
+            while self.peek() == Some(&Token::Semi) {
+                self.at += 1;
+            }
+            if self.eat_word("end") {
+                break;
+            }
+            if self.peek().is_none() {
+                return Err(self.error("syntax", "the trigger body is not closed by `END`"));
+            }
+            body.push(self.statement()?);
+        }
+        let sql = self.canonical_create_sql("CREATE TRIGGER", name_token, name_gap_end);
+        Ok(Statement::CreateTrigger { name, if_not_exists, timing, event, table, when, body, sql })
+    }
+
     /// Reads `DROP TABLE [IF EXISTS] name` and `DROP INDEX [IF EXISTS] name`.
     fn drop(&mut self) -> Result<Statement, SqlError> {
         enum Object {
             Table,
             Index,
             View,
+            Trigger,
         }
         let object = if self.eat_word("table") {
             Object::Table
@@ -3047,11 +3184,14 @@ impl<'a> Parser<'a> {
         else if self.eat_word("view") {
             Object::View
         }
+        else if self.eat_word("trigger") {
+            Object::Trigger
+        }
         else {
             let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
             let mut error = self.error(
                 "unsupported-clause",
-                format!("unsupported `DROP` object {found}; this engine accepts `DROP TABLE`, `DROP INDEX` and `DROP VIEW` only"),
+                format!("unsupported `DROP` object {found}; this engine accepts `DROP TABLE`, `DROP INDEX`, `DROP VIEW` and `DROP TRIGGER` only"),
             );
             error.clause = Some("DROP".to_string());
             return Err(error);
@@ -3060,11 +3200,13 @@ impl<'a> Parser<'a> {
             Object::Table => "DROP TABLE",
             Object::Index => "DROP INDEX",
             Object::View => "DROP VIEW",
+            Object::Trigger => "DROP TRIGGER",
         };
         self.kind = Some(match object {
             Object::Table => "drop-table",
             Object::Index => "drop-index",
             Object::View => "drop-view",
+            Object::Trigger => "drop-trigger",
         });
         let if_exists = if self.eat_word("if") {
             self.expect_word("exists")?;
@@ -3080,6 +3222,7 @@ impl<'a> Parser<'a> {
             Object::Table => Statement::DropTable { name, if_exists },
             Object::Index => Statement::DropIndex { name, if_exists },
             Object::View => Statement::DropView { name, if_exists },
+            Object::Trigger => Statement::DropTrigger { name, if_exists },
         })
     }
 
