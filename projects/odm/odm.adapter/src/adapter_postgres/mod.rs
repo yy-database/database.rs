@@ -60,9 +60,14 @@ impl PostgresSource {
     }
 
     /// Connect with an explicit timeout.
-    pub fn connect_with_timeout(endpoint: &str, timeout: Duration) -> Result<Self> {
-        let session = Session::connect(endpoint, timeout).map_err(Error::Wire)?;
-        Ok(Self { endpoint: endpoint.to_owned(), session: Mutex::new(session) })
+    ///
+    /// The gateway wire client has no startup / simple-query extraction in this
+    /// dev line, so every execute path would fail after a successful open. The
+    /// session is refused here instead of exposing a half-open backend.
+    pub fn connect_with_timeout(endpoint: &str, _timeout: Duration) -> Result<Self> {
+        Err(Error::Unsupported(format!(
+            "postgres session refused for `{endpoint}` — gateway wire client startup/simple query is not available in this dev line (use sqlite)"
+        )))
     }
 
     /// Connect with pool-timeout alias kept for call-site compatibility.

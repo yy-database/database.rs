@@ -49,6 +49,8 @@ pub const AUTHOR_CODES: &[&str] = &[
     CODE_INTERNAL,
 ];
 
+/// Diagnostic only: the selected backend has no usable wire client in this dev line.
+pub const DIAG_BACKEND_UNSUPPORTED: &str = "IRIS-BACKEND-UNSUPPORTED";
 /// Diagnostic only: the host session has been closed.
 pub const DIAG_SESSION_CLOSED: &str = "IRIS-SESSION-CLOSED";
 /// Diagnostic only: a parameter payload could not be bound.
@@ -247,7 +249,7 @@ fn from_postgres_error(err: crate::Error) -> ErrorEnvelope {
         crate::Error::Wire(inner) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, inner.to_string()).with_diagnostic("postgres.wire"),
         crate::Error::Vos(message) => ErrorEnvelope::new(CODE_SCHEMA_MISMATCH, message).with_diagnostic("postgres.vos"),
         crate::Error::Policy(message) => ErrorEnvelope::new(CODE_SCHEMA_MISMATCH, message).with_diagnostic("IRIS-SCHEMA-POLICY"),
-        crate::Error::Unsupported(message) => ErrorEnvelope::new(CODE_INTERNAL, message).with_diagnostic("postgres.unsupported"),
+        crate::Error::Unsupported(message) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, message).with_diagnostic(DIAG_BACKEND_UNSUPPORTED),
         crate::Error::Sqlite(message) => ErrorEnvelope::new(CODE_INTERNAL, message).with_diagnostic("postgres.unsupported"),
         crate::Error::Io(inner) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, inner.to_string()).with_diagnostic("postgres.io"),
     }
@@ -258,7 +260,7 @@ fn from_mysql_error(err: crate::Error) -> ErrorEnvelope {
         crate::Error::Wire(inner) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, inner.to_string()).with_diagnostic("mysql.wire"),
         crate::Error::Vos(message) => ErrorEnvelope::new(CODE_SCHEMA_MISMATCH, message).with_diagnostic("mysql.vos"),
         crate::Error::Policy(message) => ErrorEnvelope::new(CODE_SCHEMA_MISMATCH, message).with_diagnostic("IRIS-SCHEMA-POLICY"),
-        crate::Error::Unsupported(message) => ErrorEnvelope::new(CODE_INTERNAL, message).with_diagnostic("mysql.unsupported"),
+        crate::Error::Unsupported(message) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, message).with_diagnostic(DIAG_BACKEND_UNSUPPORTED),
         crate::Error::Sqlite(message) => ErrorEnvelope::new(CODE_INTERNAL, message).with_diagnostic("mysql.unsupported"),
         crate::Error::Io(inner) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, inner.to_string()).with_diagnostic("mysql.io"),
     }
