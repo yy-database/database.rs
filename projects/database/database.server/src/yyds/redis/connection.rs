@@ -29,6 +29,7 @@ use super::{
     bind::{BindError, BoundAction, BoundCommand, SetCondition, SetExpiry, bind, bind_mget, bind_set},
     blocking::BlockingRegistry,
     collections::{self, KeyKind},
+    pubsub::{ClientSink, PubSubRegistry, SinkRef, encode_ack},
     resp::{Request, RequestLimits, decode_request},
 };
 
@@ -276,19 +277,25 @@ pub fn serve_connection(stream: TcpStream, limits: RequestLimits) -> io::Result<
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    serve_io(stream, limits, None, Arc::new(KeyAccessTracker::new()), Arc::new(BlockingRegistry::new()))
+    let reader = stream.try_clone()?;
+    let sink = Arc::new(ClientSink::new(stream, None));
+    serve_io(
+        reader,
+        sink,
+        limits,
+        None,
+        Arc::new(KeyAccessTracker::new()),
+        Arc::new(BlockingRegistry::new()),
+        Arc::new(PubSubRegistry::new()),
+    )
 }
 
 /// Serves a node-owned connection with cooperative cancellation of all socket I/O.
 pub fn serve_cancellable(stream: TcpStream, limits: RequestLimits, stopping: Arc<AtomicBool>) -> io::Result<()> {
     stream.set_nonblocking(true)?;
-    serve_io(
-        CancellableSocket { stream, stopping },
-        limits,
-        None,
-        Arc::new(KeyAccessTracker::new()),
-        Arc::new(BlockingRegistry::new()),
-    )
+    let reader = CancellableSocket { stream: stream.try_clone()?, stopping: Arc::clone(&stopping) };
+    let sink = Arc::new(ClientSink::new(stream, Some(stopping)));
+    serve_io(reader, sink, limits, None, Arc::new(KeyAccessTracker::new()), Arc::new(BlockingRegistry::new()), Arc::new(PubSubRegistry::new()))
 }
 
 /// Serves a node-owned RESP2 connection using the YYDS key/value execution contract.
@@ -299,12 +306,16 @@ pub fn serve_cancellable_with_executor(
     executor: Arc<dyn KeyValueExecutor>,
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
+    let reader = CancellableSocket { stream: stream.try_clone()?, stopping: Arc::clone(&stopping) };
+    let sink = Arc::new(ClientSink::new(stream, Some(stopping)));
     serve_io(
-        CancellableSocket { stream, stopping },
+        reader,
+        sink,
         limits,
         Some(executor),
         Arc::new(KeyAccessTracker::new()),
         Arc::new(BlockingRegistry::new()),
+        Arc::new(PubSubRegistry::new()),
     )
 }
 
@@ -312,8 +323,9 @@ pub fn serve_cancellable_with_executor(
 ///
 /// The tracker holds `OBJECT IDLETIME` state, which is per-object in Redis and therefore
 /// has to be shared by every connection of the same listener rather than recreated per
-/// socket. `registry` carries the blocking wait table and has to be shared for the same
-/// reason: waiters on one connection are woken by pushes performed on another.
+/// socket. `registry` carries the blocking wait table and `pubsub` the channel table, both
+/// shared for the same reason: waiters and subscribers on one connection are reached from
+/// another.
 pub fn serve_cancellable_with_executor_and_tracker(
     stream: TcpStream,
     limits: RequestLimits,
@@ -321,9 +333,12 @@ pub fn serve_cancellable_with_executor_and_tracker(
     executor: Arc<dyn KeyValueExecutor>,
     tracker: Arc<KeyAccessTracker>,
     registry: Arc<BlockingRegistry>,
+    pubsub: Arc<PubSubRegistry>,
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
-    serve_io(CancellableSocket { stream, stopping }, limits, Some(executor), tracker, registry)
+    let reader = CancellableSocket { stream: stream.try_clone()?, stopping: Arc::clone(&stopping) };
+    let sink = Arc::new(ClientSink::new(stream, Some(stopping)));
+    serve_io(reader, sink, limits, Some(executor), tracker, registry, pubsub)
 }
 
 struct CancellableSocket {
@@ -369,12 +384,17 @@ impl Write for CancellableSocket {
 }
 
 fn serve_io(
-    mut stream: impl Read + Write,
+    mut reader: impl Read,
+    sink: Arc<ClientSink>,
     limits: RequestLimits,
     executor: Option<Arc<dyn KeyValueExecutor>>,
     tracker: Arc<KeyAccessTracker>,
     registry: Arc<BlockingRegistry>,
+    pubsub: Arc<PubSubRegistry>,
 ) -> io::Result<()> {
+    let client = pubsub.attach(Arc::clone(&sink));
+    let _subscription_guard = SubscriptionGuard { registry: Arc::clone(&pubsub), client };
+    let mut writer = SinkRef(Arc::clone(&sink));
     let mut pending = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut namespace = Namespace("redis:0".into());
@@ -389,12 +409,15 @@ fn serve_io(
                 Ok(Some(request)) => {
                     let consumed = request.consumed;
                     let result = respond(
-                        &mut stream as &mut dyn Write,
+                        &mut writer as &mut dyn Write,
                         &request,
                         tracked_view,
                         executor.as_deref(),
                         tracker.as_ref(),
                         registry.as_ref(),
+                        pubsub.as_ref(),
+                        client,
+                        &sink,
                         &mut namespace,
                         &mut state,
                     );
@@ -405,28 +428,40 @@ fn serve_io(
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    stream.write_all(b"-ERR Protocol error or request limit exceeded\r\n")?;
+                    writer.write_all(b"-ERR Protocol error or request limit exceeded\r\n")?;
                     return Ok(());
                 }
             }
         }
         let available = limits.max_frame_bytes.saturating_sub(pending.len()).min(chunk.len());
         if available == 0 {
-            stream.write_all(b"-ERR Protocol error or request limit exceeded\r\n")?;
+            writer.write_all(b"-ERR Protocol error or request limit exceeded\r\n")?;
             return Ok(());
         }
-        let received = match stream.read(&mut chunk[..available]) {
+        let received = match reader.read(&mut chunk[..available]) {
             Ok(received) => received,
             Err(error) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => return Ok(()),
             Err(error) => return Err(error),
         };
         if received == 0 {
             if !pending.is_empty() {
-                stream.write_all(b"-ERR Truncated request\r\n")?
+                writer.write_all(b"-ERR Truncated request\r\n")?
             }
             return Ok(());
         }
         pending.extend_from_slice(&chunk[..received]);
+    }
+}
+
+/// Removes the connection's subscriptions when its read loop ends.
+struct SubscriptionGuard {
+    registry: Arc<PubSubRegistry>,
+    client: u64,
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        self.registry.detach(self.client);
     }
 }
 
@@ -928,7 +963,7 @@ fn expire_condition_allows(
 ///
 /// 字符类支持 `[^...]` 取反、`a-z` 区间与类内 `\` 转义，大小写敏感，与真机
 /// `stringmatchlen` 的匹配口径一致。`MATCH` 只影响本次返回的键，不改变游标推进。
-fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+pub(crate) fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     let (mut pattern_index, mut text_index) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
     while text_index < text.len() {
@@ -1331,11 +1366,25 @@ fn respond(
     probe: Option<&dyn KeyValueExecutor>,
     tracker: &KeyAccessTracker,
     registry: &BlockingRegistry,
+    pubsub: &PubSubRegistry,
+    client: u64,
+    sink: &Arc<ClientSink>,
     namespace: &mut Namespace,
     state: &mut ConnectionState,
 ) -> io::Result<bool> {
     let command = request.arguments[0];
     let count = request.arguments.len();
+
+    // ---- RESP2 subscriber mode: only the pub/sub verbs, PING, QUIT and RESET may run.
+    // RESP3 lifted this restriction and allows any command while subscribed.
+    if state.protocol == 2 && pubsub.is_subscribed(client) && !subscriber_command_allowed(command) {
+        let message = format!(
+            "-ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n",
+            lowercase_command(command)
+        );
+        stream.write_all(message.as_bytes())?;
+        return Ok(true);
+    }
 
     // ---- Transaction control: MULTI / EXEC / DISCARD. These are always handled directly
     // and never queued (Redis would reject a second MULTI inside a MULTI block anyway).
@@ -1390,7 +1439,7 @@ fn respond(
                 }
             }
         }
-        execute_transaction(stream, executor, probe, tracker, registry, namespace, state)?;
+        execute_transaction(stream, executor, probe, tracker, registry, pubsub, client, sink, namespace, state)?;
         return Ok(true);
     }
 
@@ -1487,13 +1536,62 @@ fn respond(
         }
         write_hello(stream, protocol)?;
         state.protocol = protocol;
+        sink.set_protocol(protocol);
     }
     else if command.eq_ignore_ascii_case(b"PING") {
         match count {
-            1 => stream.write_all(b"+PONG\r\n")?,
+            1 => {
+                // In RESP2 subscriber mode PING answers the two-element `pong` array
+                // instead of the simple string; RESP3 keeps the ordinary reply.
+                if state.protocol == 2 && pubsub.is_subscribed(client) {
+                    stream.write_all(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n")?;
+                }
+                else {
+                    stream.write_all(b"+PONG\r\n")?;
+                }
+            }
             2 => write_bulk(stream, request.arguments[1])?,
             _ => stream.write_all(b"-ERR wrong number of arguments for 'ping' command\r\n")?,
         }
+    }
+    else if command.eq_ignore_ascii_case(b"RESET") {
+        if count != 1 {
+            stream.write_all(b"-ERR wrong number of arguments for 'reset' command\r\n")?;
+            return Ok(true);
+        }
+        // RESET drops subscriptions, leaves MULTI, rewrites the protocol back to RESP2
+        // and returns to database 0, which is the state a fresh connection starts in.
+        for (name, _) in pubsub.unsubscribe(client, &[], false) {
+            let _ = name;
+        }
+        for (name, _) in pubsub.unsubscribe(client, &[], true) {
+            let _ = name;
+        }
+        state.in_multi = false;
+        state.queue.clear();
+        state.watched.clear();
+        state.protocol = 2;
+        sink.set_protocol(2);
+        *namespace = Namespace("redis:0".into());
+        stream.write_all(b"+RESET\r\n")?;
+    }
+    else if command.eq_ignore_ascii_case(b"SUBSCRIBE") {
+        handle_subscribe(stream, pubsub, client, state.protocol, &request.arguments, false)?;
+    }
+    else if command.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
+        handle_unsubscribe(stream, pubsub, client, state.protocol, &request.arguments, false)?;
+    }
+    else if command.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+        handle_subscribe(stream, pubsub, client, state.protocol, &request.arguments, true)?;
+    }
+    else if command.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+        handle_unsubscribe(stream, pubsub, client, state.protocol, &request.arguments, true)?;
+    }
+    else if command.eq_ignore_ascii_case(b"PUBLISH") {
+        handle_publish(stream, pubsub, &request.arguments)?;
+    }
+    else if command.eq_ignore_ascii_case(b"PUBSUB") {
+        handle_pubsub(stream, pubsub, &request.arguments)?;
     }
     else if command.eq_ignore_ascii_case(b"ECHO") {
         if count == 2 {
@@ -2971,6 +3069,9 @@ fn execute_transaction(
     probe: Option<&dyn KeyValueExecutor>,
     tracker: &KeyAccessTracker,
     registry: &BlockingRegistry,
+    pubsub: &PubSubRegistry,
+    client: u64,
+    sink: &Arc<ClientSink>,
     namespace: &mut Namespace,
     state: &mut ConnectionState,
 ) -> io::Result<()> {
@@ -3002,6 +3103,9 @@ fn execute_transaction(
             probe,
             tracker,
             registry,
+            pubsub,
+            client,
+            sink,
             &mut inner_namespace,
             &mut inner_state,
         );
@@ -3415,6 +3519,113 @@ pub(crate) fn write_null(stream: &mut dyn Write, protocol: u8) -> io::Result<()>
 /// emits). RESP3 replaced it with the dedicated null type `_\r\n`.
 pub(crate) fn write_null_array(stream: &mut dyn Write, protocol: u8) -> io::Result<()> {
     stream.write_all(if protocol == 3 { b"_\r\n" as &[u8] } else { b"*-1\r\n" })
+}
+
+/// Commands Redis still honours while a RESP2 connection is in subscriber mode.
+fn subscriber_command_allowed(command: &[u8]) -> bool {
+    command.eq_ignore_ascii_case(b"SUBSCRIBE")
+        || command.eq_ignore_ascii_case(b"UNSUBSCRIBE")
+        || command.eq_ignore_ascii_case(b"PSUBSCRIBE")
+        || command.eq_ignore_ascii_case(b"PUNSUBSCRIBE")
+        || command.eq_ignore_ascii_case(b"PING")
+        || command.eq_ignore_ascii_case(b"QUIT")
+        || command.eq_ignore_ascii_case(b"RESET")
+}
+
+/// One `SUBSCRIBE` or `PSUBSCRIBE`: registers each name and answers one ack frame per name.
+fn handle_subscribe(
+    stream: &mut dyn Write,
+    pubsub: &PubSubRegistry,
+    client: u64,
+    protocol: u8,
+    arguments: &[&[u8]],
+    pattern: bool,
+) -> io::Result<()> {
+    if arguments.len() < 2 {
+        let kind = if pattern { "psubscribe" } else { "subscribe" };
+        stream.write_all(format!("-ERR wrong number of arguments for '{kind}' command\r\n").as_bytes())?;
+        return Ok(());
+    }
+    let kind: &[u8] = if pattern { b"psubscribe" } else { b"subscribe" };
+    for name in &arguments[1..] {
+        let remaining = pubsub.subscribe(client, name, pattern);
+        stream.write_all(&encode_ack(protocol, kind, Some(name), remaining))?;
+    }
+    Ok(())
+}
+
+/// One `UNSUBSCRIBE` or `PUNSUBSCRIBE`: removes each name, or everything when none given.
+fn handle_unsubscribe(
+    stream: &mut dyn Write,
+    pubsub: &PubSubRegistry,
+    client: u64,
+    protocol: u8,
+    arguments: &[&[u8]],
+    pattern: bool,
+) -> io::Result<()> {
+    let kind: &[u8] = if pattern { b"punsubscribe" } else { b"unsubscribe" };
+    let names: Vec<&[u8]> = arguments[1..].to_vec();
+    for (name, remaining) in pubsub.unsubscribe(client, &names, pattern) {
+        stream.write_all(&encode_ack(protocol, kind, name.as_deref(), remaining))?;
+    }
+    Ok(())
+}
+
+/// `PUBLISH`: pushes to every matching subscription and answers the receiver count.
+fn handle_publish(stream: &mut dyn Write, pubsub: &PubSubRegistry, arguments: &[&[u8]]) -> io::Result<()> {
+    if arguments.len() != 3 {
+        stream.write_all(b"-ERR wrong number of arguments for 'publish' command\r\n")?;
+        return Ok(());
+    }
+    let delivered = pubsub.publish(arguments[1], arguments[2]);
+    stream.write_all(format!(":{delivered}\r\n").as_bytes())
+}
+
+/// `PUBSUB CHANNELS | NUMSUB | NUMPAT`.
+fn handle_pubsub(stream: &mut dyn Write, pubsub: &PubSubRegistry, arguments: &[&[u8]]) -> io::Result<()> {
+    if arguments.len() < 2 {
+        stream.write_all(b"-ERR wrong number of arguments for 'pubsub' command\r\n")?;
+        return Ok(());
+    }
+    let subcommand = arguments[1];
+    if subcommand.eq_ignore_ascii_case(b"CHANNELS") {
+        if arguments.len() > 3 {
+            return write_pubsub_subcommand_error(stream, subcommand);
+        }
+        let channels = pubsub.channels(arguments.get(2).copied());
+        stream.write_all(format!("*{}\r\n", channels.len()).as_bytes())?;
+        for channel in channels {
+            write_bulk(stream, &channel)?;
+        }
+        return Ok(());
+    }
+    if subcommand.eq_ignore_ascii_case(b"NUMSUB") {
+        let channels: Vec<&[u8]> = arguments[2..].to_vec();
+        let pairs = pubsub.numsub(&channels);
+        stream.write_all(format!("*{}\r\n", pairs.len() * 2).as_bytes())?;
+        for (channel, count) in pairs {
+            write_bulk(stream, &channel)?;
+            stream.write_all(format!(":{count}\r\n").as_bytes())?;
+        }
+        return Ok(());
+    }
+    if subcommand.eq_ignore_ascii_case(b"NUMPAT") {
+        if arguments.len() != 2 {
+            return write_pubsub_subcommand_error(stream, subcommand);
+        }
+        stream.write_all(format!(":{}\r\n", pubsub.numpat()).as_bytes())?;
+        return Ok(());
+    }
+    let name = String::from_utf8_lossy(subcommand);
+    stream.write_all(format!("-ERR unknown subcommand '{name}'. Try PUBSUB HELP.\r\n").as_bytes())
+}
+
+/// Error Redis returns for a known `PUBSUB` subcommand with the wrong argument count.
+fn write_pubsub_subcommand_error(stream: &mut dyn Write, subcommand: &[u8]) -> io::Result<()> {
+    let name = String::from_utf8_lossy(subcommand);
+    stream.write_all(
+        format!("-ERR unknown subcommand or wrong number of arguments for '{name}'. Try PUBSUB HELP.\r\n").as_bytes(),
+    )
 }
 
 /// Reads the current value of one key, which is the version compared by `WATCH`.

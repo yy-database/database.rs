@@ -18,6 +18,7 @@ use database_execution::cluster::{KeyValueExecutor, LocalExecutor};
 use database_server::yyds::redis::{
     blocking::BlockingRegistry,
     connection::{KeyAccessTracker, serve_cancellable_with_executor_and_tracker},
+    pubsub::PubSubRegistry,
     resp::RequestLimits,
 };
 use database_storage::cluster_kv::MemoryShard;
@@ -39,6 +40,7 @@ fn start_server(clients: usize) -> (SocketAddr, Arc<dyn KeyValueExecutor>) {
     let stopping = Arc::new(AtomicBool::new(false));
     let tracker = Arc::new(KeyAccessTracker::new());
     let registry = Arc::new(BlockingRegistry::new());
+    let pubsub = Arc::new(PubSubRegistry::new());
     let server_executor = Arc::clone(&executor);
     thread::spawn(move || {
         let mut workers = Vec::new();
@@ -47,6 +49,7 @@ fn start_server(clients: usize) -> (SocketAddr, Arc<dyn KeyValueExecutor>) {
             let executor = Arc::clone(&server_executor);
             let tracker = Arc::clone(&tracker);
             let registry = Arc::clone(&registry);
+            let pubsub = Arc::clone(&pubsub);
             let cancellation = Arc::clone(&stopping);
             workers.push(thread::spawn(move || {
                 let _ = serve_cancellable_with_executor_and_tracker(
@@ -56,6 +59,7 @@ fn start_server(clients: usize) -> (SocketAddr, Arc<dyn KeyValueExecutor>) {
                     executor,
                     tracker,
                     registry,
+                    pubsub,
                 );
             }));
         }
