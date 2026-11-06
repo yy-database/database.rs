@@ -1189,6 +1189,32 @@ pub struct Assignment {
     pub value: Expr,
 }
 
+/// `ON CONFLICT` clause of an `INSERT`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConflictClause {
+    /// Conflict target columns; `None` when no target was written, which
+    /// catches every uniqueness conflict.
+    pub target: Option<Vec<String>>,
+    /// Optional `WHERE` predicate narrowing the target to a partial index.
+    pub predicate: Option<Expr>,
+    /// `DO NOTHING` or `DO UPDATE SET ...`.
+    pub action: ConflictAction,
+}
+
+/// What an `ON CONFLICT` clause does with the conflicting row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConflictAction {
+    /// Skip the row.
+    Nothing,
+    /// Rewrite the existing row; `excluded.*` refers to the supplied row.
+    Update {
+        /// Assignments in source order.
+        assignments: Vec<Assignment>,
+        /// Optional `WHERE` predicate gating the rewrite.
+        predicate: Option<Expr>,
+    },
+}
+
 /// The single alteration carried by an `ALTER TABLE` statement.
 #[derive(Clone, Debug)]
 pub enum AlterAction {
@@ -1368,6 +1394,8 @@ pub enum Statement {
         rows: Vec<Vec<InsertValue>>,
         /// `DEFAULT VALUES` was written: insert one row built from the column defaults.
         default_values: bool,
+        /// Optional `ON CONFLICT` clause.
+        conflict: Option<ConflictClause>,
         /// `RETURNING` projection, `*` or an explicit list.
         returning: Option<SelectItems>,
     },
@@ -2368,6 +2396,13 @@ impl<'a> Parser<'a> {
 
     fn peek_word(&self) -> Option<&str> {
         match self.peek() {
+            Some(Token::Word(word)) => Some(word.as_str()),
+            _ => None,
+        }
+    }
+
+    fn peek_word_at(&self, offset: usize) -> Option<&str> {
+        match self.tokens.get(self.at + offset) {
             Some(Token::Word(word)) => Some(word.as_str()),
             _ => None,
         }
@@ -4317,8 +4352,9 @@ impl<'a> Parser<'a> {
             // the declared default. An explicit column list is not allowed here.
             self.expect_word("default")?;
             self.expect_word("values")?;
+            let conflict = self.conflict_clause()?;
             let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
-            return Ok(Statement::Insert { schema, table, columns, rows: Vec::new(), default_values: true, returning });
+            return Ok(Statement::Insert { schema, table, columns, rows: Vec::new(), default_values: true, conflict, returning });
         }
         self.expect_word("values")?;
         let mut rows = Vec::new();
@@ -4348,8 +4384,51 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        let conflict = self.conflict_clause()?;
         let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
-        Ok(Statement::Insert { schema, table, columns, rows, default_values: false, returning })
+        Ok(Statement::Insert { schema, table, columns, rows, default_values: false, conflict, returning })
+    }
+
+    /// Parses `ON CONFLICT [(target)] [WHERE ...] DO NOTHING | DO UPDATE SET ...`.
+    fn conflict_clause(&mut self) -> Result<Option<ConflictClause>, SqlError> {
+        let matches = self.peek_word().is_some_and(|word| word.eq_ignore_ascii_case("on"))
+            && self.peek_word_at(1).is_some_and(|word| word.eq_ignore_ascii_case("conflict"));
+        if !matches {
+            return Ok(None);
+        }
+        self.at += 2;
+        let target = if self.peek() == Some(&Token::LParen) { Some(self.column_list()?) } else { None };
+        let predicate = if self.eat_word("where") { Some(self.or_expr()?) } else { None };
+        self.expect_word("do")?;
+        if self.eat_word("nothing") {
+            return Ok(Some(ConflictClause { target, predicate, action: ConflictAction::Nothing }));
+        }
+        self.expect_word("update")?;
+        self.expect_word("set")?;
+        let mut assignments = Vec::new();
+        loop {
+            if self.peek() == Some(&Token::LParen) {
+                let mut error = self
+                    .error("unsupported-clause", "row-value `SET (a, b) = (...)` assignments are not supported; assign one column per item");
+                error.clause = Some("SET".to_string());
+                return Err(error);
+            }
+            let column = self.name()?;
+            match self.peek() {
+                Some(Token::Operator(operator)) if operator == "=" => self.at += 1,
+                Some(token) => return Err(self.error("syntax", format!("expected `=` in a `SET` assignment but found {}", token.describe()))),
+                None => return Err(self.error("syntax", "`SET` assignment is incomplete")),
+            }
+            let value = self.or_expr()?;
+            assignments.push(Assignment { column, value });
+            if self.peek() == Some(&Token::Comma) {
+                self.at += 1;
+                continue;
+            }
+            break;
+        }
+        let update_predicate = if self.eat_word("where") { Some(self.or_expr()?) } else { None };
+        Ok(Some(ConflictClause { target, predicate, action: ConflictAction::Update { assignments, predicate: update_predicate } }))
     }
 
     /// Rejects a clause that SQLite does not accept on `UPDATE` / `DELETE`.
