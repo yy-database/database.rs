@@ -283,7 +283,21 @@ pub(crate) fn is_hash_command(command: &[u8]) -> bool {
 
 /// list 命令名集合。
 pub(crate) fn is_list_command(command: &[u8]) -> bool {
-    for name in [b"LPUSH".as_slice(), b"RPUSH", b"LRANGE", b"LPOP", b"RPOP", b"LLEN", b"LINDEX"] {
+    for name in [
+        b"LPUSH".as_slice(),
+        b"RPUSH",
+        b"LRANGE",
+        b"LPOP",
+        b"RPOP",
+        b"LLEN",
+        b"LINDEX",
+        b"LREM",
+        b"LSET",
+        b"LTRIM",
+        b"LINSERT",
+        b"RPOPLPUSH",
+        b"LMOVE",
+    ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
         }
@@ -788,7 +802,31 @@ pub(crate) fn handle_hash(
     }
 }
 
-/// `LPUSH` / `RPUSH` / `LRANGE` / `LPOP` / `RPOP` / `LLEN` 的分派入口。
+fn write_status(stream: &mut dyn io::Write, value: &str) -> io::Result<()> {
+    write!(stream, "+{value}\r\n")
+}
+
+/// list 的插入/弹出端，供 `LMOVE` 与 `LINSERT` 解析方向参数。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListSide {
+    Left,
+    Right,
+}
+
+fn parse_side(raw: &[u8]) -> Option<ListSide> {
+    if raw.eq_ignore_ascii_case(b"LEFT") {
+        Some(ListSide::Left)
+    }
+    else if raw.eq_ignore_ascii_case(b"RIGHT") {
+        Some(ListSide::Right)
+    }
+    else {
+        None
+    }
+}
+
+/// `LPUSH` / `RPUSH` / `LRANGE` / `LPOP` / `RPOP` / `LLEN` 及 `LREM` / `LSET` /
+/// `LTRIM` / `LINSERT` / `RPOPLPUSH` / `LMOVE` 的分派入口。
 pub(crate) fn handle_list(
     stream: &mut dyn io::Write,
     request: &Request<'_>,
@@ -958,6 +996,260 @@ pub(crate) fn handle_list(
             Some(element) => write_bulk(stream, element),
             None => write_null(stream, protocol),
         };
+    }
+    if command.eq_ignore_ascii_case(b"LREM") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "lrem");
+        }
+        let Some(count) = parse_index(request.arguments[2])
+        else {
+            return write_error(stream, "value is not an integer or out of range");
+        };
+        let key = request.arguments[1];
+        let element = request.arguments[3];
+        let mut elements = match load_list(stream, executor, base, key)? {
+            Loaded::Missing => return write_integer(stream, 0),
+            Loaded::Found(elements) => elements,
+            Loaded::Rejected => return Ok(()),
+        };
+        let mut removed = 0_i64;
+        if count >= 0 {
+            let limit = if count == 0 { usize::MAX } else { count as usize };
+            let mut kept = Vec::with_capacity(elements.len());
+            for existing in elements {
+                if (removed as usize) < limit && existing.as_slice() == element {
+                    removed += 1;
+                }
+                else {
+                    kept.push(existing);
+                }
+            }
+            elements = kept;
+        }
+        else {
+            let limit = count.unsigned_abs() as usize;
+            let mut kept = Vec::with_capacity(elements.len());
+            for existing in elements.into_iter().rev() {
+                if (removed as usize) < limit && existing.as_slice() == element {
+                    removed += 1;
+                }
+                else {
+                    kept.push(existing);
+                }
+            }
+            kept.reverse();
+            elements = kept;
+        }
+        if removed == 0 {
+            return write_integer(stream, 0);
+        }
+        if elements.is_empty() {
+            if let Err(message) = remove_value(executor, &KeyKind::List.namespace(base), key) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        else {
+            let Some(bytes) = encode_list(&elements)
+            else {
+                return write_error(stream, "list exceeds the storage limit");
+            };
+            if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), key, bytes) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        return write_integer(stream, removed);
+    }
+    if command.eq_ignore_ascii_case(b"LSET") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "lset");
+        }
+        let Some(index) = parse_index(request.arguments[2])
+        else {
+            return write_error(stream, "value is not an integer or out of range");
+        };
+        let key = request.arguments[1];
+        let mut elements = match load_list(stream, executor, base, key)? {
+            Loaded::Missing => return write_error(stream, "no such key"),
+            Loaded::Found(elements) => elements,
+            Loaded::Rejected => return Ok(()),
+        };
+        let length = elements.len() as i64;
+        let position = if index < 0 { length.saturating_add(index) } else { index };
+        if position < 0 || position >= length {
+            return write_error(stream, "index out of range");
+        }
+        elements[position as usize] = request.arguments[3].to_vec();
+        let Some(bytes) = encode_list(&elements)
+        else {
+            return write_error(stream, "list exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), key, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_status(stream, "OK");
+    }
+    if command.eq_ignore_ascii_case(b"LTRIM") {
+        if request.arguments.len() != 4 {
+            return write_arity_error(stream, "ltrim");
+        }
+        let (Some(start), Some(stop)) = (parse_index(request.arguments[2]), parse_index(request.arguments[3]))
+        else {
+            return write_error(stream, "value is not an integer or out of range");
+        };
+        let key = request.arguments[1];
+        let mut elements = match load_list(stream, executor, base, key)? {
+            Loaded::Missing => return write_status(stream, "OK"),
+            Loaded::Found(elements) => elements,
+            Loaded::Rejected => return Ok(()),
+        };
+        let length = elements.len() as i64;
+        let begin = if start < 0 { length.saturating_add(start) } else { start }.max(0);
+        let end = if stop < 0 { length.saturating_add(stop) } else { stop }.min(length - 1);
+        if begin > end || begin >= length || end < 0 {
+            if let Err(message) = remove_value(executor, &KeyKind::List.namespace(base), key) {
+                return write_storage_error(stream, &message);
+            }
+            return write_status(stream, "OK");
+        }
+        elements.drain(..begin as usize);
+        elements.truncate((end - begin + 1) as usize);
+        let Some(bytes) = encode_list(&elements)
+        else {
+            return write_error(stream, "list exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), key, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_status(stream, "OK");
+    }
+    if command.eq_ignore_ascii_case(b"LINSERT") {
+        if request.arguments.len() != 5 {
+            return write_arity_error(stream, "linsert");
+        }
+        let before = if request.arguments[2].eq_ignore_ascii_case(b"BEFORE") {
+            true
+        }
+        else if request.arguments[2].eq_ignore_ascii_case(b"AFTER") {
+            false
+        }
+        else {
+            return write_error(stream, "syntax error");
+        };
+        let key = request.arguments[1];
+        let mut elements = match load_list(stream, executor, base, key)? {
+            Loaded::Missing => return write_integer(stream, 0),
+            Loaded::Found(elements) => elements,
+            Loaded::Rejected => return Ok(()),
+        };
+        let Some(position) = elements.iter().position(|existing| existing.as_slice() == request.arguments[3])
+        else {
+            return write_integer(stream, -1);
+        };
+        let insert_at = if before { position } else { position + 1 };
+        elements.insert(insert_at, request.arguments[4].to_vec());
+        let Some(bytes) = encode_list(&elements)
+        else {
+            return write_error(stream, "list exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), key, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_integer(stream, elements.len() as i64);
+    }
+    if command.eq_ignore_ascii_case(b"RPOPLPUSH") || command.eq_ignore_ascii_case(b"LMOVE") {
+        let lmove = command.eq_ignore_ascii_case(b"LMOVE");
+        let (from, to) = if lmove {
+            if request.arguments.len() != 5 {
+                return write_arity_error(stream, "lmove");
+            }
+            let (Some(from), Some(to)) = (parse_side(request.arguments[3]), parse_side(request.arguments[4]))
+            else {
+                return write_error(stream, "syntax error");
+            };
+            (from, to)
+        }
+        else {
+            if request.arguments.len() != 3 {
+                return write_arity_error(stream, "rpoplpush");
+            }
+            (ListSide::Right, ListSide::Left)
+        };
+        let source = request.arguments[1];
+        let destination = request.arguments[2];
+        let mut elements = match load_list(stream, executor, base, source)? {
+            Loaded::Missing => Vec::new(),
+            Loaded::Found(elements) => elements,
+            Loaded::Rejected => return Ok(()),
+        };
+        // 真机先校验源类型，再校验目标类型，最后才判断源键是否为空。
+        if source != destination {
+            match find_kind(executor, base, destination) {
+                Ok(None) | Ok(Some(KeyKind::List)) => {}
+                Ok(Some(_)) => return write_wrong_type(stream),
+                Err(message) => return write_storage_error(stream, &message),
+            }
+        }
+        let element = if elements.is_empty() {
+            None
+        }
+        else {
+            match from {
+                ListSide::Left => Some(elements.remove(0)),
+                ListSide::Right => elements.pop(),
+            }
+        };
+        let Some(element) = element
+        else {
+            return write_null(stream, protocol);
+        };
+        if source == destination {
+            match to {
+                ListSide::Left => elements.insert(0, element.clone()),
+                ListSide::Right => elements.push(element.clone()),
+            }
+            let Some(bytes) = encode_list(&elements)
+            else {
+                return write_error(stream, "list exceeds the storage limit");
+            };
+            if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), source, bytes) {
+                return write_storage_error(stream, &message);
+            }
+            return write_bulk(stream, &element);
+        }
+        if elements.is_empty() {
+            if let Err(message) = remove_value(executor, &KeyKind::List.namespace(base), source) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        else {
+            let Some(bytes) = encode_list(&elements)
+            else {
+                return write_error(stream, "list exceeds the storage limit");
+            };
+            if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), source, bytes) {
+                return write_storage_error(stream, &message);
+            }
+        }
+        let mut destination_elements = match load_value(executor, &KeyKind::List.namespace(base), destination) {
+            Ok(Some(bytes)) => match decode_list(&bytes) {
+                Some(elements) => elements,
+                None => return write_error(stream, "stored list value is corrupt"),
+            },
+            Ok(None) => Vec::new(),
+            Err(message) => return write_storage_error(stream, &message),
+        };
+        match to {
+            ListSide::Left => destination_elements.insert(0, element.clone()),
+            ListSide::Right => destination_elements.push(element.clone()),
+        }
+        let Some(bytes) = encode_list(&destination_elements)
+        else {
+            return write_error(stream, "list exceeds the storage limit");
+        };
+        if let Err(message) = store_value(executor, &KeyKind::List.namespace(base), destination, bytes) {
+            return write_storage_error(stream, &message);
+        }
+        return write_bulk(stream, &element);
     }
     // LLEN
     if request.arguments.len() != 2 {
