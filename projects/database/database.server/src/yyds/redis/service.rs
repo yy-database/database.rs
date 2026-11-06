@@ -16,6 +16,7 @@ use database_cluster::control::NodeLease;
 use database_execution::cluster::KeyValueExecutor;
 
 use super::{
+    blocking::BlockingRegistry,
     connection::{KeyAccessTracker, serve_cancellable, serve_cancellable_with_executor_and_tracker},
     resp::RequestLimits,
 };
@@ -141,6 +142,9 @@ fn listen(
     // listener shares one tracker. They live in memory only and reset when the listener
     // restarts, matching an RDB load that does not persist access time.
     let tracker = Arc::new(KeyAccessTracker::new());
+    // Blocking commands wait for pushes performed by other connections, so the wait table
+    // has to be listener-scoped like the access tracker.
+    let registry = Arc::new(BlockingRegistry::new());
     let mut clients = Clients { workers: Vec::new(), stopping: Arc::clone(&stopping) };
     while !stopping.load(Ordering::Acquire) {
         clients.reap();
@@ -158,6 +162,7 @@ fn listen(
                 let cancellation = Arc::clone(&stopping);
                 let connection_executor = executor.clone();
                 let connection_tracker = Arc::clone(&tracker);
+                let connection_registry = Arc::clone(&registry);
                 let worker = thread::Builder::new().name("yyds-redis-client".into()).spawn(move || {
                     let _ = match connection_executor {
                         Some(executor) => serve_cancellable_with_executor_and_tracker(
@@ -166,6 +171,7 @@ fn listen(
                             cancellation,
                             executor,
                             connection_tracker,
+                            connection_registry,
                         ),
                         None => serve_cancellable(stream, limits, cancellation),
                     };
