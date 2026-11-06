@@ -14,10 +14,11 @@ use crate::{
 use super::error::SqlError;
 use super::json_string;
 use super::sql::{
-    AggregateFunction, AlterAction, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm, Expr,
-    ForeignKey, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal, NamedWindow, OrderKey, ScalarFunction, SelectCore,
-    SelectItems, Statement, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp, WindowFunction, WindowSpec, core_references, parse,
-    rewrite_create_index_column, rewrite_create_index_table, rewrite_create_table_column, rewrite_create_table_name, statement_references,
+    AggregateFunction, AlterAction, BinaryOp, CastType, CheckConstraint, ColumnRef, CommonTable, CompareOp, CompoundOp, CompoundTerm,
+    DropColumnConflict, Expr, ForeignKey, FrameBound, FrameEdge, FrameUnits, IndexColumn, InsertValue, JoinKind, Limit, Literal, NamedWindow,
+    OrderKey, ScalarFunction, SelectCore, SelectItems, Statement, TableRef, TransactionAction, TriggerEvent, TriggerTiming, UnaryOp,
+    WindowFunction, WindowSpec, core_references, parse, rewrite_create_index_column, rewrite_create_index_table,
+    rewrite_create_table_column, rewrite_create_table_drop_column, rewrite_create_table_name, statement_references,
 };
 
 /// One cell surfaced to the host.
@@ -1434,9 +1435,10 @@ impl Engine {
         }
     }
 
-    /// Executes the `ALTER TABLE` forms: `RENAME TO`, `RENAME COLUMN` and `ADD
-    /// COLUMN`. `DROP COLUMN` is rejected by name; it would have to rewrite
-    /// every stored record.
+    /// Executes the `ALTER TABLE` forms: `RENAME TO`, `RENAME COLUMN`, `ADD
+    /// COLUMN` and `DROP COLUMN`. A drop rewrites every stored record and the
+    /// stored `CREATE TABLE` text, refusing columns still read by an index,
+    /// a view, a trigger or a table-level constraint.
     fn run_alter_table(&mut self, table: String, action: AlterAction) -> Result<ExecResult, SqlError> {
         if is_schema_table(&table) {
             return Err(SqlError::new("readonly-system-table", format!("table {table} may not be altered")).in_statement("alter-table"));
@@ -1581,13 +1583,117 @@ impl Engine {
                 Ok(ExecResult { statement: "alter-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
             AlterAction::DropColumn { column } => {
-                let mut error = SqlError::new(
-                    "unsupported-clause",
-                    format!("`ALTER TABLE ... DROP COLUMN` is not supported (`{column}` would have to be removed from every stored row)"),
-                )
-                .in_statement("alter-table");
-                error.clause = Some("DROP COLUMN".to_string());
-                Err(error)
+                let def = &self.tables[position];
+                let column_position = def
+                    .columns
+                    .iter()
+                    .position(|existing| existing.name.eq_ignore_ascii_case(&column))
+                    .ok_or_else(|| SqlError::new("unknown-column", format!("no such column: \"{column}\"")).in_statement("alter-table"))?;
+                let primary = def.rowid_alias == Some(column_position)
+                    || def.primary_key.contains(&column_position)
+                    || def.columns[column_position].primary_key;
+                if primary {
+                    return Err(SqlError::new("invalid-alter", format!("cannot drop PRIMARY KEY column: \"{column}\"")).in_statement("alter-table"));
+                }
+                if def.columns[column_position].unique {
+                    return Err(SqlError::new("invalid-alter", format!("cannot drop UNIQUE column: \"{column}\"")).in_statement("alter-table"));
+                }
+                if def.columns.len() == 1 {
+                    return Err(SqlError::new("invalid-alter", format!("cannot drop column \"{column}\": no other columns exist"))
+                        .in_statement("alter-table"));
+                }
+                if let Some((name, _)) = self
+                    .indexes
+                    .iter()
+                    .find(|(_, index)| index.table == key && index.columns.contains(&column_position))
+                {
+                    return Err(SqlError::new(
+                        "invalid-alter",
+                        format!("error in index {name} after drop column: no such column: {column}"),
+                    )
+                    .in_statement("alter-table"));
+                }
+                let new_sql = match rewrite_create_table_drop_column(&stored, &def.columns[column_position].name) {
+                    Ok(Some(text)) => text,
+                    Ok(None) => {
+                        return Err(SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"));
+                    }
+                    Err(DropColumnConflict::TableCheck) => {
+                        return Err(SqlError::new(
+                            "invalid-alter",
+                            format!("error in table {} after drop column: no such column: {column}", def.name),
+                        )
+                        .in_statement("alter-table"));
+                    }
+                    Err(DropColumnConflict::TableForeignKey) => {
+                        return Err(SqlError::new(
+                            "invalid-alter",
+                            format!("error in table {} after drop column: unknown column \"{column}\" in foreign key definition", def.name),
+                        )
+                        .in_statement("alter-table"));
+                    }
+                };
+                if let Some((name, _)) = self
+                    .views
+                    .iter()
+                    .find(|(_, view)| statement_mentions_column(&view.query, &column, None))
+                {
+                    return Err(SqlError::new(
+                        "invalid-alter",
+                        format!("error in view {name} after drop column: no such column: {column}"),
+                    )
+                    .in_statement("alter-table"));
+                }
+                if let Some((name, _)) = self
+                    .triggers
+                    .iter()
+                    .find(|(_, trigger)| {
+                        trigger.table == key
+                            && trigger.body.iter().any(|statement| {
+                                statement_mentions_column(statement, &column, Some(&["new", "old"]))
+                            })
+                    })
+                {
+                    return Err(SqlError::new(
+                        "invalid-alter",
+                        format!("error in trigger {name} after drop column: no such column: {column}"),
+                    )
+                    .in_statement("alter-table"));
+                }
+                // The catalog is re-derived from the rewritten DDL so checks,
+                // foreign keys and the rowid alias all follow the new column
+                // positions instead of being patched by hand.
+                let mut statements = parse(&new_sql).map_err(|_| {
+                    SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table")
+                })?;
+                let Some(Statement::CreateTable { name, columns, primary_key, checks, foreign_keys, strict, .. }) =
+                    statements.drain(..).next()
+                else {
+                    return Err(SqlError::new("storage", "sqlite stored table text unrecognized").in_statement("alter-table"));
+                };
+                let derived = Self::catalog_table(name, columns, primary_key, checks, foreign_keys, strict)?;
+                self.writer.begin().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                if let Err(error) = self.writer.drop_column(&def.name, column_position) {
+                    let _ = self.writer.rollback();
+                    return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                }
+                if let Err(error) = self.writer.rewrite_table_sql(&def.name, &new_sql) {
+                    let _ = self.writer.rollback();
+                    return Err(SqlError::new("storage", error.to_string()).in_statement("alter-table"));
+                }
+                self.writer.commit().map_err(|error| SqlError::new("storage", error.to_string()).in_statement("alter-table"))?;
+                for index in self.indexes.values_mut() {
+                    if index.table != key {
+                        continue;
+                    }
+                    for position in &mut index.columns {
+                        if *position > column_position {
+                            *position -= 1;
+                        }
+                    }
+                }
+                self.tables[position] = derived;
+                Ok(ExecResult { statement: "alter-table", columns: Vec::new(), rows: Vec::new(), affected: 1 })
             }
         }
     }
@@ -6389,6 +6495,113 @@ fn resolve_foreign_keys(columns: &[ColumnSpec], keys: &[ForeignKey]) -> Result<V
     Ok(resolved)
 }
 
+/// Whether one parsed expression mentions `column`; `qualifiers` restricts the
+/// match to `NEW` / `OLD` references when provided.
+fn expression_mentions_column(expr: &Expr, column: &str, qualifiers: Option<&[&str]>) -> bool {
+    match expr {
+        Expr::Column(reference) => {
+            if !reference.name.eq_ignore_ascii_case(column) {
+                return false;
+            }
+            match (reference.qualifier.as_deref(), qualifiers) {
+                (None, None) => true,
+                (None, Some(_)) => false,
+                (Some(qualifier), Some(allowed)) => allowed.iter().any(|allowed| qualifier.eq_ignore_ascii_case(allowed)),
+                (Some(_), None) => true,
+            }
+        }
+        Expr::Literal(_) | Expr::Parameter { .. } => false,
+        Expr::Unary { value, .. } => expression_mentions_column(value, column, qualifiers),
+        Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            expression_mentions_column(left, column, qualifiers) || expression_mentions_column(right, column, qualifiers)
+        }
+        Expr::IsNull { value, .. } | Expr::IsTruth { value, .. } | Expr::Not(value) | Expr::Alias { value, .. } | Expr::Cast { value, .. } => {
+            expression_mentions_column(value, column, qualifiers)
+        }
+        Expr::Case { operand, branches, otherwise } => {
+            operand.as_ref().is_some_and(|value| expression_mentions_column(value, column, qualifiers))
+                || branches.iter().any(|(condition, value)| {
+                    expression_mentions_column(condition, column, qualifiers) || expression_mentions_column(value, column, qualifiers)
+                })
+                || otherwise.as_ref().is_some_and(|value| expression_mentions_column(value, column, qualifiers))
+        }
+        Expr::In { value, list, .. } => {
+            expression_mentions_column(value, column, qualifiers)
+                || list.iter().any(|item| expression_mentions_column(item, column, qualifiers))
+        }
+        Expr::Function { args, .. } => args.iter().any(|argument| expression_mentions_column(argument, column, qualifiers)),
+        Expr::Subquery(statement) | Expr::Exists(statement) => statement_mentions_column(statement, column, qualifiers),
+        Expr::InSubquery { value, query, .. } => {
+            expression_mentions_column(value, column, qualifiers) || statement_mentions_column(query, column, qualifiers)
+        }
+        Expr::Aggregate { argument, separator, .. } => {
+            argument.as_ref().is_some_and(|value| expression_mentions_column(value, column, qualifiers))
+                || separator.as_ref().is_some_and(|value| expression_mentions_column(value, column, qualifiers))
+        }
+        Expr::Like { value, pattern, escape, .. } => {
+            expression_mentions_column(value, column, qualifiers)
+                || expression_mentions_column(pattern, column, qualifiers)
+                || escape.as_ref().is_some_and(|value| expression_mentions_column(value, column, qualifiers))
+        }
+        Expr::Window { spec, .. } => window_mentions_column(spec, column, qualifiers),
+    }
+}
+
+/// Whether one projection mentions the column.
+fn select_items_mention_column(items: &SelectItems, column: &str, qualifiers: Option<&[&str]>) -> bool {
+    match items {
+        SelectItems::Named(items) => items.iter().any(|item| expression_mentions_column(item, column, qualifiers)),
+        SelectItems::Star | SelectItems::CountAll => false,
+    }
+}
+
+/// Whether one window specification mentions the column in its partitioning,
+/// ordering or frame offsets.
+fn window_mentions_column(spec: &WindowSpec, column: &str, qualifiers: Option<&[&str]>) -> bool {
+    let bound = |edge: &FrameBound| edge.offset.as_ref().is_some_and(|value| expression_mentions_column(value, column, qualifiers));
+    spec.partition.iter().any(|expr| expression_mentions_column(expr, column, qualifiers))
+        || spec.order.iter().any(|key| expression_mentions_column(&key.expr, column, qualifiers))
+        || spec.frame.as_ref().is_some_and(|frame| bound(&frame.start) || bound(&frame.end))
+}
+
+/// Whether one `SELECT` core mentions the column.
+fn core_mentions_column(core: &SelectCore, column: &str, qualifiers: Option<&[&str]>) -> bool {
+    select_items_mention_column(&core.items, column, qualifiers)
+        || core.from.iter().any(|source| {
+            source.query.as_ref().is_some_and(|query| statement_mentions_column(query, column, qualifiers))
+        })
+        || core.filter.as_ref().is_some_and(|expr| expression_mentions_column(expr, column, qualifiers))
+        || core.group.iter().any(|expr| expression_mentions_column(expr, column, qualifiers))
+        || core.having.as_ref().is_some_and(|expr| expression_mentions_column(expr, column, qualifiers))
+        || core.windows.iter().any(|window| window_mentions_column(&window.spec, column, qualifiers))
+}
+
+/// Whether one statement mentions the column; used to refuse dropping a column
+/// still read by a view or a trigger body.
+fn statement_mentions_column(statement: &Statement, column: &str, qualifiers: Option<&[&str]>) -> bool {
+    match statement {
+        Statement::Select { with, first, compounds, order, .. } => {
+            with.iter().any(|entry| statement_mentions_column(&entry.query, column, qualifiers))
+                || core_mentions_column(first, column, qualifiers)
+                || compounds.iter().any(|term| core_mentions_column(&term.core, column, qualifiers))
+                || order.iter().any(|key| expression_mentions_column(&key.expr, column, qualifiers))
+        }
+        Statement::Insert { returning, .. } => {
+            returning.as_ref().is_some_and(|items| select_items_mention_column(items, column, qualifiers))
+        }
+        Statement::Update { assignments, filter, returning, .. } => {
+            assignments.iter().any(|assignment| expression_mentions_column(&assignment.value, column, qualifiers))
+                || filter.as_ref().is_some_and(|expr| expression_mentions_column(expr, column, qualifiers))
+                || returning.as_ref().is_some_and(|items| select_items_mention_column(items, column, qualifiers))
+        }
+        Statement::Delete { filter, returning, .. } => {
+            filter.as_ref().is_some_and(|expr| expression_mentions_column(expr, column, qualifiers))
+                || returning.as_ref().is_some_and(|items| select_items_mention_column(items, column, qualifiers))
+        }
+        _ => false,
+    }
+}
+
 /// The error SQLite raises when a parent key is not a unique key of its table.
 fn foreign_key_mismatch(child: &TableDef, key: &ForeignKeyDef, statement: &'static str) -> SqlError {
     SqlError::new(
@@ -7983,9 +8196,56 @@ mod tests {
         let duplicate = engine.execute_one("ALTER TABLE t ADD COLUMN a TEXT").expect_err("duplicate");
         assert_eq!(duplicate.code, "duplicate-column");
         assert_eq!(duplicate.message, "duplicate column name: a");
-        let drop = engine.execute_one("ALTER TABLE t DROP COLUMN a").expect_err("drop column");
-        assert_eq!(drop.code, "unsupported-clause");
-        assert_eq!(drop.clause.as_deref(), Some("DROP COLUMN"));
+    }
+
+    #[test]
+    fn drop_column_removes_values_and_rewrites_stored_text() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        engine.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, note TEXT)").expect("create");
+        engine.execute("INSERT INTO t (a,b,note) VALUES ('x', 1, 'n'), ('y', 2, NULL)").expect("insert");
+        let dropped = engine.execute_one("ALTER TABLE t DROP COLUMN b").expect("drop");
+        assert_eq!(dropped.statement, "alter-table");
+        assert_eq!(dropped.affected, 1);
+        // SQLite removes the definition and the separating comma, leaving every
+        // other byte of the stored DDL untouched.
+        assert_eq!(
+            engine.execute_one("SELECT sql FROM sqlite_master WHERE name = 't'").expect("sql").rows,
+            vec![vec![text("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, note TEXT)")]]
+        );
+        assert_eq!(
+            engine.execute_one("SELECT id, a, note FROM t ORDER BY id").expect("rows").rows,
+            vec![
+                vec![Cell::Integer(1), text("x"), text("n")],
+                vec![Cell::Integer(2), text("y"), Cell::Null],
+            ]
+        );
+        // The shortened table keeps inserting and updating in place.
+        engine.execute_one("INSERT INTO t (a, note) VALUES ('z', 'm')").expect("insert");
+        engine.execute_one("UPDATE t SET note = 'q' WHERE id = 1").expect("update");
+        assert_eq!(
+            engine.execute_one("SELECT a, note FROM t ORDER BY id").expect("rows").rows,
+            vec![vec![text("x"), text("q")], vec![text("y"), Cell::Null], vec![text("z"), text("m")]]
+        );
+        let primary = engine.execute_one("ALTER TABLE t DROP COLUMN id").expect_err("primary key");
+        assert_eq!(primary.code, "invalid-alter");
+        let missing = engine.execute_one("ALTER TABLE t DROP COLUMN nope").expect_err("missing column");
+        assert_eq!(missing.code, "unknown-column");
+        engine.execute("CREATE TABLE u (a TEXT UNIQUE, b TEXT)").expect("unique");
+        assert_eq!(engine.execute_one("ALTER TABLE u DROP COLUMN a").expect_err("unique").code, "invalid-alter");
+        engine.execute("CREATE TABLE v (a TEXT)").expect("single column");
+        assert_eq!(engine.execute_one("ALTER TABLE v DROP COLUMN a").expect_err("last column").code, "invalid-alter");
+        engine.execute("CREATE TABLE w (a TEXT, b TEXT); CREATE INDEX wx ON w (a)").expect("indexed");
+        assert_eq!(engine.execute_one("ALTER TABLE w DROP COLUMN a").expect_err("index").code, "invalid-alter");
+        engine.execute("CREATE TABLE x (a TEXT, b TEXT, CHECK (a <> ''))").expect("table check");
+        assert_eq!(engine.execute_one("ALTER TABLE x DROP COLUMN a").expect_err("table check").code, "invalid-alter");
+        engine.execute("CREATE TABLE y (a TEXT, b TEXT, CHECK (b <> ''))").expect("unrelated check");
+        engine.execute_one("ALTER TABLE y DROP COLUMN a").expect("unrelated check survives");
+        assert_eq!(
+            engine.execute_one("SELECT sql FROM sqlite_master WHERE name = 'y'").expect("sql").rows,
+            vec![vec![text("CREATE TABLE y (b TEXT, CHECK (b <> ''))")]]
+        );
+        engine.execute("CREATE TABLE z (a TEXT CHECK (a <> ''), b TEXT)").expect("column check");
+        engine.execute_one("ALTER TABLE z DROP COLUMN a").expect("column check belongs to the column");
     }
 
     #[test]

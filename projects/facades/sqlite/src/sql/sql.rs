@@ -55,9 +55,9 @@
 //! above are the ones a future `oak-sql` node must reproduce.
 //!
 //! The schema-editing statements (`DROP TABLE`, `DROP INDEX`, `ALTER TABLE`
-//! with `RENAME TO` / `RENAME COLUMN` / `ADD COLUMN`) also live here, including
-//! the token-level rewrite of the stored `sqlite_master.sql` text and the
-//! named `DROP COLUMN` gap lock.
+//! with `RENAME TO` / `RENAME COLUMN` / `ADD COLUMN` / `DROP COLUMN`) also live
+//! here, including the token-level rewrite of the stored `sqlite_master.sql`
+//! text.
 //!
 //! These stay here until `oak-sql` grows window / `LIMIT`-expression / `CHECK`
 //! / `UPDATE` / `DELETE` / `RETURNING` / schema-editing AST nodes and
@@ -1843,6 +1843,121 @@ pub fn rewrite_create_table_column(sql: &str, old: &str, new: &str) -> Option<St
         targets.push(index);
     }
     Some(splice(sql, identifier_splices(sql, &tokens, &offsets, &targets, new)))
+}
+
+/// Why a stored `CREATE TABLE` cannot lose one column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropColumnConflict {
+    /// A table-level `CHECK` constraint mentions the column.
+    TableCheck,
+    /// A table-level `FOREIGN KEY (...)` lists the column.
+    TableForeignKey,
+}
+
+/// Rewrites a stored `CREATE TABLE` by removing the whole definition of
+/// `column`, including every constraint written inside it, plus the comma that
+/// separated it. Every other byte stays untouched, exactly as SQLite rewrites
+/// `sqlite_master.sql` after `ALTER TABLE ... DROP COLUMN`.
+///
+/// A table-level `CHECK` that mentions the column or a table-level `FOREIGN
+/// KEY` whose child list names it cannot survive the drop, so those are
+/// reported instead of rewritten. A column-level constraint belongs to the
+/// column definition and disappears with it, which is why it is not checked.
+pub fn rewrite_create_table_drop_column(sql: &str, column: &str) -> Result<Option<String>, DropColumnConflict> {
+    let Ok((tokens, offsets)) = tokenize(sql) else {
+        return Ok(None);
+    };
+    let Some(table) = create_object_name(&tokens, "table") else {
+        return Ok(None);
+    };
+    let Some(open) = (table + 1..tokens.len()).find(|index| matches!(tokens[*index], Token::LParen)) else {
+        return Ok(None);
+    };
+    // Split the column list into top-level segments, remembering the commas on
+    // both sides so the splice can remove exactly one definition.
+    let mut segments: Vec<(usize, usize, Option<usize>, Option<usize>)> = Vec::new();
+    let mut start = open + 1;
+    let mut before = None;
+    let mut depth = 0usize;
+    let mut close = None;
+    for index in open + 1..tokens.len() {
+        match tokens[index] {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                if depth == 0 {
+                    segments.push((start, index, before, None));
+                    close = Some(index);
+                    break;
+                }
+                depth -= 1;
+            }
+            Token::Comma if depth == 0 => {
+                segments.push((start, index, before, Some(index)));
+                before = Some(index);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let Some(_close) = close else {
+        return Ok(None);
+    };
+    let mut target = None;
+    for (start, end, before, after) in &segments {
+        let mut effective = *start;
+        if matches!(tokens.get(effective), Some(Token::Word(word)) if word.eq_ignore_ascii_case("constraint")) {
+            effective = (effective + 2).min(*end);
+        }
+        let keyword = match tokens.get(effective) {
+            Some(Token::Word(word)) => Some(word.to_ascii_lowercase()),
+            _ => None,
+        };
+        match keyword.as_deref() {
+            Some("check") => {
+                let rest = tokens.get(effective + 1..*end).unwrap_or(&[]);
+                if rest
+                    .iter()
+                    .enumerate()
+                    .any(|(offset, token)| {
+                        identifier_eq(token, column) && !matches!(tokens.get(effective + 2 + offset), Some(Token::LParen))
+                    })
+                {
+                    return Err(DropColumnConflict::TableCheck);
+                }
+            }
+            Some("foreign") => {
+                let mut inside = false;
+                for index in effective + 1..*end {
+                    match tokens[index] {
+                        Token::LParen if !inside => inside = true,
+                        Token::RParen if inside => break,
+                        ref token if inside && identifier_eq(token, column) => {
+                            return Err(DropColumnConflict::TableForeignKey);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("primary") | Some("unique") => {}
+            _ => {
+                if effective < *end && identifier_eq(&tokens[effective], column) {
+                    target = Some((*start, *end, *before, *after));
+                }
+            }
+        }
+    }
+    let Some((start, end, before, after)) = target else {
+        return Ok(None);
+    };
+    let last = end.saturating_sub(1);
+    let end_byte = token_end(sql, &tokens[last], offsets[last]);
+    let removal = match (after, before) {
+        (Some(comma), _) => (offsets[start], offsets[comma + 1]),
+        (None, Some(comma)) => (offsets[comma], end_byte),
+        (None, None) => (offsets[start.min(end)], end_byte),
+    };
+    let _ = close;
+    Ok(Some(splice(sql, vec![(removal.0, removal.1, String::new())])))
 }
 
 /// Rewrites every reference to `old` in a stored `CREATE INDEX` statement.
