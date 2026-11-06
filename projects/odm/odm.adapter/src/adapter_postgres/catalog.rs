@@ -20,7 +20,7 @@ pub(crate) fn inspect_catalog(session: &mut Session) -> Result<ObservedCatalog> 
     let mut tables = Vec::new();
     for row in result.rows {
         let name = cell_text(row.first()).unwrap_or_default();
-        if name.is_empty() {
+        if name.is_empty() || super::outbox::is_meta_table(&name) {
             continue;
         }
         let columns = inspect_table(session, &name)?;

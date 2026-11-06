@@ -24,7 +24,7 @@ use std::{
 
 use crate::{Error, Result};
 
-use database_query::ir::{CommitToken, IrVersion, OutboxRecord, PhysicalPlan};
+use database_query::ir::{CommitToken, IrVersion, OutboxBacklog, OutboxRecord, PhysicalPlan};
 use odm_types::{
     CapabilitySet, DriftReport, LogicalMigrationPlan, MappingManifest, ObservedCatalog, QueryCaps, Row, RowWrite, TypedLogicalPlan, WriteCaps,
 };
@@ -229,10 +229,25 @@ impl SqliteSource {
         outbox::outbox_after(&provider, after_seq, limit)
     }
 
-    /// Outbox backlog size.
-    pub fn outbox_backlog(&self) -> Result<u64> {
+    /// Outbox backlog above the lowest consumer watermark.
+    ///
+    /// Without any ack row, `pending` is the cumulative count and
+    /// [`OutboxBacklog::min_acked_seq`] is `None`.
+    pub fn outbox_backlog(&self) -> Result<OutboxBacklog> {
         let provider = self.provider.lock().expect("sqlite mutex");
         outbox::outbox_backlog(&provider)
+    }
+
+    /// Record a consumer watermark. Watermarks only move forward.
+    pub fn outbox_ack(&self, consumer: &str, acked_seq: u64) -> Result<u64> {
+        let provider = self.provider.lock().expect("sqlite mutex");
+        outbox::outbox_ack(&provider, consumer, acked_seq)
+    }
+
+    /// Delete outbox history below `before_seq`, capped at the lowest ack watermark.
+    pub fn prune_outbox(&self, before_seq: u64) -> Result<u64> {
+        let provider = self.provider.lock().expect("sqlite mutex");
+        outbox::prune(&provider, before_seq)
     }
 }
 
