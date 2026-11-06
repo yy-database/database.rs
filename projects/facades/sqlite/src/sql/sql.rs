@@ -4,11 +4,11 @@
 //!
 //! | Statement | Shape |
 //! |-----------|-------|
-//! | `CREATE TABLE` | column list with `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT` |
+//! | `CREATE TABLE` | column list with `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, or `AS SELECT` |
 //! | `CREATE INDEX` | single or multi-column index, optional `UNIQUE` and `IF NOT EXISTS` |
 //! | `CREATE VIEW` | `CREATE VIEW name AS SELECT ...`, re-evaluated on every read |
 //! | `CREATE TRIGGER` | `BEFORE` / `AFTER` `INSERT` / `UPDATE [OF cols]` / `DELETE` on one table, one or more body statements |
-//! | `INSERT` | optional column list, one or more `VALUES` tuples, optional `RETURNING` |
+//! | `INSERT` | optional column list, `VALUES` tuples or a `SELECT` source, optional `RETURNING`; `REPLACE` / `INSERT OR REPLACE` deletes conflicting rows first |
 //! | `UPDATE` | optional `AS` alias, one `SET c = expr` per column (bare left-hand side), optional `WHERE` and `RETURNING` |
 //! | `DELETE` | optional `AS` alias, optional `WHERE` and `RETURNING` |
 //! | `SELECT` | one or more comma-separated table references, `count(*)`, `*`, or an explicit column list, with optional `WHERE`, `ORDER BY` and `LIMIT` |
@@ -1302,6 +1302,9 @@ pub enum Statement {
         /// `TEMP` / `TEMPORARY`: the table lives in `sqlite_temp_master` and
         /// disappears with the connection.
         temp: bool,
+        /// `CREATE TABLE ... AS SELECT ...` body. The declared columns are
+        /// derived from the query output, so `columns` stays empty.
+        query: Option<Box<Statement>>,
         /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
         sql: String,
     },
@@ -1391,10 +1394,16 @@ pub enum Statement {
         table: String,
         /// Optional explicit column list.
         columns: Option<Vec<String>>,
-        /// One value tuple per inserted row; empty for `DEFAULT VALUES`.
+        /// One value tuple per inserted row; empty for `DEFAULT VALUES` and
+        /// `INSERT ... SELECT`.
         rows: Vec<Vec<InsertValue>>,
         /// `DEFAULT VALUES` was written: insert one row built from the column defaults.
         default_values: bool,
+        /// `SELECT` source of `INSERT ... SELECT` / `REPLACE ... SELECT`.
+        query: Option<Box<Statement>>,
+        /// `REPLACE INTO` or `INSERT OR REPLACE INTO`: delete every row that
+        /// conflicts on a uniqueness rule, then insert the new row.
+        replace: bool,
         /// Optional `ON CONFLICT` clause.
         conflict: Option<ConflictClause>,
         /// `RETURNING` projection, `*` or an explicit list.
@@ -3235,7 +3244,11 @@ impl<'a> Parser<'a> {
         }
         if self.eat_word("insert") {
             self.kind = Some("insert");
-            return self.insert();
+            return self.insert(false);
+        }
+        if self.eat_word("replace") {
+            self.kind = Some("insert");
+            return self.insert(true);
         }
         if self.eat_word("update") {
             self.kind = Some("update");
@@ -3699,6 +3712,41 @@ impl<'a> Parser<'a> {
             return Err(self.error("syntax", "temporary table name must be unqualified"));
         }
         let name_gap_end = self.offsets.get(self.at).copied().unwrap_or(self.source.len());
+        if self.eat_word("as") {
+            // `CREATE TABLE name AS SELECT ...`: the columns come from the
+            // query output, so no column list or table option is accepted.
+            let query = if self.peek_keyword("select") {
+                self.at += 1;
+                self.select()?
+            }
+            else if self.peek_keyword("with") {
+                self.with_select()?
+            }
+            else {
+                let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
+                let mut error = self.error(
+                    "unsupported-clause",
+                    format!("`CREATE TABLE ... AS` takes a `SELECT` query, not {found}"),
+                );
+                error.clause = Some("AS".to_string());
+                return Err(error);
+            };
+            return Ok(Statement::CreateTable {
+                schema,
+                name,
+                if_not_exists,
+                columns: Vec::new(),
+                primary_key: Vec::new(),
+                table_constraints: Vec::new(),
+                checks: Vec::new(),
+                foreign_keys: Vec::new(),
+                strict: false,
+                without_rowid: false,
+                temp,
+                query: Some(Box::new(query)),
+                sql: String::new(),
+            });
+        }
         self.expect_char(&Token::LParen)?;
         let mut columns = Vec::new();
         let mut primary_key: Vec<String> = Vec::new();
@@ -3813,6 +3861,7 @@ impl<'a> Parser<'a> {
             strict,
             without_rowid,
             temp,
+            query: None,
             sql,
         })
     }
@@ -4162,7 +4211,7 @@ impl<'a> Parser<'a> {
             words.push(word.to_string());
             self.at += 1;
         }
-        let mut declared = if words.is_empty() { "BLOB".to_string() } else { words.join(" ") };
+        let mut declared = if words.is_empty() { String::new() } else { words.join(" ") };
         if self.peek() == Some(&Token::LParen) {
             self.at += 1;
             let mut parameters = Vec::new();
@@ -4312,7 +4361,19 @@ impl<'a> Parser<'a> {
         Ok(literal)
     }
 
-    fn insert(&mut self) -> Result<Statement, SqlError> {
+    fn insert(&mut self, mut replace: bool) -> Result<Statement, SqlError> {
+        if self.eat_word("or") {
+            if !self.eat_word("replace") {
+                let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
+                let mut error = self.error(
+                    "unsupported-clause",
+                    format!("`INSERT OR ...` only implements the REPLACE policy; the default ABORT policy is implied (found {found})"),
+                );
+                error.clause = Some("OR".to_string());
+                return Err(error);
+            }
+            replace = true;
+        }
         self.expect_word("into")?;
         let (schema, table) = self.qualified_name()?;
         let columns = if self.peek() == Some(&Token::LParen) {
@@ -4346,7 +4407,41 @@ impl<'a> Parser<'a> {
             self.expect_word("values")?;
             let conflict = self.conflict_clause()?;
             let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
-            return Ok(Statement::Insert { schema, table, columns, rows: Vec::new(), default_values: true, conflict, returning });
+            return Ok(Statement::Insert {
+                schema,
+                table,
+                columns,
+                rows: Vec::new(),
+                default_values: true,
+                query: None,
+                replace,
+                conflict,
+                returning,
+            });
+        }
+        if self.peek_keyword("select") || self.peek_keyword("with") {
+            // `INSERT INTO t [(a, b)] SELECT ...`: the query supplies the rows,
+            // so the statement carries no `VALUES` tuples.
+            let query = if self.peek_keyword("select") {
+                self.at += 1;
+                self.select()?
+            }
+            else {
+                self.with_select()?
+            };
+            let conflict = self.conflict_clause()?;
+            let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
+            return Ok(Statement::Insert {
+                schema,
+                table,
+                columns,
+                rows: Vec::new(),
+                default_values: false,
+                query: Some(Box::new(query)),
+                replace,
+                conflict,
+                returning,
+            });
         }
         self.expect_word("values")?;
         let mut rows = Vec::new();
@@ -4378,7 +4473,17 @@ impl<'a> Parser<'a> {
         }
         let conflict = self.conflict_clause()?;
         let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
-        Ok(Statement::Insert { schema, table, columns, rows, default_values: false, conflict, returning })
+        Ok(Statement::Insert {
+            schema,
+            table,
+            columns,
+            rows,
+            default_values: false,
+            query: None,
+            replace,
+            conflict,
+            returning,
+        })
     }
 
     /// Parses `ON CONFLICT [(target)] [WHERE ...] DO NOTHING | DO UPDATE SET ...`.
@@ -4583,6 +4688,13 @@ impl<'a> Parser<'a> {
             None | Some(Token::Semi) | Some(Token::RParen) => {
                 Ok(Statement::Select { with: Vec::new(), recursive: false, first, compounds, order, limit })
             }
+            // Inside `INSERT ... SELECT`, `ON CONFLICT` and `RETURNING` belong
+            // to the insert statement, not to the query.
+            Some(Token::Word(word))
+                if self.kind == Some("insert") && (word.eq_ignore_ascii_case("returning") || word.eq_ignore_ascii_case("on")) =>
+            {
+                Ok(Statement::Select { with: Vec::new(), recursive: false, first, compounds, order, limit })
+            }
             Some(Token::Word(word)) if is_compound_keyword(word) => {
                 let mut error = self.error("syntax", format!("`ORDER BY` clause should come after {} not before", word.to_ascii_uppercase()));
                 error.clause = Some(word.to_ascii_uppercase());
@@ -4653,6 +4765,7 @@ impl<'a> Parser<'a> {
                     Some(Token::Comma) => false,
                     Some(Token::Word(word)) => match word.to_ascii_lowercase().as_str() {
                         "from" | "union" | "intersect" | "except" | "where" | "having" | "window" => true,
+                        "on" | "returning" => self.kind == Some("insert"),
                         "limit" => true,
                         "order" | "group" => matches!(self.tokens.get(self.at + 1), Some(Token::Word(next)) if next.eq_ignore_ascii_case("by")),
                         _ => false,
@@ -5015,6 +5128,7 @@ fn is_clause_keyword(word: &str) -> bool {
             | "except"
             | "intersect"
             | "window"
+            | "returning"
             | "index"
             | "case"
             | "when"

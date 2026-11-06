@@ -3124,7 +3124,7 @@ fn encode_index_key(meta: &TableMeta, index: &IndexMeta, rowid: i64, values: &[W
 fn render_create_table(name: &str, columns: &[ColumnSpec], primary_key: &[String]) -> String {
     let mut parts = Vec::with_capacity(columns.len() + 1);
     for column in columns {
-        let mut fragment = format!("{} {}", quote_identifier(&column.name), render_declared_type(&column.declared_type));
+        let mut fragment = render_column_head(&column.name, &column.declared_type);
         if column.primary_key {
             fragment.push_str(" PRIMARY KEY");
             if column.autoincrement {
@@ -3152,7 +3152,7 @@ fn render_create_table(name: &str, columns: &[ColumnSpec], primary_key: &[String
 fn render_create_table_without_rowid(name: &str, columns: &[ColumnSpec], primary_key: &[String]) -> String {
     let mut parts = Vec::with_capacity(columns.len() + 1);
     for column in columns {
-        let mut fragment = format!("{} {}", quote_identifier(&column.name), render_declared_type(&column.declared_type));
+        let mut fragment = render_column_head(&column.name, &column.declared_type);
         if column.not_null {
             fragment.push_str(" NOT NULL");
         }
@@ -3250,7 +3250,12 @@ fn quote_identifier(name: &str) -> String {
 }
 
 fn render_declared_type(declared: &str) -> String {
-    if declared.trim().is_empty() { "BLOB".to_string() } else { declared.trim().to_string() }
+    declared.trim().to_string()
+}
+
+fn render_column_head(name: &str, declared: &str) -> String {
+    let declared = render_declared_type(declared);
+    if declared.is_empty() { quote_identifier(name) } else { format!("{} {}", quote_identifier(name), declared) }
 }
 
 fn render_literal(value: &WriteValue) -> String {
