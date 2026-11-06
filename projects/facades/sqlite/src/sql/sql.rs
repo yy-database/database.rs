@@ -1179,6 +1179,8 @@ pub enum Statement {
         checks: Vec<CheckConstraint>,
         /// Table- and column-level `REFERENCES` clauses, in declaration order.
         foreign_keys: Vec<ForeignKey>,
+        /// `STRICT` table option was present.
+        strict: bool,
         /// Source text kept verbatim in `sqlite_master.sql`, as SQLite does.
         sql: String,
     },
@@ -3142,8 +3144,17 @@ impl<'a> Parser<'a> {
                 None => return Err(self.error("syntax", "create table column list is not closed")),
             }
         }
+        let mut strict = false;
+        if self.peek() == Some(&Token::Comma)
+            && matches!(self.tokens.get(self.at + 1), Some(Token::Word(word)) if word.eq_ignore_ascii_case("strict"))
+        {
+            self.at += 1;
+        }
+        if self.eat_word("strict") {
+            strict = true;
+        }
         let sql = self.raw_statement();
-        Ok(Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, sql })
+        Ok(Statement::CreateTable { name, if_not_exists, columns, primary_key, checks, foreign_keys, strict, sql })
     }
 
     /// Reads `CHECK ( expr )` after an optional `CONSTRAINT name`, and keeps the
