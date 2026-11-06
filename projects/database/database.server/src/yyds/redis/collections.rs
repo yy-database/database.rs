@@ -18,7 +18,7 @@ use database_types::cluster::Namespace;
 
 use super::{
     blocking::{BlockingRegistry, WaitOutcome, Waiter, timeout_deadline},
-    connection::{write_bulk, write_error, write_null, write_null_array},
+    connection::{glob_match, write_bulk, write_error, write_null, write_null_array},
     resp::Request,
 };
 
@@ -2013,7 +2013,7 @@ fn write_scan_page(
     let end = cursor.saturating_add(count).min(items.len());
     let next = if end >= items.len() { "0".to_string() } else { end.to_string() };
     let matched: Vec<&Vec<u8>> =
-        items[cursor..end].iter().filter(|item| pattern.map_or(true, |pattern| glob_match_local(pattern, item))).collect();
+        items[cursor..end].iter().filter(|item| pattern.map_or(true, |pattern| glob_match(pattern, item))).collect();
     stream.write_all(b"*2\r\n")?;
     write_bulk(stream, next.as_bytes())?;
     write_array_header(stream, matched.len())?;
@@ -2021,51 +2021,6 @@ fn write_scan_page(
         write_bulk(stream, item)?;
     }
     Ok(())
-}
-
-/// 与 `connection::glob_match` 相同的简易 glob，用于集合内扫描。
-fn glob_match_local(pattern: &[u8], text: &[u8]) -> bool {
-    let (mut pattern_index, mut text_index) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while text_index < text.len() {
-        if pattern_index < pattern.len() {
-            match pattern[pattern_index] {
-                b'*' => {
-                    star = Some((pattern_index, text_index));
-                    pattern_index += 1;
-                    continue;
-                }
-                b'?' => {
-                    pattern_index += 1;
-                    text_index += 1;
-                    continue;
-                }
-                b'\\' if pattern_index + 1 < pattern.len() && pattern[pattern_index + 1] == text[text_index] => {
-                    pattern_index += 2;
-                    text_index += 1;
-                    continue;
-                }
-                byte if byte == text[text_index] => {
-                    pattern_index += 1;
-                    text_index += 1;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        match star {
-            Some((star_index, resume)) => {
-                pattern_index = star_index + 1;
-                text_index = resume + 1;
-                star = Some((star_index, text_index));
-            }
-            None => return false,
-        }
-    }
-    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-        pattern_index += 1;
-    }
-    pattern_index == pattern.len()
 }
 
 /// `SADD` / `SREM` / `SMEMBERS` / `SCARD` / `SISMEMBER` 及集合代数、移动、随机读取与扫描的分派入口。
@@ -2589,6 +2544,11 @@ fn parse_lex_options(
             limit = Some((offset, count));
             index += 3;
         }
+        else if arguments[index].eq_ignore_ascii_case(b"WITHSCORES") {
+            // 真机在字典族上拒绝分数输出，并给出专门的提示。
+            write_error(stream, "syntax error, WITHSCORES not supported in combination with BYLEX")?;
+            return Ok(None);
+        }
         else {
             write_error(stream, "syntax error")?;
             return Ok(None);
@@ -2614,7 +2574,7 @@ fn write_hscan_page(
     let next = if end >= fields.len() { "0".to_string() } else { end.to_string() };
     let matched: Vec<&(Vec<u8>, Vec<u8>)> = fields[cursor..end]
         .iter()
-        .filter(|(field, _)| pattern.map_or(true, |pattern| glob_match_local(pattern, field)))
+        .filter(|(field, _)| pattern.map_or(true, |pattern| glob_match(pattern, field)))
         .collect();
     stream.write_all(b"*2\r\n")?;
     write_bulk(stream, next.as_bytes())?;
@@ -2643,7 +2603,7 @@ fn write_zscan_page(
     let next = if end >= entries.len() { "0".to_string() } else { end.to_string() };
     let matched: Vec<&(Vec<u8>, f64)> = entries[cursor..end]
         .iter()
-        .filter(|(member, _)| pattern.map_or(true, |pattern| glob_match_local(pattern, member)))
+        .filter(|(member, _)| pattern.map_or(true, |pattern| glob_match(pattern, member)))
         .collect();
     stream.write_all(b"*2\r\n")?;
     write_bulk(stream, next.as_bytes())?;
@@ -2699,11 +2659,12 @@ fn parse_positive_usize(raw: &[u8]) -> Option<usize> {
 /// 解析 `ZUNIONSTORE` / `ZINTERSTORE` 的 `numkeys`、键列表与可选选项。
 fn parse_zset_store_plan(
     stream: &mut dyn io::Write,
+    name: &str,
     arguments: &[&[u8]],
 ) -> io::Result<Option<ZSetStorePlan>> {
     let Some(numkeys) = parse_positive_usize(arguments[2])
     else {
-        write_error(stream, "at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE")?;
+        write_error(stream, &format!("at least 1 input key is needed for '{name}' command"))?;
         return Ok(None);
     };
     if arguments.len() < 3 + numkeys {
@@ -2875,7 +2836,7 @@ fn parse_diff_keys(
 ) -> io::Result<Option<(Vec<Vec<u8>>, usize)>> {
     let Some(numkeys) = parse_positive_usize(arguments[numkeys_index])
     else {
-        write_error(stream, &format!("at least 1 input key is needed for {name}"))?;
+        write_error(stream, &format!("at least 1 input key is needed for '{name}' command"))?;
         return Ok(None);
     };
     if arguments.len() < numkeys_index + 1 + numkeys {
@@ -3051,7 +3012,8 @@ fn handle_sort(
         return Ok(());
     };
     if readonly && options.store.is_some() {
-        return write_error(stream, "SORT_RO does not support the STORE option");
+        // 真机对 `SORT_RO ... STORE` 直接回答通用语法错误。
+        return write_error(stream, "syntax error");
     }
     let key = arguments[1];
     let Some(elements) = load_sort_elements(stream, executor, base, key)?
@@ -3430,7 +3392,8 @@ pub(crate) fn handle_zset(
             return write_arity_error(stream, if union { "zunionstore" } else { "zinterstore" });
         }
         let destination = request.arguments[1];
-        let Some(plan) = parse_zset_store_plan(stream, &request.arguments)?
+        let name = if union { "zunionstore" } else { "zinterstore" };
+        let Some(plan) = parse_zset_store_plan(stream, name, &request.arguments)?
         else {
             return Ok(());
         };
@@ -3451,7 +3414,7 @@ pub(crate) fn handle_zset(
         else if request.arguments.len() < 3 {
             return write_arity_error(stream, "zdiff");
         }
-        let name = if store { "ZDIFFSTORE" } else { "ZDIFF" };
+        let name = if store { "zdiffstore" } else { "zdiff" };
         let numkeys_index = if store { 2 } else { 1 };
         let Some((keys, next)) = parse_diff_keys(stream, &request.arguments, name, numkeys_index)?
         else {
@@ -4233,7 +4196,8 @@ pub(crate) fn handle_hyperloglog(
         }
         return write_integer(stream, hll_estimate(&merged));
     }
-    if request.arguments.len() < 3 {
+    // `PFMERGE` 只给目标键、不带任何源键也是合法调用，会把目标折叠为空 HLL。
+    if request.arguments.len() < 2 {
         return write_arity_error(stream, "pfmerge");
     }
     let mut merged = vec![0_u8; HLL_REGISTER_BYTES];

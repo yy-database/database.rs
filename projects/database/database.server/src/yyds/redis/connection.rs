@@ -1019,7 +1019,7 @@ pub(crate) fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
 /// 匹配一个以 `[` 开头的字符类，返回消费的图案字节数与是否命中。
 ///
 /// 口径对齐真机 `stringmatchlen`：`^` 只在紧跟 `[` 时取反，`\` 转义类内下一个字节，
-/// `a-z` 区间起点大于终点时自动交换，未闭合的字符类判定为不匹配。
+/// `a-z` 区间起点大于终点时自动交换，未闭合的字符类在模式末尾自动闭合。
 fn class_match(pattern: &[u8], byte: u8) -> Option<(usize, bool)> {
     let mut index = 1usize;
     let negated = pattern.get(index) == Some(&b'^');
@@ -1027,12 +1027,10 @@ fn class_match(pattern: &[u8], byte: u8) -> Option<(usize, bool)> {
         index += 1;
     }
     let mut matched = false;
-    let mut closed = false;
     while index < pattern.len() {
         match pattern[index] {
             b']' => {
                 index += 1;
-                closed = true;
                 break;
             }
             b'\\' if index + 1 < pattern.len() => {
@@ -1059,9 +1057,7 @@ fn class_match(pattern: &[u8], byte: u8) -> Option<(usize, bool)> {
             }
         }
     }
-    if !closed {
-        return None;
-    }
+    // 与 `Redis` 一致：未闭合的字符类在模式末尾自动闭合，`[1` 仍可匹配 `1`。
     Some((index, if negated { !matched } else { matched }))
 }
 
@@ -2376,7 +2372,7 @@ fn respond(
             b"0" => 0,
             b"1" => 1,
             _ => {
-                write_error(stream, "The bit argument must be 1 or 0")?;
+                write_error(stream, "The bit argument must be 1 or 0.")?;
                 return Ok(true);
             }
         };
@@ -2983,7 +2979,8 @@ fn respond(
                         deadline
                     }
                     else {
-                        deadline / 1000
+                        // 与真机一致：`EXPIRETIME` 按毫秒余数四舍五入到秒，余数 >= 500 进位
+                        (deadline + 500) / 1000
                     }
                 }
             }

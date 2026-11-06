@@ -1141,7 +1141,7 @@ fn bit_operations() {
     send(&mut client, &["BITPOS", "ones", "0", "0", "-1"]);
     assert_eq!(expect_integer(&mut client), -1);
     send(&mut client, &["BITPOS", "bp", "2"]);
-    expect_error(&mut client, "ERR The bit argument must be 1 or 0");
+    expect_error(&mut client, "ERR The bit argument must be 1 or 0.");
     send(&mut client, &["BITPOS", "bp", "0", "0", "5", "BOGUS"]);
     expect_error(&mut client, "ERR syntax error");
 
@@ -1498,7 +1498,7 @@ fn zset_lex_ranges_and_rank() {
     send(&mut client, &["ZREVRANGEBYLEX", "lex", "+", "-", "LIMIT", "1", "2"]);
     expect_array(&mut client, &["c", "b"]);
     send(&mut client, &["ZRANGEBYLEX", "lex", "-", "+", "WITHSCORES"]);
-    expect_error(&mut client, "ERR syntax error");
+    expect_error(&mut client, "ERR syntax error, WITHSCORES not supported in combination with BYLEX");
     send(&mut client, &["ZRANGEBYLEX", "lex", "a", "+"]);
     expect_error(&mut client, "ERR min or max not valid string range item");
     send(&mut client, &["ZRANGEBYLEX", "no-such-key", "-", "+"]);
@@ -2341,9 +2341,9 @@ fn zset_set_operations() {
 
     // numkeys / WEIGHTS / AGGREGATE / LIMIT 的参数校验。
     send(&mut client, &["ZUNIONSTORE", "dst", "0", "z2"]);
-    expect_error(&mut client, "ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE");
+    expect_error(&mut client, "ERR at least 1 input key is needed for 'zunionstore' command");
     send(&mut client, &["ZINTERSTORE", "dst", "0", "z2"]);
-    expect_error(&mut client, "ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE");
+    expect_error(&mut client, "ERR at least 1 input key is needed for 'zinterstore' command");
     send(&mut client, &["ZUNIONSTORE", "dst", "2", "z2"]);
     expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["ZUNIONSTORE", "dst", "2", "z2", "z3", "WEIGHTS", "1"]);
@@ -2357,9 +2357,9 @@ fn zset_set_operations() {
     send(&mut client, &["ZUNIONSTORE", "dst"]);
     expect_error(&mut client, "ERR wrong number of arguments for 'zunionstore' command");
     send(&mut client, &["ZDIFF", "0", "z2"]);
-    expect_error(&mut client, "ERR at least 1 input key is needed for ZDIFF");
+    expect_error(&mut client, "ERR at least 1 input key is needed for 'zdiff' command");
     send(&mut client, &["ZDIFFSTORE", "dst", "0", "z2"]);
-    expect_error(&mut client, "ERR at least 1 input key is needed for ZDIFFSTORE");
+    expect_error(&mut client, "ERR at least 1 input key is needed for 'zdiffstore' command");
     send(&mut client, &["ZDIFF", "2", "z2", "z3", "SCORES"]);
     expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["ZDIFFSTORE", "dst", "2", "z2", "z3", "WITHSCORES"]);
@@ -2467,7 +2467,7 @@ fn sort_commands() {
     send(&mut client, &["SORT", "bad"]);
     expect_error(&mut client, "ERR One or more scores can't be converted into double");
     send(&mut client, &["SORT_RO", "nums", "STORE", "out"]);
-    expect_error(&mut client, "ERR SORT_RO does not support the STORE option");
+    expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["SORT", "nums", "BOGUS"]);
     expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["SORT", "nums", "LIMIT", "1", "x"]);
@@ -2801,7 +2801,7 @@ fn hyperloglog_commands() {
     send(&mut client, &["PFCOUNT"]);
     expect_error(&mut client, "ERR wrong number of arguments for 'pfcount' command");
     send(&mut client, &["PFMERGE", "dest"]);
-    expect_error(&mut client, "ERR wrong number of arguments for 'pfmerge' command");
+    expect_status(&mut client, "OK");
 }
 
 /// `KEYS` / `TYPE` / `SCAN` 共用同一个逻辑键空间：五种集合类型与 HLL 都参与列举，
@@ -2910,7 +2910,7 @@ fn key_space_commands() {
     send(&mut client, &["KEYS", "user:[1-2]"]);
     expect_array(&mut client, &["user:1", "user:2"]);
     send(&mut client, &["KEYS", "user:[1"]);
-    expect_empty_array(&mut client);
+    expect_array(&mut client, &["user:1"]);
     send(&mut client, &["KEYS", "star-\\*"]);
     expect_array(&mut client, &["star-*"]);
     send(&mut client, &["KEYS", "star-[*]"]);
