@@ -5551,17 +5551,62 @@ fn round_cell(args: &[Cell]) -> Cell {
             None => return Cell::Null,
         },
     };
-    if digits > 0 {
-        let scale = 10f64.powi(digits.min(i32::MAX as i64) as i32);
-        Cell::Real((value * scale).round() / scale)
+    Cell::Real(round_digits(value, digits))
+}
+
+/// SQLite's `round()`: the digit count is clamped to `0..=30`, a zero count
+/// truncates `value ± 0.5` toward zero, and every other count re-reads the
+/// fixed-point text its `printf` produces, which rounds an exact decimal tie
+/// away from zero.
+fn round_digits(value: f64, digits: i64) -> f64 {
+    if !value.is_finite() {
+        return value;
     }
-    else if digits < 0 {
-        let scale = 10f64.powi((-digits).min(i32::MAX as i64) as i32);
-        Cell::Real((value / scale).round() * scale)
+    let digits = digits.clamp(0, 30) as usize;
+    if digits == 0 {
+        return if value < 0.0 { (value - 0.5).trunc() } else { (value + 0.5).trunc() };
+    }
+    let magnitude = value.abs();
+    let short = format!("{magnitude:.digits$}");
+    // A tie is a `5` directly after the kept digits with nothing but zeros
+    // behind it; Rust's own formatting rounds that tie to even, SQLite rounds
+    // it away from zero.
+    let wide = format!("{:.*}", digits + 25, magnitude);
+    let fraction = wide.split_once('.').map(|(_, fraction)| fraction).unwrap_or("");
+    let tie = fraction.len() > digits
+        && fraction.as_bytes()[digits] == b'5'
+        && fraction[digits + 1..].bytes().all(|byte| byte == b'0');
+    let text = if tie { increment_decimal(&short) } else { short };
+    let rounded: f64 = text.parse().unwrap_or(magnitude);
+    if value < 0.0 {
+        -rounded
     }
     else {
-        Cell::Real(value.round())
+        rounded
     }
+}
+
+/// Increments the last decimal digit of a non-negative fixed-point string,
+/// carrying through `9`s and into the integer part.
+fn increment_decimal(text: &str) -> String {
+    let mut characters: Vec<char> = text.chars().collect();
+    let mut index = characters.len();
+    loop {
+        if index == 0 {
+            characters.insert(0, '1');
+            break;
+        }
+        index -= 1;
+        match characters[index] {
+            '.' => continue,
+            '9' => characters[index] = '0',
+            digit => {
+                characters[index] = char::from(digit as u8 + 1);
+                break;
+            },
+        }
+    }
+    characters.into_iter().collect()
 }
 
 fn self_contained_arity(
@@ -6396,6 +6441,40 @@ mod tests {
         assert_eq!(value(&mut engine, "SELECT typeof(random())"), Cell::Text("integer".to_string()));
         assert_eq!(engine.execute_one("SELECT length(randomblob(4)), typeof(randomblob(4))").expect("randomblob").rows, vec![vec![Cell::Integer(4), Cell::Text("blob".to_string())]]);
         assert_eq!(value(&mut engine, "SELECT length(randomblob(NULL))"), Cell::Integer(1));
+    }
+
+    #[test]
+    fn round_matches_sqlite_fixed_point_rounding() {
+        let mut engine = Engine::new(None).expect("blank engine");
+        let value = |engine: &mut Engine, sql: &str| engine.execute_one(sql).expect("round query").rows[0][0].clone();
+        // Every expected value below was measured on better-sqlite3 3.53.2 and
+        // CPython sqlite3 3.49.1.
+        assert_eq!(value(&mut engine, "SELECT round(1.2345, 3)"), Cell::Real(1.234));
+        // A negative digit count is clamped to zero instead of scaling down.
+        assert_eq!(value(&mut engine, "SELECT round(123.456, -1)"), Cell::Real(123.0));
+        assert_eq!(value(&mut engine, "SELECT round(123.456, -5)"), Cell::Real(123.0));
+        // Zero digits use the truncating fast path, not ties-to-even.
+        assert_eq!(value(&mut engine, "SELECT round(2.5)"), Cell::Real(3.0));
+        assert_eq!(value(&mut engine, "SELECT round(-2.5)"), Cell::Real(-3.0));
+        assert_eq!(value(&mut engine, "SELECT round(0.5)"), Cell::Real(1.0));
+        // Exact decimal ties round away from zero, unlike Rust's own formatting.
+        assert_eq!(value(&mut engine, "SELECT round(0.25, 1)"), Cell::Real(0.3));
+        assert_eq!(value(&mut engine, "SELECT round(1.25, 1)"), Cell::Real(1.3));
+        assert_eq!(value(&mut engine, "SELECT round(-1.25, 1)"), Cell::Real(-1.3));
+        // Values just below a tie follow their binary value.
+        assert_eq!(value(&mut engine, "SELECT round(2.675, 2)"), Cell::Real(2.67));
+        assert_eq!(value(&mut engine, "SELECT round(1.005, 2)"), Cell::Real(1.0));
+        assert_eq!(value(&mut engine, "SELECT round(0.615, 2)"), Cell::Real(0.61));
+        assert_eq!(value(&mut engine, "SELECT round(0.35, 1)"), Cell::Real(0.3));
+        assert_eq!(value(&mut engine, "SELECT round(9.999, 2)"), Cell::Real(10.0));
+        // More than 30 digits is the same as 30, and text coerces like SQLite.
+        assert_eq!(value(&mut engine, "SELECT round(1.23456, 40)"), Cell::Real(1.23456));
+        assert_eq!(value(&mut engine, "SELECT round('1.5', 1)"), Cell::Real(1.5));
+        assert_eq!(value(&mut engine, "SELECT round('abc', 1)"), Cell::Real(0.0));
+        assert_eq!(value(&mut engine, "SELECT round(1.2345, 3.9)"), Cell::Real(1.234));
+        assert_eq!(value(&mut engine, "SELECT round(NULL, 1)"), Cell::Null);
+        assert_eq!(value(&mut engine, "SELECT round(1.5, NULL)"), Cell::Null);
+        assert_eq!(value(&mut engine, "SELECT typeof(round(2.5, 1))"), Cell::Text("real".to_string()));
     }
 
     fn text(value: &str) -> Cell {
