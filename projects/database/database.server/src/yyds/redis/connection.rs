@@ -901,9 +901,10 @@ fn expire_condition_allows(
     Ok(Some(allowed))
 }
 
-/// 简易 Redis glob：支持 `*`、`?` 与反斜杠转义，其余字符按字面量比较。
+/// 简易 Redis glob：支持 `*`、`?`、`[...]` 字符类与反斜杠转义，其余字符按字面量比较。
 ///
-/// `MATCH` 只影响本次返回的键，不改变游标推进，与真机的过滤语义一致。
+/// 字符类支持 `[^...]` 取反、`a-z` 区间与类内 `\` 转义，大小写敏感，与真机
+/// `stringmatchlen` 的匹配口径一致。`MATCH` 只影响本次返回的键，不改变游标推进。
 fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     let (mut pattern_index, mut text_index) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
@@ -919,6 +920,15 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
                     pattern_index += 1;
                     text_index += 1;
                     continue;
+                }
+                b'[' => {
+                    if let Some((length, matched)) = class_match(&pattern[pattern_index..], text[text_index]) {
+                        if matched {
+                            pattern_index += length;
+                            text_index += 1;
+                            continue;
+                        }
+                    }
                 }
                 b'\\' if pattern_index + 1 < pattern.len() && pattern[pattern_index + 1] == text[text_index] => {
                     pattern_index += 2;
@@ -946,6 +956,55 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
         pattern_index += 1;
     }
     pattern_index == pattern.len()
+}
+
+/// 匹配一个以 `[` 开头的字符类，返回消费的图案字节数与是否命中。
+///
+/// 口径对齐真机 `stringmatchlen`：`^` 只在紧跟 `[` 时取反，`\` 转义类内下一个字节，
+/// `a-z` 区间起点大于终点时自动交换，未闭合的字符类判定为不匹配。
+fn class_match(pattern: &[u8], byte: u8) -> Option<(usize, bool)> {
+    let mut index = 1usize;
+    let negated = pattern.get(index) == Some(&b'^');
+    if negated {
+        index += 1;
+    }
+    let mut matched = false;
+    let mut closed = false;
+    while index < pattern.len() {
+        match pattern[index] {
+            b']' => {
+                index += 1;
+                closed = true;
+                break;
+            }
+            b'\\' if index + 1 < pattern.len() => {
+                if pattern[index + 1] == byte {
+                    matched = true;
+                }
+                index += 2;
+            }
+            start if index + 2 < pattern.len() && pattern[index + 1] == b'-' => {
+                let (mut low, mut high) = (start, pattern[index + 2]);
+                if low > high {
+                    std::mem::swap(&mut low, &mut high);
+                }
+                if byte >= low && byte <= high {
+                    matched = true;
+                }
+                index += 3;
+            }
+            literal => {
+                if literal == byte {
+                    matched = true;
+                }
+                index += 1;
+            }
+        }
+    }
+    if !closed {
+        return None;
+    }
+    Some((index, if negated { !matched } else { matched }))
 }
 
 /// `SCAN cursor [MATCH pattern] [COUNT count]`。
