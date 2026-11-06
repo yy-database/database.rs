@@ -734,6 +734,117 @@ fn scan_cursor_match_and_count() {
     expect_error(&mut client, "ERR wrong number of arguments for 'scan' command");
 }
 
+/// `RENAME` / `RENAMENX` move any value type together with its TTL and overwrite a
+/// destination of a different type without leaving a stale representation behind.
+#[test]
+fn rename_any_type_and_overwrite() {
+    // `RENAME` 依赖分片的持久原子提交边界，因此跑在 `FileShard` 上。
+    let path = temp_path("rename");
+    let (mut client, _server) = file_server(&path);
+    send(&mut client, &["SET", "src", "v", "EX", "100"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["RENAME", "src", "dst"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["GET", "dst"]);
+    expect_bulk(&mut client, Some("v"));
+    send(&mut client, &["TTL", "dst"]);
+    let ttl = expect_integer(&mut client);
+    assert!((1..=100).contains(&ttl), "RENAME dropped the TTL: {ttl}");
+    send(&mut client, &["EXISTS", "src"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["TYPE", "dst"]);
+    expect_status(&mut client, "string");
+
+    send(&mut client, &["HSET", "h", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["RENAME", "h", "h2"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["TYPE", "h2"]);
+    expect_status(&mut client, "hash");
+    send(&mut client, &["HGETALL", "h2"]);
+    expect_array(&mut client, &["f", "v"]);
+    send(&mut client, &["TYPE", "h"]);
+    expect_status(&mut client, "none");
+
+    send(&mut client, &["LPUSH", "l", "a"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["RENAME", "l", "l2"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["TYPE", "l2"]);
+    expect_status(&mut client, "list");
+    send(&mut client, &["LRANGE", "l2", "0", "-1"]);
+    expect_array(&mut client, &["a"]);
+
+    send(&mut client, &["SADD", "s", "m", "n"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["RENAME", "s", "s2"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["TYPE", "s2"]);
+    expect_status(&mut client, "set");
+    send(&mut client, &["SMEMBERS", "s2"]);
+    expect_array(&mut client, &["m", "n"]);
+
+    send(&mut client, &["ZADD", "z", "1", "a", "2", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["RENAME", "z", "z2"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["TYPE", "z2"]);
+    expect_status(&mut client, "zset");
+    send(&mut client, &["ZRANGE", "z2", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "1", "b", "2"]);
+
+    // Overwriting a hash destination with a list leaves exactly one representation.
+    send(&mut client, &["HSET", "hdst", "f", "v"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["LPUSH", "lsrc", "a", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["RENAME", "lsrc", "hdst"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["TYPE", "hdst"]);
+    expect_status(&mut client, "list");
+    send(&mut client, &["LRANGE", "hdst", "0", "-1"]);
+    expect_array(&mut client, &["b", "a"]);
+    send(&mut client, &["HGETALL", "hdst"]);
+    expect_error(&mut client, WRONGTYPE);
+    send(&mut client, &["EXISTS", "lsrc"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    send(&mut client, &["SET", "a", "1"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["SET", "b", "2"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["RENAMENX", "a", "b"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["GET", "b"]);
+    expect_bulk(&mut client, Some("2"));
+    send(&mut client, &["GET", "a"]);
+    expect_bulk(&mut client, Some("1"));
+    send(&mut client, &["RENAMENX", "a", "c"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["GET", "c"]);
+    expect_bulk(&mut client, Some("1"));
+    send(&mut client, &["EXISTS", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    send(&mut client, &["RENAME", "no-such-key", "target"]);
+    expect_error(&mut client, "ERR no such key");
+    send(&mut client, &["RENAMENX", "no-such-key", "target"]);
+    expect_error(&mut client, "ERR no such key");
+
+    // Renaming a key onto itself is a no-op for RENAME and a failed NX.
+    send(&mut client, &["RENAME", "c", "c"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["RENAMENX", "c", "c"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["GET", "c"]);
+    expect_bulk(&mut client, Some("1"));
+
+    send(&mut client, &["DEL", "z2"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["EXISTS", "z2"]);
+    assert_eq!(expect_integer(&mut client), 0);
+}
+
 /// Reopening the same `.yykv` snapshot restores both the type marker (encoded in the
 /// record namespace) and the full contents.
 #[test]
@@ -752,6 +863,10 @@ fn restart_preserves_types_and_contents() {
     assert_eq!(expect_integer(&mut first), 2);
     send(&mut first, &["ZADD", "pz", "2", "b", "1", "a"]);
     assert_eq!(expect_integer(&mut first), 2);
+    send(&mut first, &["SET", "rn", "v"]);
+    expect_status(&mut first, "OK");
+    send(&mut first, &["RENAME", "rn", "rn2"]);
+    expect_status(&mut first, "OK");
 
     let (mut second, _second_server) = file_server(&path);
     send(&mut second, &["TYPE", "s"]);
@@ -785,5 +900,11 @@ fn restart_preserves_types_and_contents() {
     send(&mut second, &["SCAN", "0", "COUNT", "100"]);
     let (cursor, keys) = expect_scan(&mut second);
     assert_eq!(cursor, "0");
-    assert_eq!(keys, ["h", "l", "ps", "pz", "s"]);
+    assert_eq!(keys, ["h", "l", "ps", "pz", "rn2", "s"]);
+    send(&mut second, &["GET", "rn2"]);
+    expect_bulk(&mut second, Some("v"));
+    send(&mut second, &["TYPE", "rn2"]);
+    expect_status(&mut second, "string");
+    send(&mut second, &["EXISTS", "rn"]);
+    assert_eq!(expect_integer(&mut second), 0);
 }

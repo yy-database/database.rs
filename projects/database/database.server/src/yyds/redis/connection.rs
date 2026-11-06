@@ -1744,6 +1744,9 @@ fn respond(
         // Session / token rotation: the record moves together with its remaining deadline in
         // one shard-local durable commit, so no read-write-delete window can lose it and the
         // TTL is never reset to "fresh" by the move.
+        //
+        // 类型编码在命名空间上，因此先解析源键的实际类型，再在**该类型命名空间**内搬移，
+        // 源键的值类型与剩余过期时间都原样跟着走。
         let rename_nx = command.eq_ignore_ascii_case(b"RENAMENX");
         let name = if rename_nx { "renamenx" } else { "rename" };
         if request.arguments.len() != 3 {
@@ -1755,20 +1758,65 @@ fn respond(
             stream.write_all(b"-ERR unsupported command\r\n")?;
             return Ok(true);
         };
-        let action = database_query::cluster_kv::KeyValueAction::Rename { destination: request.arguments[2].to_vec(), if_absent: rename_nx };
-        let command = database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: request.arguments[1].to_vec(), action };
-        match executor.execute(None, command) {
-            Ok(database_query::cluster_kv::KeyValueResult::Rename { source_present, applied }) => {
-                if !source_present {
-                    write_error(stream, "no such key")?;
+        let source = request.arguments[1];
+        let destination = request.arguments[2];
+        let kind = match collections::find_kind(executor, namespace, source) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                write_error(stream, "no such key")?;
+                return Ok(true);
+            }
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        if source == destination {
+            if rename_nx {
+                stream.write_all(b":0\r\n")?;
+            }
+            else {
+                stream.write_all(b"+OK\r\n")?;
+            }
+            return Ok(true);
+        }
+        let destination_exists = match collections::find_kind(executor, namespace, destination) {
+            Ok(exists) => exists.is_some(),
+            Err(message) => {
+                write_error(stream, &message)?;
+                return Ok(true);
+            }
+        };
+        if rename_nx && destination_exists {
+            stream.write_all(b":0\r\n")?;
+            return Ok(true);
+        }
+        if destination_exists {
+            // 覆盖目标时先清掉它可能存在的其它类型表示，避免一次逻辑键出现两份值。
+            for other in KeyKind::ALL {
+                let command = KeyValueCommand {
+                    namespace: other.namespace(namespace),
+                    key: destination.to_vec(),
+                    action: KeyValueAction::Delete,
+                };
+                if let Err(error) = executor.execute(None, command) {
+                    write_error(stream, &error.to_string())?;
+                    return Ok(true);
                 }
-                else if rename_nx {
-                    stream.write_all(if applied { b":1\r\n" } else { b":0\r\n" })?;
+            }
+        }
+        let action = KeyValueAction::Rename { destination: destination.to_vec(), if_absent: false };
+        let command = KeyValueCommand { namespace: kind.namespace(namespace), key: source.to_vec(), action };
+        match executor.execute(None, command) {
+            Ok(KeyValueResult::Rename { source_present: true, .. }) => {
+                if rename_nx {
+                    stream.write_all(b":1\r\n")?;
                 }
                 else {
                     stream.write_all(b"+OK\r\n")?;
                 }
             }
+            Ok(KeyValueResult::Rename { source_present: false, .. }) => write_error(stream, "no such key")?,
             Ok(_) => write_error(stream, "RENAME executor returned unexpected result")?,
             Err(error) => write_error(stream, &error.to_string())?,
         }
