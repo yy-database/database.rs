@@ -2,6 +2,7 @@
 
 mod blocking;
 mod collections;
+mod face_parity;
 mod gateway;
 mod getex;
 mod object;

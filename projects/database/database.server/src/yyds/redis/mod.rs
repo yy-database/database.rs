@@ -12,6 +12,7 @@ pub mod blocking;
 pub mod connection;
 mod collections;
 pub mod pubsub;
+pub mod server_face;
 pub mod service;
 
 /// 命令绑定（来自 `database-protocol-redis`）。

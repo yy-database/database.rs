@@ -9,7 +9,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     io::{self, ErrorKind, Write},
-    net::TcpStream,
+    net::{Shutdown, TcpStream},
     sync::{
         Mutex, MutexGuard, Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -52,6 +52,16 @@ impl ClientSink {
     /// Writes a complete frame, ignoring a closed or cancelled socket.
     pub fn write_frame(&self, frame: &[u8]) {
         let _ = self.write_locked(frame);
+    }
+
+    /// Closes the socket from another connection, waking any blocked read or write.
+    ///
+    /// `CLIENT KILL` runs on the killing connection, so it cannot borrow the victim's
+    /// reader. Shutting the socket down on all clones makes the victim's read loop
+    /// observe end-of-file and exit, which is the clean EOF the real server produces.
+    pub fn shutdown(&self) {
+        let stream = self.lock();
+        let _ = stream.shutdown(Shutdown::Both);
     }
 
     fn lock(&self) -> MutexGuard<'_, TcpStream> {
@@ -149,6 +159,14 @@ impl PubSubRegistry {
     /// Whether the client holds at least one channel or pattern subscription.
     pub fn is_subscribed(&self, client: u64) -> bool {
         self.lock().clients.get(&client).is_some_and(|entry| entry.total() > 0)
+    }
+
+    /// Channel and pattern subscription counts of one client.
+    ///
+    /// `CLIENT LIST` reports them as `sub=` / `psub=`, so they are read from the same
+    /// table that owns the subscriptions instead of being mirrored per connection.
+    pub fn counts(&self, client: u64) -> (usize, usize) {
+        self.lock().clients.get(&client).map_or((0, 0), |entry| (entry.channels.len(), entry.patterns.len()))
     }
 
     /// Adds one subscription and answers the total count Redis reports.

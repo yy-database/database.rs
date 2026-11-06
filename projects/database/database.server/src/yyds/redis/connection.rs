@@ -30,7 +30,8 @@ use super::{
     blocking::BlockingRegistry,
     collections::{self, KeyKind},
     pubsub::{ClientSink, PubSubRegistry, SinkRef, encode_ack},
-    resp::{Request, RequestLimits, decode_request},
+    resp::{FrameError, Request, RequestLimits, decode_request},
+    server_face::{self, ClientRecord, ClientRegistry, command_context},
 };
 
 /// 协议绑定结果 → 执行层键值命令。
@@ -93,24 +94,26 @@ struct WatchedKey {
 
 /// Per-connection state carried across RESP2 frames.
 ///
-/// Session-scoped by design: transaction queueing, the watch list and the client name
-/// belong to a single connection. Key expiry is *not* here — it is stored with each KV
-/// record and therefore shared by every connection and durable across restarts.
+/// Session-scoped by design: transaction queueing and the watch list belong to a single
+/// connection. Key expiry is *not* here — it is stored with each KV record and therefore
+/// shared by every connection and durable across restarts. Fields `CLIENT LIST` reports
+/// live in the shared [`ClientRecord`] instead, because other connections read them.
 #[derive(Debug)]
-struct ConnectionState {
+pub(crate) struct ConnectionState {
     /// Protocol version negotiated through `HELLO`. Starts at 2 and becomes 3 once the
     /// client asks for it. Null and map replies are encoded with this version.
-    protocol: u8,
+    pub(crate) protocol: u8,
     /// Whether the connection is currently inside a `MULTI` block.
     in_multi: bool,
     /// Commands queued inside the active `MULTI` block.
     queue: Vec<QueuedCommand>,
-    /// Name assigned by the most recent `CLIENT SETNAME`, reported by
-    /// `CLIENT GETNAME`. Session-scoped, like the upstream client name.
-    client_name: Option<Vec<u8>>,
+    /// 连接在监听器登记表里的投影，`CLIENT LIST` / `CLIENT INFO` / `CLIENT KILL` 读写它。
+    pub(crate) record: Arc<ClientRecord>,
     /// Keys pinned by `WATCH`, in first-watch order. Cleared by `UNWATCH`, `DISCARD`
     /// and every `EXEC`, including an aborted one.
     watched: Vec<WatchedKey>,
+    /// Whether a queued command was rejected, poisoning the whole transaction.
+    multi_error: bool,
     /// Whether blocking commands must answer immediately instead of waiting.
     ///
     /// Commands replayed by `EXEC` run with this set: upstream Redis executes a queued
@@ -119,15 +122,17 @@ struct ConnectionState {
     defer_blocking: bool,
 }
 
-impl Default for ConnectionState {
-    fn default() -> Self {
-        Self { protocol: 2, in_multi: false, queue: Vec::new(), client_name: None, watched: Vec::new(), defer_blocking: false }
-    }
-}
-
 impl ConnectionState {
-    fn new() -> Self {
-        Self::default()
+    fn new(record: Arc<ClientRecord>) -> Self {
+        Self {
+            protocol: 2,
+            in_multi: false,
+            queue: Vec::new(),
+            record,
+            watched: Vec::new(),
+            multi_error: false,
+            defer_blocking: false,
+        }
     }
 }
 
@@ -278,24 +283,40 @@ pub fn serve_connection(stream: TcpStream, limits: RequestLimits) -> io::Result<
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let reader = stream.try_clone()?;
+    let (remote, local) = socket_pair(&stream);
     let sink = Arc::new(ClientSink::new(stream, None));
     serve_io(
         reader,
         sink,
+        remote,
+        local,
         limits,
         None,
         Arc::new(KeyAccessTracker::new()),
         Arc::new(BlockingRegistry::new()),
         Arc::new(PubSubRegistry::new()),
+        None,
     )
 }
 
 /// Serves a node-owned connection with cooperative cancellation of all socket I/O.
 pub fn serve_cancellable(stream: TcpStream, limits: RequestLimits, stopping: Arc<AtomicBool>) -> io::Result<()> {
     stream.set_nonblocking(true)?;
+    let (remote, local) = socket_pair(&stream);
     let reader = CancellableSocket { stream: stream.try_clone()?, stopping: Arc::clone(&stopping) };
     let sink = Arc::new(ClientSink::new(stream, Some(stopping)));
-    serve_io(reader, sink, limits, None, Arc::new(KeyAccessTracker::new()), Arc::new(BlockingRegistry::new()), Arc::new(PubSubRegistry::new()))
+    serve_io(
+        reader,
+        sink,
+        remote,
+        local,
+        limits,
+        None,
+        Arc::new(KeyAccessTracker::new()),
+        Arc::new(BlockingRegistry::new()),
+        Arc::new(PubSubRegistry::new()),
+        None,
+    )
 }
 
 /// Serves a node-owned RESP2 connection using the YYDS key/value execution contract.
@@ -306,16 +327,20 @@ pub fn serve_cancellable_with_executor(
     executor: Arc<dyn KeyValueExecutor>,
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
+    let (remote, local) = socket_pair(&stream);
     let reader = CancellableSocket { stream: stream.try_clone()?, stopping: Arc::clone(&stopping) };
     let sink = Arc::new(ClientSink::new(stream, Some(stopping)));
     serve_io(
         reader,
         sink,
+        remote,
+        local,
         limits,
         Some(executor),
         Arc::new(KeyAccessTracker::new()),
         Arc::new(BlockingRegistry::new()),
         Arc::new(PubSubRegistry::new()),
+        None,
     )
 }
 
@@ -325,7 +350,9 @@ pub fn serve_cancellable_with_executor(
 /// has to be shared by every connection of the same listener rather than recreated per
 /// socket. `registry` carries the blocking wait table and `pubsub` the channel table, both
 /// shared for the same reason: waiters and subscribers on one connection are reached from
-/// another.
+/// another. `clients` is the connection table behind `CLIENT LIST` / `CLIENT KILL`; when it
+/// is `None` the connection gets a private table, which keeps a lone probe connection's
+/// `CLIENT ID` stable at `1` like the TypeScript fallback.
 pub fn serve_cancellable_with_executor_and_tracker(
     stream: TcpStream,
     limits: RequestLimits,
@@ -334,11 +361,20 @@ pub fn serve_cancellable_with_executor_and_tracker(
     tracker: Arc<KeyAccessTracker>,
     registry: Arc<BlockingRegistry>,
     pubsub: Arc<PubSubRegistry>,
+    clients: Option<Arc<ClientRegistry>>,
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
+    let (remote, local) = socket_pair(&stream);
     let reader = CancellableSocket { stream: stream.try_clone()?, stopping: Arc::clone(&stopping) };
     let sink = Arc::new(ClientSink::new(stream, Some(stopping)));
-    serve_io(reader, sink, limits, Some(executor), tracker, registry, pubsub)
+    serve_io(reader, sink, remote, local, limits, Some(executor), tracker, registry, pubsub, clients)
+}
+
+/// `host:port` pair of a socket, defaulting to an empty string when unavailable.
+fn socket_pair(stream: &TcpStream) -> (String, String) {
+    let remote = stream.peer_addr().map(|address| address.to_string()).unwrap_or_default();
+    let local = stream.local_addr().map(|address| address.to_string()).unwrap_or_default();
+    (remote, local)
 }
 
 struct CancellableSocket {
@@ -386,19 +422,27 @@ impl Write for CancellableSocket {
 fn serve_io(
     mut reader: impl Read,
     sink: Arc<ClientSink>,
+    remote: String,
+    local: String,
     limits: RequestLimits,
     executor: Option<Arc<dyn KeyValueExecutor>>,
     tracker: Arc<KeyAccessTracker>,
     registry: Arc<BlockingRegistry>,
     pubsub: Arc<PubSubRegistry>,
+    clients: Option<Arc<ClientRegistry>>,
 ) -> io::Result<()> {
+    let clients = clients.unwrap_or_else(|| Arc::new(ClientRegistry::standalone()));
+    // 订阅登记先拿到内部 id，连接登记再带上它：`CLIENT LIST` 的 sub=/psub= 要用这个 id
+    // 去订阅表取计数。
     let client = pubsub.attach(Arc::clone(&sink));
+    let record = clients.attach(Arc::clone(&sink), client, remote, local);
     let _subscription_guard = SubscriptionGuard { registry: Arc::clone(&pubsub), client };
+    let _client_guard = ClientGuard { registry: Arc::clone(&clients), id: record.id };
     let mut writer = SinkRef(Arc::clone(&sink));
     let mut pending = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut namespace = Namespace("redis:0".into());
-    let mut state = ConnectionState::new();
+    let mut state = ConnectionState::new(Arc::clone(&record));
     // 所有普通命令走包装执行器以刷新访问计时，`OBJECT` 与 `WATCH` 需要不记时地查键，
     // 因此另保留一个未包装的执行器视图。
     let tracked = executor.as_deref().map(|inner| TrackedExecutor { inner, tracker: tracker.as_ref() });
@@ -416,6 +460,7 @@ fn serve_io(
                         tracker.as_ref(),
                         registry.as_ref(),
                         pubsub.as_ref(),
+                        clients.as_ref(),
                         client,
                         &sink,
                         &mut namespace,
@@ -427,6 +472,11 @@ fn serve_io(
                     pending.drain(..consumed);
                 }
                 Ok(None) => break,
+                // 真机静默忽略空多批量（`*0\r\n`）：不回复，连接保持。解码器在偏移 4
+                // 处判定，因此这里直接丢掉该帧。
+                Err(FrameError::EmptyCommand) => {
+                    pending.drain(..4);
+                }
                 Err(_) => {
                     writer.write_all(b"-ERR Protocol error or request limit exceeded\r\n")?;
                     return Ok(());
@@ -450,6 +500,7 @@ fn serve_io(
             return Ok(());
         }
         pending.extend_from_slice(&chunk[..received]);
+        clients.add_input(received);
     }
 }
 
@@ -457,6 +508,18 @@ fn serve_io(
 struct SubscriptionGuard {
     registry: Arc<PubSubRegistry>,
     client: u64,
+}
+
+/// 连接结束时从 `CLIENT LIST` 的登记表里移除自己。
+struct ClientGuard {
+    registry: Arc<ClientRegistry>,
+    id: u64,
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.registry.detach(self.id);
+    }
 }
 
 impl Drop for SubscriptionGuard {
@@ -598,61 +661,6 @@ fn set_deadline(expiry: SetExpiry) -> Option<i64> {
         SetExpiry::AtSeconds(seconds) => i64::try_from(seconds).ok()?.checked_mul(1000),
         SetExpiry::AtMilliseconds(milliseconds) => i64::try_from(milliseconds).ok(),
     }
-}
-
-/// `CLIENT SETNAME` / `CLIENT GETNAME` / `CLIENT SETINFO`.
-///
-/// Only the subcommands connection pools send while opening a connection are
-/// implemented. `SETINFO` is Redis 7.2 library metadata: the server keeps it for
-/// `CLIENT LIST` output, which this gateway does not render, so it is accepted as
-/// a non-persisted no-op. Everything else (`CLIENT ID`, `CLIENT KILL`,
-/// `CLIENT NO-EVICT`, ...) stays explicitly unsupported.
-fn handle_client(stream: &mut dyn Write, request: &Request<'_>, state: &mut ConnectionState) -> io::Result<()> {
-    let Some(subcommand) = request.arguments.get(1)
-    else {
-        write_error(stream, "Unknown subcommand or wrong number of arguments for 'CLIENT'. Try CLIENT HELP.")?;
-        return Ok(());
-    };
-    let count = request.arguments.len();
-    if subcommand.eq_ignore_ascii_case(b"SETINFO") {
-        if count != 4 {
-            write_error(stream, "wrong number of arguments for 'client|setinfo' command")?;
-            return Ok(());
-        }
-        let attribute = request.arguments[2];
-        if attribute.eq_ignore_ascii_case(b"LIB-NAME") || attribute.eq_ignore_ascii_case(b"LIB-VER") {
-            // Deliberately not stored: no `CLIENT LIST` projection exists yet.
-            stream.write_all(b"+OK\r\n")?;
-        }
-        else {
-            write_error(stream, &format!("Unrecognized option '{}'", String::from_utf8_lossy(attribute)))?;
-        }
-        return Ok(());
-    }
-    if subcommand.eq_ignore_ascii_case(b"SETNAME") {
-        if count != 3 {
-            write_error(stream, "wrong number of arguments for 'client|setname' command")?;
-            return Ok(());
-        }
-        state.client_name = Some(request.arguments[2].to_vec());
-        stream.write_all(b"+OK\r\n")?;
-        return Ok(());
-    }
-    if subcommand.eq_ignore_ascii_case(b"GETNAME") {
-        if count != 2 {
-            write_error(stream, "wrong number of arguments for 'client|getname' command")?;
-            return Ok(());
-        }
-        // Redis answers an empty bulk string, not a null bulk, when no name was set.
-        return match &state.client_name {
-            Some(name) => write_bulk(stream, name),
-            None => stream.write_all(b"$0\r\n\r\n"),
-        };
-    }
-    write_error(
-        stream,
-        &format!("Unknown subcommand or wrong number of arguments for '{}'. Try CLIENT HELP.", String::from_utf8_lossy(subcommand)),
-    )
 }
 
 /// `WATCH key [key ...]` — pins each key's current value as the version `EXEC` validates.
@@ -1363,6 +1371,7 @@ fn respond(
     tracker: &KeyAccessTracker,
     registry: &BlockingRegistry,
     pubsub: &PubSubRegistry,
+    clients: &ClientRegistry,
     client: u64,
     sink: &Arc<ClientSink>,
     namespace: &mut Namespace,
@@ -1370,6 +1379,10 @@ fn respond(
 ) -> io::Result<bool> {
     let command = request.arguments[0];
     let count = request.arguments.len();
+    // `CLIENT LIST` 的 cmd= / tot-cmds= 来自这里：每条命令都推进一次活动时间，
+    // 容器命令记 `parent|sub` 形式。
+    state.record.touch(command_context(command, &request.arguments));
+    clients.bump_command();
 
     // ---- RESP2 subscriber mode: only the pub/sub verbs, PING, QUIT and RESET may run.
     // RESP3 lifted this restriction and allows any command while subscribed.
@@ -1392,10 +1405,14 @@ fn respond(
         }
         if state.in_multi {
             stream.write_all(b"-ERR MULTI calls can not be nested\r\n")?;
+            // 同 TypeScript 侧：队列中的规划失败会毒化事务。
+            state.multi_error = true;
             return Ok(true);
         }
         state.in_multi = true;
         state.queue.clear();
+        state.multi_error = false;
+        state.record.set_multi(Some(0));
         stream.write_all(b"+OK\r\n")?;
         return Ok(true);
     }
@@ -1407,6 +1424,17 @@ fn respond(
         }
         if !state.in_multi {
             stream.write_all(b"-ERR EXEC without MULTI\r\n")?;
+            return Ok(true);
+        }
+        // A rejected queued command poisons the transaction: EXEC answers EXECABORT and
+        // drops the whole queue without running anything.
+        if state.multi_error {
+            state.in_multi = false;
+            state.queue.clear();
+            state.watched.clear();
+            state.multi_error = false;
+            state.record.set_multi(None);
+            stream.write_all(b"-EXECABORT Transaction discarded because of previous errors.\r\n")?;
             return Ok(true);
         }
         // Optimistic locking: any write to a watched key since WATCH abandons the whole
@@ -1424,6 +1452,7 @@ fn respond(
                     state.in_multi = false;
                     state.queue.clear();
                     state.watched.clear();
+                    state.record.set_multi(None);
                     return Ok(true);
                 }
                 Err(message) => {
@@ -1431,11 +1460,12 @@ fn respond(
                     state.in_multi = false;
                     state.queue.clear();
                     state.watched.clear();
+                    state.record.set_multi(None);
                     return Ok(true);
                 }
             }
         }
-        execute_transaction(stream, executor, probe, tracker, registry, pubsub, client, sink, namespace, state)?;
+        execute_transaction(stream, executor, probe, tracker, registry, pubsub, clients, client, sink, namespace, state)?;
         return Ok(true);
     }
 
@@ -1451,6 +1481,8 @@ fn respond(
         state.in_multi = false;
         state.queue.clear();
         state.watched.clear();
+        state.multi_error = false;
+        state.record.set_multi(None);
         stream.write_all(b"+OK\r\n")?;
         return Ok(true);
     }
@@ -1484,10 +1516,13 @@ fn respond(
     if state.in_multi {
         if let Err(error_bytes) = validate_command_for_queue(command, count, &request.arguments, executor, namespace) {
             stream.write_all(&error_bytes)?;
+            // 同 TypeScript 侧：规划失败立刻毒化事务，EXEC 整队丢弃。
+            state.multi_error = true;
             return Ok(true);
         }
         let owned = OwnedRequest { arguments: request.arguments.iter().map(|arg| arg.to_vec()).collect() };
         state.queue.push(QueuedCommand { request: owned });
+        state.record.set_multi(Some(state.queue.len()));
         stream.write_all(b"+QUEUED\r\n")?;
         return Ok(true);
     }
@@ -1532,6 +1567,7 @@ fn respond(
         }
         write_hello(stream, protocol)?;
         state.protocol = protocol;
+        state.record.set_protocol(protocol);
         sink.set_protocol(protocol);
     }
     else if command.eq_ignore_ascii_case(b"PING") {
@@ -1566,7 +1602,12 @@ fn respond(
         state.in_multi = false;
         state.queue.clear();
         state.watched.clear();
+        state.multi_error = false;
         state.protocol = 2;
+        state.record.set_protocol(2);
+        state.record.set_multi(None);
+        state.record.set_database(0);
+        state.record.set_name(None);
         sink.set_protocol(2);
         *namespace = Namespace("redis:0".into());
         stream.write_all(b"+RESET\r\n")?;
@@ -1598,14 +1639,14 @@ fn respond(
         }
     }
     else if command.eq_ignore_ascii_case(b"QUIT") {
-        if count == 1 {
-            stream.write_all(b"+OK\r\n")?;
-            return Ok(false);
-        }
-        stream.write_all(b"-ERR wrong number of arguments for 'quit' command\r\n")?;
+        // 真机忽略 QUIT 的多余参数，一律回 OK 并断连。
+        stream.write_all(b"+OK\r\n")?;
+        return Ok(false);
     }
     else if command.eq_ignore_ascii_case(b"CLIENT") {
-        handle_client(stream, request, state)?;
+        if !server_face::handle_client(stream, request, state, clients, pubsub)? {
+            return Ok(false);
+        }
     }
     else if command.eq_ignore_ascii_case(b"SELECT") && executor.is_some() {
         if count != 2 {
@@ -1613,11 +1654,24 @@ fn respond(
         }
         else if let Some(database) = parse_database(request.arguments[1]) {
             *namespace = Namespace(format!("redis:{database}"));
+            state.record.set_database(database);
             stream.write_all(b"+OK\r\n")?;
         }
         else {
             stream.write_all(b"-ERR DB index is out of range\r\n")?;
         }
+    }
+    else if command.eq_ignore_ascii_case(b"INFO") {
+        server_face::handle_info(stream, request, clients, pubsub, executor)?;
+    }
+    else if command.eq_ignore_ascii_case(b"CONFIG") {
+        server_face::handle_config(stream, request, clients)?;
+    }
+    else if command.eq_ignore_ascii_case(b"ACL") {
+        server_face::handle_acl(stream, request)?;
+    }
+    else if command.eq_ignore_ascii_case(b"COMMAND") {
+        server_face::handle_command(stream, request, state.protocol)?;
     }
     else if command.eq_ignore_ascii_case(b"EXPIRE") || command.eq_ignore_ascii_case(b"PEXPIRE") {
         let Some(executor) = executor
@@ -3042,13 +3096,26 @@ fn respond(
             Err(BindError::InvalidInteger) => stream.write_all(b"-ERR value is not an integer or out of range\r\n")?,
             Err(BindError::InvalidExpire) => stream.write_all(b"-ERR invalid expire time in 'set' command\r\n")?,
             Err(BindError::EmptyCommand) => stream.write_all(b"-ERR empty command\r\n")?,
-            Err(BindError::UnsupportedCommand) => stream.write_all(b"-ERR unsupported command\r\n")?,
+            Err(BindError::UnsupportedCommand) => write_unknown_command(stream, &request.arguments)?,
         }
     }
     else {
-        stream.write_all(b"-ERR unsupported command\r\n")?;
+        write_unknown_command(stream, &request.arguments)?;
     }
     Ok(true)
+}
+
+/// 未知命令的真机文案：命令名之外还要回显参数前缀，末尾带一个空格。
+fn write_unknown_command(stream: &mut dyn Write, arguments: &[&[u8]]) -> io::Result<()> {
+    let name = String::from_utf8_lossy(&arguments[0]);
+    let shown: Vec<String> =
+        arguments[1..].iter().map(|argument| format!("'{}'", String::from_utf8_lossy(argument))).collect();
+    if shown.is_empty() {
+        write_error(stream, &format!("unknown command '{name}'"))
+    }
+    else {
+        write_error(stream, &format!("unknown command '{name}', with args beginning with: {} ", shown.join(" ")))
+    }
 }
 
 /// Runs every queued command under a fresh per-command `ConnectionState` so that MULTI
@@ -3067,6 +3134,7 @@ fn execute_transaction(
     tracker: &KeyAccessTracker,
     registry: &BlockingRegistry,
     pubsub: &PubSubRegistry,
+    clients: &ClientRegistry,
     client: u64,
     sink: &Arc<ClientSink>,
     namespace: &mut Namespace,
@@ -3076,6 +3144,7 @@ fn execute_transaction(
     let queued = std::mem::take(&mut state.queue);
     let protocol = state.protocol;
     state.in_multi = false;
+    state.record.set_multi(None);
     // `EXEC` always releases the watched keys, whether the queue was non-empty or not.
     state.watched.clear();
 
@@ -3092,7 +3161,8 @@ fn execute_transaction(
         // KV records, so queued commands see and write it through the executor like any
         // other state. Blocking commands never wait inside `EXEC`; they take the queued
         // command's immediate answer, which is the same as upstream.
-        let mut inner_state = ConnectionState { protocol, defer_blocking: true, ..ConnectionState::new() };
+        let mut inner_state = ConnectionState { defer_blocking: true, ..ConnectionState::new(Arc::clone(&state.record)) };
+        inner_state.protocol = protocol;
         let _ = respond(
             &mut buf as &mut dyn Write,
             &inner_request,
@@ -3101,6 +3171,7 @@ fn execute_transaction(
             tracker,
             registry,
             pubsub,
+            clients,
             client,
             sink,
             &mut inner_namespace,
@@ -3460,7 +3531,9 @@ fn validate_command_for_queue(
     // Fall back to bind()'s own syntax checks.
     match bind(arguments, namespace.0.as_str()) {
         Ok(_) => Ok(()),
-        Err(BindError::WrongArity) => Err(b"-ERR wrong number of arguments\r\n".to_vec()),
+        Err(BindError::WrongArity) => {
+            Err(format!("-ERR wrong number of arguments for '{}' command\r\n", lowercase_command(command)).into_bytes())
+        }
         Err(BindError::Syntax) => Err(b"-ERR syntax error\r\n".to_vec()),
         Err(BindError::UnsupportedOptions) => Err(b"-ERR unsupported SET options\r\n".to_vec()),
         Err(BindError::InvalidInteger) => Err(b"-ERR value is not an integer or out of range\r\n".to_vec()),

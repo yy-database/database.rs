@@ -20,6 +20,7 @@ use super::{
     connection::{KeyAccessTracker, serve_cancellable, serve_cancellable_with_executor_and_tracker},
     pubsub::PubSubRegistry,
     resp::RequestLimits,
+    server_face::ClientRegistry,
 };
 
 const MAX_CLIENTS: usize = 64;
@@ -149,6 +150,10 @@ fn listen(
     // Channel and pattern subscriptions are reached from the publishing connection, so the
     // pub/sub table is listener-scoped for the same reason.
     let pubsub = Arc::new(PubSubRegistry::new());
+    // `CLIENT LIST` / `CLIENT KILL` / `CONFIG` / `INFO stats` are server-wide views, so the
+    // connection table and its counters are listener-scoped like the tables above.
+    let bound = listener.local_addr()?;
+    let client_registry = Arc::new(ClientRegistry::new(bound.port(), bound.ip().to_string()));
     let mut clients = Clients { workers: Vec::new(), stopping: Arc::clone(&stopping) };
     while !stopping.load(Ordering::Acquire) {
         clients.reap();
@@ -168,6 +173,7 @@ fn listen(
                 let connection_tracker = Arc::clone(&tracker);
                 let connection_registry = Arc::clone(&registry);
                 let connection_pubsub = Arc::clone(&pubsub);
+                let connection_clients = Arc::clone(&client_registry);
                 let worker = thread::Builder::new().name("yyds-redis-client".into()).spawn(move || {
                     let _ = match connection_executor {
                         Some(executor) => serve_cancellable_with_executor_and_tracker(
@@ -178,6 +184,7 @@ fn listen(
                             connection_tracker,
                             connection_registry,
                             connection_pubsub,
+                            Some(connection_clients),
                         ),
                         None => serve_cancellable(stream, limits, cancellation),
                     };
