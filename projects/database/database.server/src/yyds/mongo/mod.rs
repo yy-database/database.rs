@@ -6,15 +6,13 @@
 //! - 握手：`hello` / `isMaster` / `ismaster` / `ping`
 //! - 写入：`insert` / `update` / `delete`
 //! - 读取：`find` / `count` / `aggregate`
+//! - 索引：`createIndexes`
 //! - 游标：`getMore` / `killCursors`
 //!
 //! 命令语义全部由上游 `mongo` 门面的命令层提供，本模块只做 OP_MSG / OP_QUERY
 //! 编解码并注入 `MongoStorage` 后端（`storage::ExecutorStorage`）。固定语料对账
-//! 基线在 `tests/mongo/reconcile.rs`：38 条语料中 37 条逐字节一致，1 条为已记录
-//! 在案的能力差异：
-//!
-//! - 不路由 `createIndexes`，索引管理留在门面命令层。索引构建失败消息含随机
-//!   operation id 与集合 UUID，无法冻结逐字节基线。
+//! 基线在 `tests/mongo/reconcile.rs`：38 条语料中 37 条逐字节一致，1 条因失败
+//! 消息含随机 operation id 与集合 UUID 而走结构化断言。
 #![warn(missing_docs)]
 
 use std::{
@@ -38,7 +36,7 @@ pub use database_protocol_mongo::bson;
 /// OP_MSG / OP_QUERY 组帧（来自 `database-protocol-mongo`）。
 pub use database_protocol_mongo::wire;
 
-use bson::{BsonDocument, BsonValue, encode_bson, parse_bson};
+use bson::{encode_bson, parse_bson, BsonDocument, BsonValue};
 
 /// Gateway kind implemented by this crate.
 pub const GATEWAY_KIND: database_protocol::GatewayKind = database_protocol::GatewayKind::Mongo;
@@ -87,6 +85,7 @@ fn command_kind(name: &str) -> &'static str {
         "aggregate" => "aggregate",
         "delete" => "delete",
         "update" => "update",
+        "createIndexes" => "createIndexes",
         "getMore" => "getMore",
         "killCursors" => "killCursors",
         _ => "unknown",
@@ -176,6 +175,7 @@ fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecu
         "aggregate" => run(executor, "aggregate", |storage| commands::aggregate(bson_doc, storage)),
         "delete" => run(executor, "delete", |storage| commands::delete(bson_doc, storage)),
         "update" => run(executor, "update", |storage| commands::update(bson_doc, storage)),
+        "createIndexes" => run(executor, "createIndexes", |storage| commands::create_indexes(bson_doc, storage)),
         "getMore" => render(commands::get_more(bson_doc, &mut cursors())),
         "killCursors" => render(commands::kill_cursors(bson_doc, &mut cursors())),
         other => generic_error_body(other),

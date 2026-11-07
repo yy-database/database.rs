@@ -1,29 +1,41 @@
-//! 网关写读应答的逐字节基线。
+//! 网关写读应答的冻结基线。
 //!
 //! 38 条固定语料喂给网关，游标 id 是服务端不透明值，先归一化为 `1`，再与冻结
-//! 的字节基线比对。基线结果：37 条逐字节一致，1 条为已记录在案的能力差异。
+//! 基线比对：37 条逐字节一致，1 条走结构化断言，0 条已知差异。
 //!
-//! 这 1 条差异按「已知差异」断言：固定网关当前回复字节并写明原因，不写成通过。
-//! 命令语义由上游 `mongo` 门面提供，网关只做 OP_MSG 编解码与 `MongoStorage`
-//! 后端注入，不在网关里补实现来追平。
+//! 基线来源是真机 `mongod` 8.0.9，冻结于 2026-11-07。命令语义由上游 `mongo`
+//! 门面提供，网关只做 OP_MSG 编解码与 `MongoStorage` 后端注入。
+//!
+//! `createIndexes` 的失败消息内含随机 operation id 与集合 UUID（真机同样随机），
+//! 逐字节比较没有意义，改为只断言 `ok`、`code`、`codeName`、消息前缀与 namespace。
 
 use std::collections::HashMap;
 
 use database_cluster::topology::ShardMap;
 use database_execution::cluster::{KeyValueExecutor, LocalExecutor};
 use database_server::yyds::mongo::{
-    bson::{BinaryData, BsonDocument, BsonValue, encode_bson, parse_bson},
+    bson::{encode_bson, parse_bson, BinaryData, BsonDocument, BsonValue},
     handle_op_msg,
 };
 use database_storage::cluster_kv::MemoryShard;
 use database_types::cluster::{ShardEpoch, ShardId};
 
+/// 结构化断言：真机 `createIndexes` 失败消息含随机 operation id 与集合 UUID，
+/// 只冻结稳定字段，不比较完整字符串。
+struct Structured {
+    ok: f64,
+    code: i32,
+    code_name: &'static str,
+    errmsg_prefix: &'static str,
+    namespace: &'static str,
+}
+
 /// 一条语料的期望结果。
 enum Expected {
-    /// 参考实现回复的归一化字节，网关必须逐字节一致。
+    /// 冻结基线里该步骤的归一化字节，网关必须逐字节一致。
     Match(&'static str),
-    /// 已知差异：网关当前的归一化回复字节，以及差异原因。
-    KnownDifference { reply: &'static str, reason: &'static str },
+    /// 只断言稳定字段的步骤。
+    Structured(Structured),
 }
 
 struct Step {
@@ -284,10 +296,13 @@ fn corpus() -> Vec<Step> {
             ("indexes", array(vec![d(vec![("key", d(vec![("a", int(1))])), ("name", text("a_1")), ("unique", BsonValue::Bool(true))])])),
             ("$db", text("app")),
         ]),
-        Expected::KnownDifference {
-            reply: "2f000000106f6b0000000000026572726d7367000c000000756e737570706f727465640010636f6465003b00000000",
-            reason: "网关不路由 `createIndexes`，索引管理留在门面命令层。索引构建失败消息含随机 operation id 与集合 UUID，无法冻结逐字节基线，因此这一条按已知差异保留。",
-        },
+        Expected::Structured(Structured {
+            ok: 0.0,
+            code: 11000,
+            code_name: "DuplicateKey",
+            errmsg_prefix: "Index build failed:",
+            namespace: "app.undef",
+        }),
     );
     push(
         "undef",
@@ -557,36 +572,34 @@ fn executor() -> LocalExecutor<MemoryShard> {
 }
 
 #[test]
-fn reconcile_corpus_matches_reference_wire_bytes() {
+fn reconcile_corpus_matches_frozen_wire_baseline() {
     let executor = executor();
     let steps = corpus();
     assert_eq!(steps.len(), 38, "对账语料条数漂移");
 
     let mut matched = 0_usize;
-    let mut known = 0_usize;
+    let mut structured = 0_usize;
     let mut drift = Vec::new();
 
     for (index, step) in steps.iter().enumerate() {
-        let reply = hex(&execute(&executor, step));
+        let reply_bytes = execute(&executor, step);
+        let reply = hex(&reply_bytes);
         let position = index + 1;
-        match step.expected {
+        match &step.expected {
             Expected::Match(expected) => {
-                if reply == expected {
+                if reply == *expected {
                     matched += 1;
                 }
                 else {
                     drift.push(format!("{position:02} MATCH 预期失效 {}/{}\n  预期 {expected}\n  实得 {reply}", step.scenario, step.label));
                 }
             }
-            Expected::KnownDifference { reply: expected, reason } => {
-                if reply == expected {
-                    known += 1;
+            Expected::Structured(expectation) => {
+                if let Some(failure) = check_structured(position, step, expectation, &reply_bytes) {
+                    drift.push(format!("{failure}\n  实得 {reply}"));
                 }
                 else {
-                    drift.push(format!(
-                        "{position:02} 已知差异的网关字节漂移 {}/{}\n  原因 {reason}\n  预期 {expected}\n  实得 {reply}",
-                        step.scenario, step.label
-                    ));
+                    structured += 1;
                 }
             }
         }
@@ -594,5 +607,35 @@ fn reconcile_corpus_matches_reference_wire_bytes() {
 
     assert!(drift.is_empty(), "对账基线与实跑不一致：\n{}", drift.join("\n"));
     assert_eq!(matched, 37, "MATCH 条数漂移");
-    assert_eq!(known, 1, "MISMATCH 条数漂移");
+    assert_eq!(structured, 1, "结构化断言条数漂移");
+}
+
+/// 只校验稳定字段。真机 `createIndexes` 失败消息里的 operation id 与集合 UUID
+/// 每次构建都不同，不能逐字节比较。
+fn check_structured(position: usize, step: &Step, expectation: &Structured, bytes: &[u8]) -> Option<String> {
+    let Ok(document) = parse_bson(bytes)
+    else {
+        return Some(format!("{position:02} 结构化断言无法解码 BSON {}/{}", step.scenario, step.label));
+    };
+    let mut failures = Vec::new();
+    match document.get("ok") {
+        Some(BsonValue::Double(value)) if *value == expectation.ok => {}
+        _ => failures.push(format!("ok 应为 {}", expectation.ok)),
+    }
+    match document.get("code") {
+        Some(BsonValue::Int32(value)) if *value == expectation.code => {}
+        _ => failures.push(format!("code 应为 {}", expectation.code)),
+    }
+    match document.get("codeName") {
+        Some(BsonValue::String(value)) if value.as_str() == expectation.code_name => {}
+        _ => failures.push(format!("codeName 应为 {}", expectation.code_name)),
+    }
+    match document.get("errmsg") {
+        Some(BsonValue::String(value)) if value.starts_with(expectation.errmsg_prefix) && value.contains(expectation.namespace) => {}
+        _ => failures.push(format!("errmsg 应以 {} 开头并包含 {}", expectation.errmsg_prefix, expectation.namespace)),
+    }
+    if failures.is_empty() {
+        return None;
+    }
+    Some(format!("{position:02} 结构化断言失效 {}/{}：{}", step.scenario, step.label, failures.join("，")))
 }
