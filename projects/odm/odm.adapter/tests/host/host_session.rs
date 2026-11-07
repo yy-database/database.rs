@@ -152,7 +152,7 @@ fn unsupported_dsn_is_rejected_with_the_author_code() {
 #[test]
 fn outcome_json_keeps_the_envelope_shape() {
     let unit: ExecuteOutcome = ExecuteOutcome::unit();
-    assert_eq!(unit.to_json(), r#"{"error":null,"ok":true,"rows":[]}"#);
+    assert_eq!(unit.to_json(), r#"{"ok":true,"rows":[],"error":null}"#);
 }
 
 #[test]
