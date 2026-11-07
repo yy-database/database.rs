@@ -1032,6 +1032,18 @@ fn timediff(args: &[Cell]) -> Cell {
 }
 
 /// 宿主时区转换：`utc` 把输入的本地时刻换成 UTC，`localtime` 反向。
+#[cfg(not(any(unix, windows)))]
+fn to_utc(_stamp: &mut Stamp) -> bool {
+    // 无宿主时区表的 target（如 wasm32-unknown-unknown）按
+    // `SQLITE_OMIT_LOCALTIME` 的语义把该修饰符当作无操作。
+    true
+}
+
+#[cfg(not(any(unix, windows)))]
+fn to_localtime(_stamp: &mut Stamp) -> bool {
+    true
+}
+
 #[cfg(any(unix, windows))]
 fn to_utc(stamp: &mut Stamp) -> bool {
     let (year, month, day) = stamp.output_ymd();
