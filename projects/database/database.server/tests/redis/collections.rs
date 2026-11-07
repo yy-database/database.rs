@@ -1692,6 +1692,11 @@ fn zset_lex_ranges_and_rank() {
     expect_array(&mut client, &["z", "a", "m"]);
     send(&mut client, &["ZREVRANGEBYLEX", "mixed", "+", "-"]);
     expect_array(&mut client, &["m", "a", "z"]);
+    // 首元素已越过上界时，真机整段判空而不是按成员逐条筛。
+    send(&mut client, &["ZRANGEBYLEX", "mixed", "-", "[a"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["ZREMRANGEBYLEX", "mixed", "-", "[a"]);
+    assert_eq!(expect_integer(&mut client), 0);
     send(&mut client, &["ZRANGEBYLEX", "lex", "-", "+", "WITHSCORES"]);
     expect_error(&mut client, "ERR syntax error, WITHSCORES not supported in combination with BYLEX");
     send(&mut client, &["ZREVRANGEBYLEX", "lex", "+", "-", "WITHSCORES"]);
