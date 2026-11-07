@@ -572,9 +572,30 @@ fn handle_set(
         Resolved::Missing => None,
         Resolved::Kind(kind) => Some(kind),
     };
+    // `SET ... GET` 先取旧值：真机在读不到字符串（键为集合）时直接 WRONGTYPE，
+    // 不执行写入，也不再看 NX / XX 条件。
+    let old_value = if parsed.get {
+        match existing {
+            Some(KeyKind::String) => match load_string(executor, namespace, &parsed.key) {
+                Ok(value) => value,
+                Err(message) => {
+                    write_error(stream, &message)?;
+                    return Ok(());
+                }
+            },
+            Some(_) => {
+                collections::write_wrong_type(stream)?;
+                return Ok(());
+            }
+            None => None,
+        }
+    }
+    else {
+        None
+    };
     let condition = match parsed.condition {
-        SetCondition::IfAbsent if existing.is_some() => return write_null(stream, protocol),
-        SetCondition::IfPresent if existing.is_none() => return write_null(stream, protocol),
+        SetCondition::IfAbsent if existing.is_some() => return write_set_reply(stream, protocol, parsed.get, &old_value, false),
+        SetCondition::IfPresent if existing.is_none() => return write_set_reply(stream, protocol, parsed.get, &old_value, false),
         SetCondition::IfPresent if !matches!(existing, Some(KeyKind::String)) => SetCondition::Always,
         condition => condition,
     };
@@ -631,8 +652,7 @@ fn handle_set(
     };
     if !stored {
         // The condition failed: no write happened, so any existing deadline survives.
-        write_null(stream, protocol)?;
-        return Ok(());
+        return write_set_reply(stream, protocol, parsed.get, &old_value, false);
     }
     if let Some(expires_at) = inherited_expiry {
         let action = database_query::cluster_kv::KeyValueAction::SetExpiry { expires_at };
@@ -647,7 +667,29 @@ fn handle_set(
         write_error(stream, &message)?;
         return Ok(());
     }
-    stream.write_all(b"+OK\r\n")
+    write_set_reply(stream, protocol, parsed.get, &old_value, true)
+}
+
+/// `SET` 的回复：带 `GET` 时回旧值（缺失为 nil），否则成功回 `+OK`、条件不满足回 nil。
+fn write_set_reply(
+    stream: &mut dyn Write,
+    protocol: u8,
+    get: bool,
+    old_value: &Option<Vec<u8>>,
+    success: bool,
+) -> io::Result<()> {
+    if get {
+        return match old_value {
+            Some(value) => write_bulk(stream, value),
+            None => write_null(stream, protocol),
+        };
+    }
+    if success {
+        stream.write_all(b"+OK\r\n")
+    }
+    else {
+        write_null(stream, protocol)
+    }
 }
 
 /// Absolute Unix-millisecond deadline for a SET expiry option, unless it overflows.
@@ -874,8 +916,10 @@ impl ExpireFlags {
 
 /// 条件选项解析失败的原因。
 enum ExpireFlagError {
-    /// `NX` 与 `XX` / `GT` / `LT` 冲突，或 `GT` 与 `LT` 冲突。
+    /// `NX` 与 `XX` / `GT` / `LT` 冲突。
     Conflict,
+    /// `GT` 与 `LT` 冲突，真机使用另一句错误文案。
+    GtLtConflict,
     /// 不认识的选项原文。
     Unsupported(Vec<u8>),
 }
@@ -907,7 +951,7 @@ fn parse_expire_flags(arguments: &[&[u8]]) -> Result<ExpireFlags, ExpireFlagErro
         return Err(ExpireFlagError::Conflict);
     }
     if flags.gt && flags.lt {
-        return Err(ExpireFlagError::Conflict);
+        return Err(ExpireFlagError::GtLtConflict);
     }
     Ok(flags)
 }
@@ -916,6 +960,7 @@ fn parse_expire_flags(arguments: &[&[u8]]) -> Result<ExpireFlags, ExpireFlagErro
 fn write_expire_flag_error(stream: &mut dyn Write, error: ExpireFlagError) -> io::Result<()> {
     match error {
         ExpireFlagError::Conflict => write_error(stream, "NX and XX, GT or LT options at the same time are not compatible"),
+        ExpireFlagError::GtLtConflict => write_error(stream, "GT and LT options at the same time are not compatible"),
         ExpireFlagError::Unsupported(option) => {
             let text = String::from_utf8_lossy(&option);
             write_error(stream, &format!("Unsupported option {text}"))
@@ -1176,6 +1221,28 @@ fn collect_keys(executor: &dyn KeyValueExecutor, base: &Namespace) -> Result<Vec
     Ok(keys)
 }
 
+/// 清空一组逻辑库的全部类型命名空间，返回第一条失败信息。
+fn flush_databases(executor: &dyn KeyValueExecutor, databases: impl IntoIterator<Item = u32>) -> Option<String> {
+    for database in databases {
+        let base = Namespace(format!("redis:{database}"));
+        for kind in KeyKind::ALL {
+            let target = kind.namespace(&base);
+            match executor.execute_scan(None, &target, &[], None, None, 0) {
+                Ok(records) => {
+                    for (key, _) in records {
+                        let command = KeyValueCommand { namespace: target.clone(), key, action: KeyValueAction::Delete };
+                        if let Err(error) = executor.execute(None, command) {
+                            return Some(error.to_string());
+                        }
+                    }
+                }
+                Err(error) => return Some(error.to_string()),
+            }
+        }
+    }
+    None
+}
+
 /// 进程内伪随机下标，`RANDOMKEY` 用它挑一个键。
 fn random_index(bound: usize) -> usize {
     let nanos = std::time::SystemTime::now()
@@ -1309,7 +1376,7 @@ fn handle_object(
     stream: &mut dyn Write,
     request: &Request<'_>,
     probe: Option<&dyn KeyValueExecutor>,
-    tracker: &KeyAccessTracker,
+    tracker: Option<&KeyAccessTracker>,
     namespace: &Namespace,
     protocol: u8,
 ) -> io::Result<()> {
@@ -1321,7 +1388,8 @@ fn handle_object(
     }
     let known = subcommand.eq_ignore_ascii_case(b"IDLETIME")
         || subcommand.eq_ignore_ascii_case(b"REFCOUNT")
-        || subcommand.eq_ignore_ascii_case(b"FREQ");
+        || subcommand.eq_ignore_ascii_case(b"FREQ")
+        || subcommand.eq_ignore_ascii_case(b"ENCODING");
     if !known || count != 3 {
         write_error(
             stream,
@@ -1339,14 +1407,39 @@ fn handle_object(
     };
     let key = request.arguments[2];
     // 集合键也参与 `OBJECT`：先解析逻辑键落在哪个类型命名空间，再按该命名空间计时。
-    let target = match resolve_kind(stream, executor, namespace, key)? {
+    let (kind, target) = match resolve_kind(stream, executor, namespace, key)? {
         Resolved::Missing => return write_null(stream, protocol),
-        Resolved::Kind(kind) => kind.namespace(namespace),
+        Resolved::Kind(kind) => (kind, kind.namespace(namespace)),
         Resolved::Rejected => return Ok(()),
     };
+    if subcommand.eq_ignore_ascii_case(b"ENCODING") {
+        let command = database_query::cluster_kv::KeyValueCommand {
+            namespace: target,
+            key: key.to_vec(),
+            action: database_query::cluster_kv::KeyValueAction::Get,
+        };
+        let value = match executor.execute(None, command) {
+            Ok(KeyValueResult::Get(value)) => value,
+            Ok(_) => {
+                write_error(stream, "OBJECT ENCODING executor returned unexpected result")?;
+                return Ok(());
+            }
+            Err(error) => {
+                write_error(stream, &error.to_string())?;
+                return Ok(());
+            }
+        };
+        let Some(value) = value
+        else {
+            return write_null(stream, protocol);
+        };
+        return write_bulk(stream, object_encoding(kind, &value).as_bytes());
+    }
     if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
         // 纯内存计时：不写 `.yykv`、不升格式版本，重启后从零开始，与真机 RDB 的行为一致。
-        write!(stream, ":{}\r\n", tracker.idle_seconds(&target, key))
+        // 无连接计时的调用方（绑定原语）看到的是一个刚建立的连接，空闲时间从 0 起算。
+        let idle = tracker.map(|tracker| tracker.idle_seconds(&target, key)).unwrap_or(0);
+        write!(stream, ":{idle}\r\n")
     }
     else if subcommand.eq_ignore_ascii_case(b"REFCOUNT") {
         // 这是由存储结构推出的结果，不是写死的常量：每条记录在 `Record` 里独占自己的
@@ -1363,317 +1456,121 @@ fn handle_object(
     }
 }
 
-fn respond(
+/// 真机 `OBJECT ENCODING` 的报告值。
+///
+/// 存储只保存逻辑值，编码由内容与真机默认阈值推出：字符串按整数与 44 字节分界，
+/// 集合类型按条目数、单条长度与整数成员判定。
+fn object_encoding(kind: KeyKind, value: &[u8]) -> &'static str {
+    match kind {
+        KeyKind::String => {
+            if value.len() <= 20 && parse_integer(value).is_some() {
+                "int"
+            }
+            else if value.len() <= 40 {
+                "embstr"
+            }
+            else {
+                "raw"
+            }
+        }
+        KeyKind::Hash => match collections::decode_hash(value) {
+            Some(fields) if fields.len() <= 128 && fields.iter().all(|(field, value)| field.len() <= 64 && value.len() <= 64) => {
+                "listpack"
+            }
+            _ => "hashtable",
+        },
+        KeyKind::List => match collections::decode_list(value) {
+            // 真机的小列表按 `list-max-listpack-size -2`（8 KB）判定，而不是条目数。
+            Some(elements) if elements.iter().map(|element| element.len() + 2).sum::<usize>() <= 8192 => "listpack",
+            _ => "quicklist",
+        },
+        KeyKind::Set => match collections::decode_set(value) {
+            Some(members) if members.iter().all(|member| parse_integer(member).is_some()) && members.len() <= 512 => "intset",
+            Some(members) if members.len() <= 128 && members.iter().all(|member| member.len() <= 64) => "listpack",
+            _ => "hashtable",
+        },
+        KeyKind::ZSet => match collections::decode_zset(value) {
+            Some(entries) if entries.len() <= 128 && entries.iter().all(|(member, _)| member.len() <= 64) => "listpack",
+            _ => "skiplist",
+        },
+        KeyKind::Stream => "stream",
+    }
+}
+
+/// 字符串与键族的命令清单。
+///
+/// 这些命令共享同一条执行链：值读写、计数器、位域、过期、键搬移、枚举与库级操作。
+/// 集合类型（hash / list / set / zset）不在其中，由各自的族入口承接。
+pub(crate) fn is_string_command(command: &[u8]) -> bool {
+    matches!(
+        command,
+        b"GET"
+            | b"SET"
+            | b"SETNX"
+            | b"SETEX"
+            | b"PSETEX"
+            | b"GETSET"
+            | b"GETDEL"
+            | b"GETEX"
+            | b"MGET"
+            | b"MSET"
+            | b"DEL"
+            | b"EXISTS"
+            | b"TYPE"
+            | b"STRLEN"
+            | b"APPEND"
+            | b"GETRANGE"
+            | b"SETRANGE"
+            | b"INCR"
+            | b"DECR"
+            | b"INCRBY"
+            | b"DECRBY"
+            | b"INCRBYFLOAT"
+            | b"SETBIT"
+            | b"GETBIT"
+            | b"BITCOUNT"
+            | b"BITPOS"
+            | b"BITFIELD"
+            | b"BITFIELD_RO"
+            | b"TTL"
+            | b"PTTL"
+            | b"EXPIRE"
+            | b"PEXPIRE"
+            | b"EXPIREAT"
+            | b"PEXPIREAT"
+            | b"EXPIRETIME"
+            | b"PEXPIRETIME"
+            | b"PERSIST"
+            | b"RENAME"
+            | b"RENAMENX"
+            | b"COPY"
+            | b"KEYS"
+            | b"SCAN"
+            | b"RANDOMKEY"
+            | b"DBSIZE"
+            | b"FLUSHDB"
+            | b"FLUSHALL"
+            | b"OBJECT"
+    )
+}
+
+/// Serves the string and key family, returning `false` when the command belongs to a
+/// different family so the caller keeps dispatching.
+pub(crate) fn handle_string(
     stream: &mut dyn Write,
     request: &Request<'_>,
     executor: Option<&dyn KeyValueExecutor>,
     probe: Option<&dyn KeyValueExecutor>,
-    tracker: &KeyAccessTracker,
-    registry: &BlockingRegistry,
-    pubsub: &PubSubRegistry,
-    clients: &ClientRegistry,
-    client: u64,
-    sink: &Arc<ClientSink>,
-    namespace: &mut Namespace,
-    state: &mut ConnectionState,
+    tracker: Option<&KeyAccessTracker>,
+    namespace: &Namespace,
+    protocol: u8,
 ) -> io::Result<bool> {
     let command = request.arguments[0];
     let count = request.arguments.len();
-    // `CLIENT LIST` 的 cmd= / tot-cmds= 来自这里：每条命令都推进一次活动时间，
-    // 容器命令记 `parent|sub` 形式。
-    state.record.touch(command_context(command, &request.arguments));
-    clients.bump_command();
-
-    // ---- RESP2 subscriber mode: only the pub/sub verbs, PING, QUIT and RESET may run.
-    // RESP3 lifted this restriction and allows any command while subscribed.
-    if state.protocol == 2 && pubsub.is_subscribed(client) && !subscriber_command_allowed(command) {
-        let message = format!(
-            "-ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n",
-            lowercase_command(command)
-        );
-        stream.write_all(message.as_bytes())?;
-        return Ok(true);
-    }
-
-    // ---- Transaction control: MULTI / EXEC / DISCARD. These are always handled directly
-    // and never queued (Redis would reject a second MULTI inside a MULTI block anyway).
-
-    if command.eq_ignore_ascii_case(b"MULTI") {
-        if count != 1 {
-            stream.write_all(b"-ERR wrong number of arguments for 'multi' command\r\n")?;
-            return Ok(true);
-        }
-        if state.in_multi {
-            stream.write_all(b"-ERR MULTI calls can not be nested\r\n")?;
-            // 同 TypeScript 侧：队列中的规划失败会毒化事务。
-            state.multi_error = true;
-            return Ok(true);
-        }
-        state.in_multi = true;
-        state.queue.clear();
-        state.multi_error = false;
-        state.record.set_multi(Some(0));
-        stream.write_all(b"+OK\r\n")?;
-        return Ok(true);
-    }
-
-    if command.eq_ignore_ascii_case(b"EXEC") {
-        if count != 1 {
-            stream.write_all(b"-ERR wrong number of arguments for 'exec' command\r\n")?;
-            return Ok(true);
-        }
-        if !state.in_multi {
-            stream.write_all(b"-ERR EXEC without MULTI\r\n")?;
-            return Ok(true);
-        }
-        // A rejected queued command poisons the transaction: EXEC answers EXECABORT and
-        // drops the whole queue without running anything.
-        if state.multi_error {
-            state.in_multi = false;
-            state.queue.clear();
-            state.watched.clear();
-            state.multi_error = false;
-            state.record.set_multi(None);
-            stream.write_all(b"-EXECABORT Transaction discarded because of previous errors.\r\n")?;
-            return Ok(true);
-        }
-        // Optimistic locking: any write to a watched key since WATCH abandons the whole
-        // transaction before a single queued command runs. The reply is the nil array.
-        if !state.watched.is_empty() {
-            // 版本比对只读取值，不刷新访问计时，否则 `EXEC` 前的探测会把空闲时间清零。
-            let modified = match probe {
-                Some(probe) => watched_keys_modified(probe, &state.watched),
-                None => Ok(true),
-            };
-            match modified {
-                Ok(false) => {}
-                Ok(true) => {
-                    write_null_array(stream, state.protocol)?;
-                    state.in_multi = false;
-                    state.queue.clear();
-                    state.watched.clear();
-                    state.record.set_multi(None);
-                    return Ok(true);
-                }
-                Err(message) => {
-                    write_error(stream, &message)?;
-                    state.in_multi = false;
-                    state.queue.clear();
-                    state.watched.clear();
-                    state.record.set_multi(None);
-                    return Ok(true);
-                }
-            }
-        }
-        execute_transaction(stream, executor, probe, tracker, registry, pubsub, clients, client, sink, namespace, state)?;
-        return Ok(true);
-    }
-
-    if command.eq_ignore_ascii_case(b"DISCARD") {
-        if count != 1 {
-            stream.write_all(b"-ERR wrong number of arguments for 'discard' command\r\n")?;
-            return Ok(true);
-        }
-        if !state.in_multi {
-            stream.write_all(b"-ERR DISCARD without MULTI\r\n")?;
-            return Ok(true);
-        }
-        state.in_multi = false;
-        state.queue.clear();
-        state.watched.clear();
-        state.multi_error = false;
-        state.record.set_multi(None);
-        stream.write_all(b"+OK\r\n")?;
-        return Ok(true);
-    }
-
-    // ---- Optimistic locking control: WATCH / UNWATCH. `WATCH` must run before `MULTI`,
-    // while `UNWATCH` inside a `MULTI` is queued like any other command, as upstream does.
-    if command.eq_ignore_ascii_case(b"WATCH") {
-        handle_watch(stream, request, probe, namespace, state)?;
-        return Ok(true);
-    }
-
-    if command.eq_ignore_ascii_case(b"UNWATCH") {
-        if state.in_multi {
-            if count != 1 {
-                stream.write_all(b"-ERR wrong number of arguments for 'unwatch' command\r\n")?;
-                return Ok(true);
-            }
-            let owned = OwnedRequest { arguments: request.arguments.iter().map(|arg| arg.to_vec()).collect() };
-            state.queue.push(QueuedCommand { request: owned });
-            stream.write_all(b"+QUEUED\r\n")?;
-            return Ok(true);
-        }
-        handle_unwatch(stream, count, state)?;
-        return Ok(true);
-    }
-
-    // ---- Inside a MULTI block: buffer every other command and return QUEUED.
-    // Syntax / arity validation happens here so clients learn about bad commands at queue
-    // time instead of at EXEC time. The actual runtime behaviour (wrong-type, NX failure,
-    // etc.) is deferred to EXEC per Redis semantics.
-    if state.in_multi {
-        if let Err(error_bytes) = validate_command_for_queue(command, count, &request.arguments, executor, namespace) {
-            stream.write_all(&error_bytes)?;
-            // 同 TypeScript 侧：规划失败立刻毒化事务，EXEC 整队丢弃。
-            state.multi_error = true;
-            return Ok(true);
-        }
-        let owned = OwnedRequest { arguments: request.arguments.iter().map(|arg| arg.to_vec()).collect() };
-        state.queue.push(QueuedCommand { request: owned });
-        state.record.set_multi(Some(state.queue.len()));
-        stream.write_all(b"+QUEUED\r\n")?;
-        return Ok(true);
-    }
-
-    // ---- Below is the normal, command-by-command execution path.
-
-    if command.eq_ignore_ascii_case(b"HELLO") {
-        // Modern clients (redis-py 8, ioredis, redis-cli) send `HELLO 3` on connect. The
-        // answered version becomes the connection's protocol: subsequent null replies use
-        // `_\r\n` under RESP3 and the null bulk string under RESP2. `HELLO` without an
-        // argument reports the version already in force, like upstream Redis.
-        let protocol = match request.arguments.get(1) {
-            None => state.protocol,
-            Some(raw) => match parse_integer(raw) {
-                Some(2) => 2,
-                Some(3) => 3,
-                Some(_) => {
-                    stream.write_all(b"-NOPROTO unsupported protocol version\r\n")?;
-                    return Ok(true);
-                }
-                None => {
-                    stream.write_all(b"-ERR Protocol version is not an integer or out of range\r\n")?;
-                    return Ok(true);
-                }
-            },
-        };
-        let mut index = 2;
-        while index < count {
-            let option = request.arguments[index];
-            if option.eq_ignore_ascii_case(b"AUTH") && index + 2 < count {
-                // The local gateway has no credential model, so HELLO AUTH is accepted
-                // for the same reason `yyds` accepts any MySQL user.
-                index += 3;
-            }
-            else if option.eq_ignore_ascii_case(b"SETNAME") && index + 1 < count {
-                index += 2;
-            }
-            else {
-                stream.write_all(b"-ERR Syntax error in HELLO option\r\n")?;
-                return Ok(true);
-            }
-        }
-        write_hello(stream, protocol)?;
-        state.protocol = protocol;
-        state.record.set_protocol(protocol);
-        sink.set_protocol(protocol);
-    }
-    else if command.eq_ignore_ascii_case(b"PING") {
-        match count {
-            1 => {
-                // In RESP2 subscriber mode PING answers the two-element `pong` array
-                // instead of the simple string; RESP3 keeps the ordinary reply.
-                if state.protocol == 2 && pubsub.is_subscribed(client) {
-                    stream.write_all(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n")?;
-                }
-                else {
-                    stream.write_all(b"+PONG\r\n")?;
-                }
-            }
-            2 => write_bulk(stream, request.arguments[1])?,
-            _ => stream.write_all(b"-ERR wrong number of arguments for 'ping' command\r\n")?,
-        }
-    }
-    else if command.eq_ignore_ascii_case(b"RESET") {
-        if count != 1 {
-            stream.write_all(b"-ERR wrong number of arguments for 'reset' command\r\n")?;
-            return Ok(true);
-        }
-        // RESET drops subscriptions, leaves MULTI, rewrites the protocol back to RESP2
-        // and returns to database 0, which is the state a fresh connection starts in.
-        for (name, _) in pubsub.unsubscribe(client, &[], false) {
-            let _ = name;
-        }
-        for (name, _) in pubsub.unsubscribe(client, &[], true) {
-            let _ = name;
-        }
-        state.in_multi = false;
-        state.queue.clear();
-        state.watched.clear();
-        state.multi_error = false;
-        state.protocol = 2;
-        state.record.set_protocol(2);
-        state.record.set_multi(None);
-        state.record.set_database(0);
-        state.record.set_name(None);
-        sink.set_protocol(2);
-        *namespace = Namespace("redis:0".into());
-        stream.write_all(b"+RESET\r\n")?;
-    }
-    else if command.eq_ignore_ascii_case(b"SUBSCRIBE") {
-        handle_subscribe(stream, pubsub, client, state.protocol, &request.arguments, false)?;
-    }
-    else if command.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
-        handle_unsubscribe(stream, pubsub, client, state.protocol, &request.arguments, false)?;
-    }
-    else if command.eq_ignore_ascii_case(b"PSUBSCRIBE") {
-        handle_subscribe(stream, pubsub, client, state.protocol, &request.arguments, true)?;
-    }
-    else if command.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
-        handle_unsubscribe(stream, pubsub, client, state.protocol, &request.arguments, true)?;
-    }
-    else if command.eq_ignore_ascii_case(b"PUBLISH") {
-        handle_publish(stream, pubsub, &request.arguments)?;
-    }
-    else if command.eq_ignore_ascii_case(b"PUBSUB") {
-        handle_pubsub(stream, pubsub, &request.arguments)?;
-    }
-    else if command.eq_ignore_ascii_case(b"ECHO") {
-        if count == 2 {
-            write_bulk(stream, request.arguments[1])?
-        }
-        else {
-            stream.write_all(b"-ERR wrong number of arguments for 'echo' command\r\n")?
-        }
-    }
-    else if command.eq_ignore_ascii_case(b"QUIT") {
-        // 真机忽略 QUIT 的多余参数，一律回 OK 并断连。
-        stream.write_all(b"+OK\r\n")?;
+    if !is_string_command(command) {
         return Ok(false);
     }
-    else if command.eq_ignore_ascii_case(b"CLIENT") {
-        if !server_face::handle_client(stream, request, state, clients, pubsub)? {
-            return Ok(false);
-        }
-    }
-    else if command.eq_ignore_ascii_case(b"SELECT") && executor.is_some() {
-        if count != 2 {
-            stream.write_all(b"-ERR wrong number of arguments for 'select' command\r\n")?;
-        }
-        else if let Some(database) = parse_database(request.arguments[1]) {
-            *namespace = Namespace(format!("redis:{database}"));
-            state.record.set_database(database);
-            stream.write_all(b"+OK\r\n")?;
-        }
-        else {
-            stream.write_all(b"-ERR DB index is out of range\r\n")?;
-        }
-    }
-    else if command.eq_ignore_ascii_case(b"INFO") {
-        server_face::handle_info(stream, request, clients, pubsub, executor)?;
-    }
-    else if command.eq_ignore_ascii_case(b"CONFIG") {
-        server_face::handle_config(stream, request, clients)?;
-    }
-    else if command.eq_ignore_ascii_case(b"ACL") {
-        server_face::handle_acl(stream, request)?;
-    }
-    else if command.eq_ignore_ascii_case(b"COMMAND") {
-        server_face::handle_command(stream, request, state.protocol)?;
-    }
-    else if command.eq_ignore_ascii_case(b"EXPIRE") || command.eq_ignore_ascii_case(b"PEXPIRE") {
+    if command.eq_ignore_ascii_case(b"EXPIRE") || command.eq_ignore_ascii_case(b"PEXPIRE") {
         let Some(executor) = executor
         else {
             stream.write_all(b"-ERR unsupported command\r\n")?;
@@ -1897,7 +1794,7 @@ fn respond(
                         for result in results {
                             match result {
                                 KeyValueResult::Get(Some(value)) => write_bulk(stream, &value)?,
-                                KeyValueResult::Get(None) => write_null(stream, state.protocol)?,
+                                KeyValueResult::Get(None) => write_null(stream, protocol)?,
                                 _ => unreachable!(),
                             }
                         }
@@ -2506,11 +2403,8 @@ fn respond(
             }
         }
     }
-    else if collections::is_hyperloglog_command(command) {
-        collections::handle_hyperloglog(stream, request, executor, namespace)?;
-    }
     else if command.eq_ignore_ascii_case(b"SET") {
-        handle_set(stream, request, executor, namespace, state.protocol)?;
+        handle_set(stream, request, executor, namespace, protocol)?;
     }
     else if command.eq_ignore_ascii_case(b"PERSIST") || command.eq_ignore_ascii_case(b"SETEX") {
         let Some(executor) = executor
@@ -2557,13 +2451,15 @@ fn respond(
                 stream.write_all(b"-ERR wrong number of arguments for 'setex' command\r\n")?;
                 return Ok(true);
             }
-            let seconds = match parse_integer(request.arguments[2]) {
-                Some(v) if v > 0 => v,
-                _ => {
-                    stream.write_all(b"-ERR invalid expire time in 'setex' command\r\n")?;
-                    return Ok(true);
-                }
+            let Some(seconds) = parse_integer(request.arguments[2])
+            else {
+                write_error(stream, "value is not an integer or out of range")?;
+                return Ok(true);
             };
+            if seconds <= 0 {
+                stream.write_all(b"-ERR invalid expire time in 'setex' command\r\n")?;
+                return Ok(true);
+            }
             let expires_at = now_unix_ms() + seconds.saturating_mul(1000);
             let result = executor.execute(
                 None,
@@ -2618,15 +2514,17 @@ fn respond(
         // value itself is checked after the lookup, so `GETEX missing EX not-a-number`
         // returns nil instead of an expiry error, as upstream does.
         let mut spec: Option<ExpirySpec<'_>> = None;
+        let mut spec_kind: Option<&[u8]> = None;
         let mut index = 2;
         while index < count {
             let option = request.arguments[index];
-            if spec.is_some() {
+            if spec_kind.is_some_and(|kind| !kind.eq_ignore_ascii_case(option)) {
                 stream.write_all(b"-ERR syntax error\r\n")?;
                 return Ok(true);
             }
             if option.eq_ignore_ascii_case(b"PERSIST") {
                 spec = Some(ExpirySpec::Persist);
+                spec_kind = Some(option);
                 index += 1;
             }
             else if option.eq_ignore_ascii_case(b"EX")
@@ -2651,6 +2549,7 @@ fn respond(
                 else {
                     ExpirySpec::MillisecondsAt(raw)
                 });
+                spec_kind = Some(option);
                 index += 2;
             }
             else {
@@ -2690,7 +2589,7 @@ fn respond(
         // argument is deliberately left unparsed in that branch.
         let Some(value) = value
         else {
-            write_null(stream, state.protocol)?;
+            write_null(stream, protocol)?;
             return Ok(true);
         };
         if let Some(spec) = spec {
@@ -2733,23 +2632,11 @@ fn respond(
         }
         write_bulk(stream, &value)?;
     }
-    else if collections::is_hash_command(command) {
-        collections::handle_hash(stream, request, executor, namespace, state.protocol)?;
-    }
-    else if collections::is_list_command(command) {
-        collections::handle_list(stream, request, executor, namespace, state.protocol, registry, !state.defer_blocking)?;
-    }
-    else if collections::is_set_command(command) {
-        collections::handle_set(stream, request, executor, namespace, state.protocol)?;
-    }
-    else if collections::is_zset_command(command) {
-        collections::handle_zset(stream, request, executor, namespace, state.protocol)?;
-    }
     else if command.eq_ignore_ascii_case(b"SCAN") {
         handle_scan(stream, request, executor, namespace)?;
     }
     else if command.eq_ignore_ascii_case(b"OBJECT") {
-        handle_object(stream, request, probe, tracker, namespace, state.protocol)?;
+        handle_object(stream, request, probe, tracker, namespace, protocol)?;
     }
     else if command.eq_ignore_ascii_case(b"RENAME") || command.eq_ignore_ascii_case(b"RENAMENX") {
         // Session / token rotation: the record moves together with its remaining deadline in
@@ -2904,7 +2791,7 @@ fn respond(
             return Ok(true);
         }
         match collect_keys(executor, namespace) {
-            Ok(keys) if keys.is_empty() => write_null(stream, state.protocol)?,
+            Ok(keys) if keys.is_empty() => write_null(stream, protocol)?,
             Ok(keys) => {
                 let index = random_index(keys.len());
                 write_bulk(stream, &keys[index])?;
@@ -2977,6 +2864,33 @@ fn respond(
             None => stream.write_all(b"+OK\r\n")?,
         }
     }
+    else if command.eq_ignore_ascii_case(b"FLUSHDB") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count > 2 {
+            write_error(stream, "wrong number of arguments for 'flushdb' command")?;
+            return Ok(true);
+        }
+        if count == 2
+            && !request.arguments[1].eq_ignore_ascii_case(b"ASYNC")
+            && !request.arguments[1].eq_ignore_ascii_case(b"SYNC")
+        {
+            write_error(stream, "syntax error")?;
+            return Ok(true);
+        }
+        let database = namespace
+            .0
+            .strip_prefix("redis:")
+            .and_then(|text| text.parse::<u32>().ok())
+            .unwrap_or(0);
+        match flush_databases(executor, [database]) {
+            Some(message) => write_error(stream, &message)?,
+            None => stream.write_all(b"+OK\r\n")?,
+        }
+    }
     else if command.eq_ignore_ascii_case(b"COPY") {
         let Some(executor) = executor
         else {
@@ -3041,6 +2955,116 @@ fn respond(
         };
         write!(stream, ":{value}\r\n")?;
     }
+    else if command.eq_ignore_ascii_case(b"SETNX") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 3 {
+            stream.write_all(b"-ERR wrong number of arguments for 'setnx' command\r\n")?;
+            return Ok(true);
+        }
+        let key = request.arguments[1];
+        match resolve_kind(stream, executor, namespace, key)? {
+            Resolved::Rejected => {}
+            // 任意类型的旧键都算「已存在」，真机不会因为类型不同而报错。
+            Resolved::Kind(_) => stream.write_all(b":0\r\n")?,
+            Resolved::Missing => {
+                let action = database_query::cluster_kv::KeyValueAction::PutIfAbsent(request.arguments[2].to_vec());
+                let command = database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action };
+                match executor.execute(None, command) {
+                    Ok(KeyValueResult::PutIfAbsent { revision }) => {
+                        stream.write_all(if revision.is_some() { b":1\r\n" } else { b":0\r\n" })?
+                    }
+                    Ok(_) => write_error(stream, "SETNX executor returned unexpected result")?,
+                    Err(error) => write_error(stream, &error.to_string())?,
+                }
+            }
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"PSETEX") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count != 4 {
+            stream.write_all(b"-ERR wrong number of arguments for 'psetex' command\r\n")?;
+            return Ok(true);
+        }
+        let Some(milliseconds) = parse_integer(request.arguments[2])
+        else {
+            write_error(stream, "value is not an integer or out of range")?;
+            return Ok(true);
+        };
+        if milliseconds <= 0 {
+            write_error(stream, "invalid expire time in 'psetex' command")?;
+            return Ok(true);
+        }
+        let expires_at = now_unix_ms().saturating_add(milliseconds);
+        let action = database_query::cluster_kv::KeyValueAction::PutExpiring { value: request.arguments[3].to_vec(), expires_at };
+        let command = database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: request.arguments[1].to_vec(), action };
+        match executor.execute(None, command) {
+            Ok(KeyValueResult::Put { .. }) => {
+                if let Err(message) = clear_other_kinds(executor, namespace, request.arguments[1]) {
+                    write_error(stream, &message)?;
+                    return Ok(true);
+                }
+                stream.write_all(b"+OK\r\n")?;
+            }
+            Ok(_) => write_error(stream, "PSETEX executor returned unexpected result")?,
+            Err(error) => write_error(stream, &error.to_string())?,
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"MSET") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        if count < 3 || count % 2 == 0 {
+            stream.write_all(b"-ERR wrong number of arguments for 'mset' command\r\n")?;
+            return Ok(true);
+        }
+        for pair in request.arguments[1..].chunks(2) {
+            let key = pair[0];
+            let action = database_query::cluster_kv::KeyValueAction::Put(pair[1].to_vec());
+            let command = database_query::cluster_kv::KeyValueCommand { namespace: namespace.clone(), key: key.to_vec(), action };
+            match executor.execute(None, command) {
+                Ok(KeyValueResult::Put { .. }) => {
+                    if let Err(message) = clear_other_kinds(executor, namespace, key) {
+                        write_error(stream, &message)?;
+                        return Ok(true);
+                    }
+                }
+                Ok(_) => {
+                    write_error(stream, "MSET executor returned unexpected result")?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    write_error(stream, &error.to_string())?;
+                    return Ok(true);
+                }
+            }
+        }
+        stream.write_all(b"+OK\r\n")?;
+    }
+    else if command.eq_ignore_ascii_case(b"BITFIELD") || command.eq_ignore_ascii_case(b"BITFIELD_RO") {
+        let Some(executor) = executor
+        else {
+            stream.write_all(b"-ERR unsupported command\r\n")?;
+            return Ok(true);
+        };
+        collections::handle_bitfield(
+            stream,
+            executor,
+            namespace,
+            &request.arguments,
+            command.eq_ignore_ascii_case(b"BITFIELD_RO"),
+        )?;
+        return Ok(true);
+    }
     else if let Some(executor) = executor {
         // --- Generic bind()-backed commands (GET, INCR, DECR, GETDEL, GETSET).
         // Expiry semantics are enforced by the KV layer: expired records read as absent
@@ -3066,17 +3090,17 @@ fn respond(
                     Ok(result) => {
                         match result {
                             KeyValueResult::Get(Some(value)) => write_bulk(stream, &value)?,
-                            KeyValueResult::Get(None) => write_null(stream, state.protocol)?,
+                            KeyValueResult::Get(None) => write_null(stream, protocol)?,
                             KeyValueResult::Exists(exists) => stream.write_all(if exists { b":1\r\n" } else { b":0\r\n" })?,
                             KeyValueResult::GetDelete(Some(value)) => write_bulk(stream, &value)?,
-                            KeyValueResult::GetDelete(None) => write_null(stream, state.protocol)?,
+                            KeyValueResult::GetDelete(None) => write_null(stream, protocol)?,
                             KeyValueResult::GetSet(Some(value)) => write_bulk(stream, &value)?,
-                            KeyValueResult::GetSet(None) => write_null(stream, state.protocol)?,
+                            KeyValueResult::GetSet(None) => write_null(stream, protocol)?,
                             KeyValueResult::Put { .. } => stream.write_all(b"+OK\r\n")?,
                             KeyValueResult::PutIfAbsent { revision: Some(_) } => stream.write_all(b"+OK\r\n")?,
-                            KeyValueResult::PutIfAbsent { revision: None } => write_null(stream, state.protocol)?,
+                            KeyValueResult::PutIfAbsent { revision: None } => write_null(stream, protocol)?,
                             KeyValueResult::PutIfPresent { revision: Some(_) } => stream.write_all(b"+OK\r\n")?,
-                            KeyValueResult::PutIfPresent { revision: None } => write_null(stream, state.protocol)?,
+                            KeyValueResult::PutIfPresent { revision: None } => write_null(stream, protocol)?,
                             KeyValueResult::Increment { value } => write!(stream, ":{value}\r\n")?,
                             KeyValueResult::Delete { removed } => stream.write_all(if removed { b":1\r\n" } else { b":0\r\n" })?,
                             // Expiry and rename results only surface through their dedicated
@@ -3099,6 +3123,338 @@ fn respond(
             Err(BindError::UnsupportedCommand) => write_unknown_command(stream, &request.arguments)?,
         }
     }
+    Ok(true)
+}
+
+
+fn respond(
+    stream: &mut dyn Write,
+    request: &Request<'_>,
+    executor: Option<&dyn KeyValueExecutor>,
+    probe: Option<&dyn KeyValueExecutor>,
+    tracker: &KeyAccessTracker,
+    registry: &BlockingRegistry,
+    pubsub: &PubSubRegistry,
+    clients: &ClientRegistry,
+    client: u64,
+    sink: &Arc<ClientSink>,
+    namespace: &mut Namespace,
+    state: &mut ConnectionState,
+) -> io::Result<bool> {
+    let command = request.arguments[0];
+    let count = request.arguments.len();
+    // `CLIENT LIST` 的 cmd= / tot-cmds= 来自这里：每条命令都推进一次活动时间，
+    // 容器命令记 `parent|sub` 形式。
+    state.record.touch(command_context(command, &request.arguments));
+    clients.bump_command();
+
+    // ---- RESP2 subscriber mode: only the pub/sub verbs, PING, QUIT and RESET may run.
+    // RESP3 lifted this restriction and allows any command while subscribed.
+    if state.protocol == 2 && pubsub.is_subscribed(client) && !subscriber_command_allowed(command) {
+        let message = format!(
+            "-ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n",
+            lowercase_command(command)
+        );
+        stream.write_all(message.as_bytes())?;
+        return Ok(true);
+    }
+
+    // ---- Transaction control: MULTI / EXEC / DISCARD. These are always handled directly
+    // and never queued (Redis would reject a second MULTI inside a MULTI block anyway).
+
+    if command.eq_ignore_ascii_case(b"MULTI") {
+        if count != 1 {
+            stream.write_all(b"-ERR wrong number of arguments for 'multi' command\r\n")?;
+            return Ok(true);
+        }
+        if state.in_multi {
+            stream.write_all(b"-ERR MULTI calls can not be nested\r\n")?;
+            // 同 TypeScript 侧：队列中的规划失败会毒化事务。
+            state.multi_error = true;
+            return Ok(true);
+        }
+        state.in_multi = true;
+        state.queue.clear();
+        state.multi_error = false;
+        state.record.set_multi(Some(0));
+        stream.write_all(b"+OK\r\n")?;
+        return Ok(true);
+    }
+
+    if command.eq_ignore_ascii_case(b"EXEC") {
+        if count != 1 {
+            stream.write_all(b"-ERR wrong number of arguments for 'exec' command\r\n")?;
+            return Ok(true);
+        }
+        if !state.in_multi {
+            stream.write_all(b"-ERR EXEC without MULTI\r\n")?;
+            return Ok(true);
+        }
+        // A rejected queued command poisons the transaction: EXEC answers EXECABORT and
+        // drops the whole queue without running anything.
+        if state.multi_error {
+            state.in_multi = false;
+            state.queue.clear();
+            state.watched.clear();
+            state.multi_error = false;
+            state.record.set_multi(None);
+            stream.write_all(b"-EXECABORT Transaction discarded because of previous errors.\r\n")?;
+            return Ok(true);
+        }
+        // Optimistic locking: any write to a watched key since WATCH abandons the whole
+        // transaction before a single queued command runs. The reply is the nil array.
+        if !state.watched.is_empty() {
+            // 版本比对只读取值，不刷新访问计时，否则 `EXEC` 前的探测会把空闲时间清零。
+            let modified = match probe {
+                Some(probe) => watched_keys_modified(probe, &state.watched),
+                None => Ok(true),
+            };
+            match modified {
+                Ok(false) => {}
+                Ok(true) => {
+                    write_null_array(stream, state.protocol)?;
+                    state.in_multi = false;
+                    state.queue.clear();
+                    state.watched.clear();
+                    state.record.set_multi(None);
+                    return Ok(true);
+                }
+                Err(message) => {
+                    write_error(stream, &message)?;
+                    state.in_multi = false;
+                    state.queue.clear();
+                    state.watched.clear();
+                    state.record.set_multi(None);
+                    return Ok(true);
+                }
+            }
+        }
+        execute_transaction(stream, executor, probe, tracker, registry, pubsub, clients, client, sink, namespace, state)?;
+        return Ok(true);
+    }
+
+    if command.eq_ignore_ascii_case(b"DISCARD") {
+        if count != 1 {
+            stream.write_all(b"-ERR wrong number of arguments for 'discard' command\r\n")?;
+            return Ok(true);
+        }
+        if !state.in_multi {
+            stream.write_all(b"-ERR DISCARD without MULTI\r\n")?;
+            return Ok(true);
+        }
+        state.in_multi = false;
+        state.queue.clear();
+        state.watched.clear();
+        state.multi_error = false;
+        state.record.set_multi(None);
+        stream.write_all(b"+OK\r\n")?;
+        return Ok(true);
+    }
+
+    // ---- Optimistic locking control: WATCH / UNWATCH. `WATCH` must run before `MULTI`,
+    // while `UNWATCH` inside a `MULTI` is queued like any other command, as upstream does.
+    if command.eq_ignore_ascii_case(b"WATCH") {
+        handle_watch(stream, request, probe, namespace, state)?;
+        return Ok(true);
+    }
+
+    if command.eq_ignore_ascii_case(b"UNWATCH") {
+        if state.in_multi {
+            if count != 1 {
+                stream.write_all(b"-ERR wrong number of arguments for 'unwatch' command\r\n")?;
+                return Ok(true);
+            }
+            let owned = OwnedRequest { arguments: request.arguments.iter().map(|arg| arg.to_vec()).collect() };
+            state.queue.push(QueuedCommand { request: owned });
+            stream.write_all(b"+QUEUED\r\n")?;
+            return Ok(true);
+        }
+        handle_unwatch(stream, count, state)?;
+        return Ok(true);
+    }
+
+    // ---- Inside a MULTI block: buffer every other command and return QUEUED.
+    // Syntax / arity validation happens here so clients learn about bad commands at queue
+    // time instead of at EXEC time. The actual runtime behaviour (wrong-type, NX failure,
+    // etc.) is deferred to EXEC per Redis semantics.
+    if state.in_multi {
+        if let Err(error_bytes) = validate_command_for_queue(command, count, &request.arguments, executor, namespace) {
+            stream.write_all(&error_bytes)?;
+            // 同 TypeScript 侧：规划失败立刻毒化事务，EXEC 整队丢弃。
+            state.multi_error = true;
+            return Ok(true);
+        }
+        let owned = OwnedRequest { arguments: request.arguments.iter().map(|arg| arg.to_vec()).collect() };
+        state.queue.push(QueuedCommand { request: owned });
+        state.record.set_multi(Some(state.queue.len()));
+        stream.write_all(b"+QUEUED\r\n")?;
+        return Ok(true);
+    }
+
+    // ---- Below is the normal, command-by-command execution path.
+
+    if command.eq_ignore_ascii_case(b"HELLO") {
+        // Modern clients (redis-py 8, ioredis, redis-cli) send `HELLO 3` on connect. The
+        // answered version becomes the connection's protocol: subsequent null replies use
+        // `_\r\n` under RESP3 and the null bulk string under RESP2. `HELLO` without an
+        // argument reports the version already in force, like upstream Redis.
+        let protocol = match request.arguments.get(1) {
+            None => state.protocol,
+            Some(raw) => match parse_integer(raw) {
+                Some(2) => 2,
+                Some(3) => 3,
+                Some(_) => {
+                    stream.write_all(b"-NOPROTO unsupported protocol version\r\n")?;
+                    return Ok(true);
+                }
+                None => {
+                    stream.write_all(b"-ERR Protocol version is not an integer or out of range\r\n")?;
+                    return Ok(true);
+                }
+            },
+        };
+        let mut index = 2;
+        while index < count {
+            let option = request.arguments[index];
+            if option.eq_ignore_ascii_case(b"AUTH") && index + 2 < count {
+                // The local gateway has no credential model, so HELLO AUTH is accepted
+                // for the same reason `yyds` accepts any MySQL user.
+                index += 3;
+            }
+            else if option.eq_ignore_ascii_case(b"SETNAME") && index + 1 < count {
+                index += 2;
+            }
+            else {
+                stream.write_all(b"-ERR Syntax error in HELLO option\r\n")?;
+                return Ok(true);
+            }
+        }
+        write_hello(stream, protocol)?;
+        state.protocol = protocol;
+        state.record.set_protocol(protocol);
+        sink.set_protocol(protocol);
+    }
+    else if command.eq_ignore_ascii_case(b"PING") {
+        match count {
+            1 => {
+                // In RESP2 subscriber mode PING answers the two-element `pong` array
+                // instead of the simple string; RESP3 keeps the ordinary reply.
+                if state.protocol == 2 && pubsub.is_subscribed(client) {
+                    stream.write_all(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n")?;
+                }
+                else {
+                    stream.write_all(b"+PONG\r\n")?;
+                }
+            }
+            2 => write_bulk(stream, request.arguments[1])?,
+            _ => stream.write_all(b"-ERR wrong number of arguments for 'ping' command\r\n")?,
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"RESET") {
+        if count != 1 {
+            stream.write_all(b"-ERR wrong number of arguments for 'reset' command\r\n")?;
+            return Ok(true);
+        }
+        // RESET drops subscriptions, leaves MULTI, rewrites the protocol back to RESP2
+        // and returns to database 0, which is the state a fresh connection starts in.
+        for (name, _) in pubsub.unsubscribe(client, &[], false) {
+            let _ = name;
+        }
+        for (name, _) in pubsub.unsubscribe(client, &[], true) {
+            let _ = name;
+        }
+        state.in_multi = false;
+        state.queue.clear();
+        state.watched.clear();
+        state.multi_error = false;
+        state.protocol = 2;
+        state.record.set_protocol(2);
+        state.record.set_multi(None);
+        state.record.set_database(0);
+        state.record.set_name(None);
+        sink.set_protocol(2);
+        *namespace = Namespace("redis:0".into());
+        stream.write_all(b"+RESET\r\n")?;
+    }
+    else if command.eq_ignore_ascii_case(b"SUBSCRIBE") {
+        handle_subscribe(stream, pubsub, client, state.protocol, &request.arguments, false)?;
+    }
+    else if command.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
+        handle_unsubscribe(stream, pubsub, client, state.protocol, &request.arguments, false)?;
+    }
+    else if command.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+        handle_subscribe(stream, pubsub, client, state.protocol, &request.arguments, true)?;
+    }
+    else if command.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+        handle_unsubscribe(stream, pubsub, client, state.protocol, &request.arguments, true)?;
+    }
+    else if command.eq_ignore_ascii_case(b"PUBLISH") {
+        handle_publish(stream, pubsub, &request.arguments)?;
+    }
+    else if command.eq_ignore_ascii_case(b"PUBSUB") {
+        handle_pubsub(stream, pubsub, &request.arguments)?;
+    }
+    else if command.eq_ignore_ascii_case(b"ECHO") {
+        if count == 2 {
+            write_bulk(stream, request.arguments[1])?
+        }
+        else {
+            stream.write_all(b"-ERR wrong number of arguments for 'echo' command\r\n")?
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"QUIT") {
+        // 真机忽略 QUIT 的多余参数，一律回 OK 并断连。
+        stream.write_all(b"+OK\r\n")?;
+        return Ok(false);
+    }
+    else if command.eq_ignore_ascii_case(b"CLIENT") {
+        if !server_face::handle_client(stream, request, state, clients, pubsub)? {
+            return Ok(false);
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"SELECT") && executor.is_some() {
+        if count != 2 {
+            stream.write_all(b"-ERR wrong number of arguments for 'select' command\r\n")?;
+        }
+        else if let Some(database) = parse_database(request.arguments[1]) {
+            *namespace = Namespace(format!("redis:{database}"));
+            state.record.set_database(database);
+            stream.write_all(b"+OK\r\n")?;
+        }
+        else {
+            stream.write_all(b"-ERR DB index is out of range\r\n")?;
+        }
+    }
+    else if command.eq_ignore_ascii_case(b"INFO") {
+        server_face::handle_info(stream, request, clients, pubsub, executor)?;
+    }
+    else if command.eq_ignore_ascii_case(b"CONFIG") {
+        server_face::handle_config(stream, request, clients)?;
+    }
+    else if command.eq_ignore_ascii_case(b"ACL") {
+        server_face::handle_acl(stream, request)?;
+    }
+    else if command.eq_ignore_ascii_case(b"COMMAND") {
+        server_face::handle_command(stream, request, state.protocol)?;
+    }
+    else if handle_string(stream, request, executor, probe, Some(tracker), namespace, state.protocol)? {
+        // 字符串与键族的回复已由 handle_string 写出。
+    }
+    else if collections::is_hyperloglog_command(command) {
+        collections::handle_hyperloglog(stream, request, executor, namespace)?;
+    }
+    else if collections::is_hash_command(command) {
+        collections::handle_hash(stream, request, executor, namespace, state.protocol)?;
+    }
+    else if collections::is_list_command(command) {
+        collections::handle_list(stream, request, executor, namespace, state.protocol, registry, !state.defer_blocking)?;
+    }
+    else if collections::is_set_command(command) {
+        collections::handle_set(stream, request, executor, namespace, state.protocol)?;
+    }
+    else if collections::is_zset_command(command) {
+        collections::handle_zset(stream, request, executor, namespace, state.protocol)?;
+    }
     else {
         write_unknown_command(stream, &request.arguments)?;
     }
@@ -3106,7 +3462,7 @@ fn respond(
 }
 
 /// 未知命令的真机文案：命令名之外还要回显参数前缀，末尾带一个空格。
-fn write_unknown_command(stream: &mut dyn Write, arguments: &[&[u8]]) -> io::Result<()> {
+pub(crate) fn write_unknown_command(stream: &mut dyn Write, arguments: &[&[u8]]) -> io::Result<()> {
     let name = String::from_utf8_lossy(&arguments[0]);
     let shown: Vec<String> =
         arguments[1..].iter().map(|argument| format!("'{}'", String::from_utf8_lossy(argument))).collect();

@@ -35,11 +35,14 @@ pub(crate) enum KeyKind {
     Set,
     /// 有序集合，成员与 `f64` 分数保存在一个值 blob 内，读取时按分数再按成员排序。
     ZSet,
+    /// 流，由下游流实现写入同一份键值存储；这里只用于类型探测、删除与枚举。
+    Stream,
 }
 
 impl KeyKind {
     /// 所有已知类型，按探测顺序排列（字符串优先，保持既有语义）。
-    pub(crate) const ALL: [KeyKind; 5] = [KeyKind::String, KeyKind::Hash, KeyKind::List, KeyKind::Set, KeyKind::ZSet];
+    pub(crate) const ALL: [KeyKind; 6] =
+        [KeyKind::String, KeyKind::Hash, KeyKind::List, KeyKind::Set, KeyKind::ZSet, KeyKind::Stream];
 
     /// `TYPE` 回复里使用的类型名。
     pub(crate) fn name(self) -> &'static str {
@@ -49,6 +52,7 @@ impl KeyKind {
             KeyKind::List => "list",
             KeyKind::Set => "set",
             KeyKind::ZSet => "zset",
+            KeyKind::Stream => "stream",
         }
     }
 
@@ -62,6 +66,7 @@ impl KeyKind {
             KeyKind::List => Namespace(format!("{}:list", base.0)),
             KeyKind::Set => Namespace(format!("{}:set", base.0)),
             KeyKind::ZSet => Namespace(format!("{}:zset", base.0)),
+            KeyKind::Stream => Namespace(format!("{}:stream", base.0)),
         }
     }
 }
@@ -386,8 +391,6 @@ pub(crate) fn is_zset_command(command: &[u8]) -> bool {
         b"ZINTERCARD",
         b"SORT",
         b"SORT_RO",
-        b"BITFIELD",
-        b"BITFIELD_RO",
     ] {
         if command.eq_ignore_ascii_case(name) {
             return true;
@@ -4107,7 +4110,7 @@ fn normalize_bitfield(value: i128, encoding: BitEncoding, overflow: BitOverflow)
 }
 
 /// 执行 `BITFIELD` / `BITFIELD_RO`。
-fn handle_bitfield(
+pub(crate) fn handle_bitfield(
     stream: &mut dyn io::Write,
     executor: &dyn KeyValueExecutor,
     base: &Namespace,
@@ -4188,9 +4191,6 @@ pub(crate) fn handle_zset(
     else {
         return write_error(stream, "unsupported command");
     };
-    if command.eq_ignore_ascii_case(b"BITFIELD") || command.eq_ignore_ascii_case(b"BITFIELD_RO") {
-        return handle_bitfield(stream, executor, base, &request.arguments, command.eq_ignore_ascii_case(b"BITFIELD_RO"));
-    }
     if command.eq_ignore_ascii_case(b"SORT") || command.eq_ignore_ascii_case(b"SORT_RO") {
         return handle_sort(stream, executor, base, &request.arguments, command.eq_ignore_ascii_case(b"SORT_RO"));
     }
