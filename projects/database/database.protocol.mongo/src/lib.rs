@@ -3,4 +3,5 @@
 
 pub mod bson;
 pub mod decimal128;
+pub mod json;
 pub mod wire;
