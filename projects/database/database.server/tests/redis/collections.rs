@@ -1687,6 +1687,8 @@ fn zset_lex_ranges_and_rank() {
     expect_array(&mut client, &["c", "b"]);
     send(&mut client, &["ZRANGEBYLEX", "lex", "-", "+", "WITHSCORES"]);
     expect_error(&mut client, "ERR syntax error, WITHSCORES not supported in combination with BYLEX");
+    send(&mut client, &["ZREVRANGEBYLEX", "lex", "+", "-", "WITHSCORES"]);
+    expect_error(&mut client, "ERR syntax error, WITHSCORES not supported in combination with BYLEX");
     send(&mut client, &["ZRANGEBYLEX", "lex", "a", "+"]);
     expect_error(&mut client, "ERR min or max not valid string range item");
     send(&mut client, &["ZRANGEBYLEX", "no-such-key", "-", "+"]);
@@ -2553,13 +2555,13 @@ fn zset_set_operations() {
     send(&mut client, &["ZDIFFSTORE", "dst", "2", "z2", "z3", "WITHSCORES"]);
     expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["ZINTERCARD", "0", "z2"]);
-    expect_error(&mut client, "ERR numkeys should be greater than 0");
+    expect_error(&mut client, "ERR at least 1 input key is needed for 'zintercard' command");
     send(&mut client, &["ZINTERCARD", "2", "z2"]);
-    expect_error(&mut client, "ERR Number of keys can't be greater than number of args");
+    expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["ZINTERCARD", "2", "z2", "z3", "LIMIT", "-1"]);
     expect_error(&mut client, "ERR LIMIT can't be negative");
     send(&mut client, &["ZINTERCARD", "2", "z2", "z3", "LIMIT", "x"]);
-    expect_error(&mut client, "ERR value is not an integer or out of range");
+    expect_error(&mut client, "ERR LIMIT can't be negative");
     send(&mut client, &["ZINTERCARD", "2", "z2", "z3", "LIMIT"]);
     expect_error(&mut client, "ERR syntax error");
 }
@@ -3202,7 +3204,7 @@ fn zset_family_options_ranges_and_pops() {
     send(&mut client, &["ZADD", "z", "GT", "LT", "1", "a"]);
     expect_error(&mut client, "ERR GT, LT, and/or NX options at the same time are not compatible");
     send(&mut client, &["ZADD", "z", "INCR", "1", "a", "2", "b"]);
-    expect_error(&mut client, "ERR syntax error");
+    expect_error(&mut client, "ERR INCR option supports a single increment-element pair");
     send(&mut client, &["ZADD", "z", "NX", "1"]);
     expect_error(&mut client, "ERR syntax error");
     send(&mut client, &["ZADD", "z"]);
@@ -3322,6 +3324,8 @@ fn zset_family_options_ranges_and_pops() {
     send(&mut client, &["ZPOPMIN", "p", "0"]);
     expect_empty_array(&mut client);
     send(&mut client, &["ZPOPMIN", "p", "-1"]);
+    expect_error(&mut client, "ERR value is out of range, must be positive");
+    send(&mut client, &["ZPOPMIN", "p", "x"]);
     expect_error(&mut client, "ERR value is out of range, must be positive");
     send(&mut client, &["ZPOPMIN", "p", "5"]);
     expect_array(&mut client, &["b", "2"]);

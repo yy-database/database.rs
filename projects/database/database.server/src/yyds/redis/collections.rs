@@ -3054,7 +3054,7 @@ fn parse_zadd_options(
         return Ok(None);
     }
     if options.incr && remaining != 2 {
-        write_error(stream, "syntax error")?;
+        write_error(stream, "INCR option supports a single increment-element pair")?;
         return Ok(None);
     }
     Ok(Some((options, index)))
@@ -4213,19 +4213,20 @@ pub(crate) fn handle_zset(
         }
         let Some(numkeys) = parse_positive_usize(request.arguments[1])
         else {
-            return write_error(stream, "numkeys should be greater than 0");
+            return write_error(stream, "at least 1 input key is needed for 'zintercard' command");
         };
         if request.arguments.len() < 2 + numkeys {
-            return write_error(stream, "Number of keys can't be greater than number of args");
+            return write_error(stream, "syntax error");
         }
         let keys: Vec<Vec<u8>> = request.arguments[2..2 + numkeys].iter().map(|key| key.to_vec()).collect();
         let mut limit: usize = 0;
         match request.arguments.len() - (2 + numkeys) {
             0 => {}
             2 if request.arguments[2 + numkeys].eq_ignore_ascii_case(b"LIMIT") => {
+                // 真机对非整数与负数统一回复「不能为负」。
                 let Some(value) = parse_index(request.arguments[3 + numkeys])
                 else {
-                    return write_error(stream, "value is not an integer or out of range");
+                    return write_error(stream, "LIMIT can't be negative");
                 };
                 if value < 0 {
                     return write_error(stream, "LIMIT can't be negative");
@@ -4714,8 +4715,8 @@ pub(crate) fn handle_zset(
         let count = if with_count {
             match parse_index(request.arguments[2]) {
                 Some(value) if value >= 0 => value as usize,
-                Some(_) => return write_error(stream, "value is out of range, must be positive"),
-                None => return write_error(stream, "value is not an integer or out of range"),
+                // 真机对非整数与负数使用同一条「必须为正」的提示。
+                _ => return write_error(stream, "value is out of range, must be positive"),
             }
         }
         else {
