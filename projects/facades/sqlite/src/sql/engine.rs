@@ -17,6 +17,7 @@ use crate::{
 };
 
 use super::{
+    datetime::{self, DateTimeFunction},
     error::SqlError,
     json_string,
     sql::{
@@ -9863,13 +9864,19 @@ fn in_result(value: &Cell, list: &[Cell], negated: bool) -> Cell {
 
 fn eval_function(name: ScalarFunction, args: &[Cell]) -> Cell {
     match name {
-        ScalarFunction::Abs => match numeric(&args[0]) {
-            None => Cell::Null,
-            Some(Number::Int(value)) => match value.checked_abs() {
+        // `abs()` 对整数保持整数，对实数与文本一律走二进制浮点，所以
+        // `typeof(abs('-7'))` 是 `real` 而不是 `integer`。
+        ScalarFunction::Abs => match &args[0] {
+            Cell::Null => Cell::Null,
+            Cell::Integer(value) => match value.checked_abs() {
                 Some(value) => Cell::Integer(value),
-                None => Cell::Real(-(value as f64)),
+                None => Cell::Real(-(*value as f64)),
             },
-            Some(Number::Real(value)) => Cell::Real(value.abs()),
+            cell => match numeric(cell) {
+                Some(Number::Int(value)) => Cell::Real((value as f64).abs()),
+                Some(Number::Real(value)) => Cell::Real(value.abs()),
+                None => Cell::Null,
+            },
         },
         ScalarFunction::Coalesce => args.iter().find(|cell| !matches!(cell, Cell::Null)).cloned().unwrap_or(Cell::Null),
         ScalarFunction::Length => match &args[0] {
@@ -9933,6 +9940,41 @@ fn eval_function(name: ScalarFunction, args: &[Cell]) -> Cell {
         ScalarFunction::Soundex => soundex_cell(&args[0]),
         ScalarFunction::Min => min_max_cell(args, false),
         ScalarFunction::Max => min_max_cell(args, true),
+        ScalarFunction::Ceil => integral_or_real(args, f64::ceil),
+        ScalarFunction::Floor => integral_or_real(args, f64::floor),
+        ScalarFunction::Trunc => integral_or_real(args, f64::trunc),
+        ScalarFunction::Sqrt => real_function(args, f64::sqrt),
+        ScalarFunction::Pow => real_function2(args, f64::powf),
+        ScalarFunction::Mod => real_function2(args, |left, right| left % right),
+        ScalarFunction::Exp => real_function(args, f64::exp),
+        ScalarFunction::Ln => positive_real_function(args, f64::ln),
+        ScalarFunction::Log => log_cell(args),
+        ScalarFunction::Log2 => positive_real_function(args, f64::log2),
+        ScalarFunction::Log10 => positive_real_function(args, f64::log10),
+        ScalarFunction::Sin => real_function(args, f64::sin),
+        ScalarFunction::Cos => real_function(args, f64::cos),
+        ScalarFunction::Tan => real_function(args, f64::tan),
+        ScalarFunction::Asin => real_function(args, f64::asin),
+        ScalarFunction::Acos => real_function(args, f64::acos),
+        ScalarFunction::Atan => real_function(args, f64::atan),
+        ScalarFunction::Atan2 => real_function2(args, f64::atan2),
+        ScalarFunction::Sinh => real_function(args, f64::sinh),
+        ScalarFunction::Cosh => real_function(args, f64::cosh),
+        ScalarFunction::Tanh => real_function(args, f64::tanh),
+        ScalarFunction::Asinh => real_function(args, f64::asinh),
+        ScalarFunction::Acosh => real_function(args, f64::acosh),
+        ScalarFunction::Atanh => real_function(args, f64::atanh),
+        ScalarFunction::Degrees => real_function(args, f64::to_degrees),
+        ScalarFunction::Radians => real_function(args, f64::to_radians),
+        ScalarFunction::Pi => Cell::Real(std::f64::consts::PI),
+        ScalarFunction::Sign => sign_cell(args),
+        ScalarFunction::Date => datetime::eval(DateTimeFunction::Date, args),
+        ScalarFunction::Time => datetime::eval(DateTimeFunction::Time, args),
+        ScalarFunction::Datetime => datetime::eval(DateTimeFunction::Datetime, args),
+        ScalarFunction::JulianDay => datetime::eval(DateTimeFunction::JulianDay, args),
+        ScalarFunction::UnixEpoch => datetime::eval(DateTimeFunction::UnixEpoch, args),
+        ScalarFunction::Strftime => datetime::eval(DateTimeFunction::Strftime, args),
+        ScalarFunction::Timediff => datetime::eval(DateTimeFunction::Timediff, args),
     }
 }
 
@@ -10593,6 +10635,139 @@ fn round_digits(value: f64, digits: i64) -> f64 {
     let text = if tie { increment_decimal(&short) } else { short };
     let rounded: f64 = text.parse().unwrap_or(magnitude);
     if value < 0.0 { -rounded } else { rounded }
+}
+
+/// 数学函数的取数口径：整数与实数原样，文本必须整体可解析为数值，`NULL`
+/// 与 blob 视为无值。SQLite 对文本套用 numeric affinity，因此 `'2abc'` 是
+/// `NULL` 而不是前缀 `2`。
+fn math_number(cell: &Cell) -> Option<Number> {
+    match cell {
+        Cell::Null => None,
+        Cell::Integer(value) => Some(Number::Int(*value)),
+        Cell::Real(value) => Some(Number::Real(*value)),
+        Cell::Text(text) => parse_full_number(text),
+        Cell::Blob(_) => None,
+    }
+}
+
+/// 整体解析一段文本：两端空白可有，中途出现任何非数值字符即拒绝。整数
+/// 字面量返回 [`Number::Int`]，带小数点或指数的返回 [`Number::Real`]。
+fn parse_full_number(text: &str) -> Option<Number> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return Some(Number::Int(value));
+    }
+    match trimmed.parse::<f64>() {
+        Ok(value) if value.is_finite() => Some(Number::Real(value)),
+        _ => None,
+    }
+}
+
+/// 数学结果统一出口：`NaN` 记为 `NULL`，正负无穷保留为实数，与 SQLite 的
+/// `sqlite3_result_double` 一致。
+fn real_result(value: f64) -> Cell {
+    if value.is_nan() { Cell::Null } else { Cell::Real(value) }
+}
+
+/// 一元数学函数：入参按 [`math_number`] 取数，输出恒为实数。
+fn real_function(args: &[Cell], function: fn(f64) -> f64) -> Cell {
+    match args.first().and_then(math_number) {
+        Some(Number::Int(value)) => real_result(function(value as f64)),
+        Some(Number::Real(value)) => real_result(function(value)),
+        None => Cell::Null,
+    }
+}
+
+/// 二元数学函数：两个入参都按 [`math_number`] 取数，输出恒为实数。
+fn real_function2(args: &[Cell], function: fn(f64, f64) -> f64) -> Cell {
+    let left = match args.first().and_then(math_number) {
+        Some(Number::Int(value)) => value as f64,
+        Some(Number::Real(value)) => value,
+        None => return Cell::Null,
+    };
+    let right = match args.get(1).and_then(math_number) {
+        Some(Number::Int(value)) => value as f64,
+        Some(Number::Real(value)) => value,
+        None => return Cell::Null,
+    };
+    real_result(function(left, right))
+}
+
+/// 定义域为正数的数学函数（`ln`、`log2`、`log10`）：非正入参返回 `NULL`，
+/// 不把 `-inf` 泄漏成实数。
+fn positive_real_function(args: &[Cell], function: fn(f64) -> f64) -> Cell {
+    let value = match args.first().and_then(math_number) {
+        Some(Number::Int(value)) => value as f64,
+        Some(Number::Real(value)) => value,
+        None => return Cell::Null,
+    };
+    if value <= 0.0 {
+        return Cell::Null;
+    }
+    real_result(function(value))
+}
+
+/// `ceil` / `floor` / `trunc`：整数入参原样返回整数，实数入参返回取整后的
+/// 实数，非数值文本与 `NULL` 返回 `NULL`。
+fn integral_or_real(args: &[Cell], function: fn(f64) -> f64) -> Cell {
+    match args.first().and_then(math_number) {
+        Some(Number::Int(value)) => Cell::Integer(value),
+        Some(Number::Real(value)) => real_result(function(value)),
+        None => Cell::Null,
+    }
+}
+
+/// `sign()`：返回 `-1`、`0` 或 `1`，恒为整数；入参不是数值时返回 `NULL`。
+fn sign_cell(args: &[Cell]) -> Cell {
+    match args.first().and_then(math_number) {
+        Some(Number::Int(value)) => Cell::Integer(value.signum()),
+        Some(Number::Real(value)) => {
+            let sign = if value > 0.0 {
+                1
+            }
+            else if value < 0.0 {
+                -1
+            }
+            else {
+                0
+            };
+            Cell::Integer(sign)
+        }
+        None => Cell::Null,
+    }
+}
+
+/// `log()`：单参是十进制对数，双参时底数必须大于 1 且真数必须为正，否则
+/// 返回 `NULL`（底数为 1 时 SQLite 同样返回 `NULL` 而不是无穷）。
+fn log_cell(args: &[Cell]) -> Cell {
+    if args.len() == 1 {
+        let value = match args.first().and_then(math_number) {
+            Some(Number::Int(value)) => value as f64,
+            Some(Number::Real(value)) => value,
+            None => return Cell::Null,
+        };
+        if value <= 0.0 {
+            return Cell::Null;
+        }
+        return real_result(value.log10());
+    }
+    let base = match args.first().and_then(math_number) {
+        Some(Number::Int(value)) => value as f64,
+        Some(Number::Real(value)) => value,
+        None => return Cell::Null,
+    };
+    let value = match args.get(1).and_then(math_number) {
+        Some(Number::Int(value)) => value as f64,
+        Some(Number::Real(value)) => value,
+        None => return Cell::Null,
+    };
+    if base <= 1.0 || value <= 0.0 {
+        return Cell::Null;
+    }
+    real_result(value.ln() / base.ln())
 }
 
 /// Increments the last decimal digit of a non-negative fixed-point string,
