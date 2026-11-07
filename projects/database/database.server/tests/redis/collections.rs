@@ -3468,6 +3468,9 @@ fn zset_family_options_ranges_and_pops() {
     assert_eq!(expect_integer(&mut client), 4);
     send(&mut client, &["ZADD", "score", "1.5", "half", "0.1", "tenth", "1", "one"]);
     assert_eq!(expect_integer(&mut client), 3);
+    // `2^62` 仍在整数路径上，超过后改走最短往返数字。
+    send(&mut client, &["ZADD", "score", "4611686018427387904", "edge", "4611686018427388928", "past"]);
+    assert_eq!(expect_integer(&mut client), 2);
     for (member, expected) in [
         ("tiny", "1e-20"),
         ("up", "inf"),
@@ -3476,6 +3479,8 @@ fn zset_family_options_ranges_and_pops() {
         ("half", "1.5"),
         ("tenth", "0.1"),
         ("one", "1"),
+        ("edge", "4611686018427387904"),
+        ("past", "4611686018427389000"),
     ] {
         send(&mut client, &["ZSCORE", "score", member]);
         expect_bulk(&mut client, Some(expected));
