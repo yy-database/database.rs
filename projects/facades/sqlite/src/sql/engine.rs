@@ -9921,7 +9921,432 @@ fn eval_function(name: ScalarFunction, args: &[Cell]) -> Cell {
             Some(true) => Cell::Null,
             _ => args[0].clone(),
         },
+        ScalarFunction::Printf => printf_cell(args),
+        ScalarFunction::Char => Cell::Text(args.iter().map(|cell| character_for_code(integer_argument(cell))).collect()),
+        ScalarFunction::Unicode => match &args[0] {
+            Cell::Null => Cell::Null,
+            cell => match cast_text(cell).chars().next() {
+                Some(character) => Cell::Integer(character as i64),
+                None => Cell::Null,
+            },
+        },
+        ScalarFunction::Soundex => soundex_cell(&args[0]),
+        ScalarFunction::Min => min_max_cell(args, false),
+        ScalarFunction::Max => min_max_cell(args, true),
     }
+}
+
+/// 多参数 `min` / `max`：任一参数为 `NULL` 时返回 `NULL`。`min` 在相等时
+/// 取后一个参数，`max` 在相等时保留前一个参数，与 SQLite 的比较循环一致。
+fn min_max_cell(args: &[Cell], want_max: bool) -> Cell {
+    if args.iter().any(|cell| matches!(cell, Cell::Null)) {
+        return Cell::Null;
+    }
+    let mut result = &args[0];
+    for candidate in &args[1..] {
+        let replace = if want_max {
+            compare_values(result, candidate, CompareOp::Lt) == Some(true)
+        } else {
+            compare_values(result, candidate, CompareOp::GtEq) == Some(true)
+        };
+        if replace {
+            result = candidate;
+        }
+    }
+    result.clone()
+}
+
+fn character_for_code(code: i64) -> char {
+    u32::try_from(code).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}')
+}
+
+/// `soundex`：首字母大写后按 SQLite 的分组追加数字，最多四位，不足补 `0`。
+fn soundex_cell(cell: &Cell) -> Cell {
+    let text = cast_text(cell);
+    let mut letters = text.chars().filter(|character| character.is_ascii_alphabetic());
+    let Some(first) = letters.next() else {
+        return Cell::Text("?000".to_string());
+    };
+    let mut encoded = String::new();
+    encoded.push(first.to_ascii_uppercase());
+    let mut previous = soundex_code(first);
+    for letter in letters {
+        let code = soundex_code(letter);
+        if code == 0 {
+            previous = 0;
+            continue;
+        }
+        if code != previous {
+            encoded.push((b'0' + code) as char);
+            if encoded.len() == 4 {
+                break;
+            }
+        }
+        previous = code;
+    }
+    while encoded.len() < 4 {
+        encoded.push('0');
+    }
+    Cell::Text(encoded)
+}
+
+fn soundex_code(character: char) -> u8 {
+    match character.to_ascii_uppercase() {
+        'B' | 'F' | 'P' | 'V' => 1,
+        'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => 2,
+        'D' | 'T' => 3,
+        'L' => 4,
+        'M' | 'N' => 5,
+        'R' => 6,
+        _ => 0,
+    }
+}
+
+fn integer_argument(cell: &Cell) -> i64 {
+    match cast_numeric(cell) {
+        Cell::Integer(value) => value,
+        Cell::Real(value) => value as i64,
+        _ => 0,
+    }
+}
+
+fn real_argument(cell: &Cell) -> f64 {
+    match cast_numeric(cell) {
+        Cell::Integer(value) => value as f64,
+        Cell::Real(value) => value,
+        _ => 0.0,
+    }
+}
+
+/// `printf` / `format`：`NULL` 格式串返回 `NULL`，位置参数写法同样返回 `NULL`。
+fn printf_cell(args: &[Cell]) -> Cell {
+    let Some(format) = text_form(&args[0]) else {
+        return Cell::Null;
+    };
+    if format.contains('$') {
+        return Cell::Null;
+    }
+    let characters: Vec<char> = format.chars().collect();
+    let mut output = String::new();
+    let mut index = 0usize;
+    let mut argument = 1usize;
+    while index < characters.len() {
+        if characters[index] != '%' {
+            output.push(characters[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index >= characters.len() {
+            output.push('%');
+            break;
+        }
+        if characters[index] == '%' {
+            output.push('%');
+            index += 1;
+            continue;
+        }
+        let mut flags = String::new();
+        while index < characters.len() && "-+ 0#".contains(characters[index]) {
+            flags.push(characters[index]);
+            index += 1;
+        }
+        let mut width = 0usize;
+        while index < characters.len() && characters[index].is_ascii_digit() {
+            width = width.saturating_mul(10).saturating_add((characters[index] as u8 - b'0') as usize);
+            index += 1;
+        }
+        let mut precision = None;
+        if index < characters.len() && characters[index] == '.' {
+            index += 1;
+            let mut digits = 0usize;
+            while index < characters.len() && characters[index].is_ascii_digit() {
+                digits = digits.saturating_mul(10).saturating_add((characters[index] as u8 - b'0') as usize);
+                index += 1;
+            }
+            precision = Some(digits);
+        }
+        while index < characters.len() && "lhL".contains(characters[index]) {
+            index += 1;
+        }
+        if index >= characters.len() {
+            output.push('%');
+            break;
+        }
+        let conversion = characters[index];
+        index += 1;
+        // `%n` 不消费参数也不产出字符，解析继续。
+        if conversion == 'n' {
+            continue;
+        }
+        if !"diufFeEgGxXocszqQwp".contains(conversion) {
+            // 未知转换终止解析：已有输出原样返回，否则整体为 NULL。
+            return if output.is_empty() { Cell::Null } else { Cell::Text(output) };
+        }
+        let cell = args.get(argument).cloned().unwrap_or(Cell::Null);
+        argument += 1;
+        let rendered = render_conversion(conversion, &cell, &flags, width, precision);
+        output.push_str(&rendered);
+    }
+    Cell::Text(output)
+}
+
+fn render_conversion(conversion: char, cell: &Cell, flags: &str, width: usize, precision: Option<usize>) -> String {
+    let left = flags.contains('-');
+    let zero = flags.contains('0') && !left;
+    let plus = flags.contains('+');
+    let space = flags.contains(' ');
+    let alternate = flags.contains('#');
+    match conversion {
+        'd' | 'i' => {
+            let value = integer_argument(cell);
+            let digits = format!("{}", value.unsigned_abs());
+            let digits = apply_integer_precision(digits, precision);
+            let sign = if value < 0 {
+                "-"
+            } else if plus {
+                "+"
+            } else if space {
+                " "
+            } else {
+                ""
+            };
+            pad_text(&format!("{sign}{digits}"), width, left, zero, sign.len())
+        }
+        'u' => {
+            let value = integer_argument(cell) as u64;
+            let digits = apply_integer_precision(value.to_string(), precision);
+            pad_text(&digits, width, left, zero, 0)
+        }
+        'x' | 'X' => {
+            let digits = format!("{:x}", integer_argument(cell) as u64);
+            let digits = apply_integer_precision(digits, precision);
+            let digits = if conversion == 'X' { digits.to_ascii_uppercase() } else { digits };
+            let prefix = if alternate && integer_argument(cell) != 0 {
+                if conversion == 'X' { "0X" } else { "0x" }
+            } else {
+                ""
+            };
+            pad_text(&format!("{prefix}{digits}"), width, left, zero, prefix.len())
+        }
+        'o' => {
+            let digits = format!("{:o}", integer_argument(cell) as u64);
+            let digits = apply_integer_precision(digits, precision);
+            let prefix = if alternate && !digits.starts_with('0') { "0" } else { "" };
+            pad_text(&format!("{prefix}{digits}"), width, left, zero, prefix.len())
+        }
+        'f' | 'F' => {
+            let value = real_argument(cell);
+            let keep = precision.unwrap_or(6);
+            let (integer, fraction) = fixed_parts(value.abs(), keep);
+            let mut body = integer;
+            if keep > 0 {
+                body.push('.');
+                body.push_str(&fraction);
+            } else if alternate {
+                body.push('.');
+            }
+            let sign = if value.is_sign_negative() || value < 0.0 {
+                "-"
+            } else if plus {
+                "+"
+            } else if space {
+                " "
+            } else {
+                ""
+            };
+            pad_text(&format!("{sign}{body}"), width, left, zero, sign.len())
+        }
+        'e' | 'E' => {
+            let value = real_argument(cell);
+            let keep = precision.unwrap_or(6);
+            let (integer, fraction, exponent) = scientific_parts(value.abs(), keep);
+            let letter = if conversion == 'E' { 'E' } else { 'e' };
+            let sign = if value.is_sign_negative() || value < 0.0 {
+                "-"
+            } else if plus {
+                "+"
+            } else if space {
+                " "
+            } else {
+                ""
+            };
+            let body = if fraction.is_empty() {
+                format!("{integer}{letter}{}{:02}", if exponent < 0 { '-' } else { '+' }, exponent.unsigned_abs())
+            } else {
+                format!("{integer}.{fraction}{letter}{}{:02}", if exponent < 0 { '-' } else { '+' }, exponent.unsigned_abs())
+            };
+            pad_text(&format!("{sign}{body}"), width, left, zero, sign.len())
+        }
+        'g' | 'G' => {
+            let value = real_argument(cell);
+            let significant = precision.unwrap_or(6).max(1);
+            let (integer, fraction, exponent) = scientific_parts(value.abs(), significant - 1);
+            let mut body = if exponent < -4 || exponent >= significant as i32 {
+                let fraction = trim_decimal_zeros(&fraction, alternate);
+                let letter = if conversion == 'G' { 'E' } else { 'e' };
+                let mantissa = if fraction.is_empty() { integer } else { format!("{integer}.{fraction}") };
+                format!("{mantissa}{letter}{}{:02}", if exponent < 0 { '-' } else { '+' }, exponent.unsigned_abs())
+            } else {
+                let keep = (significant as i32 - 1 - exponent).max(0) as usize;
+                let (integer, fraction) = fixed_parts(value.abs(), keep);
+                let fraction = trim_decimal_zeros(&fraction, alternate);
+                if fraction.is_empty() {
+                    if alternate {
+                        format!("{integer}.")
+                    } else {
+                        integer
+                    }
+                } else {
+                    format!("{integer}.{fraction}")
+                }
+            };
+            if conversion == 'G' {
+                body = body.to_ascii_uppercase();
+            }
+            let sign = if value.is_sign_negative() || value < 0.0 {
+                "-"
+            } else if plus {
+                "+"
+            } else if space {
+                " "
+            } else {
+                ""
+            };
+            pad_text(&format!("{sign}{body}"), width, left, zero, sign.len())
+        }
+        'c' => {
+            let first: String = cast_text(cell).chars().next().map(|character| character.to_string()).unwrap_or_else(|| "\u{0000}".to_string());
+            // 精度对 `%c` 表示重复次数，零与一都只输出一个字符。
+            let body = first.repeat(precision.unwrap_or(1).max(1));
+            // 字符串类转换忽略 `0` 标志，补位一律用空格。
+            pad_text(&body, width, left, false, 0)
+        }
+        's' | 'z' => {
+            let body = match (conversion, cell) {
+                ('z', Cell::Null) => String::new(),
+                _ => cast_text(cell),
+            };
+            let body = truncate_characters(body, precision);
+            pad_text(&body, width, left, false, 0)
+        }
+        'q' | 'w' => {
+            let body = match cell {
+                Cell::Null => "(NULL)".to_string(),
+                _ => {
+                    let text = truncate_characters(cast_text(cell), precision);
+                    if conversion == 'q' { text.replace('\'', "''") } else { text }
+                }
+            };
+            pad_text(&body, width, left, false, 0)
+        }
+        'Q' => {
+            let body = match cell {
+                Cell::Null => "NULL".to_string(),
+                _ => {
+                    let text = truncate_characters(cast_text(cell), precision);
+                    format!("'{}'", text.replace('\'', "''"))
+                }
+            };
+            pad_text(&body, width, left, false, 0)
+        }
+        'p' => {
+            let digits = format!("{:X}", integer_argument(cell) as u64);
+            let digits = apply_integer_precision(digits, precision);
+            let prefix = if alternate && integer_argument(cell) != 0 { "0x" } else { "" };
+            pad_text(&format!("{prefix}{digits}"), width, left, zero, prefix.len())
+        }
+        // SQLite 对未知转换按文本渲染，这里保持同样的宽松行为。
+        _ => pad_text(&cast_text(cell), width, left, zero, 0),
+    }
+}
+
+fn apply_integer_precision(digits: String, precision: Option<usize>) -> String {
+    match precision {
+        Some(minimum) if digits.len() < minimum => format!("{}{digits}", "0".repeat(minimum - digits.len())),
+        _ => digits,
+    }
+}
+
+fn truncate_characters(text: String, precision: Option<usize>) -> String {
+    match precision {
+        Some(limit) => text.chars().take(limit).collect(),
+        None => text,
+    }
+}
+
+fn pad_text(body: &str, width: usize, left: bool, zero: bool, prefix_len: usize) -> String {
+    if left {
+        let count = body.chars().count();
+        if count >= width {
+            return body.to_string();
+        }
+        return format!("{body}{}", " ".repeat(width - count));
+    }
+    if zero {
+        let prefix: String = body.chars().take(prefix_len).collect();
+        let rest: String = body.chars().skip(prefix_len).collect();
+        // 符号计入宽度，`0x` / 八进制前导 `0` 一类前缀不计入宽度。
+        let sign_like = prefix.starts_with('-') || prefix.starts_with('+') || prefix.starts_with(' ');
+        let measured = if sign_like { body.chars().count() } else { rest.chars().count() };
+        if measured >= width {
+            return body.to_string();
+        }
+        return format!("{prefix}{}{rest}", "0".repeat(width - measured));
+    }
+    let count = body.chars().count();
+    if count >= width {
+        return body.to_string();
+    }
+    format!("{}{body}", " ".repeat(width - count))
+}
+
+fn trim_decimal_zeros(fraction: &str, keep_zero: bool) -> String {
+    if keep_zero {
+        return fraction.to_string();
+    }
+    fraction.trim_end_matches('0').to_string()
+}
+
+/// 把 `value` 按十进制四舍五入到 `keep` 位小数，返回整数段与小数段。
+fn fixed_parts(value: f64, keep: usize) -> (String, String) {
+    let probe = format!("{value:.precision$}", precision = keep + 20);
+    let (probe_integer, probe_fraction) = probe.split_once('.').unwrap_or((probe.as_str(), ""));
+    let tail: String = probe_fraction.chars().skip(keep).collect();
+    if tail.starts_with('5') && tail.chars().skip(1).all(|character| character == '0') {
+        let mut digits: String = probe_integer.chars().chain(probe_fraction.chars().take(keep)).collect();
+        digits = increment_decimal(&digits);
+        let split = digits.len() - keep;
+        return (digits[..split].to_string(), digits[split..].to_string());
+    }
+    let rounded = format!("{value:.precision$}", precision = keep);
+    match rounded.split_once('.') {
+        Some((integer, fraction)) => (integer.to_string(), fraction.to_string()),
+        None => (rounded, String::new()),
+    }
+}
+
+/// 把 `value` 规格化为 `整数位.小数位 e 指数`，尾数按十进制四舍五入。
+fn scientific_parts(value: f64, keep: usize) -> (String, String, i32) {
+    if value == 0.0 {
+        return ("0".to_string(), "0".repeat(keep), 0);
+    }
+    let probe = format!("{value:.precision$e}", precision = keep + 20);
+    let (probe_mantissa, probe_exponent) = probe.split_once('e').unwrap_or((probe.as_str(), "0"));
+    let probe_digits: String = probe_mantissa.chars().filter(|character| character.is_ascii_digit()).collect();
+    let tail: String = probe_digits.chars().skip(keep + 1).collect();
+    let exponent: i32 = probe_exponent.parse().unwrap_or(0);
+    let digits = if tail.starts_with('5') && tail.chars().skip(1).all(|character| character == '0') {
+        increment_decimal(&probe_digits.chars().take(keep + 1).collect::<String>())
+    } else {
+        let rounded = format!("{value:.precision$e}", precision = keep);
+        rounded.split_once('e').map(|(mantissa, _)| mantissa.chars().filter(|character| character.is_ascii_digit()).collect()).unwrap_or_else(|| "0".to_string())
+    };
+    if digits.len() > keep + 1 {
+        let digit = digits.chars().take(keep + 1).collect::<String>();
+        return (digit[..1].to_string(), digit[1..].to_string(), exponent + 1);
+    }
+    (digits[..1].to_string(), digits[1..].to_string(), exponent)
 }
 
 /// `trim` 家族：按字符集去除两端字符，第二个参数缺省时只去除空格。

@@ -413,6 +413,18 @@ pub enum ScalarFunction {
     IfNull,
     /// `nullif(x, y)`，两者相等时返回 `NULL`，否则返回 `x`。
     NullIf,
+    /// `printf(format, ...)` / `format(format, ...)`，按 SQLite 的格式化规则渲染。
+    Printf,
+    /// `char(...)`，把整数码点拼成文本。
+    Char,
+    /// `unicode(x)`，返回首个字符的码点。
+    Unicode,
+    /// `soundex(x)`，按 SQLite 的 Soundex 规则编码。
+    Soundex,
+    /// 多参数 `min(a, b, ...)`，任一参数为 `NULL` 时返回 `NULL`。
+    Min,
+    /// 多参数 `max(a, b, ...)`，任一参数为 `NULL` 时返回 `NULL`。
+    Max,
 }
 
 impl ScalarFunction {
@@ -438,6 +450,12 @@ impl ScalarFunction {
             "replace" => Some(Self::Replace),
             "ifnull" => Some(Self::IfNull),
             "nullif" => Some(Self::NullIf),
+            "printf" | "format" => Some(Self::Printf),
+            "char" => Some(Self::Char),
+            "unicode" => Some(Self::Unicode),
+            "soundex" => Some(Self::Soundex),
+            "min" => Some(Self::Min),
+            "max" => Some(Self::Max),
             _ => None,
         }
     }
@@ -464,6 +482,12 @@ impl ScalarFunction {
             Self::Replace => "replace",
             Self::IfNull => "ifnull",
             Self::NullIf => "nullif",
+            Self::Printf => "printf",
+            Self::Char => "char",
+            Self::Unicode => "unicode",
+            Self::Soundex => "soundex",
+            Self::Min => "min",
+            Self::Max => "max",
         }
     }
 
@@ -479,6 +503,10 @@ impl ScalarFunction {
             Self::Trim | Self::Ltrim | Self::Rtrim => (1..=2).contains(&count),
             Self::Replace => count == 3,
             Self::IfNull | Self::NullIf => count == 2,
+            Self::Printf => count >= 1,
+            Self::Char => true,
+            Self::Unicode | Self::Soundex => count == 1,
+            Self::Min | Self::Max => count >= 2,
         }
     }
 }
@@ -2996,7 +3024,9 @@ impl<'a> Parser<'a> {
                 order,
             });
         }
-        if let Some(function) = aggregate {
+        // 多参数 `min` / `max` 是标量函数，单参数形式仍走聚合分支。
+        let scalar_min_max = args.len() > 1 && matches!(aggregate, Some(AggregateFunction::Min | AggregateFunction::Max));
+        if let Some(function) = aggregate.filter(|_| !scalar_min_max) {
             // Only `group_concat` takes the optional separator argument.
             let wanted = if function == AggregateFunction::GroupConcat { 1..=2 } else { 1..=1 };
             if !wanted.contains(&args.len()) {
