@@ -1400,12 +1400,19 @@ fn handle_object(
         || subcommand.eq_ignore_ascii_case(b"REFCOUNT")
         || subcommand.eq_ignore_ascii_case(b"FREQ")
         || subcommand.eq_ignore_ascii_case(b"ENCODING");
-    if !known || count != 3 {
+    if !known {
+        write_error(
+            stream,
+            &format!("unknown subcommand '{}'. Try OBJECT HELP.", String::from_utf8_lossy(subcommand)),
+        )?;
+        return Ok(());
+    }
+    if count != 3 {
         write_error(
             stream,
             &format!(
-                "Unknown subcommand or wrong number of arguments for '{}'. Try OBJECT HELP.",
-                String::from_utf8_lossy(subcommand)
+                "wrong number of arguments for 'object|{}' command",
+                String::from_utf8_lossy(subcommand).to_ascii_lowercase()
             ),
         )?;
         return Ok(());
@@ -1476,7 +1483,7 @@ fn object_encoding(kind: KeyKind, value: &[u8]) -> &'static str {
             if value.len() <= 20 && parse_integer(value).is_some() {
                 "int"
             }
-            else if value.len() <= 40 {
+            else if value.len() <= 36 {
                 "embstr"
             }
             else {
