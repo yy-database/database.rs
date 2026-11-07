@@ -3,7 +3,13 @@
 //! Two frontends reach the same executor: VOS (`prepare_vos`, `query_vos`,
 //! `execute_vos_write`) and SQL (`prepare_sql`, `query_sql`, `execute_sql_write`).
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, sync::Arc};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+use super::super::kv::lease::now_millis;
 
 use crate::engine::{
     Error, Result,
@@ -13,6 +19,43 @@ use database_query::local::{PreparedStatement, QueryRow, fingerprint as fp, prep
 use database_types::Value;
 
 use super::{Backend, Connection};
+
+/// 单条语句的阶段计时起点。
+///
+/// 原生目标用单调时钟 `Instant`。浏览器 WASM 目标上 `Instant::now()` 会
+/// panic（`wasm-pack --target web` 关掉了 std 时钟），因此改走租约路径
+/// `lease::now_millis` 的同一条 cfg 时钟，不再另造第二个时钟实现。
+#[cfg(not(target_arch = "wasm32"))]
+type Tick = Instant;
+
+/// 浏览器 WASM 下的计时起点：毫秒时间戳。
+#[cfg(target_arch = "wasm32")]
+type Tick = u64;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn tick() -> Tick {
+    Instant::now()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn tick() -> Tick {
+    now_millis()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn tick_nanos(started: Tick) -> u128 {
+    started.elapsed().as_nanos()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn tick_nanos(started: Tick) -> u128 {
+    // 租约时钟只有毫秒精度，换算回纳秒让 `*_ns` 字段保持同一单位。
+    now_millis().saturating_sub(started) as u128 * 1_000_000
+}
 
 impl Connection {
     fn object_resolver(&self) -> Arc<dyn database_query::local::ObjectResolver> {
@@ -124,9 +167,9 @@ impl Connection {
         values: &[Value],
         profile: &mut ReadProfile,
     ) -> Result<Vec<QueryRow>> {
-        let started = Instant::now();
+        let started = tick();
         let values = database_query::local::bind_ordered(stmt, values)?;
-        profile.bind_ns += started.elapsed().as_nanos();
+        profile.bind_ns += tick_nanos(started);
         self.run_prepared_read_profiled(stmt, &values, Some(profile))
     }
 
@@ -146,30 +189,30 @@ impl Connection {
         // would read less than the snapshot the caller expects.
         if self.has_open_transaction() {
             let state = self.active_state_unlocked()?;
-            let started = Instant::now();
+            let started = tick();
             self.check_schema_drift(stmt, &state)?;
             if let Some(profile) = profile.as_deref_mut() {
-                profile.drift_ns += started.elapsed().as_nanos();
+                profile.drift_ns += tick_nanos(started);
             }
             return self.execute_with_profiled(stmt, values, resolved_contract(&state)?, &state.records, profile);
         }
 
         // Phase one: metadata only. The decoded contract is what lets the
         // query layer prove which record-key window one statement can reach.
-        let started = Instant::now();
+        let started = tick();
         let metadata = self.read_state_metadata()?;
         if let Some(profile) = profile.as_deref_mut() {
-            profile.metadata_ns += started.elapsed().as_nanos();
+            profile.metadata_ns += tick_nanos(started);
         }
-        let started = Instant::now();
+        let started = tick();
         self.check_schema_drift(stmt, &metadata)?;
         if let Some(profile) = profile.as_deref_mut() {
-            profile.drift_ns += started.elapsed().as_nanos();
+            profile.drift_ns += tick_nanos(started);
         }
-        let started = Instant::now();
+        let started = tick();
         let window = database_query::local::read_window(&stmt.ops, resolved_contract(&metadata)?, values)?;
         if let Some(profile) = profile.as_deref_mut() {
-            profile.plan_ns += started.elapsed().as_nanos();
+            profile.plan_ns += tick_nanos(started);
         }
         let Some(window) = window
         else {
@@ -190,10 +233,10 @@ impl Connection {
         // Phase two: metadata plus the window, read as one pager transaction.
         // Table rows stay in the decoded page images; only metadata and, for
         // single-file images, the embedded object catalog are owned.
-        let started = Instant::now();
+        let started = tick();
         let (state, rows) = self.read_state_window_rows(&window, metadata)?;
         if let Some(profile) = profile.as_deref_mut() {
-            profile.window_read_ns += started.elapsed().as_nanos();
+            profile.window_read_ns += tick_nanos(started);
         }
         if schema_basis(&state) != basis {
             // The durable schema moved between the two reads, so the window
@@ -230,7 +273,7 @@ impl Connection {
         else {
             return self.execute_with(stmt, values, contract, records);
         };
-        let started = Instant::now();
+        let started = tick();
         let (rows, exec) = database_query::local::with_object_resolver(Some(self.object_resolver()), || {
             database_query::local::execute_prepared_profiled(stmt, values, Some(contract), records)
         })?;
@@ -265,7 +308,7 @@ impl Connection {
             })?;
             return Ok(out);
         };
-        let started = Instant::now();
+        let started = tick();
         let (out, exec) = database_query::local::with_object_resolver(Some(self.object_resolver()), || {
             database_query::local::execute_prepared_borrowed(stmt, values, Some(contract), records, &source, true)
         })?;
@@ -273,8 +316,8 @@ impl Connection {
         Ok(out)
     }
 
-    fn add_exec_profile(&self, profile: &mut ReadProfile, started: Instant, exec: &database_query::local::ExecProfile, row_count: usize) {
-        profile.exec_ns += started.elapsed().as_nanos();
+    fn add_exec_profile(&self, profile: &mut ReadProfile, started: Tick, exec: &database_query::local::ExecProfile, row_count: usize) {
+        profile.exec_ns += tick_nanos(started);
         profile.scanned_rows += row_count;
         profile.scan_ns += exec.scan_ns;
         profile.filter_ns += exec.filter_ns;
