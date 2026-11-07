@@ -5,38 +5,41 @@
 //!
 //! - 握手：`hello` / `isMaster` / `ismaster` / `ping`
 //! - 写入：`insert` / `delete`
-//! - 读取：`find` / `count` / `aggregate`（仅 `$match`、`$group`、`$project`）
+//! - 读取：`find` / `count` / `aggregate`
 //! - 游标：`getMore` / `killCursors`
 //!
-//! 与 MongoDB 参考实现（`mongo-core`）的固定语料对账基线在
-//! `tests/mongo/reconcile.rs`：38 条语料中 34 条逐字节一致。以下差异按「已知差异」
-//! 固化在测试里，当前不补实现——补 `update` 或索引属于命令层是否上收的结构裁决：
+//! 命令语义全部由上游 `mongo` 门面的命令层提供，本模块只做 OP_MSG / OP_QUERY
+//! 编解码并注入 `MongoStorage` 后端（`storage::ExecutorStorage`）。固定语料对账
+//! 基线在 `tests/mongo/reconcile.rs`：38 条语料中 35 条逐字节一致，3 条为已记录
+//! 在案的能力差异，当前不补实现：
 //!
 //! - 不实现 `update`，该命令与替换式更新都只回通用的 `59 unsupported`。
-//! - 不实现索引（`createIndexes`），唯一性只在 `_id` 上由网关自己维护。因此唯一
-//!   索引与 `{a: []}` 触发的 `undefined` 键路径无法在本网关触发。
-//! - `aggregate` 遇到未支持 stage 时 `errmsg` 只回 stage 名（如 `$out`），参考
-//!   实现会在 `errmsg` 里附支持列表。
+//! - 不实现索引（`createIndexes`），因此唯一索引与 `{a: []}` 触发的 `undefined`
+//!   键路径无法在本网关触发。
 #![warn(missing_docs)]
 
 use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    sync::{Mutex, MutexGuard, OnceLock, atomic::Ordering as AtomicOrdering},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{Mutex, MutexGuard, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use database_execution::cluster::KeyValueExecutor;
+use mongo::{
+    commands::{self, CommandError},
+    cursor::CursorStore,
+    storage::MongoStorage,
+};
 
 pub mod connection;
 pub mod service;
+mod storage;
 
 /// BSON 编解码（来自 `database-protocol-mongo`）。
 pub use database_protocol_mongo::bson;
 /// OP_MSG / OP_QUERY 组帧（来自 `database-protocol-mongo`）。
 pub use database_protocol_mongo::wire;
 
-use bson::{BsonDocument, BsonValue, encode_bson, parse_bson, value_to_key};
+use bson::{BsonDocument, BsonValue, encode_bson, parse_bson};
 
 /// Gateway kind implemented by this crate.
 pub const GATEWAY_KIND: database_protocol::GatewayKind = database_protocol::GatewayKind::Mongo;
@@ -120,6 +123,35 @@ pub fn handle_op_query(op_query_body: &[u8], executor: Option<&dyn KeyValueExecu
     dispatch_command(&bson_doc, executor)
 }
 
+/// 全网关共享的游标表，游标编号由门面的命令层分配。
+static CURSORS: OnceLock<Mutex<CursorStore>> = OnceLock::new();
+
+fn cursors() -> MutexGuard<'static, CursorStore> {
+    CURSORS.get_or_init(|| Mutex::new(CursorStore::default())).lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// 把门面返回的命令文档或错误文档编码成应答帧。
+fn render(result: Result<BsonDocument, CommandError>) -> Vec<u8> {
+    match result {
+        Ok(document) => encode_bson(&document),
+        Err(error) => encode_bson(&commands::error_document(&error)),
+    }
+}
+
+/// 在 `KeyValueExecutor` 适配器上执行一条门面命令。
+fn run(
+    executor: Option<&dyn KeyValueExecutor>,
+    command: &str,
+    apply: impl FnOnce(&dyn MongoStorage) -> Result<BsonDocument, CommandError>,
+) -> Vec<u8> {
+    let Some(executor) = executor
+    else {
+        return build_error_bson(2, &format!("{command} requires an executor"));
+    };
+    let storage = storage::ExecutorStorage::new(executor);
+    render(apply(&storage))
+}
+
 /// Routes one decoded command document to its handler.
 fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
     let Some(command_name) = bson_doc.command_name()
@@ -130,13 +162,21 @@ fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecu
     match command_name {
         "hello" | "isMaster" | "ismaster" => build_hello_bson(),
         "ping" => build_ok_bson(1),
-        "insert" => handle_insert(bson_doc, executor),
-        "find" => handle_find(bson_doc, executor),
-        "count" => handle_count(bson_doc, executor),
-        "aggregate" => handle_aggregate(bson_doc, executor),
-        "delete" => handle_delete(bson_doc, executor),
-        "getMore" => handle_get_more(bson_doc),
-        "killCursors" => handle_kill_cursors(bson_doc),
+        "insert" => run(executor, "insert", |storage| commands::insert(bson_doc, storage)),
+        "find" => {
+            let Some(executor) = executor
+            else {
+                return build_error_bson(2, "find requires an executor");
+            };
+            let storage = storage::ExecutorStorage::new(executor);
+            let mut cursor_store = cursors();
+            render(commands::find(bson_doc, &storage, &mut cursor_store))
+        }
+        "count" => run(executor, "count", |storage| commands::count(bson_doc, storage)),
+        "aggregate" => run(executor, "aggregate", |storage| commands::aggregate(bson_doc, storage)),
+        "delete" => run(executor, "delete", |storage| commands::delete(bson_doc, storage)),
+        "getMore" => render(commands::get_more(bson_doc, &mut cursors())),
+        "killCursors" => render(commands::kill_cursors(bson_doc, &mut cursors())),
         other => generic_error_body(other),
     }
 }
@@ -282,11 +322,6 @@ fn code_name(code: i32) -> Option<&'static str> {
     }
 }
 
-/// 写入应答的成功标记是 `ok: 1.0`（double），不是整数。
-fn write_ok() -> BsonValue {
-    BsonValue::Double(1.0)
-}
-
 /// A minimal BSON error document returned for commands we deliberately reject.
 /// Kept minimal (`errmsg: "unsupported"`) so existing handshake tests still pass.
 pub fn generic_error_body(_command: &str) -> Vec<u8> {
@@ -294,775 +329,8 @@ pub fn generic_error_body(_command: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// insert
-// ---------------------------------------------------------------------------
-
-/// Renders an `_id` value the way MongoDB's duplicate-key message does.
-fn describe_id(value: &BsonValue) -> String {
-    match value {
-        BsonValue::String(text) => format!("\"{text}\""),
-        BsonValue::Int32(number) => number.to_string(),
-        BsonValue::Int64(number) => number.to_string(),
-        BsonValue::ObjectId(bytes) => {
-            let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-            format!("ObjectId('{hex}')")
-        }
-        other => format!("{other:?}"),
-    }
-}
-
-fn handle_insert(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
-    let Some(executor) = executor
-    else {
-        return build_error_bson(2, "insert requires an executor");
-    };
-
-    let Some(ns) = namespace_from_command(doc, "insert")
-    else {
-        return build_error_bson(73, "insert command missing collection name");
-    };
-
-    let Some(BsonValue::Array(docs)) = doc.get("documents")
-    else {
-        return build_error_bson(2, "insert requires a 'documents' array");
-    };
-
-    // MongoDB defaults to an ordered insert and only continues past a failed
-    // document when the client explicitly asks for `ordered: false`.
-    let ordered = match doc.get("ordered") {
-        Some(BsonValue::Bool(ordered)) => *ordered,
-        _ => true,
-    };
-
-    let mut inserted: i64 = 0;
-    let mut write_errors = BsonDocument::new();
-
-    for (idx, item) in docs.iter().enumerate() {
-        match item {
-            BsonValue::Document(sub) => {
-                let mut doc_with_id = sub.clone();
-                let has_id = doc_with_id.fields.iter().any(|(k, _)| k == "_id");
-                if !has_id {
-                    doc_with_id.push("_id".to_string(), BsonValue::ObjectId(generate_object_id()));
-                }
-                let Some(id_val) = doc_with_id.fields.iter().find(|(k, _)| k == "_id").map(|(_, v)| v.clone())
-                else {
-                    continue;
-                };
-                let key = value_to_key(&id_val);
-
-                // MongoDB's `_id` is a unique key: a repeated value is a duplicate-key
-                // error, not an overwrite. Emulated writes go through a plain Put, so the
-                // check has to be explicit before writing.
-                match executor.execute(
-                    None,
-                    database_query::cluster_kv::KeyValueCommand {
-                        namespace: ns.clone(),
-                        key: key.clone(),
-                        action: database_query::cluster_kv::KeyValueAction::Get,
-                    },
-                ) {
-                    Ok(database_query::cluster_kv::KeyValueResult::Get(Some(_))) => {
-                        let mut err = BsonDocument::new();
-                        err.push("index".to_string(), BsonValue::Int32(idx as i32));
-                        err.push("code".to_string(), BsonValue::Int32(11000));
-                        err.push(
-                            "errmsg".to_string(),
-                            BsonValue::String(format!(
-                                "E11000 duplicate key error collection: {} index: _id_ dup key: {{ _id: {} }}",
-                                namespace_string(doc, "insert"),
-                                describe_id(&id_val)
-                            )),
-                        );
-                        let mut key_pattern = BsonDocument::new();
-                        key_pattern.push("_id".to_string(), BsonValue::Int32(1));
-                        err.push("keyPattern".to_string(), BsonValue::Document(key_pattern));
-                        let mut key_value = BsonDocument::new();
-                        key_value.push("_id".to_string(), id_val);
-                        err.push("keyValue".to_string(), BsonValue::Document(key_value));
-                        write_errors.push(format!("err{idx}"), BsonValue::Document(err));
-                        if ordered {
-                            break;
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                let payload = encode_bson(&doc_with_id);
-                let result = executor.execute(
-                    None,
-                    database_query::cluster_kv::KeyValueCommand {
-                        namespace: ns.clone(),
-                        key,
-                        action: database_query::cluster_kv::KeyValueAction::Put(payload),
-                    },
-                );
-                match result {
-                    Ok(database_query::cluster_kv::KeyValueResult::Put { .. }) => inserted += 1,
-                    _ => {
-                        let mut err = BsonDocument::new();
-                        err.push("index".to_string(), BsonValue::Int32(idx as i32));
-                        err.push("errmsg".to_string(), BsonValue::String("insert failed".to_string()));
-                        write_errors.push(format!("err{idx}"), BsonValue::Document(err));
-                        if ordered {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {
-                let mut err = BsonDocument::new();
-                err.push("index".to_string(), BsonValue::Int32(idx as i32));
-                err.push("errmsg".to_string(), BsonValue::String("documents must be objects".to_string()));
-                write_errors.push(format!("err{idx}"), BsonValue::Document(err));
-                if ordered {
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut resp = BsonDocument::new();
-    resp.push("n".to_string(), count_value(inserted));
-    if !write_errors.fields.is_empty() {
-        let err_list: Vec<BsonValue> = write_errors.fields.into_iter().map(|(_, v)| v).collect();
-        resp.push("writeErrors".to_string(), BsonValue::Array(err_list));
-    }
-    resp.push("ok".to_string(), write_ok());
-    encode_bson(&resp)
-}
-
-// ---------------------------------------------------------------------------
-// find
-// ---------------------------------------------------------------------------
-
-fn handle_find(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
-    let Some(executor) = executor
-    else {
-        return build_error_bson(2, "find requires an executor");
-    };
-
-    let Some(ns) = namespace_from_command(doc, "find")
-    else {
-        return build_error_bson(73, "find command missing collection name");
-    };
-
-    let filter = match doc.get("filter") {
-        Some(BsonValue::Document(filter)) => filter.clone(),
-        _ => BsonDocument::new(),
-    };
-    let sort = parse_sort(doc.get("sort"));
-    let skip = parse_count(doc.get("skip"));
-    let limit = parse_count(doc.get("limit"));
-    let batch_size = parse_count(doc.get("batchSize"));
-
-    let mut documents = collect_matching(executor, &ns, &filter);
-    sort_documents(&mut documents, &sort);
-
-    let start = skip.min(documents.len());
-    let end = if limit > 0 { (start + limit).min(documents.len()) } else { documents.len() };
-    let mut window: Vec<BsonValue> = documents.into_iter().skip(start).take(end - start).map(BsonValue::Document).collect();
-
-    let namespace = namespace_string(doc, "find");
-    let cursor_id = if batch_size > 0 && window.len() > batch_size {
-        let remaining = window.split_off(batch_size);
-        let id = NEXT_CURSOR_ID.fetch_add(1, AtomicOrdering::Relaxed);
-        let mut cursors = lock_cursors();
-        cursors.retain(|_, state| state.last_used.elapsed() < CURSOR_IDLE_TIMEOUT);
-        cursors.insert(id, CursorState { namespace: namespace.clone(), remaining, last_used: Instant::now() });
-        id
-    }
-    else {
-        0
-    };
-
-    encode_cursor_reply(&namespace, "firstBatch", window, cursor_id)
-}
-
-/// Answers `count`, which `estimated_document_count` and direct `db.command`
-/// calls use. `query` reuses the same matcher as `find`.
-fn handle_count(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
-    let Some(executor) = executor
-    else {
-        return build_error_bson(2, "count requires an executor");
-    };
-
-    let Some(ns) = namespace_from_command(doc, "count")
-    else {
-        return build_error_bson(73, "count command missing collection name");
-    };
-
-    let filter = match doc.get("query") {
-        Some(BsonValue::Document(filter)) => filter.clone(),
-        _ => BsonDocument::new(),
-    };
-    let skip = parse_count(doc.get("skip"));
-    let limit = parse_count(doc.get("limit"));
-
-    let matched = collect_matching(executor, &ns, &filter).len();
-    let start = skip.min(matched);
-    let end = if limit > 0 { (start + limit).min(matched) } else { matched };
-
-    let mut resp = BsonDocument::new();
-    resp.push("n".to_string(), count_value((end - start) as i64));
-    resp.push("ok".to_string(), write_ok());
-    encode_bson(&resp)
-}
-
-/// Runs the aggregation stages this gateway serves: `$match`, `$group` with a
-/// constant `_id` and a `$sum: 1` accumulator, and `$project` field selection.
-///
-/// Every other stage answers `59` on purpose, so a caller can tell "this stage
-/// is not implemented" from "the pipeline matched nothing".
-fn handle_aggregate(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
-    let Some(executor) = executor
-    else {
-        return build_error_bson(2, "aggregate requires an executor");
-    };
-
-    let Some(ns) = namespace_from_command(doc, "aggregate")
-    else {
-        return build_error_bson(73, "aggregate command missing collection name");
-    };
-
-    let stages = match doc.get("pipeline") {
-        Some(BsonValue::Array(stages)) => stages,
-        _ => return build_error_bson(2, "aggregate requires a pipeline array"),
-    };
-
-    let mut documents = collect_matching(executor, &ns, &BsonDocument::new());
-    for stage in stages {
-        let stage_doc = match stage {
-            BsonValue::Document(stage_doc) => stage_doc,
-            _ => return build_error_bson(59, "aggregate stage must be a document"),
-        };
-        let Some((name, body)) = stage_doc.fields.first()
-        else {
-            return build_error_bson(59, "aggregate stage is empty");
-        };
-        match name.as_str() {
-            "$match" => {
-                let BsonValue::Document(filter) = body
-                else {
-                    return build_error_bson(59, "$match requires a document");
-                };
-                documents.retain(|document| document_matches(document, filter));
-            }
-            "$group" => {
-                let BsonValue::Document(spec) = body
-                else {
-                    return build_error_bson(59, "$group requires a document");
-                };
-                match group_documents(&documents, spec) {
-                    Ok(grouped) => documents = grouped,
-                    Err(message) => return build_error_bson(59, &message),
-                }
-            }
-            "$project" => {
-                let BsonValue::Document(spec) = body
-                else {
-                    return build_error_bson(59, "$project requires a document");
-                };
-                documents = documents.iter().map(|document| project_document(document, spec)).collect();
-            }
-            other => return build_error_bson(59, other),
-        }
-    }
-
-    let namespace = namespace_string(doc, "aggregate");
-    encode_cursor_reply(&namespace, "firstBatch", documents.into_iter().map(BsonValue::Document).collect(), 0)
-}
-
-/// Returns the batch requested by a following `getMore`, draining the stored cursor.
-fn handle_get_more(doc: &BsonDocument) -> Vec<u8> {
-    let Some(cursor_id) = doc.get("getMore").and_then(int_value)
-    else {
-        return build_error_bson(2, "getMore requires a cursor id");
-    };
-    let batch_size = parse_count(doc.get("batchSize"));
-
-    let mut cursors = lock_cursors();
-    cursors.retain(|_, state| state.last_used.elapsed() < CURSOR_IDLE_TIMEOUT);
-    let Some(state) = cursors.get_mut(&cursor_id)
-    else {
-        return build_error_bson(43, &format!("cursor id {cursor_id} not found"));
-    };
-    state.last_used = Instant::now();
-    let take = if batch_size > 0 { batch_size.min(state.remaining.len()) } else { state.remaining.len() };
-    let namespace = state.namespace.clone();
-    let batch: Vec<BsonValue> = state.remaining.drain(..take).collect();
-    let drained = state.remaining.is_empty();
-    if drained {
-        cursors.remove(&cursor_id);
-    }
-    drop(cursors);
-
-    encode_cursor_reply(&namespace, "nextBatch", batch, if drained { 0 } else { cursor_id })
-}
-
-/// Drops the cursors a driver closed. The gateway does not need the collection
-/// name because cursor ids are globally unique.
-fn handle_kill_cursors(doc: &BsonDocument) -> Vec<u8> {
-    let ids = match doc.get("cursors") {
-        Some(BsonValue::Array(ids)) => ids.clone(),
-        _ => Vec::new(),
-    };
-    let mut killed = Vec::new();
-    let mut not_found = Vec::new();
-    let mut cursors = lock_cursors();
-    for id in ids.iter().filter_map(int_value) {
-        if cursors.remove(&id).is_some() {
-            killed.push(BsonValue::Int64(id));
-        }
-        else {
-            not_found.push(BsonValue::Int64(id));
-        }
-    }
-
-    let mut resp = BsonDocument::new();
-    resp.push("cursorsKilled".to_string(), BsonValue::Array(killed));
-    resp.push("cursorsNotFound".to_string(), BsonValue::Array(not_found));
-    resp.push("cursorsAlive".to_string(), BsonValue::Array(Vec::new()));
-    resp.push("cursorsUnknown".to_string(), BsonValue::Array(Vec::new()));
-    resp.push("ok".to_string(), BsonValue::Int32(1));
-    encode_bson(&resp)
-}
-
-/// Builds the `cursor` sub-document shared by `find` (`firstBatch`) and
-/// `getMore` (`nextBatch`).
-fn encode_cursor_reply(namespace: &str, batch_key: &str, batch: Vec<BsonValue>, cursor_id: i64) -> Vec<u8> {
-    let mut cursor = BsonDocument::new();
-    cursor.push(batch_key.to_string(), BsonValue::Array(batch));
-    cursor.push("id".to_string(), BsonValue::Int64(cursor_id));
-    cursor.push("ns".to_string(), BsonValue::String(namespace.to_string()));
-
-    let mut resp = BsonDocument::new();
-    resp.push("ok".to_string(), BsonValue::Int32(1));
-    resp.push("cursor".to_string(), BsonValue::Document(cursor));
-    encode_bson(&resp)
-}
-
-/// Reads every document the filter accepts, using the `_id` key directly when
-/// the filter is a plain `_id` equality.
-fn collect_matching(executor: &dyn KeyValueExecutor, ns: &database_types::cluster::Namespace, filter: &BsonDocument) -> Vec<BsonDocument> {
-    if let Some(id_value) = single_id_lookup(filter) {
-        let key = value_to_key(id_value);
-        return match executor.execute(
-            None,
-            database_query::cluster_kv::KeyValueCommand { namespace: ns.clone(), key, action: database_query::cluster_kv::KeyValueAction::Get },
-        ) {
-            Ok(database_query::cluster_kv::KeyValueResult::Get(Some(bytes))) => match parse_bson(&bytes) {
-                Ok(document) if document_matches(&document, filter) => vec![document],
-                _ => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
-    }
-
-    let results = executor.execute_scan(None, ns, b"", None, None, 0).unwrap_or_default();
-    let mut documents = Vec::new();
-    for (_key, value) in results {
-        if let Ok(candidate) = parse_bson(&value) {
-            if document_matches(&candidate, filter) {
-                documents.push(candidate);
-            }
-        }
-    }
-    documents
-}
-
-/// Returns the `_id` value when the filter is exactly one `_id` equality
-/// without query operators.
-fn single_id_lookup(filter: &BsonDocument) -> Option<&BsonValue> {
-    if filter.fields.len() != 1 {
-        return None;
-    }
-    let (key, value) = filter.fields.first()?;
-    if key != "_id" {
-        return None;
-    }
-    match value {
-        BsonValue::Document(operators) if operators.fields.iter().any(|(op, _)| op.starts_with('$')) => None,
-        _ => Some(value),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// filter, sort and window helpers
-// ---------------------------------------------------------------------------
-
-/// Applies a `$group` stage with a constant `_id` and `$sum: 1` accumulators.
-/// An empty input produces an empty result, exactly like a real server.
-fn group_documents(documents: &[BsonDocument], spec: &BsonDocument) -> Result<Vec<BsonDocument>, String> {
-    let Some(id) = spec.get("_id")
-    else {
-        return Err("$group requires an `_id` expression".to_string());
-    };
-    if matches!(id, BsonValue::Document(_) | BsonValue::Array(_)) {
-        return Err("$group only supports a constant `_id`".to_string());
-    }
-
-    let mut counters: Vec<String> = Vec::new();
-    for (field, accumulator) in spec.fields.iter().filter(|(field, _)| field != "_id") {
-        let BsonValue::Document(accumulator) = accumulator
-        else {
-            return Err(format!("$group field `{field}` is not a `$sum` accumulator"));
-        };
-        match accumulator.get("$sum") {
-            Some(BsonValue::Int32(1) | BsonValue::Int64(1)) => counters.push(field.clone()),
-            Some(_) => return Err(format!("$group field `{field}` only supports `$sum: 1`")),
-            None => return Err(format!("$group field `{field}` is not a `$sum` accumulator")),
-        }
-    }
-    if counters.is_empty() {
-        return Err("$group requires at least one `$sum` accumulator".to_string());
-    }
-    if documents.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut grouped = BsonDocument::new();
-    grouped.push("_id".to_string(), id.clone());
-    for field in counters {
-        let count = documents.len() as i64;
-        grouped.push(field, count_value(count));
-    }
-    Ok(vec![grouped])
-}
-
-fn count_value(count: i64) -> BsonValue {
-    i32::try_from(count).map(BsonValue::Int32).unwrap_or(BsonValue::Int64(count))
-}
-
-/// Applies a `$project` stage: inclusion (`field: 1`) keeps only the listed
-/// fields plus `_id`, exclusion (`field: 0`) drops the listed fields.
-fn project_document(document: &BsonDocument, spec: &BsonDocument) -> BsonDocument {
-    let inclusion_only = spec.fields.iter().any(|(field, rule)| field != "_id" && rule_is_inclusion(rule));
-    let id_excluded = spec.get("_id").map(rule_is_exclusion).unwrap_or(false);
-    let mut projected = BsonDocument::new();
-    for (field, value) in document.fields.iter() {
-        let keep = match spec.get(field) {
-            Some(rule) if rule_is_inclusion(rule) => true,
-            Some(_) => false,
-            None if field == "_id" => !id_excluded,
-            None => !inclusion_only,
-        };
-        if keep {
-            projected.push(field.clone(), value.clone());
-        }
-    }
-    projected
-}
-
-fn rule_is_inclusion(value: &BsonValue) -> bool {
-    matches!(value, BsonValue::Int32(1) | BsonValue::Int64(1) | BsonValue::Bool(true))
-        || matches!(value, BsonValue::Double(number) if *number == 1.0)
-}
-
-fn rule_is_exclusion(value: &BsonValue) -> bool {
-    matches!(value, BsonValue::Int32(0) | BsonValue::Int64(0) | BsonValue::Bool(false))
-        || matches!(value, BsonValue::Double(number) if *number == 0.0)
-}
-
-/// Parses the `sort` document into `(field, direction)` pairs, ignoring
-/// anything that is not a numeric direction.
-fn parse_sort(sort: Option<&BsonValue>) -> Vec<(String, i32)> {
-    match sort {
-        Some(BsonValue::Document(document)) => document
-            .fields
-            .iter()
-            .filter_map(|(field, direction)| int_value(direction).filter(|value| *value != 0).map(|value| (field.clone(), value as i32)))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn sort_documents(documents: &mut [BsonDocument], sort: &[(String, i32)]) {
-    if sort.is_empty() {
-        return;
-    }
-    documents.sort_by(|left, right| compare_documents(left, right, sort));
-}
-
-fn compare_documents(left: &BsonDocument, right: &BsonDocument, sort: &[(String, i32)]) -> Ordering {
-    for (field, direction) in sort {
-        let ordering = match (lookup_field(left, field), lookup_field(right, field)) {
-            (Some(left), Some(right)) => compare_values(left, right),
-            (Some(_), None) => Ordering::Greater,
-            (None, Some(_)) => Ordering::Less,
-            (None, None) => Ordering::Equal,
-        };
-        if ordering != Ordering::Equal {
-            return if *direction < 0 { ordering.reverse() } else { ordering };
-        }
-    }
-    Ordering::Equal
-}
-
-/// Returns whether a document satisfies every equality / comparison predicate.
-/// One level of dotted nesting (`a.b`) is supported, which covers the document
-/// shapes this gateway stores.
-fn document_matches(document: &BsonDocument, filter: &BsonDocument) -> bool {
-    for (field, expected) in &filter.fields {
-        let (path, entry) = match expected {
-            BsonValue::Document(operators) if operators.fields.iter().any(|(op, _)| op.starts_with('$')) => (field.as_str(), Some(operators)),
-            _ => (field.as_str(), None),
-        };
-        let actual = lookup_field(document, path);
-        match entry {
-            Some(operators) => {
-                for (operator, operand) in &operators.fields {
-                    let matched = match operator.as_str() {
-                        "$eq" => values_equal(actual, operand),
-                        "$ne" => !values_equal(actual, operand),
-                        "$gt" => actual.map(|value| compare_values(value, operand)) == Some(Ordering::Greater),
-                        "$gte" => matches!(actual.map(|value| compare_values(value, operand)), Some(Ordering::Greater | Ordering::Equal)),
-                        "$lt" => actual.map(|value| compare_values(value, operand)) == Some(Ordering::Less),
-                        "$lte" => matches!(actual.map(|value| compare_values(value, operand)), Some(Ordering::Less | Ordering::Equal)),
-                        _ => false,
-                    };
-                    if !matched {
-                        return false;
-                    }
-                }
-            }
-            None => {
-                if !values_equal(actual, expected) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-fn lookup_field<'a>(document: &'a BsonDocument, path: &str) -> Option<&'a BsonValue> {
-    if let Some(value) = document.get(path) {
-        return Some(value);
-    }
-    let (head, tail) = path.split_once('.')?;
-    match document.get(head)? {
-        BsonValue::Document(inner) => inner.get(tail),
-        _ => None,
-    }
-}
-
-fn values_equal(actual: Option<&BsonValue>, expected: &BsonValue) -> bool {
-    match (actual, expected) {
-        (None, BsonValue::Null) => true,
-        (None, _) => false,
-        (Some(left), right) => match (left, right) {
-            (BsonValue::Document(left), BsonValue::Document(right)) => encode_bson(left) == encode_bson(right),
-            (BsonValue::Array(left), BsonValue::Array(right)) => {
-                left.len() == right.len() && left.iter().zip(right.iter()).all(|(left, right)| values_equal(Some(left), right))
-            }
-            (BsonValue::Null, BsonValue::Null) => true,
-            _ => numeric_equal(left, right).unwrap_or_else(|| scalar_key(left) == scalar_key(right)),
-        },
-    }
-}
-
-fn numeric_equal(left: &BsonValue, right: &BsonValue) -> Option<bool> {
-    Some(number_of(left)? == number_of(right)?)
-}
-
-fn scalar_key(value: &BsonValue) -> String {
-    match value {
-        BsonValue::String(text) => format!("s:{text}"),
-        BsonValue::Bool(flag) => format!("b:{flag}"),
-        BsonValue::ObjectId(bytes) => format!("o:{bytes:?}"),
-        BsonValue::Binary(data) => format!("y:{data:?}"),
-        other => format!("x:{other:?}"),
-    }
-}
-
-fn number_of(value: &BsonValue) -> Option<f64> {
-    match value {
-        BsonValue::Int32(number) => Some(*number as f64),
-        BsonValue::Int64(number) => Some(*number as f64),
-        BsonValue::Double(number) => Some(*number),
-        _ => None,
-    }
-}
-
-/// Total order used by `sort` and the query operators.
-///
-/// `BsonValue::compare` 已按 BSON 规范给出覆盖全部变体的全序，这里直接复用，
-/// 避免两套排序在新增类型时漂移。
-fn compare_values(left: &BsonValue, right: &BsonValue) -> Ordering {
-    left.compare(right)
-}
-
-fn parse_count(value: Option<&BsonValue>) -> usize {
-    value.and_then(int_value).filter(|count| *count > 0).map(|count| count as usize).unwrap_or(0)
-}
-
-fn int_value(value: &BsonValue) -> Option<i64> {
-    match value {
-        BsonValue::Int32(number) => Some(*number as i64),
-        BsonValue::Int64(number) => Some(*number),
-        BsonValue::Double(number) => Some(*number as i64),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// cursors
-// ---------------------------------------------------------------------------
-
-/// One open `find` cursor holding the documents a later `getMore` will drain.
-#[derive(Debug)]
-struct CursorState {
-    namespace: String,
-    remaining: Vec<BsonValue>,
-    last_used: Instant,
-}
-
-/// Cursors are reclaimed after this much idle time, mirroring the timeout a
-/// driver expects from a real server.
-const CURSOR_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-
-static NEXT_CURSOR_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
-
-fn lock_cursors() -> MutexGuard<'static, HashMap<i64, CursorState>> {
-    match cursor_registry().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn cursor_registry() -> &'static Mutex<HashMap<i64, CursorState>> {
-    static CURSORS: OnceLock<Mutex<HashMap<i64, CursorState>>> = OnceLock::new();
-    CURSORS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// ---------------------------------------------------------------------------
-// delete
-// ---------------------------------------------------------------------------
-
-fn handle_delete(doc: &BsonDocument, executor: Option<&dyn KeyValueExecutor>) -> Vec<u8> {
-    let Some(executor) = executor
-    else {
-        return build_error_bson(2, "delete requires an executor");
-    };
-
-    let Some(ns) = namespace_from_command(doc, "delete")
-    else {
-        return build_error_bson(73, "delete command missing collection name");
-    };
-
-    let delete_specs = match doc.get("deletes") {
-        Some(BsonValue::Array(arr)) => arr.clone(),
-        _ => {
-            let mut single = BsonDocument::new();
-            single.push("q".to_string(), BsonValue::Document(BsonDocument::new()));
-            single.push("limit".to_string(), BsonValue::Int32(0));
-            vec![BsonValue::Document(single)]
-        }
-    };
-
-    let mut deleted: i64 = 0;
-
-    for spec in &delete_specs {
-        let Some(spec_doc) = (match spec {
-            BsonValue::Document(d) => Some(d),
-            _ => None,
-        })
-        else {
-            continue;
-        };
-        let filter = match spec_doc.get("q") {
-            Some(BsonValue::Document(f)) => f,
-            _ => &BsonDocument::new(),
-        };
-        let limit = match spec_doc.get("limit") {
-            Some(BsonValue::Int32(n)) if *n >= 0 => *n as usize,
-            _ => 0,
-        };
-
-        if let Some(id_value) = single_id_lookup(filter) {
-            let key = value_to_key(id_value);
-            if let Ok(database_query::cluster_kv::KeyValueResult::Delete { removed: true }) = executor.execute(
-                None,
-                database_query::cluster_kv::KeyValueCommand {
-                    namespace: ns.clone(),
-                    key,
-                    action: database_query::cluster_kv::KeyValueAction::Delete,
-                },
-            ) {
-                deleted += 1;
-            }
-        }
-        else {
-            let results = executor.execute_scan(None, &ns, b"", None, None, 0).unwrap_or_default();
-            let mut removed_so_far = 0;
-            for (k, value) in results {
-                if limit > 0 && removed_so_far >= limit {
-                    break;
-                }
-                let Ok(candidate) = parse_bson(&value)
-                else {
-                    continue;
-                };
-                if !document_matches(&candidate, filter) {
-                    continue;
-                }
-                if let Ok(database_query::cluster_kv::KeyValueResult::Delete { removed: true }) = executor.execute(
-                    None,
-                    database_query::cluster_kv::KeyValueCommand {
-                        namespace: ns.clone(),
-                        key: k,
-                        action: database_query::cluster_kv::KeyValueAction::Delete,
-                    },
-                ) {
-                    deleted += 1;
-                    removed_so_far += 1;
-                }
-            }
-        }
-    }
-
-    let mut resp = BsonDocument::new();
-    resp.push("n".to_string(), count_value(deleted));
-    resp.push("ok".to_string(), write_ok());
-    encode_bson(&resp)
-}
-
-// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-fn namespace_from_command(doc: &BsonDocument, command_key: &str) -> Option<database_types::cluster::Namespace> {
-    let db = doc.database();
-    let collection = match doc.get(command_key) {
-        Some(BsonValue::String(collection)) if valid_collection_name(collection) => collection.clone(),
-        _ => return None,
-    };
-    Some(database_types::cluster::Namespace(format!("{db}.{collection}")))
-}
-
-/// Applies MongoDB's namespace rules to a collection name: it cannot be empty,
-/// cannot contain `$` or a null byte, cannot start or end with `.`, and cannot
-/// carry an empty segment.
-fn valid_collection_name(name: &str) -> bool {
-    if name.is_empty() || name.contains('$') || name.contains('\0') {
-        return false;
-    }
-    if name.starts_with('.') || name.ends_with('.') {
-        return false;
-    }
-    !name.contains("..")
-}
-
-fn namespace_string(doc: &BsonDocument, command_key: &str) -> String {
-    let db = doc.database();
-    let collection = match doc.get(command_key) {
-        Some(BsonValue::String(c)) => c.clone(),
-        _ => "unknown".to_string(),
-    };
-    format!("{db}.{collection}")
-}
 
 /// Generates a 12-byte Mongo ObjectId using the classic 4+5+3 layout: unix
 /// timestamp + random bytes + monotonic counter. Good enough for a gateway

@@ -420,6 +420,32 @@ fn document_option(value: &serde_json::Value) -> Result<BsonDocument, String> {
     }
 }
 
+/// 把单个集合的选项与索引编码成后端无关的 catalog 记录。
+///
+/// `.yykv` 后端把它写进 `.yyds` catalog，执行器后端把它写进预留的
+/// `!catalog` namespace，两者共用同一份字节格式，因此切换后端不需要重写元数据。
+pub fn collection_record(namespace: &str, options: &CollectionOptions, indexes: &[IndexSpec]) -> String {
+    let mut text = format!("{{\"version\":{CATALOG_DOCUMENT_VERSION},\"collections\":[");
+    text.push_str(&collection_options_json(namespace, options));
+    text.push_str("],\"indexes\":[");
+    for (position, index) in indexes.iter().filter(|index| index.namespace == namespace).enumerate() {
+        if position > 0 {
+            text.push(',');
+        }
+        text.push_str(&index.to_json());
+    }
+    text.push_str("]}");
+    text
+}
+
+/// 解析 [`collection_record`] 生成的记录，只返回该 namespace 自己的部分。
+pub fn parse_collection_record(namespace: &str, text: &str) -> Result<(CollectionOptions, Vec<IndexSpec>), StoreError> {
+    let options = parse_collections(text)?.remove(namespace).unwrap_or_default();
+    let indexes =
+        parse_indexes(text)?.into_iter().filter(|index| index.namespace == namespace).collect();
+    Ok((options, indexes))
+}
+
 fn legacy_namespaces(shard: &FileShard) -> Vec<String> {
     match shard.scan(&Namespace(CATALOG_NAMESPACE.to_string()), b"", None, None, 0) {
         Ok(records) => records.into_iter().filter_map(|record| String::from_utf8(record.key.bytes).ok()).collect(),
