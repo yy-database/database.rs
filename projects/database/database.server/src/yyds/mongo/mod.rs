@@ -4,18 +4,17 @@
 //! 返回 MongoDB 形态的应答。不是完整的 MongoDB 服务端，命令子集如下：
 //!
 //! - 握手：`hello` / `isMaster` / `ismaster` / `ping`
-//! - 写入：`insert` / `delete`
+//! - 写入：`insert` / `update` / `delete`
 //! - 读取：`find` / `count` / `aggregate`
 //! - 游标：`getMore` / `killCursors`
 //!
 //! 命令语义全部由上游 `mongo` 门面的命令层提供，本模块只做 OP_MSG / OP_QUERY
 //! 编解码并注入 `MongoStorage` 后端（`storage::ExecutorStorage`）。固定语料对账
-//! 基线在 `tests/mongo/reconcile.rs`：38 条语料中 35 条逐字节一致，3 条为已记录
-//! 在案的能力差异，当前不补实现：
+//! 基线在 `tests/mongo/reconcile.rs`：38 条语料中 37 条逐字节一致，1 条为已记录
+//! 在案的能力差异：
 //!
-//! - 不实现 `update`，该命令与替换式更新都只回通用的 `59 unsupported`。
-//! - 不实现索引（`createIndexes`），因此唯一索引与 `{a: []}` 触发的 `undefined`
-//!   键路径无法在本网关触发。
+//! - 不路由 `createIndexes`，索引管理留在门面命令层。索引构建失败消息含随机
+//!   operation id 与集合 UUID，无法冻结逐字节基线。
 #![warn(missing_docs)]
 
 use std::{
@@ -87,6 +86,7 @@ fn command_kind(name: &str) -> &'static str {
         "count" => "count",
         "aggregate" => "aggregate",
         "delete" => "delete",
+        "update" => "update",
         "getMore" => "getMore",
         "killCursors" => "killCursors",
         _ => "unknown",
@@ -175,6 +175,7 @@ fn dispatch_command(bson_doc: &BsonDocument, executor: Option<&dyn KeyValueExecu
         "count" => run(executor, "count", |storage| commands::count(bson_doc, storage)),
         "aggregate" => run(executor, "aggregate", |storage| commands::aggregate(bson_doc, storage)),
         "delete" => run(executor, "delete", |storage| commands::delete(bson_doc, storage)),
+        "update" => run(executor, "update", |storage| commands::update(bson_doc, storage)),
         "getMore" => render(commands::get_more(bson_doc, &mut cursors())),
         "killCursors" => render(commands::kill_cursors(bson_doc, &mut cursors())),
         other => generic_error_body(other),
