@@ -16,7 +16,7 @@ path = "src/lib.rs"
 default = ["storage"]
 # `.yykv` / `.yyds` 文档存储与命令语义。只做 BSON / JSON / wire 编解码的
 # wasm 目标关闭它，避免把 `std::fs` 编进目标。
-storage = ["dep:database-types", "dep:database-storage", "dep:database-cluster"]
+storage = ["dep:database-types", "dep:database-storage", "dep:database-cluster", "dep:regex"]
 
 [dependencies]
 database-protocol-mongo = { workspace = true }
@@ -26,3 +26,5 @@ database-cluster = { workspace = true, optional = true }
 # `preserve_order` 让命令文档保持调用方发送时的字段顺序。MongoDB 比较嵌入文档与
 # `$addToSet` 值都按字段顺序，解析期排序会把不同文档静默合并成同一个值。
 serde_json = { version = "1", features = ["preserve_order"] }
+# `$regex` / `$options` 的匹配语义由 Rust `regex` 承载，不手写正则引擎。
+regex = { workspace = true, optional = true }
