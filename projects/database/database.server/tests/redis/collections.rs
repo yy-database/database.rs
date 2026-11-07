@@ -1603,7 +1603,8 @@ fn read_rank_with_score(client: &mut TcpStream) -> Option<(i64, String)> {
                 other => panic!("unexpected rank reply {:?}", other),
             }
         }
-        Reply::Array(None) => None,
+        // 真机的 `WITHSCORE` 缺失成员回 bulk null（RESP2 `$-1`）。
+        Reply::Bulk(None) => None,
         other => panic!("expected rank array, got {}", describe(&other)),
     }
 }
@@ -3110,4 +3111,399 @@ fn key_space_commands() {
     let (cursor, keys) = expect_scan(&mut client);
     assert_eq!(cursor, "0");
     assert_eq!(keys, ["order:3"]);
+}
+
+/// 读取一段原始回复字节，用于 RESP3 下的精确比对。
+fn expect_raw(client: &mut TcpStream, expected: &[u8]) {
+    let mut buffer = vec![0u8; expected.len()];
+    client.read_exact(&mut buffer).unwrap();
+    assert_eq!(buffer, expected, "unexpected reply bytes");
+}
+
+/// 把 `[member, score]` 子数组解成字符串对。
+fn pair_items(reply: &Reply) -> Vec<(String, String)> {
+    match reply {
+        Reply::Array(Some(items)) => items
+            .iter()
+            .map(|item| match item {
+                Reply::Array(Some(pair)) if pair.len() == 2 => {
+                    let member = match &pair[0] {
+                        Reply::Bulk(Some(bytes)) => String::from_utf8(bytes.clone()).unwrap(),
+                        other => panic!("expected member bulk, got {}", describe(other)),
+                    };
+                    let score = match &pair[1] {
+                        Reply::Bulk(Some(bytes)) => String::from_utf8(bytes.clone()).unwrap(),
+                        other => panic!("expected score bulk, got {}", describe(other)),
+                    };
+                    (member, score)
+                }
+                other => panic!("expected member/score pair, got {}", describe(other)),
+            })
+            .collect(),
+        other => panic!("expected pair array, got {}", describe(other)),
+    }
+}
+
+/// `ZMPOP` 的 `[key, [[member, score]...]]` 回复。
+fn expect_mpop(client: &mut TcpStream, key: &str, expected: &[(&str, &str)]) {
+    match read_reply(client) {
+        Reply::Array(Some(items)) if items.len() == 2 => {
+            match &items[0] {
+                Reply::Bulk(Some(bytes)) => assert_eq!(bytes, key.as_bytes()),
+                other => panic!("expected key bulk, got {}", describe(other)),
+            }
+            let pairs = pair_items(&items[1]);
+            let expected: Vec<(String, String)> =
+                expected.iter().map(|(member, score)| (member.to_string(), score.to_string())).collect();
+            assert_eq!(pairs, expected);
+        }
+        other => panic!("expected mpop array, got {}", describe(&other)),
+    }
+}
+
+/// zset 族的选项、范围、弹出、随机与集合运算。
+#[test]
+fn zset_family_options_ranges_and_pops() {
+    let (mut client, _server) = memory_server("redis-zset-family");
+
+    // ZADD 的 NX / XX / GT / LT / CH / INCR 组合。
+    send(&mut client, &["ZADD", "z", "1", "a", "2", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZADD", "z", "NX", "9", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZSCORE", "z", "a"]);
+    expect_bulk(&mut client, Some("1"));
+    send(&mut client, &["ZADD", "z", "XX", "9", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZSCORE", "z", "a"]);
+    expect_bulk(&mut client, Some("9"));
+    send(&mut client, &["ZADD", "z", "CH", "9", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZADD", "z", "CH", "5", "a"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZADD", "z", "GT", "3", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZADD", "z", "LT", "3", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZADD", "z", "GT", "7", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZSCORE", "z", "a"]);
+    expect_bulk(&mut client, Some("7"));
+    send(&mut client, &["ZADD", "z", "INCR", "2.5", "a"]);
+    expect_bulk(&mut client, Some("9.5"));
+    send(&mut client, &["ZADD", "z", "NX", "INCR", "1", "a"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["ZADD", "z", "XX", "INCR", "1", "missing"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["ZADD", "z", "NX", "XX", "1", "a"]);
+    expect_error(&mut client, "ERR XX and NX options at the same time are not compatible");
+    send(&mut client, &["ZADD", "z", "GT", "NX", "1", "a"]);
+    expect_error(&mut client, "ERR GT, LT, and/or NX options at the same time are not compatible");
+    send(&mut client, &["ZADD", "z", "GT", "LT", "1", "a"]);
+    expect_error(&mut client, "ERR GT, LT, and/or NX options at the same time are not compatible");
+    send(&mut client, &["ZADD", "z", "INCR", "1", "a", "2", "b"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZADD", "z", "NX", "1"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZADD", "z"]);
+    expect_error(&mut client, "ERR wrong number of arguments for 'zadd' command");
+
+    // ZRANGE 的四种范围形态与选项互斥。
+    send(&mut client, &["ZADD", "r", "1", "a", "2", "b", "2", "c", "3", "d"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZRANGE", "r", "0", "-1"]);
+    expect_array(&mut client, &["a", "b", "c", "d"]);
+    send(&mut client, &["ZRANGE", "r", "0", "-1", "REV"]);
+    expect_array(&mut client, &["d", "c", "b", "a"]);
+    send(&mut client, &["ZRANGE", "r", "1", "2", "REV"]);
+    expect_array(&mut client, &["c", "b"]);
+    send(&mut client, &["ZRANGE", "r", "(1", "3", "BYSCORE", "WITHSCORES"]);
+    expect_array(&mut client, &["b", "2", "c", "2", "d", "3"]);
+    send(&mut client, &["ZRANGE", "r", "3", "(1", "BYSCORE", "REV"]);
+    expect_array(&mut client, &["d", "c", "b"]);
+    send(&mut client, &["ZRANGE", "r", "3", "2", "BYSCORE", "LIMIT", "0", "1", "REV"]);
+    expect_array(&mut client, &["d"]);
+    send(&mut client, &["ZRANGE", "r", "-", "+", "BYLEX"]);
+    expect_array(&mut client, &["a", "b", "c", "d"]);
+    send(&mut client, &["ZRANGE", "r", "+", "-", "BYLEX", "REV"]);
+    expect_array(&mut client, &["d", "c", "b", "a"]);
+    send(&mut client, &["ZRANGE", "r", "[b", "(d", "BYLEX"]);
+    expect_array(&mut client, &["b", "c"]);
+    send(&mut client, &["ZRANGE", "r", "0", "-1", "LIMIT", "0", "1"]);
+    expect_error(
+        &mut client,
+        "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+    );
+    send(&mut client, &["ZRANGE", "r", "-", "+", "BYLEX", "WITHSCORES"]);
+    expect_error(&mut client, "ERR syntax error, WITHSCORES not supported in combination with BYLEX");
+    send(&mut client, &["ZRANGE", "r", "0", "-1", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+
+    send(&mut client, &["ZREVRANGE", "r", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["d", "3", "c", "2", "b", "2", "a", "1"]);
+    send(&mut client, &["ZREVRANGE", "r", "0", "0"]);
+    expect_array(&mut client, &["d"]);
+
+    // ZRANGESTORE 覆盖任意类型的目标，空结果删除目标。
+    send(&mut client, &["ZRANGESTORE", "copy", "r", "3", "1", "BYSCORE", "REV", "LIMIT", "0", "2"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZRANGE", "copy", "0", "-1", "WITHSCORES"]);
+    expect_array(&mut client, &["c", "2", "d", "3"]);
+    send(&mut client, &["ZRANGESTORE", "copy", "r", "5", "6", "BYSCORE"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["EXISTS", "copy"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["SET", "text", "x"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["ZRANGESTORE", "text", "r", "0", "0"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["TYPE", "text"]);
+    expect_status(&mut client, "zset");
+    send(&mut client, &["ZRANGESTORE", "copy", "text", "-", "+", "BYLEX", "WITHSCORES"]);
+    expect_error(&mut client, "ERR syntax error");
+
+    // 排名、批量分数与字典序计数。
+    send(&mut client, &["ZRANK", "r", "b"]);
+    assert_eq!(expect_integer(&mut client), 1);
+    send(&mut client, &["ZREVRANK", "r", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZRANK", "r", "b", "WITHSCORE"]);
+    match read_reply(&mut client) {
+        Reply::Array(Some(items)) => {
+            assert_eq!(items.len(), 2);
+            match &items[0] {
+                Reply::Integer(rank) => assert_eq!(*rank, 1),
+                other => panic!("expected rank integer, got {}", describe(other)),
+            }
+            match &items[1] {
+                Reply::Bulk(Some(bytes)) => assert_eq!(bytes, b"2"),
+                other => panic!("expected score bulk, got {}", describe(other)),
+            }
+        }
+        other => panic!("expected WITHSCORE array, got {}", describe(&other)),
+    }
+    send(&mut client, &["ZRANK", "r", "ghost", "WITHSCORE"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["ZRANK", "r", "b", "BOGUS"]);
+    expect_error(&mut client, "ERR syntax error");
+
+    send(&mut client, &["ZMSCORE", "r", "a", "b", "ghost"]);
+    match read_reply(&mut client) {
+        Reply::Array(Some(items)) => {
+            assert_eq!(items.len(), 3);
+            match &items[0] {
+                Reply::Bulk(Some(bytes)) => assert_eq!(bytes, b"1"),
+                other => panic!("expected score bulk, got {}", describe(other)),
+            }
+            assert!(matches!(items[2], Reply::Bulk(None)), "missing member should be null");
+        }
+        other => panic!("expected ZMSCORE array, got {}", describe(&other)),
+    }
+    send(&mut client, &["ZMSCORE", "ghost", "a"]);
+    match read_reply(&mut client) {
+        Reply::Array(Some(items)) => assert!(matches!(items[0], Reply::Bulk(None))),
+        other => panic!("expected ZMSCORE array, got {}", describe(&other)),
+    }
+
+    send(&mut client, &["ZLEXCOUNT", "r", "-", "+"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZLEXCOUNT", "r", "[b", "[c"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZLEXCOUNT", "r", "b", "c"]);
+    expect_error(&mut client, "ERR min or max not valid string range item");
+
+    // 弹出族与键清空即删除。
+    send(&mut client, &["ZADD", "p", "1", "a", "2", "b", "3", "c", "4", "d"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZPOPMIN", "p"]);
+    expect_array(&mut client, &["a", "1"]);
+    send(&mut client, &["ZPOPMAX", "p", "2"]);
+    expect_array(&mut client, &["d", "4", "c", "3"]);
+    send(&mut client, &["ZPOPMIN", "p", "0"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["ZPOPMIN", "p", "-1"]);
+    expect_error(&mut client, "ERR value is out of range, must be positive");
+    send(&mut client, &["ZPOPMIN", "p", "5"]);
+    expect_array(&mut client, &["b", "2"]);
+    send(&mut client, &["EXISTS", "p"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZPOPMIN", "p"]);
+    expect_empty_array(&mut client);
+
+    // ZRANDMEMBER 的成员域、数量与去重契约。
+    send(&mut client, &["ZADD", "rand", "1", "a", "2", "b", "3", "c"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    send(&mut client, &["ZRANDMEMBER", "rand"]);
+    let single = match read_reply(&mut client) {
+        Reply::Bulk(Some(bytes)) => String::from_utf8(bytes).unwrap(),
+        other => panic!("expected bulk member, got {}", describe(&other)),
+    };
+    assert!(["a", "b", "c"].contains(&single.as_str()), "unexpected member {single}");
+    send(&mut client, &["ZRANDMEMBER", "rand", "10"]);
+    let mut unique = match read_reply(&mut client) {
+        Reply::Array(Some(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Reply::Bulk(Some(bytes)) => String::from_utf8(bytes).unwrap(),
+                other => panic!("expected bulk member, got {}", describe(&other)),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("expected member array, got {}", describe(&other)),
+    };
+    assert_eq!(unique.len(), 3);
+    unique.sort();
+    assert_eq!(unique, ["a", "b", "c"]);
+    send(&mut client, &["ZRANDMEMBER", "rand", "-5"]);
+    let repeated = match read_reply(&mut client) {
+        Reply::Array(Some(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Reply::Bulk(Some(bytes)) => String::from_utf8(bytes).unwrap(),
+                other => panic!("expected bulk member, got {}", describe(&other)),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("expected member array, got {}", describe(&other)),
+    };
+    assert_eq!(repeated.len(), 5);
+    assert!(repeated.iter().all(|member| ["a", "b", "c"].contains(&member.as_str())));
+    send(&mut client, &["ZRANDMEMBER", "rand", "0"]);
+    expect_empty_array(&mut client);
+    send(&mut client, &["ZRANDMEMBER", "rand", "2", "WITHSCORES"]);
+    match read_reply(&mut client) {
+        Reply::Array(Some(items)) => {
+            // RESP2 把分数平铺在成员之后。
+            assert_eq!(items.len(), 4);
+            for pair in items.chunks(2) {
+                let (Reply::Bulk(Some(member)), Reply::Bulk(Some(score))) = (&pair[0], &pair[1])
+                else {
+                    panic!("expected member/score bulk pair");
+                };
+                let member = String::from_utf8(member.clone()).unwrap();
+                let score = String::from_utf8(score.clone()).unwrap();
+                assert!(
+                    matches!((member.as_str(), score.as_str()), ("a", "1") | ("b", "2") | ("c", "3")),
+                    "unexpected member {member} with score {score}"
+                );
+            }
+        }
+        other => panic!("expected WITHSCORES array, got {}", describe(&other)),
+    }
+    send(&mut client, &["ZRANDMEMBER", "rand", "-1", "WITHSCORES"]);
+    match read_reply(&mut client) {
+        Reply::Array(Some(items)) => assert_eq!(items.len(), 2),
+        other => panic!("expected WITHSCORES array, got {}", describe(&other)),
+    }
+    send(&mut client, &["ZRANDMEMBER", "ghost"]);
+    expect_bulk(&mut client, None);
+    send(&mut client, &["ZRANDMEMBER", "rand", "WITHSCORES"]);
+    expect_error(&mut client, "ERR value is not an integer or out of range");
+
+    // ZMPOP / BZMPOP 的非阻塞形态。
+    send(&mut client, &["ZADD", "m2", "1", "a", "2", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZMPOP", "1", "ghost", "MIN"]);
+    expect_null_array(&mut client);
+    send(&mut client, &["ZMPOP", "2", "ghost", "m2", "MAX", "COUNT", "1"]);
+    expect_mpop(&mut client, "m2", &[("b", "2")]);
+    send(&mut client, &["ZMPOP", "1", "m2", "MIN"]);
+    expect_mpop(&mut client, "m2", &[("a", "1")]);
+    send(&mut client, &["EXISTS", "m2"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["ZMPOP", "0", "m2", "MIN"]);
+    expect_error(&mut client, "ERR numkeys should be greater than 0");
+    send(&mut client, &["ZMPOP", "1", "m2", "SIDE"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["ZMPOP", "1", "m2", "MIN", "COUNT", "0"]);
+    expect_error(&mut client, "ERR count should be greater than 0");
+
+    send(&mut client, &["ZADD", "bz", "1", "a", "2", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["BZPOPMIN", "ghost", "bz", "0"]);
+    expect_array(&mut client, &["bz", "a", "1"]);
+    send(&mut client, &["BZPOPMAX", "bz", "0.01"]);
+    expect_array(&mut client, &["bz", "b", "2"]);
+    send(&mut client, &["BZPOPMIN", "bz", "0"]);
+    expect_null_array(&mut client);
+    send(&mut client, &["BZPOPMIN", "bz", "-1"]);
+    expect_error(&mut client, "ERR timeout is negative");
+    send(&mut client, &["BZPOPMIN", "bz", "abc"]);
+    expect_error(&mut client, "ERR timeout is not a float or out of range");
+    send(&mut client, &["BZMPOP", "0", "1", "bz", "MIN"]);
+    expect_null_array(&mut client);
+
+    // 非存储型的并集与交集。
+    send(&mut client, &["ZADD", "u1", "1", "a", "2", "b"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZADD", "u2", "3", "b", "4", "c"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["ZUNION", "2", "u1", "u2", "WITHSCORES"]);
+    expect_array(&mut client, &["a", "1", "c", "4", "b", "5"]);
+    send(&mut client, &["ZINTER", "2", "u1", "u2", "WITHSCORES"]);
+    expect_array(&mut client, &["b", "5"]);
+    send(&mut client, &["ZINTER", "2", "u1", "u2", "WEIGHTS", "2", "3", "AGGREGATE", "MAX"]);
+    expect_array(&mut client, &["b"]);
+    send(&mut client, &["ZUNION", "0", "u1"]);
+    expect_error(&mut client, "ERR at least 1 input key is needed for 'zunion' command");
+    send(&mut client, &["ZUNION", "2", "u1"]);
+    expect_error(&mut client, "ERR syntax error");
+
+    // 分数格式逐字节对齐真机。
+    send(&mut client, &["ZADD", "score", "1e-20", "tiny", "inf", "up", "-inf", "down", "-3", "neg"]);
+    assert_eq!(expect_integer(&mut client), 4);
+    send(&mut client, &["ZADD", "score", "1.5", "half", "0.1", "tenth", "1", "one"]);
+    assert_eq!(expect_integer(&mut client), 3);
+    for (member, expected) in [
+        ("tiny", "1e-20"),
+        ("up", "inf"),
+        ("down", "-inf"),
+        ("neg", "-3"),
+        ("half", "1.5"),
+        ("tenth", "0.1"),
+        ("one", "1"),
+    ] {
+        send(&mut client, &["ZSCORE", "score", member]);
+        expect_bulk(&mut client, Some(expected));
+    }
+}
+
+/// RESP3 下分数使用原生 double，`WITHSCORES` 使用成员/分数子数组。
+#[test]
+fn zset_resp3_double_replies() {
+    let (mut client, _server) = memory_server("redis-zset-resp3");
+    send(&mut client, &["HELLO", "3"]);
+    let mut header = [0u8; 4];
+    client.read_exact(&mut header).unwrap();
+    assert_eq!(&header, b"%7\r\n", "HELLO 3 did not switch protocol");
+    let mut rest = Vec::new();
+    loop {
+        let mut chunk = [0u8; 1];
+        client.read_exact(&mut chunk).unwrap();
+        rest.push(chunk[0]);
+        if rest.ends_with(b"*0\r\n") {
+            break;
+        }
+    }
+
+    send(&mut client, &["ZADD", "z", "1", "a", "2.5", "b"]);
+    expect_raw(&mut client, b":2\r\n");
+    send(&mut client, &["ZSCORE", "z", "a"]);
+    expect_raw(&mut client, b",1\r\n");
+    send(&mut client, &["ZRANGE", "z", "0", "-1", "WITHSCORES"]);
+    expect_raw(&mut client, b"*2\r\n*2\r\n$1\r\na\r\n,1\r\n*2\r\n$1\r\nb\r\n,2.5\r\n");
+    send(&mut client, &["ZINCRBY", "z", "0.5", "a"]);
+    expect_raw(&mut client, b",1.5\r\n");
+    send(&mut client, &["ZMSCORE", "z", "a", "ghost"]);
+    expect_raw(&mut client, b"*2\r\n,1.5\r\n_\r\n");
+    send(&mut client, &["ZRANK", "z", "ghost", "WITHSCORE"]);
+    expect_raw(&mut client, b"_\r\n");
+    send(&mut client, &["ZPOPMIN", "z"]);
+    expect_raw(&mut client, b"*2\r\n$1\r\na\r\n,1.5\r\n");
+    send(&mut client, &["ZRANDMEMBER", "ghost"]);
+    expect_raw(&mut client, b"_\r\n");
+    send(&mut client, &["ZMPOP", "1", "ghost", "MIN"]);
+    expect_raw(&mut client, b"_\r\n");
+    send(&mut client, &["BZPOPMIN", "ghost", "0"]);
+    expect_raw(&mut client, b"_\r\n");
+    send(&mut client, &["ZRANGE", "z", "0", "-1", "WITHSCORES"]);
+    expect_raw(&mut client, b"*1\r\n*2\r\n$1\r\nb\r\n,2.5\r\n");
 }
