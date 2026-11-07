@@ -535,7 +535,7 @@ fn write_set_error(stream: &mut dyn Write, error: BindError) -> io::Result<()> {
         BindError::Syntax => stream.write_all(b"-ERR syntax error\r\n"),
         BindError::InvalidInteger => stream.write_all(b"-ERR value is not an integer or out of range\r\n"),
         BindError::InvalidExpire => stream.write_all(b"-ERR invalid expire time in 'set' command\r\n"),
-        BindError::UnsupportedOptions => stream.write_all(b"-ERR unsupported SET options\r\n"),
+        BindError::UnsupportedOptions => stream.write_all(b"-ERR syntax error\r\n"),
         BindError::EmptyCommand => stream.write_all(b"-ERR empty command\r\n"),
         BindError::UnsupportedCommand => stream.write_all(b"-ERR unsupported command\r\n"),
     }
@@ -1221,10 +1221,20 @@ fn collect_keys(executor: &dyn KeyValueExecutor, base: &Namespace) -> Result<Vec
     Ok(keys)
 }
 
+/// Builds the base namespace of another logical database from the current one.
+///
+/// The L1 gateway names databases `redis:<index>` while an embedded binding may
+/// mount the same catalog under a prefix of its own, so only the trailing index
+/// is replaced and the prefix is preserved.
+fn database_namespace(base: &Namespace, database: u32) -> Namespace {
+    let text = base.0.as_str();
+    let split = text.rfind(|character: char| !character.is_ascii_digit()).map_or(0, |index| index + 1);
+    Namespace(format!("{}{database}", &text[..split]))
+}
+
 /// 清空一组逻辑库的全部类型命名空间，返回第一条失败信息。
-fn flush_databases(executor: &dyn KeyValueExecutor, databases: impl IntoIterator<Item = u32>) -> Option<String> {
-    for database in databases {
-        let base = Namespace(format!("redis:{database}"));
+fn flush_databases(executor: &dyn KeyValueExecutor, databases: impl IntoIterator<Item = Namespace>) -> Option<String> {
+    for base in databases {
         for kind in KeyKind::ALL {
             let target = kind.namespace(&base);
             match executor.execute_scan(None, &target, &[], None, None, 0) {
@@ -1292,7 +1302,7 @@ fn handle_copy(
         }
     }
     let destination_base = match destination_database {
-        Some(database) => Namespace(format!("redis:{database}")),
+        Some(database) => database_namespace(namespace, u32::from(database)),
         None => namespace.clone(),
     };
     if destination_base == *namespace && source == destination {
@@ -2831,35 +2841,8 @@ pub(crate) fn handle_string(
             write_error(stream, "syntax error")?;
             return Ok(true);
         }
-        let mut failure: Option<String> = None;
-        for database in 0..16u32 {
-            let base = Namespace(format!("redis:{database}"));
-            for kind in KeyKind::ALL {
-                let target = kind.namespace(&base);
-                match executor.execute_scan(None, &target, &[], None, None, 0) {
-                    Ok(records) => {
-                        for (key, _) in records {
-                            let command =
-                                KeyValueCommand { namespace: target.clone(), key, action: KeyValueAction::Delete };
-                            if let Err(error) = executor.execute(None, command) {
-                                failure = Some(error.to_string());
-                                break;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        failure = Some(error.to_string());
-                    }
-                }
-                if failure.is_some() {
-                    break;
-                }
-            }
-            if failure.is_some() {
-                break;
-            }
-        }
-        match failure {
+        let bases = (0..16u32).map(|database| database_namespace(namespace, database));
+        match flush_databases(executor, bases) {
             Some(message) => write_error(stream, &message)?,
             None => stream.write_all(b"+OK\r\n")?,
         }
@@ -2881,12 +2864,7 @@ pub(crate) fn handle_string(
             write_error(stream, "syntax error")?;
             return Ok(true);
         }
-        let database = namespace
-            .0
-            .strip_prefix("redis:")
-            .and_then(|text| text.parse::<u32>().ok())
-            .unwrap_or(0);
-        match flush_databases(executor, [database]) {
+        match flush_databases(executor, [namespace.clone()]) {
             Some(message) => write_error(stream, &message)?,
             None => stream.write_all(b"+OK\r\n")?,
         }
@@ -3116,7 +3094,7 @@ pub(crate) fn handle_string(
             }
             Err(BindError::WrongArity) => stream.write_all(b"-ERR wrong number of arguments\r\n")?,
             Err(BindError::Syntax) => stream.write_all(b"-ERR syntax error\r\n")?,
-            Err(BindError::UnsupportedOptions) => stream.write_all(b"-ERR unsupported SET options\r\n")?,
+            Err(BindError::UnsupportedOptions) => stream.write_all(b"-ERR syntax error\r\n")?,
             Err(BindError::InvalidInteger) => stream.write_all(b"-ERR value is not an integer or out of range\r\n")?,
             Err(BindError::InvalidExpire) => stream.write_all(b"-ERR invalid expire time in 'set' command\r\n")?,
             Err(BindError::EmptyCommand) => stream.write_all(b"-ERR empty command\r\n")?,
@@ -3417,7 +3395,7 @@ fn respond(
             stream.write_all(b"-ERR wrong number of arguments for 'select' command\r\n")?;
         }
         else if let Some(database) = parse_database(request.arguments[1]) {
-            *namespace = Namespace(format!("redis:{database}"));
+            *namespace = database_namespace(namespace, u32::from(database));
             state.record.set_database(database);
             stream.write_all(b"+OK\r\n")?;
         }
@@ -3891,7 +3869,7 @@ fn validate_command_for_queue(
             Err(format!("-ERR wrong number of arguments for '{}' command\r\n", lowercase_command(command)).into_bytes())
         }
         Err(BindError::Syntax) => Err(b"-ERR syntax error\r\n".to_vec()),
-        Err(BindError::UnsupportedOptions) => Err(b"-ERR unsupported SET options\r\n".to_vec()),
+        Err(BindError::UnsupportedOptions) => Err(b"-ERR syntax error\r\n".to_vec()),
         Err(BindError::InvalidInteger) => Err(b"-ERR value is not an integer or out of range\r\n".to_vec()),
         Err(BindError::InvalidExpire) => Err(b"-ERR invalid expire time in 'set' command\r\n".to_vec()),
         Err(BindError::EmptyCommand) => Err(b"-ERR empty command\r\n".to_vec()),
