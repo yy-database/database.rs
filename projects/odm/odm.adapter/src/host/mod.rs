@@ -13,7 +13,12 @@ use std::{path::Path, sync::Mutex};
 use odm_types::{CapabilitySet, DatasourceKind, Iris, Planner, ReferenceStore, Row, expand_endpoint, load_project, resolve_path};
 use serde_json::{Value as JsonValue, json};
 
-use crate::{adapter_mysql::MysqlSource, adapter_postgres::PostgresSource, adapter_sqlite::SqliteSource};
+use crate::{
+    adapter_mysql::MysqlSource,
+    adapter_postgres::PostgresSource,
+    adapter_sqlite::SqliteSource,
+    connector_local::{Error as LocalError, LocalSource},
+};
 
 pub mod bind;
 pub mod operation;
@@ -69,8 +74,6 @@ pub const DIAG_TRANSACTION_NOT_OPEN: &str = "IRIS-TRANSACTION-NOT-OPEN";
 pub const DIAG_MANAGED_PUSH_UNSUPPORTED: &str = "IRIS-MANAGED-PUSH-UNSUPPORTED";
 /// Diagnostic only: the selected backend cannot represent a schema capability.
 pub const DIAG_SCHEMA_VECTOR_UNSUPPORTED: &str = "IRIS-SCHEMA-VECTOR-UNSUPPORTED";
-/// Diagnostic only: this dev line has no YYDB connector yet.
-pub const DIAG_YYDB_CONNECTOR_MISSING: &str = "IRIS-YYDB-CONNECTOR-MISSING";
 
 /// Host facade version (the `odm-adapter` crate version).
 pub fn version() -> &'static str {
@@ -216,6 +219,11 @@ fn from_odm_error(err: odm_types::Error) -> ErrorEnvelope {
     }
 }
 
+/// Source text for backends that can only consume VOS text.
+fn text_source(bound: &bind::BoundParameters) -> Result<&str, ErrorEnvelope> {
+    bound.text_only().map_err(|err| ErrorEnvelope::invalid_argument(DIAG_PARAM_ENCODING, err))
+}
+
 fn classify_backend_message(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("unique constraint failed") || lower.contains("primary key") {
@@ -263,6 +271,26 @@ fn from_mysql_error(err: crate::Error) -> ErrorEnvelope {
         crate::Error::Unsupported(message) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, message).with_diagnostic(DIAG_BACKEND_UNSUPPORTED),
         crate::Error::Sqlite(message) => ErrorEnvelope::new(CODE_INTERNAL, message).with_diagnostic("mysql.unsupported"),
         crate::Error::Io(inner) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, inner.to_string()).with_diagnostic("mysql.io"),
+    }
+}
+
+fn from_local_error(err: LocalError) -> ErrorEnvelope {
+    match err {
+        LocalError::Yydb(inner) => {
+            let code = match &inner {
+                database_execution::engine::Error::UniqueViolation { .. } => CODE_UNIQUE_CONFLICT,
+                database_execution::engine::Error::VectorDimensionExceeded { .. } => CODE_VECTOR_DIMENSION,
+                database_execution::engine::Error::Schema { .. }
+                | database_execution::engine::Error::SchemaConflict { .. }
+                | database_execution::engine::Error::SchemaInvalidated { .. } => CODE_SCHEMA_MISMATCH,
+                database_execution::engine::Error::Io(_) | database_execution::engine::Error::SessionClosed => CODE_CONNECTION_FAILED,
+                _ => CODE_INTERNAL,
+            };
+            ErrorEnvelope::new(code, inner.to_string()).with_diagnostic(inner.code_with_prefix("yydb"))
+        }
+        LocalError::NotReady(report) => ErrorEnvelope::new(CODE_CONNECTION_FAILED, report.message).with_diagnostic(report.code),
+        LocalError::Runtime(message) => ErrorEnvelope::internal(DIAG_EXEC_FAILED, message),
+        LocalError::Policy(message) => ErrorEnvelope::new(CODE_SCHEMA_MISMATCH, message).with_diagnostic("yydb.policy"),
     }
 }
 
@@ -347,6 +375,8 @@ fn type_declares_vector(ty: &vos::CanonicalType) -> bool {
 enum SessionStore {
     Memory(Iris),
     Sqlite(SqliteSource),
+    /// Embedded YYDB (`.yydb` file or `.yydx` main file plus its object store).
+    Yydb(LocalSource),
     /// A PostgreSQL session keeps its open transaction, if any, on this
     /// connection so statements inside `transaction` share one backend transaction.
     Postgres {
@@ -365,20 +395,25 @@ impl SessionStore {
         match self {
             Self::Memory(_) => CapabilitySet::reference_full(),
             Self::Sqlite(_) => SqliteSource::capabilities(),
+            Self::Yydb(_) => LocalSource::capabilities(),
             Self::Postgres { .. } => PostgresSource::capabilities(),
             Self::Mysql { .. } => MysqlSource::capabilities(),
         }
     }
 
-    fn query(&self, planner: &Planner, source: &str) -> Result<Vec<Row>, ErrorEnvelope> {
+    fn query(&self, planner: &Planner, bound: &bind::BoundParameters) -> Result<Vec<Row>, ErrorEnvelope> {
         match self {
-            Self::Memory(iris) => iris.session().query(source).map_err(from_odm_error),
+            Self::Memory(iris) => iris.session().query(text_source(bound)?).map_err(from_odm_error),
             Self::Sqlite(db) => {
-                let plan = planner.plan_source(source).map_err(from_odm_error)?;
+                let plan = planner.plan_source(text_source(bound)?).map_err(from_odm_error)?;
                 db.execute_plan(&plan).map_err(from_sqlite_error)
             }
+            // YYDB binds typed `bytes` / `vector` / `file` parameters itself, so
+            // the source keeps its `$name` placeholders and the payloads travel
+            // beside it instead of being rendered into VOS text.
+            Self::Yydb(db) => db.run_with_params(&bound.source, &bound.value_parameters).map_err(from_local_error),
             Self::Postgres { db, transaction } => {
-                let plan = planner.plan_source(source).map_err(from_odm_error)?;
+                let plan = planner.plan_source(text_source(bound)?).map_err(from_odm_error)?;
                 let mut guard = transaction.lock().map_err(|_| lock_failed())?;
                 match guard.as_mut() {
                     Some(txn) => txn.execute_plan(&plan).map_err(from_postgres_error),
@@ -386,7 +421,7 @@ impl SessionStore {
                 }
             }
             Self::Mysql { db, transaction } => {
-                let plan = planner.plan_source(source).map_err(from_odm_error)?;
+                let plan = planner.plan_source(text_source(bound)?).map_err(from_odm_error)?;
                 let mut guard = transaction.lock().map_err(|_| lock_failed())?;
                 match guard.as_mut() {
                     Some(txn) => txn.execute_plan(&plan).map_err(from_mysql_error),
@@ -396,10 +431,11 @@ impl SessionStore {
         }
     }
 
-    fn execute_unit(&self, planner: &Planner, source: &str) -> Result<(), ErrorEnvelope> {
+    fn execute_unit(&self, planner: &Planner, bound: &bind::BoundParameters) -> Result<(), ErrorEnvelope> {
         match self {
-            Self::Memory(iris) => iris.session().execute(source).map_err(from_odm_error),
-            _ => self.query(planner, source).map(|_| ()),
+            Self::Memory(iris) => iris.session().execute(text_source(bound)?).map_err(from_odm_error),
+            Self::Yydb(db) => db.execute_with_params(&bound.source, &bound.value_parameters).map_err(from_local_error),
+            _ => self.query(planner, bound).map(|_| ()),
         }
     }
 
@@ -411,6 +447,12 @@ impl SessionStore {
                     return Err(transaction_already_open());
                 }
                 db.begin().map_err(from_sqlite_error)
+            }
+            Self::Yydb(db) => {
+                if db.in_transaction() {
+                    return Err(transaction_already_open());
+                }
+                db.begin().map_err(from_local_error)
             }
             Self::Postgres { db, transaction } => {
                 let mut guard = transaction.lock().map_err(|_| lock_failed())?;
@@ -440,6 +482,12 @@ impl SessionStore {
                 }
                 db.commit().map_err(from_sqlite_error)
             }
+            Self::Yydb(db) => {
+                if !db.in_transaction() {
+                    return Err(transaction_not_open());
+                }
+                db.commit().map_err(from_local_error)
+            }
             Self::Postgres { transaction, .. } => {
                 let mut guard = transaction.lock().map_err(|_| lock_failed())?;
                 match guard.take() {
@@ -465,6 +513,12 @@ impl SessionStore {
                     return Err(transaction_not_open());
                 }
                 db.rollback().map_err(from_sqlite_error)
+            }
+            Self::Yydb(db) => {
+                if !db.in_transaction() {
+                    return Err(transaction_not_open());
+                }
+                db.rollback().map_err(from_local_error)
             }
             Self::Postgres { transaction, .. } => {
                 let mut guard = transaction.lock().map_err(|_| lock_failed())?;
@@ -510,15 +564,12 @@ impl HostSession {
 
     /// YYDB profile over a `.yydb` file or `.yydx` directory layout.
     ///
-    /// This dev line has no YYDB connector yet: it needs a new workspace member
-    /// that is not approved in phase one. The call fails with an explicit
-    /// diagnostic instead of opening an empty session that looks usable.
+    /// A `.yydx` main path is resolved by the embedded engine to its sibling
+    /// object store; `:memory:` opens an ephemeral database.
     pub fn open_yydb(endpoint: &str) -> Result<Self, ErrorEnvelope> {
-        Err(ErrorEnvelope::new(
-            CODE_CONNECTION_FAILED,
-            format!("dev 线尚未提供 yydb 连接器：`{endpoint}` 需要第二阶段批准的 yydb connector，当前请改用 sqlite/postgres/mysql/memory"),
-        )
-        .with_diagnostic(DIAG_YYDB_CONNECTOR_MISSING))
+        let path = endpoint.strip_prefix("file:").unwrap_or(endpoint);
+        let db = if path == ":memory:" { LocalSource::open_in_memory() } else { LocalSource::open(path) }.map_err(from_local_error)?;
+        Ok(Self::new_store(SessionStore::Yydb(db)))
     }
 
     /// PostgreSQL profile over a real server URL.
@@ -541,11 +592,8 @@ impl HostSession {
         let store = match ds.kind {
             DatasourceKind::Yydb => {
                 let endpoint = expand_endpoint(ds, source).map_err(|err| ErrorEnvelope::internal(DIAG_EXEC_FAILED, err))?;
-                return Err(ErrorEnvelope::new(
-                    CODE_CONNECTION_FAILED,
-                    format!("dev 线尚未提供 yydb 连接器：datasource `{source}` 指向 `{endpoint}`，需要第二阶段批准的 yydb connector"),
-                )
-                .with_diagnostic(DIAG_YYDB_CONNECTOR_MISSING));
+                let path = resolve_path(&project_dir, &endpoint);
+                SessionStore::Yydb(LocalSource::open(path).map_err(from_local_error)?)
             }
             DatasourceKind::Sqlite => {
                 let endpoint = expand_endpoint(ds, source).map_err(|err| ErrorEnvelope::internal(DIAG_EXEC_FAILED, err))?;
@@ -635,11 +683,7 @@ impl HostSession {
         else {
             return ExecuteOutcome::failure(closed());
         };
-        let source = match bound.text_only() {
-            Ok(source) => source,
-            Err(err) => return ExecuteOutcome::failure(ErrorEnvelope::invalid_argument(DIAG_PARAM_ENCODING, err)),
-        };
-        match store.query(&self.planner, source) {
+        match store.query(&self.planner, bound) {
             Ok(rows) => ExecuteOutcome::rows(rows),
             Err(err) => ExecuteOutcome::failure(err),
         }
@@ -672,11 +716,7 @@ impl HostSession {
         else {
             return ExecuteOutcome::failure(closed());
         };
-        let source = match bound.text_only() {
-            Ok(source) => source,
-            Err(err) => return ExecuteOutcome::failure(ErrorEnvelope::invalid_argument(DIAG_PARAM_ENCODING, err)),
-        };
-        match store.execute_unit(&self.planner, source) {
+        match store.execute_unit(&self.planner, &bound) {
             Ok(()) => ExecuteOutcome::unit(),
             Err(err) => ExecuteOutcome::failure(err),
         }
@@ -701,11 +741,12 @@ impl HostSession {
         }
         match &self.store {
             Some(SessionStore::Sqlite(db)) => db.managed_push(schema).map_err(from_sqlite_error).map(|_| ()),
+            Some(SessionStore::Yydb(db)) => db.ensure_schema(schema).map_err(from_local_error),
             Some(SessionStore::Postgres { db, .. }) => db.managed_push(schema).map_err(from_postgres_error).map(|_| ()),
             Some(SessionStore::Mysql { db, .. }) => db.managed_push(schema).map_err(from_mysql_error).map(|_| ()),
             _ => Err(ErrorEnvelope::invalid_argument(
                 DIAG_MANAGED_PUSH_UNSUPPORTED,
-                "managed_push is only supported on sqlite, postgres and mysql sessions",
+                "managed_push is only supported on sqlite, yydb, postgres and mysql sessions",
             )),
         }
     }
@@ -759,6 +800,9 @@ impl HostSession {
     /// same database file can be opened again from this process.
     pub fn close(&mut self) {
         self.closed = true;
+        if let Some(SessionStore::Yydb(db)) = self.store.as_ref() {
+            db.close();
+        }
         drop(self.store.take());
     }
 
