@@ -16,6 +16,7 @@ use database_execution::{
     cluster::{KeyValueExecutor, TransactionHandle},
     sql_exec::execute_plan,
 };
+use database_protocol_mysql::PROTOCOL_VERSION;
 use database_query::{
     MYSQL_BLOB_CAPACITY, SqlBoundExpression, SqlBoundLiteral, SqlCatalogBoundExpression, SqlCatalogBoundStatement, SqlColumn, SqlDialect,
     SqlErrorKind, SqlExecutionPlan, SqlFieldType, SqlFrontendError, SqlParameterStyle, SqlResult, SqlSchemaCheckpoint, SqlSchemaRegistry,
@@ -765,7 +766,7 @@ fn serve_session(mut stream: impl Read + Write, runtime: Option<Arc<MysqlSqlRunt
 
 fn handshake() -> Vec<u8> {
     let mut payload = Vec::with_capacity(80);
-    payload.push(10);
+    payload.push(PROTOCOL_VERSION);
     payload.extend_from_slice(b"8.0.36-yyds\0");
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.extend_from_slice(b"yydsseed");
