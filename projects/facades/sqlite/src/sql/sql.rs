@@ -9,7 +9,7 @@
 //! | `CREATE VIEW` | `CREATE VIEW name AS SELECT ...`, re-evaluated on every read |
 //! | `CREATE TRIGGER` | `BEFORE` / `AFTER` `INSERT` / `UPDATE [OF cols]` / `DELETE` on one table, one or more body statements |
 //! | `INSERT` | optional column list, `VALUES` tuples or a `SELECT` source, optional `RETURNING`; `REPLACE` / `INSERT OR REPLACE` deletes conflicting rows first |
-//! | `UPDATE` | optional `AS` alias, one `SET c = expr` per column (bare left-hand side), optional `WHERE` and `RETURNING` |
+//! | `UPDATE` | optional `AS` alias, one `SET c = expr` per column (bare left-hand side) or a row value `SET (a, b) = (x, y)`, optional `FROM` sources, `WHERE` and `RETURNING` |
 //! | `DELETE` | optional `AS` alias, optional `WHERE` and `RETURNING` |
 //! | `SELECT` | one or more comma-separated table references, `count(*)`, `*`, or an explicit column list, with optional `WHERE`, `ORDER BY` and `LIMIT` |
 //!
@@ -31,13 +31,13 @@
 //! same `SELECT` evaluator, so correlation and set operators behave identically
 //! at every nesting depth.
 //!
-//! Anything else (functions in `FROM`, row-value `SET (a, b) = (...)`,
-//! `UPDATE OR ...` conflict policies, `SET c = DEFAULT`, `RETURNING *, ...`,
-//! `ORDER BY` / `LIMIT` on `UPDATE` and `DELETE`, `ALTER`, `WITH RECURSIVE`,
-//! the `GROUPS` / `EXCLUDE` frame units) is rejected with a structured error
-//! instead of being silently approximated. Every rejection carries the
-//! statement kind, the offending clause when one is recognized, and the byte
-//! offset inside the input.
+//! Anything else (a row-value subquery on the right of `SET (a, b) = (select
+//! ...)`, `UPDATE OR ...` conflict policies, `SET c = DEFAULT`,
+//! `RETURNING *, ...`, `ORDER BY` / `LIMIT` on `UPDATE` and `DELETE`, `ALTER`,
+//! `WITH RECURSIVE`, the `GROUPS` / `EXCLUDE` frame units) is rejected with a
+//! structured error instead of being silently approximated. Every rejection
+//! carries the statement kind, the offending clause when one is recognized,
+//! and the byte offset inside the input.
 //!
 //! ## Transitional shapes
 //!
@@ -1785,12 +1785,15 @@ pub enum Statement {
         /// `REPLACE INTO` or `INSERT OR REPLACE INTO`: delete every row that
         /// conflicts on a uniqueness rule, then insert the new row.
         replace: bool,
+        /// `INSERT OR IGNORE INTO`: skip rows that violate any constraint
+        /// instead of failing the statement.
+        ignore: bool,
         /// Optional `ON CONFLICT` clause.
         conflict: Option<ConflictClause>,
         /// `RETURNING` projection, `*` or an explicit list.
         returning: Option<SelectItems>,
     },
-    /// `UPDATE t [AS alias] SET c = expr [, ...] [WHERE expr] [RETURNING ...]`.
+    /// `UPDATE t [AS alias] SET c = expr [, (a, b) = (x, y) ...] [FROM ...] [WHERE expr] [RETURNING ...]`.
     Update {
         /// Optional `schema.` qualifier of the target table.
         schema: Option<String>,
@@ -1800,6 +1803,9 @@ pub enum Statement {
         alias: Option<String>,
         /// Assignments in source order; a repeated column keeps its last value.
         assignments: Vec<Assignment>,
+        /// `FROM` sources joined against the target row; a row value
+        /// assignment contributes several targets from one parenthesized item.
+        from: Vec<TableRef>,
         /// Optional `WHERE` predicate; every row is visited when absent.
         filter: Option<Expr>,
         /// `RETURNING` projection, `*` or an explicit list.
@@ -4876,8 +4882,13 @@ impl<'a> Parser<'a> {
             Some(Token::Minus) => matches!(self.tokens.get(self.at + 1), Some(Token::Int(_)) | Some(Token::Real(_))),
             _ => false,
         };
+        // 只有字面量正好填满整个元素时才走字面量分支；`1 + 1`、`abs(1)` 这类
+        // 以字面量开头的表达式按表达式求值。
         if literal_head {
-            return Ok(InsertValue::Literal(self.literal()?));
+            let after = if matches!(self.peek(), Some(Token::Minus)) { self.at + 2 } else { self.at + 1 };
+            if matches!(self.tokens.get(after), Some(Token::Comma) | Some(Token::RParen)) {
+                return Ok(InsertValue::Literal(self.literal()?));
+            }
         }
         Ok(InsertValue::Expression(self.or_expr()?))
     }
@@ -4916,17 +4927,25 @@ impl<'a> Parser<'a> {
     }
 
     fn insert(&mut self, mut replace: bool) -> Result<Statement, SqlError> {
+        let mut ignore = false;
         if self.eat_word("or") {
-            if !self.eat_word("replace") {
+            if self.eat_word("replace") {
+                replace = true;
+            }
+            else if self.eat_word("ignore") {
+                ignore = true;
+            }
+            else {
                 let found = self.peek().map(Token::describe).unwrap_or_else(|| "end of SQL".to_string());
                 let mut error = self.error(
                     "unsupported-clause",
-                    format!("`INSERT OR ...` only implements the REPLACE policy; the default ABORT policy is implied (found {found})"),
+                    format!(
+                        "`INSERT OR ...` only implements the IGNORE and REPLACE policies; the default ABORT policy is implied (found {found})"
+                    ),
                 );
                 error.clause = Some("OR".to_string());
                 return Err(error);
             }
-            replace = true;
         }
         self.expect_word("into")?;
         let (schema, table) = self.qualified_name()?;
@@ -4969,6 +4988,7 @@ impl<'a> Parser<'a> {
                 default_values: true,
                 query: None,
                 replace,
+                ignore,
                 conflict,
                 returning,
             });
@@ -4993,6 +5013,7 @@ impl<'a> Parser<'a> {
                 default_values: false,
                 query: Some(Box::new(query)),
                 replace,
+                ignore,
                 conflict,
                 returning,
             });
@@ -5027,7 +5048,7 @@ impl<'a> Parser<'a> {
         }
         let conflict = self.conflict_clause()?;
         let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
-        Ok(Statement::Insert { schema, table, columns, rows, default_values: false, query: None, replace, conflict, returning })
+        Ok(Statement::Insert { schema, table, columns, rows, default_values: false, query: None, replace, ignore, conflict, returning })
     }
 
     /// Parses `ON CONFLICT [(target)] [WHERE ...] DO NOTHING | DO UPDATE SET ...`.
@@ -5138,41 +5159,142 @@ impl<'a> Parser<'a> {
         let mut assignments = Vec::new();
         loop {
             if self.peek() == Some(&Token::LParen) {
-                let mut error = self
-                    .error("unsupported-clause", "row-value `SET (a, b) = (...)` assignments are not supported; assign one column per item");
-                error.clause = Some("SET".to_string());
-                return Err(error);
+                self.row_value_assignment(&mut assignments)?;
             }
-            let column = self.name()?;
-            if self.peek() == Some(&Token::Dot) {
-                return Err(self.error("syntax", "`UPDATE ... SET` takes a bare column name; a table qualifier is not accepted before `.`"));
+            else {
+                let column = self.name()?;
+                if self.peek() == Some(&Token::Dot) {
+                    return Err(self.error("syntax", "`UPDATE ... SET` takes a bare column name; a table qualifier is not accepted before `.`"));
+                }
+                match self.peek() {
+                    Some(Token::Operator(operator)) if operator == "=" => self.at += 1,
+                    Some(token) => {
+                        return Err(self.error("syntax", format!("expected `=` in a `SET` assignment but found {}", token.describe())));
+                    }
+                    None => return Err(self.error("syntax", "`SET` assignment is incomplete")),
+                }
+                let found_default = self.peek_word().is_some_and(|word| word.eq_ignore_ascii_case("default"));
+                if found_default {
+                    let mut error = self.error(
+                        "unsupported-clause",
+                        "`SET <column> = DEFAULT` is not supported; SQLite has no column default in an `UPDATE`, so state the value explicitly",
+                    );
+                    error.clause = Some("DEFAULT".to_string());
+                    return Err(error);
+                }
+                let value = self.or_expr()?;
+                assignments.push(Assignment { column, value });
             }
-            match self.peek() {
-                Some(Token::Operator(operator)) if operator == "=" => self.at += 1,
-                Some(token) => return Err(self.error("syntax", format!("expected `=` in a `SET` assignment but found {}", token.describe()))),
-                None => return Err(self.error("syntax", "`SET` assignment is incomplete")),
-            }
-            let found_default = self.peek_word().is_some_and(|word| word.eq_ignore_ascii_case("default"));
-            if found_default {
-                let mut error = self.error(
-                    "unsupported-clause",
-                    "`SET <column> = DEFAULT` is not supported; SQLite has no column default in an `UPDATE`, so state the value explicitly",
-                );
-                error.clause = Some("DEFAULT".to_string());
-                return Err(error);
-            }
-            let value = self.or_expr()?;
-            assignments.push(Assignment { column, value });
             if self.peek() == Some(&Token::Comma) {
                 self.at += 1;
                 continue;
             }
             break;
         }
+        let from = if self.eat_word("from") { self.update_from()? } else { Vec::new() };
         let filter = if self.eat_word("where") { Some(self.or_expr()?) } else { None };
         let returning = if self.eat_word("returning") { Some(self.returning()?) } else { None };
         self.statement_ends("UPDATE")?;
-        Ok(Statement::Update { schema, table, alias, assignments, filter, returning })
+        Ok(Statement::Update { schema, table, alias, assignments, from, filter, returning })
+    }
+
+    /// Reads one `SET (a, b) = (x, y)` row-value assignment into `assignments`.
+    ///
+    /// SQLite evaluates both sides against the row as it was before the
+    /// statement, so a rotation like `SET (a, b) = (b, a)` swaps the values.
+    /// A parenthesized subquery on the right-hand side has its own row-value
+    /// shape and stays unsupported.
+    fn row_value_assignment(&mut self, assignments: &mut Vec<Assignment>) -> Result<(), SqlError> {
+        self.at += 1;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.name()?);
+            match self.peek() {
+                Some(Token::Comma) => self.at += 1,
+                Some(Token::RParen) => {
+                    self.at += 1;
+                    break;
+                }
+                Some(token) => {
+                    return Err(
+                        self.error("syntax", format!("expected `,` or `)` in the row-value target list but found {}", token.describe()))
+                    );
+                }
+                None => return Err(self.error("syntax", "the row-value target list is not closed")),
+            }
+        }
+        match self.peek() {
+            Some(Token::Operator(operator)) if operator == "=" => self.at += 1,
+            Some(token) => {
+                return Err(self.error("syntax", format!("expected `=` in a row-value assignment but found {}", token.describe())));
+            }
+            None => return Err(self.error("syntax", "the row-value assignment is incomplete")),
+        }
+        if self.peek() != Some(&Token::LParen) {
+            return Err(self.error("syntax", "a row-value assignment takes a parenthesized value list on the right"));
+        }
+        self.at += 1;
+        if self.peek_keyword("select") {
+            let mut error = self.error(
+                "unsupported-clause",
+                "a row-value subquery on the right of `SET (a, b) = (...)` is not supported; list the values explicitly",
+            );
+            error.clause = Some("SET".to_string());
+            return Err(error);
+        }
+        let mut values = Vec::new();
+        loop {
+            values.push(self.or_expr()?);
+            match self.peek() {
+                Some(Token::Comma) => self.at += 1,
+                Some(Token::RParen) => {
+                    self.at += 1;
+                    break;
+                }
+                Some(token) => {
+                    return Err(self.error("syntax", format!("expected `,` or `)` in the row-value list but found {}", token.describe())));
+                }
+                None => return Err(self.error("syntax", "the row-value list is not closed")),
+            }
+        }
+        if values.len() != columns.len() {
+            return Err(self.error("arity-mismatch", format!("{} columns assigned {} values", columns.len(), values.len())));
+        }
+        for (column, value) in columns.into_iter().zip(values) {
+            assignments.push(Assignment { column, value });
+        }
+        Ok(())
+    }
+
+    /// Reads the `FROM` list of an `UPDATE`. Plain products (`a, b`) and
+    /// `CROSS JOIN` are accepted; an `ON` / `USING` / `NATURAL` join would need
+    /// a join planner the update path does not run, so it is rejected.
+    fn update_from(&mut self) -> Result<Vec<TableRef>, SqlError> {
+        let mut from = Vec::new();
+        loop {
+            from.push(self.table_ref()?);
+            while self.peek_keyword("cross") {
+                self.at += 1;
+                self.expect_word("join")?;
+                from.push(self.table_ref()?);
+            }
+            if let Some(word) = self.peek_word() {
+                if ["join", "inner", "left", "right", "full", "natural", "outer"].iter().any(|keyword| word.eq_ignore_ascii_case(keyword)) {
+                    let mut error = self.error(
+                        "unsupported-clause",
+                        "an `ON` / `USING` / `NATURAL` join in an `UPDATE ... FROM` clause is not supported; use a comma product",
+                    );
+                    error.clause = Some("FROM".to_string());
+                    return Err(error);
+                }
+            }
+            if self.peek() == Some(&Token::Comma) {
+                self.at += 1;
+                continue;
+            }
+            break;
+        }
+        Ok(from)
     }
 
     fn delete(&mut self) -> Result<Statement, SqlError> {
