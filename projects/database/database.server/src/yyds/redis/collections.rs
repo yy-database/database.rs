@@ -2977,11 +2977,13 @@ fn select_range(
                 write_error(stream, "min or max not valid string range item")?;
                 return Ok(None);
             };
+            // The server walks the skiplist in (score, member) order and filters by
+            // the member bounds, so mixed scores keep their score order.
+            sort_zset(&mut entries);
             let mut selected: Vec<(Vec<u8>, f64)> = entries
                 .into_iter()
                 .filter(|(member, _)| lex_at_least(member, &min) && lex_at_most(member, &max))
                 .collect();
-            selected.sort_by(|left, right| left.0.cmp(&right.0));
             if request.reverse {
                 selected.reverse();
             }
@@ -4465,10 +4467,15 @@ pub(crate) fn handle_zset(
             Loaded::Found(entries) => entries,
             Loaded::Rejected => return Ok(()),
         };
-        // 字典族假定所有分数相同，因此只按成员字节比较。
-        let mut members: Vec<Vec<u8>> = entries.into_iter().map(|(member, _)| member).collect();
-        members.sort();
-        members.retain(|member| lex_at_least(member, &min) && lex_at_most(member, &max));
+        // 与真机一致：按 (score, member) 遍历后按成员边界过滤，分数不一致时
+        // 保留分数顺序而不是重排成字典序。
+        let mut entries = entries;
+        sort_zset(&mut entries);
+        let mut members: Vec<Vec<u8>> = entries
+            .into_iter()
+            .filter(|(member, _)| lex_at_least(member, &min) && lex_at_most(member, &max))
+            .map(|(member, _)| member)
+            .collect();
         if reverse {
             members.reverse();
         }
@@ -4494,7 +4501,12 @@ pub(crate) fn handle_zset(
         let key = request.arguments[1];
         let mut entries = match load_zset(stream, executor, base, key)? {
             Loaded::Missing => {
-                return write_null(stream, protocol);
+                return if with_score {
+                    write_null_array(stream, protocol)
+                }
+                else {
+                    write_null(stream, protocol)
+                };
             }
             Loaded::Found(entries) => entries,
             Loaded::Rejected => return Ok(()),
@@ -4512,7 +4524,16 @@ pub(crate) fn handle_zset(
                     write_integer(stream, rank)?;
                 }
             }
-            None => write_null(stream, protocol)?,
+            // `WITHSCORE` answers an array on success, so the server keeps the array
+            // shape for a miss and replies a null array under RESP2.
+            None => {
+                if with_score {
+                    write_null_array(stream, protocol)?
+                }
+                else {
+                    write_null(stream, protocol)?
+                }
+            }
         }
         return Ok(());
     }
