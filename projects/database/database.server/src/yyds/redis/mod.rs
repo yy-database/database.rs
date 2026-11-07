@@ -87,6 +87,26 @@ pub fn execute_set_command(
     collections::handle_set(stream, &request, Some(executor), namespace, protocol)
 }
 
+/// Executes one list-family request against an external executor and writes the RESP reply.
+///
+/// Command semantics, reply framing and type checks stay in the redis collection
+/// handler. Blocking commands run in their non-blocking form: an empty key replies
+/// at once and the caller owns the wait loop.
+pub fn execute_list_command(
+    stream: &mut dyn io::Write,
+    arguments: &[&[u8]],
+    executor: &dyn KeyValueExecutor,
+    namespace: &database_types::cluster::Namespace,
+    protocol: u8,
+) -> io::Result<()> {
+    let request = resp::Request {
+        arguments: arguments.to_vec(),
+        consumed: 0,
+    };
+    let registry = blocking::BlockingRegistry::new();
+    collections::handle_list(stream, &request, Some(executor), namespace, protocol, &registry, false)
+}
+
 /// Banner shown when a disguise server starts.
 pub fn startup_banner(port: u16) -> String {
     protocol_startup_banner(&GatewayConfig::new(GATEWAY_KIND).with_port(port))

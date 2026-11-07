@@ -304,6 +304,7 @@ pub(crate) fn is_list_command(command: &[u8]) -> bool {
         b"LINSERT",
         b"RPOPLPUSH",
         b"LMOVE",
+        b"LMPOP",
         b"BLPOP",
         b"BRPOP",
         b"BLMOVE",
@@ -1396,6 +1397,81 @@ fn handle_blocking_mpop(
     }
 }
 
+/// `LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]`。
+///
+/// 按参数顺序扫描，第一个非空列表胜出；前面的键先过类型检查，与真机一致。
+fn handle_mpop(
+    stream: &mut dyn io::Write,
+    executor: &dyn KeyValueExecutor,
+    base: &Namespace,
+    arguments: &[&[u8]],
+    protocol: u8,
+) -> io::Result<()> {
+    if arguments.len() < 4 {
+        return write_arity_error(stream, "lmpop");
+    }
+    let Some(numkeys) = parse_index(arguments[1])
+    else {
+        return write_error(stream, "numkeys should be greater than 0");
+    };
+    if numkeys <= 0 {
+        return write_error(stream, "numkeys should be greater than 0");
+    }
+    let numkeys = numkeys as usize;
+    let keys_end = 2 + numkeys;
+    if arguments.len() < keys_end + 1 {
+        return write_error(stream, "syntax error");
+    }
+    let Some(side) = parse_side(arguments[keys_end])
+    else {
+        return write_error(stream, "syntax error");
+    };
+    let mut count = 1_usize;
+    if arguments.len() > keys_end + 1 {
+        if arguments.len() != keys_end + 3 || !arguments[keys_end + 1].eq_ignore_ascii_case(b"COUNT") {
+            return write_error(stream, "syntax error");
+        }
+        let Some(value) = parse_index(arguments[keys_end + 2])
+        else {
+            return write_error(stream, "count should be greater than 0");
+        };
+        if value <= 0 {
+            return write_error(stream, "count should be greater than 0");
+        }
+        count = value as usize;
+    }
+    for key in &arguments[2..keys_end] {
+        let elements = match load_list(stream, executor, base, key)? {
+            Loaded::Missing => continue,
+            Loaded::Found(elements) => elements,
+            Loaded::Rejected => return Ok(()),
+        };
+        if elements.is_empty() {
+            continue;
+        }
+        let take = count.min(elements.len());
+        let (popped, kept): (Vec<Vec<u8>>, Vec<Vec<u8>>) = match side {
+            ListSide::Left => (elements[..take].to_vec(), elements[take..].to_vec()),
+            // 与 `RPOP key count` 一致：从表尾逐个弹出，回复是尾端在前。
+            ListSide::Right => (
+                elements[elements.len() - take..].iter().rev().cloned().collect(),
+                elements[..elements.len() - take].to_vec(),
+            ),
+        };
+        if let Err(message) = persist_list(executor, base, key, &kept) {
+            return write_storage_error(stream, &message);
+        }
+        write_array_header(stream, 2)?;
+        write_bulk(stream, key)?;
+        write_array_header(stream, popped.len())?;
+        for element in &popped {
+            write_bulk(stream, element)?;
+        }
+        return Ok(());
+    }
+    write_null_array(stream, protocol)
+}
+
 /// 列表命令的分派入口。
 pub(crate) fn handle_list(
     stream: &mut dyn io::Write,
@@ -1422,6 +1498,9 @@ pub(crate) fn handle_list(
     }
     if command.eq_ignore_ascii_case(b"LPOS") {
         return handle_lpos(stream, executor, base, &request.arguments, protocol);
+    }
+    if command.eq_ignore_ascii_case(b"LMPOP") {
+        return handle_mpop(stream, executor, base, &request.arguments, protocol);
     }
     if command.eq_ignore_ascii_case(b"LPUSH") || command.eq_ignore_ascii_case(b"RPUSH") {
         let insert_at_head = command.eq_ignore_ascii_case(b"LPUSH");

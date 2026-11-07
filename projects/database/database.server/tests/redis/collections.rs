@@ -360,6 +360,76 @@ fn list_pop_count_order() {
     assert_eq!(expect_integer(&mut client), 0);
 }
 
+/// `LMPOP` scans keys in order, honours `LEFT`/`RIGHT` and `COUNT`, removes the
+/// key once it empties, and reports every argument error with the server wording.
+#[test]
+fn list_mpop_scans_and_counts() {
+    let (mut client, _server) = memory_server("redis-list-mpop");
+    let read_mpop = |client: &mut TcpStream| -> Option<(String, Vec<String>)> {
+        match read_reply(client) {
+            Reply::Array(None) => None,
+            Reply::Array(Some(mut items)) if items.len() == 2 => {
+                let elements = match items.pop().unwrap() {
+                    Reply::Array(Some(elements)) => elements
+                        .into_iter()
+                        .map(|item| match item {
+                            Reply::Bulk(Some(bytes)) => String::from_utf8(bytes).unwrap(),
+                            other => panic!("expected bulk element, got {}", describe(&other)),
+                        })
+                        .collect(),
+                    other => panic!("expected element array, got {}", describe(&other)),
+                };
+                let key = match items.pop().unwrap() {
+                    Reply::Bulk(Some(bytes)) => String::from_utf8(bytes).unwrap(),
+                    other => panic!("expected key bulk, got {}", describe(&other)),
+                };
+                Some((key, elements))
+            }
+            other => panic!("expected LMPOP reply, got {}", describe(&other)),
+        }
+    };
+
+    send(&mut client, &["LMPOP", "2", "a", "b", "LEFT"]);
+    assert_eq!(read_mpop(&mut client), None);
+    send(&mut client, &["RPUSH", "a", "a1", "a2"]);
+    assert_eq!(expect_integer(&mut client), 2);
+    send(&mut client, &["RPUSH", "b", "b1", "b2", "b3"]);
+    assert_eq!(expect_integer(&mut client), 3);
+
+    send(&mut client, &["LMPOP", "2", "a", "b", "LEFT"]);
+    assert_eq!(read_mpop(&mut client), Some(("a".into(), vec!["a1".into()])));
+    send(&mut client, &["LMPOP", "2", "a", "b", "RIGHT", "COUNT", "5"]);
+    assert_eq!(read_mpop(&mut client), Some(("a".into(), vec!["a2".into()])));
+    send(&mut client, &["EXISTS", "a"]);
+    assert_eq!(expect_integer(&mut client), 0);
+    send(&mut client, &["LMPOP", "2", "a", "b", "RIGHT", "COUNT", "2"]);
+    assert_eq!(read_mpop(&mut client), Some(("b".into(), vec!["b3".into(), "b2".into()])));
+    send(&mut client, &["LRANGE", "b", "0", "-1"]);
+    expect_array(&mut client, &["b1"]);
+
+    send(&mut client, &["LMPOP", "2", "a", "b", "LEFT"]);
+    assert_eq!(read_mpop(&mut client), Some(("b".into(), vec!["b1".into()])));
+    send(&mut client, &["EXISTS", "b"]);
+    assert_eq!(expect_integer(&mut client), 0);
+
+    send(&mut client, &["LMPOP", "0", "a", "LEFT"]);
+    expect_error(&mut client, "ERR numkeys should be greater than 0");
+    send(&mut client, &["LMPOP", "abc", "a", "LEFT"]);
+    expect_error(&mut client, "ERR numkeys should be greater than 0");
+    send(&mut client, &["LMPOP", "3", "a", "b", "LEFT"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["LMPOP", "1", "a", "MIDDLE"]);
+    expect_error(&mut client, "ERR syntax error");
+    send(&mut client, &["LMPOP", "1", "a", "LEFT", "COUNT", "0"]);
+    expect_error(&mut client, "ERR count should be greater than 0");
+    send(&mut client, &["LMPOP", "1", "a", "LEFT", "COUNT", "abc"]);
+    expect_error(&mut client, "ERR count should be greater than 0");
+    send(&mut client, &["SET", "s", "v"]);
+    expect_status(&mut client, "OK");
+    send(&mut client, &["LMPOP", "2", "a", "s", "LEFT"]);
+    expect_error(&mut client, WRONGTYPE);
+}
+
 /// `LPUSH` prepends each value in order, `LRANGE` handles negative indexes and
 /// out-of-range slices, and pops trim the list down to an absent key.
 #[test]
